@@ -346,6 +346,107 @@ and `s3:ListAllMyBuckets` in addition to the data-plane ones. If the
 operator doesn't want to grant these, they leave `template.enabled =
 false` and manage `[[storage.buckets]]` manually.
 
+## D-019: Tiered compaction (L0 → L1 → L2 → L3)
+
+**Date:** 2026-05-26
+**Status:** accepted (schema seam from v0.1, policy lands v0.6)
+
+Compaction merges blocks within a level into one block at the next
+level up. Targets: L0 ≈ 128 MiB (freshly written), L1 ≈ 1 GiB, L2 ≈
+10 GiB, L3 ≈ 100 GiB. Level fan-out is ~8, capping write
+amplification at roughly `log_8(total_size_per_day)` — about 3× at
+50 TB/month rather than the 5–10× of naïve "merge whenever small."
+
+Size-tiered (not levelled / LevelDB-style) because observability is
+append-mostly and size-tiered's slightly worse read amplification
+is recovered by our parquet pruning anyway.
+
+The `level` column on `blocks` is added in v0.1 so the policy can
+land later without a schema migration. Until then, all blocks are
+L0 and "compaction" just doesn't do anything except mark blocks
+for promotion when the threshold is crossed.
+
+## D-020: Valkey-as-service-registry + consistent hashing for agent routing
+
+**Date:** 2026-05-26
+**Status:** accepted
+
+Agents discover scry servers via a Valkey sorted set
+(`scry/servers/<region>`) with TTL-based heartbeats and reaping.
+Agent-side selection uses consistent hashing on `agent_id` with
+top-3 fallback for live server outages.
+
+Properties: stable affinity (an agent's data concentrates on one
+server, not fragmented across many), smooth rebalancing (1/N
+churn on server set changes), no central LB required, no DNS
+truncation issues.
+
+Alternative discovery backends (k8s/EDS, Consul) are pluggable
+via the agent's `[discovery]` config block. Valkey is the default
+because we already depend on it for control-plane pub/sub.
+
+DNS round-robin was rejected as the default because it breaks at
+~20–30 servers (UDP truncation), has no health awareness, and gives
+no stable affinity.
+
+## D-021: Capacity-aware agent assignment via weighted virtual nodes
+
+**Date:** 2026-05-26
+**Status:** accepted (policy is v0.7+; mechanism in v0.1 wire and
+discovery)
+
+Servers publish a capacity weight along with their registration.
+The consistent-hash ring grants a server `weight × base_vnodes`
+positions, so higher-capacity servers receive a proportionally
+larger share of agents.
+
+We deliberately do *not* implement load-based per-agent steering
+("which agent is hot, move it elsewhere"). That pattern is chatty,
+prone to thrashing, and rarely worth its complexity. Static
+weighting plus large vnode counts give us 90% of the benefit.
+
+Weight is operator-configured initially; auto-derivation from
+CPU/network/WAL-throughput headroom is a v0.7+ extension.
+
+## D-022: Deployment topology modes (full / ingest-only / query-only)
+
+**Date:** 2026-05-26
+**Status:** accepted
+
+A scry binary can run in one of three modes selected by `[role]`
+flags. `full` is the default and is correct up to ~30 instances.
+`ingest-only` and `query-only` exist for large deployments where
+sizing ingest (CPU + WAL disk I/O) separately from query (RAM +
+network) yields meaningful operational wins.
+
+Query-only nodes are stateless beyond their catalog cache; they
+register on a separate discovery channel (`scry/queriers/<region>`)
+so a query router can pick from them independently of ingest
+routing.
+
+This split was added because the design is otherwise symmetric and
+adding the role flag costs nothing now but would require careful
+threading later. The wire protocol and catalog don't change.
+
+## D-023: Catalog snapshot bootstrap for fast cold starts
+
+**Date:** 2026-05-26
+**Status:** accepted (mechanism v0.6+; snapshot writer optional
+before that)
+
+A new instance bootstraps its catalog from (1) catalog snapshot in
+object storage if present, (2) Valkey tail from the snapshot's
+sequence number, (3) full bucket walk as fallback. Snapshots are
+written hourly by the instance holding a designated lease and
+stored as parquet objects in a known location.
+
+This caps cold-start time at "one snapshot read + recent tail"
+regardless of bucket size. Without it, a fresh instance walking
+1.2M blocks takes minutes; with it, seconds.
+
+Small deployments can skip the snapshot writer entirely and rely
+on the full-walk fallback.
+
 ## Deferred / open
 
 These are not decisions yet; they're flagged for "we'll decide when the

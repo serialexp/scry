@@ -57,6 +57,52 @@ is marketing.
                 └──────────────────────────────────────┘
 ```
 
+The diagram shows the data plane. The **control plane** is a single
+Valkey instance, used for:
+
+- Agent → server discovery (live server registry + consistent
+  hashing on the agent side; see [Discovery](#discovery)).
+- Block-event pub/sub between instances for fast catalog
+  convergence (see [Block discovery](#block-discovery-valkey-pubsub-with-polling-backstop)).
+- Bucket-event pub/sub for pool changes (auto-provisioning,
+  sealing).
+
+Valkey is a **cache-invalidation hint**, not a system of record;
+object storage is always the source of truth. Valkey unavailability
+gracefully degrades to polling-based discovery; no correctness is
+lost.
+
+### Deployment topologies
+
+A scry binary can run in one of three modes, selected by config:
+
+| Mode             | Ingest | Query | Compaction | Retention | Notes |
+|------------------|--------|-------|------------|-----------|-------|
+| **full** (default) | ✓ | ✓ | ✓ | ✓ | The "one binary does it all" mode. Correct choice up to ~30 instances. |
+| **ingest-only**  | ✓ | ✗ | ✓ | ✓ | Specialised writer nodes — receive from agents, manage WAL, run background tasks. No query endpoint exposed. |
+| **query-only**   | ✗ | ✓ | ✗ | ✗ | Specialised reader nodes — read from object storage, serve queries, no WAL, no agent traffic. Stateless beyond its catalog cache. |
+
+Single-mode deployments are configured via `[role]`:
+
+```toml
+[role]
+ingest     = true
+query      = true
+background = true   # compaction + retention
+```
+
+All three default to `true`; setting one to `false` excludes that
+subsystem. The discovery layer only registers servers that have
+`ingest = true`; query-only nodes register on a separate channel
+(`scry/queriers/<region>`) for query load-balancing if a query
+router is in front.
+
+This split is **optional** — at small scale, `full` everywhere is
+fine. At large scale, dedicating ingest nodes (high CPU + WAL disk
+I/O) separately from query nodes (high RAM for caches + network
+bandwidth for object-store reads) lets you size them to their
+actual workload.
+
 ## The record model
 
 Every signal reduces to:
@@ -146,25 +192,8 @@ Each bucket in the catalog is either:
   out). Operator may remove from config and delete the underlying
   bucket out-of-band to reclaim provider quota.
 
-The `buckets` table in the catalog tracks this:
-
-```sql
-CREATE TABLE buckets (
-  name        TEXT PRIMARY KEY,    -- logical name in config
-  endpoint    TEXT NOT NULL,
-  region      TEXT,
-  max_bytes   INTEGER,             -- soft cap; triggers seal when crossed
-  sealed_at   INTEGER,             -- unix ts, NULL = open
-  total_bytes INTEGER NOT NULL DEFAULT 0
-);
-```
-
-And each block carries its bucket:
-
-```sql
-ALTER TABLE blocks ADD COLUMN bucket TEXT NOT NULL
-  REFERENCES buckets(name);
-```
+The catalog's `buckets` and `blocks` tables track all of this; see
+[Schema](#schema) for full definitions.
 
 #### Write path
 
@@ -341,22 +370,101 @@ in via `bucket-created` events on Valkey.
 ### The catalog
 
 The catalog is **derived state**: a SQLite database mirroring "what
-blocks exist and what's in their `.meta.json`". It's rebuilt from a
-bucket `ListObjects` walk at startup, and kept in sync incrementally
-during runtime.
+blocks exist, what's roughly in them, and which buckets they live in."
+Each instance maintains its own catalog; instances converge via Valkey
+events (see [Synchronisation](#synchronisation)).
 
 - Writers append rows when they upload a block.
-- Readers query the catalog to plan a query (which blocks intersect the
-  time range, which can be pruned by label fingerprint).
-- Other readers learn about new blocks via either (a) periodic
-  incremental `ListObjects` polling with a `start_after` marker, or (b)
-  an optional pub/sub notification (S3 event notifications, NATS,
-  whatever) — *optional* because polling is fine at our cadence.
+- Readers query the catalog to plan a query (which blocks intersect
+  the time range, which can be pruned by label fingerprint).
+- Peers learn about new blocks via Valkey pub/sub, with
+  `ListObjects`-based polling and periodic full walks as backstops.
 
-The catalog **is not the source of truth.** If it drifts from the
-bucket, we re-derive it. This is the property that lets multi-writer
-work without coordination: writers don't have to agree on the catalog,
-because the catalog is just a cache of `ListObjects`.
+The catalog **is not the source of truth.** Object storage is. If a
+catalog drifts from the bucket, we re-derive by walking the bucket
+and reading sidecars. This is the property that lets multi-writer
+work without coordination: writers don't have to agree on the
+catalog, because the catalog is just a cache of what's in the bucket.
+
+#### Schema
+
+The complete catalog schema, consolidated. All tables are per
+instance; cross-instance convergence happens via Valkey events on top.
+
+```sql
+-- All buckets known to this instance.
+CREATE TABLE buckets (
+  name        TEXT PRIMARY KEY,         -- logical name from config or template
+  endpoint    TEXT NOT NULL,
+  region      TEXT,
+  max_bytes   INTEGER,                  -- soft cap; triggers seal when crossed
+  state       TEXT NOT NULL,            -- open | sealed | drained
+  sealed_at   INTEGER,                  -- unix ts, NULL while open
+  total_bytes INTEGER NOT NULL DEFAULT 0,
+  created_at  INTEGER NOT NULL
+);
+
+-- All blocks (mirrors object-store sidecars).
+CREATE TABLE blocks (
+  uuid           TEXT PRIMARY KEY,      -- UUID v7
+  bucket         TEXT NOT NULL REFERENCES buckets(name),
+  signal         TEXT NOT NULL,         -- metrics | logs | traces | profiles
+  date           TEXT NOT NULL,         -- yyyy-mm-dd of ts_min
+  writer_id      TEXT NOT NULL,         -- producer
+  level          INTEGER NOT NULL DEFAULT 0,  -- compaction level; 0 = freshly written
+  ts_min         INTEGER NOT NULL,      -- unix nanos
+  ts_max         INTEGER NOT NULL,
+  row_count      INTEGER NOT NULL,
+  byte_size      INTEGER NOT NULL,      -- parquet on-disk size
+  schema_version INTEGER NOT NULL,
+  fingerprint    BLOB,                  -- xxh3 label-fingerprint bloom
+  superseded_by  TEXT REFERENCES blocks(uuid),   -- set during compaction grace
+  deleted_at     INTEGER                -- soft-delete during grace period
+);
+
+CREATE INDEX idx_blocks_query   ON blocks(signal, date, ts_min, ts_max)
+  WHERE deleted_at IS NULL;
+CREATE INDEX idx_blocks_compact ON blocks(bucket, signal, date, level)
+  WHERE deleted_at IS NULL;
+
+-- Per-(signal, writer, date) cursor for incremental ListObjects polling.
+CREATE TABLE poll_cursors (
+  signal       TEXT NOT NULL,
+  writer_id    TEXT NOT NULL,
+  date         TEXT NOT NULL,
+  highest_uuid TEXT NOT NULL,
+  PRIMARY KEY (signal, writer_id, date)
+);
+```
+
+The `level` column is populated from day one even though tiered
+compaction policy (see [Compaction](#compaction)) is a later
+milestone — adding the column up front means no schema migration
+when the policy lands. Freshly-written blocks are always L0; merged
+outputs increment.
+
+`superseded_by` and `deleted_at` together implement compaction's
+grace-period semantics: a block being phased out is marked
+`superseded_by = <merged_uuid>`, removed from query planning via the
+partial index `WHERE deleted_at IS NULL`, and physically deleted from
+object storage 10 minutes later when `deleted_at` is set.
+
+#### Bootstrap
+
+A new instance bootstraps its catalog from, in priority order:
+
+1. **Catalog snapshot in object storage** (if present). A designated
+   bucket holds a periodically-updated parquet of catalog rows,
+   keyed by `(bucket, uuid)`. Snapshots are written by the instance
+   currently holding the snapshot lease, once per hour. Snapshot
+   bootstrap is O(GB read) regardless of bucket population.
+2. **Tail Valkey** from a sequence number recorded in the snapshot.
+3. **Full bucket walk** as the ultimate fallback when no snapshot
+   exists (first deployment, or all snapshots lost).
+
+Snapshots are an optimisation that becomes load-bearing past a few
+hundred thousand blocks; small deployments can skip the snapshot
+mechanism entirely and bootstrap by full walk.
 
 ### The WAL
 
@@ -410,29 +518,168 @@ and makes retention a pure prefix-delete.
 
 ## Ingest
 
-The agent and server speak a single binschema-defined wire protocol.
+Ingest covers everything from a record being produced on a host to
+being durable in the WAL of a scry server. Three pieces: the **agent**
+(what runs on the host), the **discovery layer** (how agents find
+servers), and the **wire protocol** (how data moves between them).
+
+### The agent
+
+A single Rust binary running per host. It is the only thing producing
+data for scry; we explicitly own this end of the pipeline so we don't
+inherit OTLP/Prom-remote-write/Loki-push protocol quirks.
+
+#### Collectors
+
+The agent runs a configurable set of collectors:
+
+- **Prometheus scraper.** Scrapes HTTP `/metrics` endpoints on a
+  schedule. Targets discovered via static config, file SD, or a
+  pluggable discovery (k8s, EC2, etc. — same shape Prometheus uses).
+- **File tail.** Watches log files with rotation handling. Parses
+  according to a configurable format (JSON, plain text with a
+  timestamp regex, logfmt).
+- **journald reader.** Streams systemd journal entries.
+- **pprof puller.** Periodically fetches profiling endpoints
+  (`/debug/pprof/...`) and ships them as profile records.
+- **OTLP receiver** (optional). For applications that already emit
+  OTLP and where re-instrumenting isn't worth it. Speaks OTLP/HTTP
+  on a configurable port; translates to the internal record format
+  before shipping.
+
+Collectors are independent goroutines/tasks; each runs at its own
+cadence and pushes into a shared outbound buffer.
+
+#### Local spool
+
+The agent has its own local disk spool (a smaller version of the
+server's WAL):
+
+- Records arriving from collectors are appended to a spool segment
+  before being shipped.
+- Spool is fsynced on segment rotation, not per record.
+- A spool segment is deleted only after the server has acknowledged
+  every record in it as WAL-durable.
+- On agent restart, unshipped spool segments are replayed.
+
+This means agent → server is *at-least-once* delivery. Cross-restart
+dedup is the agent's job: each batch carries a stable
+`(agent_id, batch_id)` and the server filters duplicates against a
+recent-batch-id cache (a few minutes' worth, the time it takes for a
+batch to clear the WAL on the receiver).
+
+#### Backpressure
+
+If the agent's outbound buffer fills (server unreachable or
+applying backpressure), collectors stop reading from their sources.
+Prom scrapes get skipped (recorded as a hole in the time series),
+log tail pauses (kernel buffers, then file accumulates), journald
+pauses, pprof pulls skip. **The agent never drops records silently
+and never grows memory unboundedly.** Either the source's own
+buffer absorbs the pause, or the system surfaces backpressure to
+the source where it can be reasoned about.
+
+### Discovery
+
+Agents must locate scry servers. DNS round-robin works up to maybe
+20–30 servers; beyond that we need a real discovery layer. The design
+uses **Valkey as a service registry**:
+
+#### Server registration
+
+Each scry server, on startup and every 10 seconds thereafter, runs:
+
+```
+ZADD scry/servers/<region> <now_ms> <addr:port>
+EXPIRE scry/servers/<region> 30
+```
+
+A sorted set keyed by last-heartbeat timestamp. A background reaper
+on any instance prunes entries with `<now_ms - 30000>` (servers that
+missed three heartbeats).
+
+#### Agent-side selection
+
+Agents pull the live server set from Valkey, cached locally and
+refreshed every 30 s. They use **consistent hashing with virtual
+nodes** to pick a server: `hash(agent_id) → ring position → owning
+vnode → server`.
+
+Properties:
+
+- **Stable affinity.** A given agent always picks the same server
+  while the server set is unchanged. That agent's WAL data
+  concentrates on one server rather than fragmenting across many.
+- **Smooth rebalancing.** Adding or removing one server reassigns
+  only `1/N` of agents.
+- **Top-K fallback.** Each agent computes its top-3 servers from
+  the ring. If the primary is unreachable, fall back to #2 then #3
+  without waiting for Valkey's TTL.
+
+#### Capacity-aware weighting
+
+Agents and servers don't have uniform capacity in practice. One
+high-volume service can produce 100× the data of another; one
+server may have more bandwidth than the next. We support this with
+**weighted virtual nodes**:
+
+- Each server publishes a capacity weight along with its
+  registration (`ZADD scry/servers/<region> <ts> <addr:port:weight>`).
+  Weight is operator-configured or auto-derived from
+  CPU/network/WAL-throughput headroom.
+- The hash ring gives a server `weight × base_vnodes` positions.
+  Higher-capacity servers get more vnodes and receive a
+  proportionally larger share of agent assignments.
+- Reassignment is rare — only on join/leave events, not on transient
+  load fluctuation. We deliberately avoid "load-based steering" of
+  individual agents (it's chatty and prone to thrashing).
+
+#### Alternative backends
+
+For deployments with existing service-mesh infrastructure
+(Kubernetes Service + Envoy/EDS, Consul, Nomad), a pluggable
+`[discovery]` backend in agent config can use those instead. Valkey
+is the default because we already require it.
+
+### Wire protocol
+
+Agent ↔ server speak a single binschema-defined binary protocol.
 Sketch (not final):
 
 ```
-Hello       { agent_id, hostname, agent_version }
-Hello.Ack   { server_time_ns, session_id }
-Batch       { session_id, seq, signal, records: Vec<Record> }
-Batch.Ack   { seq, durable_seq }   // durable_seq = highest seq written to WAL+fsynced
-Bye         { session_id }
+Hello       { agent_id, hostname, agent_version, capabilities }
+Hello.Ack   { server_time_ns, session_id, server_caps }
+Batch       { session_id, batch_id, signal, records: Vec<Record> }
+Batch.Ack   { batch_id, durable_seq }   // durable_seq = highest WAL-fsynced batch
+Bye         { session_id, reason }
 ```
 
-- Long-lived TCP connection (TLS in prod), multiplexed by `seq`.
-- Backpressure: server stops `Ack`ing when its WAL is behind its target
-  buffer. Agent stops reading from collectors when too many unacked
-  batches are in flight.
-- Re-delivery: agent persists unacked batches to *its own* local
-  spool, replays after reconnect. Server dedupes by `(session_id, seq)`
-  for the lifetime of a session; cross-session dedup is the agent's
-  responsibility (idempotent batch IDs).
+- Long-lived TCP connection with TLS (mTLS in prod), multiplexed.
+- Backpressure: server stops `Ack`ing when its WAL is behind its
+  target buffer. Agent stops reading from collectors when too many
+  unacked batches are in flight.
+- Re-delivery: agent persists unacked batches to its local spool,
+  replays on reconnect.
+- Cross-session dedup: stable `(agent_id, batch_id)` identifies a
+  batch across sessions; server keeps a recent-batch-id cache.
 
-This protocol is **dumb on purpose.** No service discovery. No mesh. No
-"smart agent." If you want fan-out to multiple servers, run multiple
-agent→server links.
+The protocol is **dumb on purpose.** No routing decisions in the
+protocol itself; routing is in the discovery layer (above).
+
+### Server-side flow
+
+When a server receives a `Batch`:
+
+1. **Validate** schema, deduplicate against the recent-batch-id
+   cache.
+2. **Append** records to the appropriate WAL segment (per signal).
+3. **Update** the block builder's in-memory state for the affected
+   `(signal, day)` blocks.
+4. **Ack** when the WAL segment containing this batch has been
+   fsynced.
+
+The block builder's lifecycle is described under
+[Storage layer → The block builder](#the-block-builder).
 
 ## Query
 
@@ -522,27 +769,86 @@ Other processes' deletions are observed via catalog updates (see
 
 ## Compaction
 
-Background task in the same process. Per-`(bucket, signal, day)`:
+Compaction runs as a background task in every server process,
+competing for partition-scoped leases. Its job is to reduce the
+number of small blocks (and thus the number of objects to open and
+metadata to load on every query) while bounding the write
+amplification cost.
 
-1. List blocks for `(bucket, signal, day)` in the catalog.
-2. If the count of "small" blocks (< 32 MiB compressed, say) exceeds a
-   threshold, plan a merge:
-   - Pick the K smallest blocks (bounded total input size).
-   - Read all of them in a streaming merge by `ts`.
-   - Write one new block to the *current active bucket* with
-     `If-None-Match: *` (even if inputs came from a sealed bucket).
-   - Insert the new catalog row.
-   - Delete the inputs *only after* the new row is durable in the
-     catalog and the new parquet object is confirmed present.
-3. Repeat until "small block count" is below the threshold.
+### Tiered levels
 
-Multi-writer correctness: compaction work is partitioned by
-`(bucket, signal, day)`. A lightweight lease (a small object at
-`<bucket>/_compact_lease/<signal>/<yyyy-mm-dd>` with a TTL and an ETag
-check on takeover) ensures only one writer compacts a given partition
-at a time. Worst case: a stale lease causes wasted work; correctness is
-preserved because compaction output is content-addressed and inputs are
-only deleted after success.
+Blocks live at one of several **levels**, recorded in
+`blocks.level`. Each level has a target size; compaction merges
+within a level to produce one block at the next level up.
+
+| Level | Target size | Source                                          |
+|-------|-------------|-------------------------------------------------|
+| L0    | ~128 MiB    | Freshly written from the block builder          |
+| L1    | ~1 GiB      | Merge of ~8 L0 blocks                           |
+| L2    | ~10 GiB     | Merge of ~8 L1 blocks                           |
+| L3    | ~100 GiB    | Merge of ~8 L2 blocks                           |
+
+L3 is the practical ceiling — past that, individual parquet files
+get large enough that random-access reads suffer. For most
+deployments L2 is the highest level reached.
+
+The level structure caps total write amplification at roughly
+`log_k(total_size_per_day)` where `k` is the level fan-out (8 in the
+table above). At 50 TB/month and a 90-day retention, each byte
+written gets re-written ~3 times across compaction passes, total. A
+naïve "merge whenever there are small blocks" policy would re-write
+each byte 5–10 times, which at scale dominates real ingest cost.
+
+### Compaction policy
+
+For each `(bucket, signal, day, level)` partition, the policy:
+
+1. Count blocks at this level for this partition.
+2. If count `>= K` (e.g. 8), select the K smallest by byte size and
+   plan a merge into level `level + 1`.
+3. If count `< K`, do nothing — wait for more blocks to arrive.
+
+This is **size-tiered** rather than **levelled** compaction
+(LevelDB-style). Size-tiered is simpler, has better write
+amplification at the cost of slightly worse read amplification, and
+fits append-mostly observability workloads better than the
+write-mostly KV workloads LevelDB targets.
+
+### Per-merge sequence
+
+1. Acquire the compaction lease for the partition (see
+   [Multi-writer coordination](#multi-writer-coordination) below).
+2. Read the K input blocks via streaming merge sorted by `ts`.
+3. Write one new block to the *current active bucket* (regardless of
+   which buckets the inputs lived in), at level `input_level + 1`.
+   Upload with `If-None-Match: *`.
+4. Insert the new catalog row. Publish `block-created` on Valkey.
+5. Mark inputs `superseded_by = <new_uuid>` in the catalog.
+   Publish `blocks-superseded`. **At this moment new queries skip
+   the inputs.**
+6. Wait the [10-minute grace period](#compaction-deletion-10-minute-grace-period).
+7. Set `deleted_at = now()` on inputs, then `DELETE` the input
+   objects from their respective buckets.
+8. Drop the input catalog rows. Publish `blocks-deleted`. Release
+   the lease.
+
+### Multi-writer coordination
+
+Compaction work is partitioned by `(bucket, signal, day)`. A
+lightweight lease (a small object at
+`<bucket>/_compact_lease/<signal>/<yyyy-mm-dd>` with a TTL and an
+ETag check on takeover) ensures only one writer compacts a given
+partition at a time. The lease is acquired by conditional PUT and
+renewed by `If-Match: <etag>`.
+
+**Worst case:** a stale lease causes wasted work — two writers both
+produce a merged block. Both blocks are valid; the next compaction
+round picks them up as small-at-the-next-level and merges them.
+**Correctness is preserved by immutability + content addressing.**
+
+Compaction never touches the WAL. The WAL is the
+"recent-and-not-yet-uploaded" path; compaction operates strictly on
+already-uploaded blocks.
 
 Compaction never touches the WAL. The WAL is purely the
 "recent-and-not-yet-uploaded" path.
@@ -591,17 +897,9 @@ and **periodic `ListObjects` polling** as the source-of-truth backstop:
 
 Polling does *not* re-list the bucket from scratch; that would scale
 with bucket lifetime and waste both list-API calls and CPU. Instead,
-each instance keeps a small cursor table in its SQLite catalog:
-
-```sql
-CREATE TABLE poll_cursors (
-  signal       TEXT NOT NULL,
-  writer_id    TEXT NOT NULL,
-  date         TEXT NOT NULL,  -- yyyy-mm-dd
-  highest_uuid TEXT NOT NULL,  -- last UUID v7 seen in this prefix
-  PRIMARY KEY (signal, writer_id, date)
-);
-```
+each instance keeps a `poll_cursors` table in its SQLite catalog
+(schema in [Schema](#schema)) recording the highest UUID v7 seen per
+`(signal, writer_id, date)`.
 
 A poll for `(signal, writer_id, date)` is:
 
@@ -779,6 +1077,140 @@ Because blocks never straddle a day boundary, this is a pure
 prefix-delete. No partial-block resurrection logic. No
 "open the block and find old records" scan.
 
+## Scaling
+
+scry is designed to scale from a single host running a homelab's
+worth of observability data to a multi-node deployment ingesting tens
+of terabytes per month. This section sketches the envelope and the
+dimensions that need attention as scale grows.
+
+### Sizing envelope
+
+| Compressed/month | Sustained ingest | Servers (with redundancy) | Bucket pool size |
+|------------------|------------------|---------------------------|-------------------|
+| 500 GB           | ~0.2 MB/s        | 1                         | 1                 |
+| 5 TB             | ~2 MB/s          | 2                         | 1–2               |
+| 50 TB            | ~19 MB/s sust, ~200 MB/s peak | 6–10           | 5–10 (rotating)   |
+
+A single server with modern NVMe and a 10 Gbps NIC handles
+50–100 MB/s of compressed ingest comfortably (parquet encode + WAL
+fsync + object-store PUT bandwidth). Capacity is scaled by adding
+servers, not by tuning individual ones harder.
+
+### What scales as-is
+
+The following dimensions scale linearly or sublinearly with
+deployment size with no design changes:
+
+- **Object-store PUT/GET rate.** S3 partition rate limits apply per
+  prefix; `writer_id` in the path naturally distributes writes
+  across partitions, giving us `N_writers × 3500 PUT/sec` headroom.
+- **WAL throughput.** Per server, no cross-server interaction.
+- **Compaction parallelism.** Partition-scoped leases let N servers
+  compact N different partitions concurrently with no coordination
+  overhead.
+- **Retention.** Idempotent DELETE; no coordination at any scale.
+- **Catalog row count.** SQLite handles millions of rows trivially.
+  90-day retention at 50 TB/month is ~1.2M block rows; query
+  planning on indexed columns is sub-millisecond.
+- **Cache hit rates.** Block immutability means cache entries are
+  valid for their full lifetime; hit rates stay high as catalog
+  grows.
+- **Cursor-driven polling cost.** Bounded by recent write rate, not
+  by bucket lifetime or population.
+- **Bucket pool size.** Auto-provisioning + retention together cap
+  the live pool size at `ceil(retention_days / bucket_fill_days) +
+  small_constant`, regardless of deployment age.
+
+### What needs attention at the upper end
+
+These are dimensions where the design degrades or hits practical
+limits past ~6–10 instances or 50+ TB/month, and where specific
+extensions are planned:
+
+#### Write amplification — tiered compaction
+
+Already addressed: see [Compaction → Tiered levels](#tiered-levels).
+The catalog carries a `level` column from v0.1 so the policy can be
+added without schema migration. Naïve "merge whenever small"
+compaction multiplies real ingest cost by 5–10× at scale; tiered
+keeps it at ~3×.
+
+#### Hot-shard imbalance — capacity-aware assignment
+
+Already addressed: see [Discovery → Capacity-aware weighting](#capacity-aware-weighting).
+Without it, naïve consistent hashing assumes uniform agent load,
+and one heavy producer can saturate a single server while peers
+sit idle.
+
+#### Catalog cold-start cost — snapshot bootstrap
+
+Already addressed: see [Schema → Bootstrap](#bootstrap). A fresh
+server bootstrapping its catalog from a full bucket walk is O(N
+objects). At ~1.2M blocks (50 TB/month scale) that's ~2 minutes of
+ListObjects on cold paths. Snapshot bootstrap drops this to seconds.
+
+#### Pub/sub fan-out — channel sharding
+
+When per-block message rate exceeds a few thousand per second
+(deep into the upper envelope), a single `scry/blocks/<signal>`
+channel becomes hot. The fix is to shard:
+`scry/blocks/<signal>/<hash(writer_id) % N_shards>`. Subscribers
+listen to all shards for signals they care about; publishers
+hash-route. Not implemented in v0.1, baked into the channel-name
+schema so the shift is non-breaking when added.
+
+#### Full-walk reconciliation work — distributed walks
+
+The 30-minute full bucket walk is currently run by every instance
+independently. Past a few instances this is redundant. The fix is
+hash-partitioned walks: each `(bucket, signal, date)` partition is
+assigned to one instance based on `hash(partition) % N_servers`;
+that instance walks it and publishes results. Not v0.1.
+
+#### Metrics cardinality — separate index layer
+
+The single biggest scaling unknown in the design. Per-block label-
+fingerprint blooms prune well at modest cardinality but lose
+effectiveness as the number of distinct label combinations grows.
+Above some threshold, a separate **postings-list index**
+(Prometheus-TSDB style, or simpler "labels-to-block-set"
+materialised view) is required. This is the topic of a dedicated
+metrics design conversation, deliberately deferred from the
+generic-storage-layer design captured here. **Until this is
+resolved, scry's metrics ceiling is unproven**, even though the
+other three pillars scale predictably.
+
+### What's deliberately out of scope
+
+- **Distributed query execution.** Splitting one query across N
+  reader instances (Ballista-style) is real work and adds a
+  coordination protocol. Single-instance DataFusion reading parquet
+  from object storage scales very far — Trino and Athena run this
+  same model at petabyte scale. If we ever measure a real ceiling,
+  we add Ballista or roll our own. Not in the foreseeable plan.
+- **Cross-region replication.** Geographic distribution is a
+  separate problem from scaling within a region. The intended
+  pattern is "run regional scry deployments, query each
+  independently." A future cross-region story would build on top
+  of this rather than embedding into the storage layer.
+- **Geo-aware agent routing.** Agents pick servers from their
+  local region's registry; cross-region agent traffic is not a
+  scry concern.
+
+### Operational notes
+
+- **Network bandwidth.** At 50 TB/month sustained ingest +
+  compaction read/write traffic + query reads, expect 10 Gbps NICs
+  to be the minimum on ingest servers and 25 Gbps preferred at
+  peak. Query servers want similar for fast object-store reads.
+- **Object-store egress costs.** Free on Hetzner; $0.09/GB on AWS
+  S3. Plan provider choice accordingly — at 50 TB/month, an AWS-
+  hosted scry deployment is ~$4500/month in egress alone if
+  queries pull all the data through scry rather than letting
+  clients query directly. This is one reason we keep queries
+  *server-side* (clients receive results, not raw parquet).
+
 ## Configuration
 
 The entire config file:
@@ -820,11 +1252,22 @@ segment_mib = 256
 ingest = "0.0.0.0:4000"
 query  = "0.0.0.0:4001"
 
+[role]
+# All true by default. Set false to specialise this server. See
+# Deployment topologies. Discovery only advertises ingest=true nodes
+# on the ingest channel.
+ingest     = true
+query      = true
+background = true   # compaction + retention
+
 [valkey]
 url = "redis://valkey.internal:6379"
-# Used for low-latency block-discovery pub/sub between instances.
-# Optional: omit for single-instance deployments. When set but
-# unreachable, scry falls back to ListObjects polling.
+region = "eu-central"
+# Used for the control plane: agent->server discovery, block-event
+# pub/sub, bucket-event pub/sub. Optional for single-instance
+# deployments. When set but unreachable, scry degrades to polling-
+# based block discovery and refuses new agent registrations until
+# Valkey is back.
 
 [retention]
 metrics  = "90d"
@@ -839,22 +1282,36 @@ it."
 
 ## Open questions
 
-These are deliberately left unresolved at v0; they need answers before
-the milestones that depend on them:
+These genuinely need answers before the milestones that depend on
+them. Items that are "deferred to a known plan" (tiered compaction
+policy, channel sharding, distributed walks) live in
+[Scaling](#scaling) rather than here.
 
-- **Profiles payload format.** Native pprof is the obvious answer, but
-  pprof-in-parquet has nontrivial schema questions (deeply nested,
-  shared symbol tables). We may want to denormalise on ingest and store
-  one row per sample-with-resolved-stack.
-- **High-cardinality metrics.** At what point do we have to do
-  something smarter than per-block label-fingerprint blooms? Real-world
-  measurement will decide; we won't speculate now.
-- **TLS / auth between agent and server.** Probably mTLS with a CA file
-  shipped to agents, but the operational shape (cert rotation, joining)
-  is worth a dedicated mini-design.
-- **Read replicas.** Single-writer / multi-reader is implicit in the
-  design (any process pointed at the bucket can serve queries), but the
-  catalog-cache-coherence story for *just* readers needs sketching.
-- **PromQL on parquet, performantly.** Mimir's blocks-storage path
-  caches a lot in store-gateways. We get away with less because our
-  scale is smaller, but this is the milestone with the most unknowns.
+- **Metrics cardinality and indexing.** The biggest scaling unknown.
+  Per-block label-fingerprint blooms prune well at modest cardinality
+  but degrade as the number of distinct label combinations grows. A
+  postings-list index (Prometheus-TSDB-style) or simpler
+  labels-to-block-set materialised view is likely needed past some
+  threshold. Deserves a dedicated design conversation before any
+  serious metrics workload is loaded.
+- **Profiles payload schema.** Native pprof is the obvious answer,
+  but pprof-in-parquet has nontrivial schema questions (deeply
+  nested, shared symbol tables). We may want to denormalise on
+  ingest and store one row per sample-with-resolved-stack. Resolves
+  during v0.4 design.
+- **PromQL semantics on DataFusion.** Range vectors, instant
+  vectors, recording rules, and alerting do not map cleanly to SQL.
+  How much we can lower into DataFusion's logical plan vs how much
+  needs custom plan nodes is an open performance/complexity
+  tradeoff. Resolves during v0.5 design.
+- **TLS / auth between agent and server.** Probably mTLS with a CA
+  shipped to agents, but the operational shape (cert rotation,
+  joining flow, agent identity binding) is worth a dedicated mini-
+  design before v0.2 ships outside the homelab.
+- **Backup and disaster recovery.** Object storage gives us
+  durability, but does scry itself need to back anything up? The
+  catalog is derived; the WAL is per-server and recoverable from
+  re-ingest in principle. The honest answer is "depends what
+  guarantees we offer," which we haven't pinned down.
+- **License.** Probably MIT or Apache-2.0. Pick before external
+  contributors show up.
