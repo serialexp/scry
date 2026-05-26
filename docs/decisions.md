@@ -240,6 +240,33 @@ This gives "no-config works fine" by default and "tidy named writers"
 when an operator cares. No coordination protocol either way — UUIDs
 don't collide, and explicit names are an operator concern.
 
+## D-016: Cursor-driven polling, not prefix walks
+
+**Date:** 2026-05-26
+**Status:** accepted
+
+Polling for new blocks uses `ListObjects` with `start-after` keyed on
+the highest UUID v7 we've already ingested per `(signal, writer_id,
+day)` prefix. Because v7 UUIDs are time-prefixed and lexically
+sortable, this returns only blocks created after our cursor with no
+client-side filtering and no scan-from-scratch.
+
+The cursor table lives in the SQLite catalog and is updated by both
+the pub/sub path and the polling path — they converge on the same
+state. Poll cost is bounded by recent write rate, not by bucket
+lifetime; a 5-year-old bucket polls as fast as a fresh one.
+
+Polling cadence adapts to Valkey health: 60 s when pub/sub is
+healthy (pure backstop), 5 s during a Valkey outage (primary
+mechanism), and an immediate full-cursor sweep on reconnect.
+Cadences are baked in, not exposed as knobs.
+
+This explicitly avoids adding an hour-level prefix to the block path.
+The benefit such a prefix would give (bounded recovery scan after a
+Valkey outage) is already provided by UUID v7 + `start-after`, while
+the costs (smaller compaction unit, more leases, more cursor rows)
+are real. Prefer the cheaper mechanism we already have.
+
 ## Deferred / open
 
 These are not decisions yet; they're flagged for "we'll decide when the

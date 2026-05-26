@@ -356,10 +356,59 @@ and **periodic `ListObjects` polling** as the source-of-truth backstop:
   sidecar contents.
 - Every instance `SUBSCRIBE`s to those channels and updates its
   catalog on receipt. Propagation latency is sub-millisecond.
-- Independently, every instance polls `ListObjects` (with a
-  `start-after` marker per prefix) every 5 seconds and reconciles
-  anything pub/sub missed.
+- Independently, every instance polls `ListObjects` as a backstop
+  (see [Cursor-driven polling](#cursor-driven-polling) below).
 - Every 30 minutes, a full bucket walk reconciles drift end-to-end.
+
+#### Cursor-driven polling
+
+Polling does *not* re-list the bucket from scratch; that would scale
+with bucket lifetime and waste both list-API calls and CPU. Instead,
+each instance keeps a small cursor table in its SQLite catalog:
+
+```sql
+CREATE TABLE poll_cursors (
+  signal       TEXT NOT NULL,
+  writer_id    TEXT NOT NULL,
+  date         TEXT NOT NULL,  -- yyyy-mm-dd
+  highest_uuid TEXT NOT NULL,  -- last UUID v7 seen in this prefix
+  PRIMARY KEY (signal, writer_id, date)
+);
+```
+
+A poll for `(signal, writer_id, date)` is:
+
+```
+LIST prefix=<signal>/<date>/<writer_id>/  start-after=<highest_uuid>
+```
+
+Because block UUIDs are v7 (time-prefixed and lexically sortable by
+creation time), `start-after` returns only blocks newer than what
+we've already ingested. Each cursor is updated whenever we observe a
+block via *either* pub/sub or polling — both paths converge on the
+same state.
+
+**Crucially, poll cost does not grow with bucket size.** A bucket
+five years old polls at the same speed as one started yesterday,
+because we only scan today's and yesterday's per-writer prefixes
+(yesterday is included to catch late uploads near day boundaries).
+
+#### Polling cadence
+
+Polling cadence adapts to Valkey health:
+
+- **Healthy (Valkey reachable, recent message received):** poll
+  every 60 seconds. Pure backstop; pub/sub is doing the real work.
+- **Degraded (Valkey unreachable or silent past threshold):** poll
+  every 5 seconds. Pub/sub is no longer trusted, polling is the
+  primary mechanism.
+- **On Valkey reconnect:** immediately trigger one full cursor
+  sweep across all `(signal, writer_id, date)` rows before
+  returning to the healthy cadence. Reconnect is the moment of
+  maximum unknown; that's when the sweep earns its cost.
+
+These cadences are baked-in behavior, not config knobs. If they
+prove wrong in practice we'll revisit.
 
 This is a deliberate three-tier defense: pub/sub for normal-case
 latency, short polling for "Valkey was briefly down," full walks for
