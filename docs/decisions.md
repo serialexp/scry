@@ -763,8 +763,56 @@ future readers will want the rationale for:
 
 The dummy record itself (`{ ts_unix_nano, key, value }`) is a v0.1-only
 artefact. It does not appear in any wire-protocol decision; the
-spewer reuses the existing `Batch` frame with a `Signal::Dummy = 0xFF`
-sentinel that is removed when real signals come online.
+spewer reuses the existing `Batch` frame with a `Signal::Dummy = 0xFE`
+sentinel that is removed when real signals come online (0xFF was
+already taken by `SIGNAL_ALL` in `FlowControl`).
+
+## D-030: v0.1 storage layer — complete
+
+**Date:** 2026-05-26
+**Status:** accepted
+
+The pipeline described in D-029 is in. `scripts/smoke.sh` is the
+scripted exit criterion: it empties the dev Garage bucket, runs
+noise-sink (`--storage --wal-dir --catalog`), sends a known number
+of dummy batches through noise-spewer (using `--max-batches` for an
+exact count — `--rate × --duration` is off-by-one in practice), then
+runs `scry-list` against a fresh empty catalog and asserts that the
+reconciled row count equals exactly the number of records sent and
+that at least one block landed. The smoke run at `--max-batches 2000`
+(× 256 records/batch = 512,000 records) passes with `total_rows=512000
+blocks=1`.
+
+What that proves, in architecture terms:
+
+- The wire path decodes a `DummyBatch` correctly under zstd.
+- The WAL durability boundary works in both directions: a SIGKILL
+  mid-stream leaves the most recent few records lost (consistent
+  with the "fsync on rotation, not per record" doc), but everything
+  earlier replays into a fresh block on next start.
+- The block builder produces a parquet that round-trips through
+  `object_store` to Garage, sorted by `ts_unix_nano`, with a sidecar
+  that's parseable as `BlockMeta`.
+- The catalog can be **rebuilt from the bucket alone**
+  (`reconcile_from_bucket`). That's the property that lets multi-
+  writer work later without coordination, and v0.1 demonstrates it
+  with one writer and three blocks across separate process runs.
+
+What's deferred to v0.2 (still applies as written in
+`v0.1-storage.md § Open questions parked for v0.2`):
+
+- Label-fingerprint bloom in the catalog `fingerprint BLOB` column —
+  decided when the first signal with labels lands.
+- WAL replay across `(signal, day)` boundary — no day boundary in
+  v0.1 because every record is "now".
+- Signal-specific block builders — likely a trait per signal that
+  produces a `RecordBatch`; details when signal #2 arrives.
+- Whether `scry-server` is its own crate or a binary inside
+  `scry-storage` — defer until composition pressure shows up.
+
+`Signal::Dummy = 0xFE` is the only piece of v0.1 that goes away when
+real signals land. Everything else (WAL framing, sidecar schema,
+catalog schema, object-storage path layout) is forward-compatible.
 
 ## Deferred / open
 
