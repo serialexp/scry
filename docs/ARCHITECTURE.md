@@ -987,6 +987,49 @@ their query shapes don't benefit from an inverted index over labels:
 - **Profiles:** queries are `(profile_type, time_range)`. Already
   well-pruned by existing block-level stats.
 
+### Cardinality enumeration queries
+
+A class of operationally important queries — "show me the top 20
+metric names by series count," "which labels have the most distinct
+values," "what's the cardinality of `pod` right now" — is notoriously
+hard for single-instance query engines because the naïve plan
+materialises every matching series in querier memory before grouping
+and counting. Mimir's queriers OOM on `topk(20, count by (__name__)
+({__name__=~".+"}))` at 622k active series for exactly this reason.
+
+scry's scatter-gather + postings combination handles these queries
+without OOM, as a free property of the design rather than a
+specially-built endpoint:
+
+1. The coordinator dispatches to workers, partitioning blocks
+   across the worker pool.
+2. **Workers read only the `.postings.parquet` files** for their
+   assigned blocks — not the main parquet, not the sample data.
+   For top-by-metric-name, that's "rows where `label_name =
+   '__name__'`" — a small fraction of even the postings file.
+3. Workers build a partial map `{group_key → fingerprint_set}`. For
+   *exact* counts the set is a sorted `Vec<u64>` of fingerprints;
+   for *approximate* counts (when exactness isn't required) it's a
+   **HyperLogLog sketch** with a few KB of bounded memory per group
+   regardless of underlying cardinality.
+4. Workers ship partial maps to the coordinator (small — bounded by
+   the number of distinct group keys, not by series count).
+5. Coordinator unions the per-group sets/sketches, computes the
+   final count per group, picks top-K.
+
+Peak memory anywhere in this flow is bounded by `(postings file
+size) + (group_key count × set_or_sketch size)`, never by raw series
+count. At 60M active series and ~10k distinct metric names, the
+coordinator's working set is single-digit megabytes; the workers'
+working sets are smaller still.
+
+The same property handles `count(group by (label) ({...}))` style
+queries, label-value enumeration, and similar metadata workloads
+that operators run when investigating cardinality issues. Because
+these are first-class queries through the normal query path, no
+separate cardinality-analysis endpoint is needed; cardinality
+introspection is just metric querying with the right plan.
+
 ### Cardinality safeguards (optional)
 
 Bad exporters can blow up cardinality (e.g. emitting `user_id` or
