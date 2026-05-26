@@ -109,6 +109,19 @@ for _ in $(seq 1 50); do
     sleep 0.1
 done
 
+# Background RSS sampler. Emits "epoch_ns,vmrss_kb" every 100 ms so we
+# can see the shape of memory growth — steady creep vs spike at flush
+# — not just the peak number that `time -v` reports at the end.
+(
+    while [[ -d /proc/$SINK_PID ]]; do
+        ts=$(date +%s%N)
+        rss=$(awk '/^VmRSS:/ { print $2; exit }' /proc/$SINK_PID/status 2>/dev/null || echo "")
+        [[ -n "$rss" ]] && printf '%s,%s\n' "$ts" "$rss"
+        sleep 0.1
+    done
+) > "$SMOKE_DIR/rss.csv" 2>/dev/null &
+RSS_PID=$!
+
 echo "[smoke] spewer: $BATCHES batches × $RECORDS_PER_BATCH records = $EXPECTED_RECORDS records expected (rate=$RATE b/s)"
 ./target/release/noise-spewer \
     --addr "$LISTEN" \
@@ -123,6 +136,8 @@ kill -INT "$SINK_PID"
 # Wait on the time wrapper, not on the sink directly — time exits
 # after the sink does, AND it's the process that writes sink.time.
 wait "$TIME_PID" 2>/dev/null || true
+# Sampler exits on its own when /proc/$SINK_PID disappears; reap.
+wait "$RSS_PID" 2>/dev/null || true
 trap - EXIT
 
 # ── Verify ──────────────────────────────────────────────────────────
@@ -197,6 +212,36 @@ if [[ -f "$SMOKE_DIR/sink.time" ]]; then
             printf "[smoke] page faults       : minor=%s major=%s\n",           minflt, majflt
         }
     ' "$SMOKE_DIR/sink.time"
+
+    if [[ -s "$SMOKE_DIR/rss.csv" ]]; then
+        awk -F, '
+            NR == 1 { t0 = $1; min = $2; max = $2; max_t = $1 }
+            {
+                if ($2 < min) min = $2
+                if ($2 > max) { max = $2; max_t = $1 }
+                samples[NR] = $2
+                last_t = $1
+            }
+            END {
+                n = NR
+                if (n == 0) exit
+                # Median
+                # (simple insertion sort — n is at most a few hundred for our runs)
+                for (i = 1; i <= n; i++) {
+                    for (j = i; j > 1 && samples[j-1] > samples[j]; j--) {
+                        tmp = samples[j]; samples[j] = samples[j-1]; samples[j-1] = tmp
+                    }
+                }
+                median = (n % 2) ? samples[(n+1)/2] : (samples[n/2] + samples[n/2+1]) / 2
+                wall_s     = (last_t - t0) / 1e9
+                peak_at_s  = (max_t - t0) / 1e9
+                printf "[smoke] RSS trace         : min=%.1f MiB  median=%.1f MiB  max=%.1f MiB  (n=%d over %.1fs)\n", \
+                    min/1024.0, median/1024.0, max/1024.0, n, wall_s
+                printf "[smoke] RSS peak at       : %.2f s into sink lifetime (%.0f%% of run)\n", \
+                    peak_at_s, (wall_s > 0 ? peak_at_s/wall_s*100 : 0)
+            }
+        ' "$SMOKE_DIR/rss.csv"
+    fi
 else
     echo "[smoke] (no sink.time — perf stats unavailable)"
 fi
