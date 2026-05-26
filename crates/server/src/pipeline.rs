@@ -5,19 +5,55 @@
 //! sessions via `Arc<Mutex<_>>`. Per `ARCHITECTURE.md § The WAL` the
 //! WAL is per-writer, not per-session — every connection that lands on
 //! this process funnels Dummy ingest through the same pipeline.
+//!
+//! ## Background upload
+//!
+//! The slow part of closing a block (parquet encode + S3 PUT, ~3 s for
+//! a 46 MiB block on Garage) used to run inline inside `ingest()`,
+//! pinning the pipeline mutex and blocking every subsequent inbound
+//! batch on every connection. That made the server ack-bound on upload
+//! latency rather than on its own ingest throughput.
+//!
+//! Now: when the builder hits `should_close`, the WAL is rotated and
+//! the full builder is swapped out for a fresh one synchronously (both
+//! are fast — fsync + `mem::replace`), then the slow upload is spawned
+//! as a tokio task. The task acquires a permit from a small semaphore
+//! (`MAX_INFLIGHT_UPLOADS`) so we never pile up unbounded blocks under
+//! a slow bucket; when the upload finishes it briefly re-acquires the
+//! WAL and catalog locks to call `mark_uploaded` and `insert_block`.
+//!
+//! The WAL and catalog therefore live behind `Arc<Mutex<…>>` so the
+//! background task can share them with the ingest path. Lock contention
+//! is negligible: append/rotate take microseconds, mark_uploaded is a
+//! handful of `unlink` syscalls, and `insert_block` is a single SQLite
+//! INSERT.
 
 use anyhow::{Context, Result};
 use object_store::ObjectStore;
 use scry_block::{BlockBuilderConfig, DummyBlockBuilder};
 use scry_catalog::Catalog;
 use scry_proto::streaming::decode_dummy_batch_into;
-use scry_wal::{Wal, WalConfig};
+use scry_wal::{SegmentId, Wal, WalConfig};
 use std::{path::PathBuf, sync::Arc};
+use tokio::{
+    sync::{Mutex, Semaphore},
+    task::JoinSet,
+};
 use tracing::{info, warn};
 use uuid::Uuid;
 
+/// Maximum number of block uploads in flight concurrently. Two gives
+/// us one block actively uploading while the next one finishes filling,
+/// without unbounded growth under a slow bucket. Hardcoded for v0.1;
+/// promote to `BlockBuilderConfig` (or a dedicated `IngestConfig`) if
+/// a real workload ever justifies tuning it.
+const MAX_INFLIGHT_UPLOADS: usize = 2;
+
 pub struct DummyPipeline {
-    wal: Wal,
+    /// Shared with the upload task so it can call `mark_uploaded` after
+    /// a successful upload without funnelling back through the ingest
+    /// path.
+    wal: Arc<Mutex<Wal>>,
     builder: DummyBlockBuilder,
     store: Arc<dyn ObjectStore>,
     /// Optional online catalog. Updates here are best-effort: a failed
@@ -25,9 +61,19 @@ pub struct DummyPipeline {
     /// fail the ingest path, because the bucket is the source of
     /// truth and a future `scry-list --reconcile` would re-derive the
     /// row anyway.
-    catalog: Option<Catalog>,
+    catalog: Option<Arc<Mutex<Catalog>>>,
     writer_uuid: Uuid,
     cfg: BlockBuilderConfig,
+    /// Pending upload tasks. Each entry is a spawned task that owns the
+    /// old builder + a semaphore permit. `flush()` drains this on
+    /// shutdown; routine ingest only `try_join_next`s to reap finished
+    /// ones so the set doesn't grow unboundedly during a long run.
+    in_flight: JoinSet<()>,
+    /// Bounds concurrent uploads so a slow bucket can't let blocks pile
+    /// up in RAM. When the permit count is exhausted, the next spawn
+    /// awaits the permit, which transitively backpressures the ingest
+    /// path through the pipeline mutex held by the caller.
+    upload_sem: Arc<Semaphore>,
 }
 
 impl DummyPipeline {
@@ -66,20 +112,22 @@ impl DummyPipeline {
         }
 
         Ok(Self {
-            wal,
+            wal: Arc::new(Mutex::new(wal)),
             builder,
             store,
-            catalog,
+            catalog: catalog.map(|c| Arc::new(Mutex::new(c))),
             writer_uuid,
             cfg,
+            in_flight: JoinSet::new(),
+            upload_sem: Arc::new(Semaphore::new(MAX_INFLIGHT_UPLOADS)),
         })
     }
 
     /// Append a single DummyBatch payload (already zstd-decoded; the
     /// binschema-encoded form is what hits the WAL). On replay we
     /// decode the same bytes back into records, so this is the unit
-    /// of crash-recovery atomicity. Auto-flushes if the builder hits
-    /// its close threshold.
+    /// of crash-recovery atomicity. Auto-spawns a background upload
+    /// task if the builder hits its close threshold.
     ///
     /// Decode is streaming: we never materialise a `DummyBatch` /
     /// `Vec<DummyRecord>` / per-record `String` + `Vec<u8>`. See
@@ -95,22 +143,33 @@ impl DummyPipeline {
         // is overwritten by a clean re-decode. Net effect: a decode
         // failure just gets a retry from the agent; no duplicate or
         // missing records.
-        self.wal.append(payload).await.context("WAL append")?;
+        self.wal
+            .lock()
+            .await
+            .append(payload)
+            .await
+            .context("WAL append")?;
 
         let n = decode_dummy_batch_into(payload, &mut self.builder)
             .map_err(|e| anyhow::anyhow!("DummyBatch: {e}"))?
             as u64;
 
         if self.builder.should_close() {
-            self.flush().await?;
+            self.spawn_upload().await?;
         }
+        // Reap any finished upload tasks so the JoinSet doesn't grow
+        // for the lifetime of the process. Non-blocking — we don't
+        // wait for in-flight work here.
+        self.reap_finished();
         Ok(n)
     }
 
-    /// Seal the active WAL segment, upload the active block, and
-    /// delete the uploaded WAL segments. A no-op if the builder is
-    /// empty (no segment to seal, nothing to upload).
-    pub async fn flush(&mut self) -> Result<()> {
+    /// Rotate the WAL, swap in a fresh builder, and hand the full one
+    /// to a background task for upload. The synchronous portion (WAL
+    /// rotate + builder swap) is fast; the slow parquet encode + S3
+    /// PUT runs entirely in the spawned task with the pipeline mutex
+    /// released as soon as the caller returns from `ingest`.
+    async fn spawn_upload(&mut self) -> Result<()> {
         if self.builder.is_empty() {
             return Ok(());
         }
@@ -119,60 +178,142 @@ impl DummyPipeline {
         // earlier sealed-but-not-uploaded segments). After rotation,
         // any subsequent appends go into a fresh segment that does
         // not participate in this block.
-        let sealed = self.wal.rotate().await.context("WAL rotate on flush")?;
+        let sealed = self
+            .wal
+            .lock()
+            .await
+            .rotate()
+            .await
+            .context("WAL rotate on spawn_upload")?;
 
         let new_builder = DummyBlockBuilder::new(self.writer_uuid, self.cfg);
         let old_builder = std::mem::replace(&mut self.builder, new_builder);
-        match old_builder.finish_and_upload(self.store.as_ref()).await {
-            Ok(Some(meta)) => {
-                self.wal
-                    .mark_uploaded(sealed)
-                    .await
-                    .context("WAL mark_uploaded after block upload")?;
-                // Catalog update is best-effort by design: the bucket
-                // is the source of truth, and reconcile_from_bucket
-                // can always re-derive a missing row. We don't want a
-                // transient sqlite hiccup to fail the ingest path.
-                if let Some(cat) = self.catalog.as_ref() {
-                    match cat.insert_block(&meta) {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            tracing::debug!(block_uuid = %meta.uuid, "catalog row already present");
-                        }
-                        Err(e) => {
-                            warn!(
-                                block_uuid = %meta.uuid,
-                                error = %e,
-                                "catalog insert failed; bucket has the data — recover via scry-list --reconcile"
-                            );
-                        }
-                    }
-                }
-                info!(
-                    block_uuid = %meta.uuid,
-                    row_count = meta.row_count,
-                    byte_size = meta.byte_size,
-                    "dummy block uploaded; WAL segments through {} released",
-                    sealed.0,
-                );
-            }
-            Ok(None) => {
-                // Builder was empty after rotation — vanishingly
-                // unlikely since we checked above, but possible if
-                // someone called flush() under tight races. Leave the
-                // sealed WAL segment in place; replay will pick it up
-                // next time.
-                warn!("flush() produced no block; WAL segment retained for replay");
-            }
-            Err(e) => {
-                // The upload failed. The sealed WAL segment is *not*
-                // marked uploaded, so a future flush (or next-start
-                // replay) will retry. Returning the error lets the
-                // caller decide whether the ingest path should fail
-                // the batch.
-                return Err(e.context("dummy block upload"));
+
+        let store = self.store.clone();
+        let wal = self.wal.clone();
+        let catalog = self.catalog.clone();
+        let sem = self.upload_sem.clone();
+        self.in_flight.spawn(async move {
+            // Acquire the permit *inside* the task. If
+            // MAX_INFLIGHT_UPLOADS are already in flight, we wait
+            // here without holding the pipeline mutex. Owned variant
+            // so the permit's lifetime is tied to the task, not to a
+            // borrow of the semaphore.
+            let _permit = sem
+                .acquire_owned()
+                .await
+                .expect("upload semaphore is never closed");
+            run_upload(old_builder, sealed, store, wal, catalog).await;
+        });
+        Ok(())
+    }
+
+    /// Reap completed upload tasks from the JoinSet. Non-blocking;
+    /// only drains tasks that have already finished. Errors are logged
+    /// (the panic / join error itself; per-upload errors are already
+    /// logged inside `run_upload` before the task ends).
+    fn reap_finished(&mut self) {
+        while let Some(joined) = self.in_flight.try_join_next() {
+            if let Err(e) = joined {
+                warn!(error = %e, "upload task join error");
             }
         }
+    }
+
+    /// Drain everything: rotate any remaining records into a final
+    /// upload task and await all in-flight tasks. Called on graceful
+    /// shutdown so we don't leave records sitting in the active block
+    /// — the WAL still has them for replay, but the bucket is the
+    /// source of truth so we'd rather close cleanly.
+    pub async fn flush(&mut self) -> Result<()> {
+        if !self.builder.is_empty() {
+            self.spawn_upload().await?;
+        }
+        let mut errors = 0u64;
+        while let Some(joined) = self.in_flight.join_next().await {
+            if let Err(e) = joined {
+                warn!(error = %e, "upload task join error during flush");
+                errors += 1;
+            }
+        }
+        if errors > 0 {
+            anyhow::bail!("{errors} upload task(s) failed during flush");
+        }
         Ok(())
+    }
+}
+
+/// The body of an upload task: encode + PUT, then catch up the WAL and
+/// catalog. Per-step errors are logged here; the task itself never
+/// returns an error (so a single failed block doesn't poison the
+/// JoinSet), but a failed upload leaves the sealed WAL segment in
+/// place for the next process start to replay.
+async fn run_upload(
+    builder: DummyBlockBuilder,
+    sealed: SegmentId,
+    store: Arc<dyn ObjectStore>,
+    wal: Arc<Mutex<Wal>>,
+    catalog: Option<Arc<Mutex<Catalog>>>,
+) {
+    match builder.finish_and_upload(store.as_ref()).await {
+        Ok(Some(meta)) => {
+            // WAL release: the sealed segments through `sealed` have
+            // been uploaded; safe to delete. We re-acquire the lock
+            // briefly here; the ingest path's `append` will contend
+            // with us for a few microseconds.
+            if let Err(e) = wal.lock().await.mark_uploaded(sealed).await {
+                warn!(
+                    sealed_seq = sealed.0,
+                    error = %e,
+                    "WAL mark_uploaded after block upload"
+                );
+            }
+            // Catalog update is best-effort by design: the bucket is
+            // the source of truth, and reconcile_from_bucket can
+            // always re-derive a missing row. We don't want a
+            // transient sqlite hiccup to fail the ingest path.
+            if let Some(cat) = catalog.as_ref() {
+                match cat.lock().await.insert_block(&meta) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::debug!(block_uuid = %meta.uuid, "catalog row already present");
+                    }
+                    Err(e) => {
+                        warn!(
+                            block_uuid = %meta.uuid,
+                            error = %e,
+                            "catalog insert failed; bucket has the data — recover via scry-list --reconcile"
+                        );
+                    }
+                }
+            }
+            info!(
+                block_uuid = %meta.uuid,
+                row_count = meta.row_count,
+                byte_size = meta.byte_size,
+                "dummy block uploaded; WAL segments through {} released",
+                sealed.0,
+            );
+        }
+        Ok(None) => {
+            // Builder was empty — vanishingly unlikely since
+            // spawn_upload checks above, but possible if someone
+            // called flush() under tight races. Leave the sealed WAL
+            // segment in place; replay will pick it up next time.
+            warn!("upload produced no block; WAL segment retained for replay");
+        }
+        Err(e) => {
+            // The upload failed. The sealed WAL segment is *not*
+            // marked uploaded, so a future flush (or next-start
+            // replay) will retry. We don't propagate the error from
+            // the task — failing the task would also be invisible
+            // because the JoinSet entry just records a returned unit.
+            // Logging here is the recovery signal.
+            warn!(
+                sealed_seq = sealed.0,
+                error = %e,
+                "dummy block upload failed; WAL segment retained for replay"
+            );
+        }
     }
 }
