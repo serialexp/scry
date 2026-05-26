@@ -85,11 +85,16 @@ version of each block.
 
 ## Storage layer
 
-### Block layout in the bucket
+### Block layout
+
+A block is addressed by `(bucket, path)`, where `bucket` is a logical
+name in scry's config (see [Bucket pool and sealing](#bucket-pool-and-sealing))
+that maps to a concrete `(backend, endpoint, region, bucket_name)`.
+Within any bucket, the path layout is:
 
 ```
-s3://<bucket>/<signal>/<yyyy>/<mm>/<dd>/<writer_id>/<block_uuid>.parquet
-s3://<bucket>/<signal>/<yyyy>/<mm>/<dd>/<writer_id>/<block_uuid>.meta.json
+<signal>/<yyyy>/<mm>/<dd>/<writer_id>/<block_uuid>.parquet
+<signal>/<yyyy>/<mm>/<dd>/<writer_id>/<block_uuid>.meta.json
 ```
 
 - `signal` ∈ `{metrics, logs, traces, profiles}`. Each signal is a
@@ -111,6 +116,117 @@ s3://<bucket>/<signal>/<yyyy>/<mm>/<dd>/<writer_id>/<block_uuid>.meta.json
 
 The sidecar is what the catalog reads to prune; we never open the
 parquet just to find out whether it might contain matches.
+
+### Bucket pool and sealing
+
+A scry deployment is configured with an **ordered list of buckets**.
+The first single-bucket deployment uses a list of length one;
+multi-bucket deployments append entries as old buckets fill up.
+
+Two real-world constraints motivate this:
+
+1. **Hard provider limits.** Hetzner Object Storage caps a bucket at
+   100 TiB. S3 and R2 have no documented limit, but other providers
+   vary. The design must survive a hard ceiling somewhere.
+2. **Full-walk performance.** The 30-min reconciliation scan walks the
+   bucket. At 100 TiB / 128 MiB blocks ≈ 800k objects, that's ~800
+   list pages. Acceptable but degrading. Multiple smaller buckets
+   parallelise the walk for free.
+
+#### Bucket states
+
+Each bucket in the catalog is either:
+
+- **Open** — accepts new writes; first open bucket in config order is
+  the *active* bucket.
+- **Sealed** — no new writes, but blocks are still read and
+  compacted. Sealing is *advisory*, not enforced; in-flight uploads
+  to a freshly-sealed bucket complete normally.
+- **Drained** — sealed and contains zero blocks (all retention'd
+  out). Operator may remove from config and delete the underlying
+  bucket out-of-band to reclaim provider quota.
+
+The `buckets` table in the catalog tracks this:
+
+```sql
+CREATE TABLE buckets (
+  name        TEXT PRIMARY KEY,    -- logical name in config
+  endpoint    TEXT NOT NULL,
+  region      TEXT,
+  max_bytes   INTEGER,             -- soft cap; triggers seal when crossed
+  sealed_at   INTEGER,             -- unix ts, NULL = open
+  total_bytes INTEGER NOT NULL DEFAULT 0
+);
+```
+
+And each block carries its bucket:
+
+```sql
+ALTER TABLE blocks ADD COLUMN bucket TEXT NOT NULL
+  REFERENCES buckets(name);
+```
+
+#### Write path
+
+Writers always upload to the **earliest open bucket** in the config
+list. This is deterministic without coordination — every writer
+picks the same one. On successful upload, the writer increments
+`total_bytes` for that bucket in its local catalog and publishes the
+block-created event (which carries the bucket name and the block's
+byte size, so peers update *their* `total_bytes` too).
+
+`total_bytes` will diverge briefly across instances because pub/sub
+takes time to propagate, but converges on the same value once
+events drain.
+
+#### Automatic sealing
+
+When `total_bytes >= max_bytes` on the active bucket, the writer that
+notices first triggers a seal:
+
+1. Acquire a single global seal lease at
+   `<next_bucket>/_seal_lease` (conditional PUT, short TTL).
+2. Write a `_sealed` marker object into the *outgoing* bucket. This
+   is advisory — the bucket still accepts writes from peers who
+   haven't seen the seal yet, but new peers will route around it.
+3. Set `sealed_at = now()` in the local catalog and publish a
+   `bucket-sealed` event on Valkey.
+4. Release the seal lease.
+
+Peers receive the event and switch their "earliest open" calculation
+to the next bucket. Sealing is idempotent — multiple writers racing
+to seal converge on the same outcome.
+
+**Slack between `max_bytes` and the provider's hard limit matters.**
+Because pub/sub propagation takes a moment and multiple writers may
+have blocks in flight, the bucket can overshoot `max_bytes` by tens
+to hundreds of MiB. Configure `max_bytes` well below the hard limit
+(e.g. 90 TiB on a 100 TiB Hetzner bucket) to absorb this.
+
+#### Query path
+
+The query planner consults the catalog for matching blocks. Each
+block's `bucket` column tells it where to fetch from. The planner
+groups blocks by bucket and issues parallel reads against each
+bucket's `object_store` instance. Multi-bucket adds zero hot-path
+cost — we were already issuing parallel ranged GETs per block.
+
+#### Multi-bucket and compaction
+
+Compaction is scoped per `(bucket, signal, day)`, so the lease key
+becomes `<bucket>/_compact_lease/<signal>/<yyyy-mm-dd>`. Within a
+partition, the merged output goes to the *current* active bucket
+even if the inputs came from a sealed one (because the active bucket
+is where new writes go by definition). Inputs are deleted from their
+original buckets after the grace period. No cross-bucket consistency
+problem because object-store APIs are independent per bucket.
+
+#### Multi-bucket and retention
+
+Retention deletes blocks from whatever bucket they live in. When a
+sealed bucket reaches zero remaining blocks, scry logs a notice and
+marks it `drained` in the catalog. The operator removes it from
+config and deletes the underlying bucket out-of-band.
 
 ### The catalog
 
@@ -296,22 +412,23 @@ Other processes' deletions are observed via catalog updates (see
 
 ## Compaction
 
-Background task in the same process. Per-signal-per-day:
+Background task in the same process. Per-`(bucket, signal, day)`:
 
-1. List blocks for `(signal, day)` in the catalog.
+1. List blocks for `(bucket, signal, day)` in the catalog.
 2. If the count of "small" blocks (< 32 MiB compressed, say) exceeds a
    threshold, plan a merge:
    - Pick the K smallest blocks (bounded total input size).
    - Read all of them in a streaming merge by `ts`.
-   - Write one new block. Upload with `If-None-Match: *`.
+   - Write one new block to the *current active bucket* with
+     `If-None-Match: *` (even if inputs came from a sealed bucket).
    - Insert the new catalog row.
    - Delete the inputs *only after* the new row is durable in the
      catalog and the new parquet object is confirmed present.
 3. Repeat until "small block count" is below the threshold.
 
 Multi-writer correctness: compaction work is partitioned by
-`(signal, day)`. A lightweight lease (a small object at
-`s3://.../_compact_lease/<signal>/<yyyy-mm-dd>` with a TTL and an ETag
+`(bucket, signal, day)`. A lightweight lease (a small object at
+`<bucket>/_compact_lease/<signal>/<yyyy-mm-dd>` with a TTL and an ETag
 check on takeover) ensures only one writer compacts a given partition
 at a time. Worst case: a stale lease causes wasted work; correctness is
 preserved because compaction output is content-addressed and inputs are
@@ -557,12 +674,20 @@ prefix-delete. No partial-block resurrection logic. No
 The entire config file:
 
 ```toml
-[storage]
-backend  = "s3"           # s3 | fs
-bucket   = "scry-prod"
-endpoint = "https://s3.eu-west-1.amazonaws.com"
-region   = "eu-west-1"
+# Bucket pool, in order. Writers always target the earliest open
+# bucket. Add a new entry when getting close to the active bucket's
+# max_bytes; scry will auto-seal the old one when it fills.
+[[storage.buckets]]
+name      = "scry-2026"
+backend   = "s3"             # s3 | fs
+endpoint  = "https://fsn1.your-objectstorage.com"
+bucket    = "scry-prod-2026"
+region    = "eu-central"
+max_bytes = "90 TiB"         # seal at ~90% of the provider's hard limit
 # credentials via standard AWS env vars
+
+# Single-bucket deployments use exactly one entry above; nothing else
+# needs to change. Multi-bucket adds further [[storage.buckets]] blocks.
 
 [wal]
 dir         = "/var/lib/scry/wal"

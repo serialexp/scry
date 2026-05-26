@@ -267,6 +267,44 @@ Valkey outage) is already provided by UUID v7 + `start-after`, while
 the costs (smaller compaction unit, more leases, more cursor rows)
 are real. Prefer the cheaper mechanism we already have.
 
+## D-017: Bucket pool with automatic sealing, from v0.1
+
+**Date:** 2026-05-26
+**Status:** accepted
+
+A scry deployment is configured with an *ordered list of buckets*,
+not a single bucket. Writers always upload to the earliest open
+bucket. When a bucket's tracked `total_bytes` exceeds `max_bytes`,
+the first writer to notice seals it (via a single global seal lease
+and a `_sealed` marker object) and peers route to the next bucket.
+Sealed buckets are still read and compacted; drained buckets (sealed
++ zero blocks remaining) are surfaced to the operator for removal.
+
+This addresses two real constraints: hard provider limits (Hetzner's
+100 TiB/bucket ceiling) and degrading full-walk performance at large
+single-bucket populations. Multi-bucket also gives free parallelism
+on the 30-min reconciliation scan.
+
+Single-bucket deployments use a list of length one. Default behavior
+is identical to a hypothetical single-bucket-only design — operators
+who never multi-bucket pay zero added complexity.
+
+We do this in v0.1 (not v0.6+) because the schema seam — `bucket`
+column on `blocks`, `buckets` table in the catalog — is cheap now and
+expensive after the catalog has been in the field for a year. We
+explicitly reject the "ship single-bucket now, migrate later" path
+as paying for a benefit we don't get.
+
+Sealing is automatic on the `max_bytes` soft cap, not manual,
+because operators shouldn't need to monitor and intervene at the
+moment a bucket fills. `max_bytes` should be configured well below
+the provider's hard limit (e.g. 90 TiB on Hetzner's 100 TiB) to
+absorb in-flight writes that cross the threshold before pub/sub
+propagates the seal event.
+
+Multi-bucket-per-signal (one pool per signal, so logs and traces
+don't share quota) is a future extension; not in v0.1.
+
 ## Deferred / open
 
 These are not decisions yet; they're flagged for "we'll decide when the
