@@ -1425,19 +1425,14 @@ name = "noise-sink"
 version = "0.0.1"
 dependencies = [
  "anyhow",
- "binschema-runtime",
  "clap",
- "object_store",
- "scry-block",
  "scry-catalog",
  "scry-objstore",
- "scry-proto",
- "scry-wal",
+ "scry-server",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "uuid",
- "zstd",
 ]
 
 [[package]]
@@ -2178,6 +2173,23 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "twox-hash 1.6.3",
+ "zstd",
+]
+
+[[package]]
+name = "scry-server"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "binschema-runtime",
+ "object_store",
+ "scry-block",
+ "scry-catalog",
+ "scry-proto",
+ "scry-wal",
+ "tokio",
+ "tracing",
+ "uuid",
  "zstd",
 ]
 

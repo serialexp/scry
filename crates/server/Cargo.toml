@@ -1,0 +1,22 @@
+[package]
+name        = "scry-server"
+version     = "0.0.1"
+edition.workspace = true
+license.workspace = true
+description = "scry ingest server: TCP listener, handshake, batch dispatch. Owns the per-writer DummyPipeline (WAL + parquet builder + optional catalog) shared across sessions. Designed to be composed into the eventual single scry binary alongside storage and query."
+
+[dependencies]
+anyhow            = { workspace = true }
+binschema-runtime = { workspace = true }
+object_store      = { workspace = true }
+scry-block        = { workspace = true }
+scry-catalog      = { workspace = true }
+scry-proto        = { workspace = true }
+scry-wal          = { workspace = true }
+tokio             = { workspace = true }
+tracing           = { workspace = true }
+uuid              = { workspace = true }
+zstd              = { workspace = true }
+
+[lints]
+workspace = true

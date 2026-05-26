@@ -36,6 +36,8 @@ scripts/smoke.sh                  # the scripted v0.1 exit criterion
 
 Tweak via env vars: `BATCHES=20000 RATE=4000 scripts/smoke.sh` for stress runs. The script empties the dev Garage bucket on every run; don't point it at a bucket whose contents you want to keep.
 
+The smoke script also wraps `noise-sink` in `/usr/bin/time -v` and prints a service-performance block at the end — peak RSS, user/sys CPU, records/sec, and **CPU-µs / record** (the headline regression sentinel; rate-independent, unlike `%CPU` which slides with the inter-batch idle gap). Full `time -v` output is kept in `$SMOKE_DIR/sink.time` for context (ctx switches, page faults, etc.). The script sends SIGINT directly to the noise-sink PID, not to `time`, because GNU time does not forward signals to its child.
+
 Regenerate Rust bindings from the wire schema (only path that should touch `crates/proto/src/generated.rs` or `crates/binschema-runtime/src/*.rs`):
 
 ```bash
@@ -60,9 +62,12 @@ Crates in `crates/`:
 - **`scry-block`** — block builder + reader. `DummyBlockBuilder` buffers records column-shaped (three Vecs, sorted on close), serialises a single-row-group parquet (zstd-3), uploads parquet + JSON sidecar via `object_store::ObjectStore::put`. `BlockMeta` is the sidecar struct; `block_path` builds the canonical key (`<signal>/<yyyy>/<mm>/<dd>/<writer_id>/<block_uuid>.{parquet,meta.json}`).
 - **`scry-catalog`** — rusqlite-bundled catalog. Schema verbatim from `ARCHITECTURE.md § The catalog § Schema` minus the `buckets` table (single-bucket v0.1). `Catalog::{open, insert_block, list_blocks, get_block, block_count, reconcile_from_bucket}`. WAL journal mode, partial indices on `(signal,date,ts_min,ts_max)` and `(bucket,signal,date,level)` where `deleted_at IS NULL`.
 
+**Server**
+- **`scry-server`** — the ingest server as a library. Owns the TCP listener, handshake, Batch/Ping/Goodbye dispatch, the per-session counters, and the process-scoped `DummyPipeline` (WAL + active block builder + optional catalog, shared across sessions via `Arc<Mutex<_>>`, per `ARCHITECTURE.md § The WAL` — WAL is per-writer, not per-session). Pipeline is constructed by the caller and passed to `Server::new(...)`, so the eventual single `scry` binary can share it with future background uploaders or catalog-lookup code. `Server::serve_with_shutdown(shutdown_fut)` binds, accepts until the future completes, then flushes the pipeline once and returns.
+
 **Binaries**
 - **`noise-spewer`** — TCP client. Does the Hello handshake, then emits random metrics/logs/traces/profiles/dummy batches at a target rate, respecting `max_inflight_batches` from the HelloAck. Payload generators live in `gen.rs`. `--max-batches N` for an exact count (rate × duration is off-by-one).
-- **`noise-sink`** — TCP listener + v0.1 ingest server. Validates Hello, sends HelloAck, loops on Batch/Ping/Goodbye/Hello, decompresses + decodes each Batch payload. With `--storage --wal-dir [--catalog]` the Dummy path is **durable**: `DummyPipeline` (process-scoped, `Arc<Mutex<_>>`) owns the WAL, the active builder, and the optional catalog. Replay walks the WAL into a fresh builder on startup; SIGINT triggers a graceful flush.
+- **`noise-sink`** — thin CLI around `scry-server`. Parses flags, optionally constructs a `DummyPipeline` from `SCRY_OBJSTORE_*` env + `--wal-dir [--catalog]`, then hands it to `Server::serve_with_shutdown(ctrl_c)`. All wire-protocol behaviour lives in `scry-server`.
 - **`scry-list`** — catalog inspector. Opens a SQLite catalog (creates the schema if missing), runs `reconcile_from_bucket` unless `--no-reconcile`, prints one line per block + a `# total rows=N bytes=N` trailer.
 
 **Tooling**

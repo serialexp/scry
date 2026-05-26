@@ -7,6 +7,7 @@ members = [
     "crates/wal",
     "crates/block",
     "crates/catalog",
+    "crates/server",
     "crates/noise-spewer",
     "crates/noise-sink",
     "crates/scry-list",
@@ -25,6 +26,7 @@ scry-objstore     = { path = "crates/objstore" }
 scry-wal          = { path = "crates/wal" }
 scry-block        = { path = "crates/block" }
 scry-catalog      = { path = "crates/catalog" }
+scry-server       = { path = "crates/server" }
 
 anyhow    = "1"
 arrow     = "53"

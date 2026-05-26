@@ -3,7 +3,7 @@ name        = "noise-sink"
 version     = "0.0.1"
 edition.workspace = true
 license.workspace = true
-description = "Test harness: scry ingest server for the v0.1 storage path. Decodes batches, appends Dummy batches to the WAL, builds parquet blocks, uploads to object storage."
+description = "Test harness: thin CLI around scry-server. Listens for agents, optionally enables the v0.1 storage path (WAL + parquet blocks → object storage + optional online catalog)."
 
 [[bin]]
 name = "noise-sink"
@@ -11,19 +11,14 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow            = { workspace = true }
-binschema-runtime = { workspace = true }
 clap              = { workspace = true }
-object_store      = { workspace = true }
-scry-block        = { workspace = true }
 scry-catalog      = { workspace = true }
 scry-objstore     = { workspace = true }
-scry-proto        = { workspace = true }
-scry-wal          = { workspace = true }
+scry-server       = { workspace = true }
 tokio             = { workspace = true }
 tracing           = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid              = { workspace = true }
-zstd              = { workspace = true }
 
 [lints]
 workspace = true

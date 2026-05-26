@@ -45,6 +45,15 @@ if ! command -v aws >/dev/null; then
     exit 2
 fi
 
+# GNU time (not the bash builtin) gives us peak RSS + total CPU
+# of the sink over its whole lifetime, including the final flush
+# triggered by SIGINT. The shell builtin `time` cannot do this.
+TIME_BIN="${TIME_BIN:-/usr/bin/time}"
+if [[ ! -x "$TIME_BIN" ]]; then
+    echo "[smoke] GNU time not at $TIME_BIN — install \`time\` or set TIME_BIN" >&2
+    exit 2
+fi
+
 # ── Build ───────────────────────────────────────────────────────────
 echo "[smoke] building release binaries..."
 cargo build --release -p noise-sink -p noise-spewer -p scry-list >&2
@@ -61,16 +70,35 @@ AWS_REGION="$SCRY_OBJSTORE_REGION" \
         s3 rm "s3://$SCRY_OBJSTORE_BUCKET/" --recursive >/dev/null || true
 
 # ── Run the pipeline ────────────────────────────────────────────────
+# noise-sink runs under /usr/bin/time so we can capture peak RSS +
+# user/sys CPU across its whole lifetime, including the final flush.
+# Time does NOT forward SIGINT to its child, so we send the shutdown
+# signal directly to noise-sink via its PID (found with pgrep).
 echo "[smoke] starting noise-sink on $LISTEN..."
-RUST_LOG="${RUST_LOG:-info}" ./target/release/noise-sink \
-    --listen "$LISTEN" \
-    --storage \
-    --wal-dir "$SMOKE_DIR/wal" \
-    --catalog "$SMOKE_DIR/online.sqlite" \
+RUST_LOG="${RUST_LOG:-info}" "$TIME_BIN" -v -o "$SMOKE_DIR/sink.time" \
+    ./target/release/noise-sink \
+        --listen "$LISTEN" \
+        --storage \
+        --wal-dir "$SMOKE_DIR/wal" \
+        --catalog "$SMOKE_DIR/online.sqlite" \
     > "$SMOKE_DIR/sink.log" 2>&1 &
-SINK_PID=$!
-# Make sure we don't leave a sink running if the script aborts.
-trap 'kill -9 $SINK_PID 2>/dev/null || true' EXIT
+TIME_PID=$!
+# Find the actual noise-sink child of /usr/bin/time. Fork+exec is
+# fast but not instantaneous; poll briefly.
+SINK_PID=""
+for _ in $(seq 1 50); do
+    SINK_PID=$(pgrep -P "$TIME_PID" 2>/dev/null || true)
+    [[ -n "$SINK_PID" ]] && break
+    sleep 0.05
+done
+if [[ -z "$SINK_PID" ]]; then
+    echo "[smoke] could not locate noise-sink under time(pid=$TIME_PID)" >&2
+    kill -9 "$TIME_PID" 2>/dev/null || true
+    exit 1
+fi
+# Cleanup on script abort. Kill the sink first (so time writes its
+# stats file), then the time wrapper if it survives.
+trap 'kill -9 "$SINK_PID" "$TIME_PID" 2>/dev/null || true' EXIT
 
 # Wait for the listener to actually bind. A small poll loop keeps us
 # robust against slow startup without leaning on an arbitrary sleep.
@@ -92,7 +120,9 @@ echo "[smoke] spewer: $BATCHES batches × $RECORDS_PER_BATCH records = $EXPECTED
 
 echo "[smoke] SIGINT noise-sink → graceful flush..."
 kill -INT "$SINK_PID"
-wait "$SINK_PID" 2>/dev/null || true
+# Wait on the time wrapper, not on the sink directly — time exits
+# after the sink does, AND it's the process that writes sink.time.
+wait "$TIME_PID" 2>/dev/null || true
 trap - EXIT
 
 # ── Verify ──────────────────────────────────────────────────────────
@@ -122,6 +152,53 @@ fi
 if [[ -z "${block_count:-}" || "$block_count" -lt 1 ]]; then
     echo "[smoke] FAIL: catalog reports zero blocks"
     failed=1
+fi
+
+# ── Service performance ────────────────────────────────────────────
+# Parse /usr/bin/time -v output. The full sink.time file is kept for
+# anyone who wants the long form. We surface the headline numbers
+# here so regressions are obvious in the smoke output itself.
+#
+# Most useful single regression sentinel: CPU-µs per record. It's
+# wall-clock-independent so it doesn't slide around with machine
+# load, and it captures the cost of the whole ingest pipeline
+# (decode + WAL append + builder append + occasional parquet
+# build/upload during the final flush).
+if [[ -f "$SMOKE_DIR/sink.time" ]]; then
+    awk -v records="$EXPECTED_RECORDS" '
+        /Maximum resident set size/ { rss_kb     = $NF }
+        /User time \(seconds\)/     { user_sec   = $NF }
+        /System time \(seconds\)/   { sys_sec    = $NF }
+        /Percent of CPU/            { cpu_pct    = $NF }
+        /Elapsed \(wall clock\)/ {
+            # Format: "h:mm:ss" or "m:ss.ss"
+            n = split($NF, p, ":")
+            if (n == 3) { wall = p[1]*3600 + p[2]*60 + p[3] }
+            else        { wall = p[1]*60 + p[2] }
+        }
+        /Voluntary context switches/    { vcs  = $NF }
+        /Involuntary context switches/  { ivcs = $NF }
+        /Minor \(reclaiming/            { minflt = $NF }
+        /Major \(requiring/             { majflt = $NF }
+        END {
+            cpu_sec    = user_sec + sys_sec
+            rss_mib    = rss_kb / 1024.0
+            rec_per_s  = (wall > 0) ? records / wall : 0
+            us_per_rec = (records > 0) ? cpu_sec * 1e6 / records : 0
+            printf "[smoke] ──── service performance ────\n"
+            printf "[smoke] wall clock        : %.2f s\n", wall
+            printf "[smoke] peak RSS          : %.1f MiB\n", rss_mib
+            printf "[smoke] user CPU          : %.2f s\n", user_sec
+            printf "[smoke] system CPU        : %.2f s\n", sys_sec
+            printf "[smoke] %%CPU              : %s\n",     cpu_pct
+            printf "[smoke] records/sec       : %.0f\n",    rec_per_s
+            printf "[smoke] CPU-µs / record   : %.2f\n",    us_per_rec
+            printf "[smoke] ctx switches      : voluntary=%s involuntary=%s\n", vcs, ivcs
+            printf "[smoke] page faults       : minor=%s major=%s\n",           minflt, majflt
+        }
+    ' "$SMOKE_DIR/sink.time"
+else
+    echo "[smoke] (no sink.time — perf stats unavailable)"
 fi
 
 if [[ $failed -eq 0 ]]; then
