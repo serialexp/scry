@@ -1,0 +1,25 @@
+[package]
+name        = "scry-catalog"
+version     = "0.0.1"
+edition.workspace = true
+license.workspace = true
+description = "SQLite-backed catalog of scry blocks. Mirrors block sidecars; derivable from the bucket via reconcile_from_bucket()."
+
+[dependencies]
+anyhow       = { workspace = true }
+chrono       = { workspace = true }
+futures      = { workspace = true }
+object_store = { workspace = true }
+rusqlite     = { version = "0.31", features = ["bundled"] }
+scry-block   = { workspace = true }
+serde_json   = { workspace = true }
+tracing      = { workspace = true }
+uuid         = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio    = { workspace = true, features = ["macros", "rt-multi-thread"] }
+bytes    = { workspace = true }
+
+[lints]
+workspace = true

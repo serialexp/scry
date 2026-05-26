@@ -1,22 +1,30 @@
-//! noise-sink — minimal scry ingest server, *no storage layer*.
+//! noise-sink — minimal scry ingest server.
 //!
 //! Accepts TCP connections, completes the handshake, decodes Batch
 //! payloads (after zstd decompression), validates them against the
 //! announced signal's schema, and replies with BatchAck. Maintains
 //! per-connection counters and prints a summary on disconnect.
 //!
-//! Run:
+//! With `--storage --wal-dir DIR` the Dummy ingest path is *durable*:
+//! every accepted DummyBatch is appended to a local WAL, the records
+//! are added to an in-memory parquet builder, and the builder is
+//! flushed to object storage when it fills (or on graceful shutdown).
+//! The WAL is replayed at startup so an unclean exit doesn't lose
+//! acknowledged records.
+//!
+//! Run (no storage):
 //!   noise-sink --listen 127.0.0.1:4000
 //!
-//! Designed strictly for protocol exercise. The next iteration replaces
-//! this with the real ingest server (WAL + block builder + parquet
-//! upload).
+//! Run (v0.1 storage path):
+//!   source docker/garage/.env
+//!   noise-sink --listen 127.0.0.1:4000 --storage --wal-dir ./wal
 
 use anyhow::{Context, Result};
 use binschema_runtime::{BitOrder, BitStreamDecoder};
 use clap::Parser;
 use object_store::ObjectStore;
 use scry_block::{BlockBuilderConfig, DummyBlockBuilder};
+use scry_catalog::Catalog;
 use scry_objstore::{open as open_objstore, ObjStoreConfig};
 use scry_proto::{
     build,
@@ -33,8 +41,10 @@ use scry_proto::{
         DummyBatch, FrameMsg, HelloOutput, LogsBatch, MetricsBatch, ProfilesBatch, TracesBatch,
     },
 };
+use scry_wal::{Wal, WalConfig};
 use std::{
     net::SocketAddr,
+    path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
     sync::Arc,
     time::Duration,
@@ -42,6 +52,7 @@ use std::{
 use tokio::{
     io::{AsyncWriteExt, BufReader, BufWriter},
     net::{TcpListener, TcpStream},
+    sync::Mutex,
 };
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -57,11 +68,27 @@ struct Args {
     #[arg(long)]
     writer_id: Option<String>,
 
-    /// Enable the v0.1 storage path: Dummy batches are accumulated
-    /// into parquet blocks and uploaded to object storage. Requires
+    /// Enable the v0.1 storage path: Dummy batches are durably
+    /// recorded in the WAL, accumulated into parquet blocks, and
+    /// uploaded to object storage. Requires `--wal-dir` and the
     /// `SCRY_OBJSTORE_*` env vars (see `docker/garage/.env`).
     #[arg(long)]
     storage: bool,
+
+    /// Root directory for the WAL. A `dummy/` subdirectory is created
+    /// for v0.1; real signals get their own subdirs later. Required
+    /// when `--storage` is set.
+    #[arg(long)]
+    wal_dir: Option<PathBuf>,
+
+    /// Path to the SQLite catalog file. If provided, every uploaded
+    /// block is recorded into the catalog inline (no reconcile loop
+    /// needed for catalog freshness). The file is created with the
+    /// canonical schema if it doesn't already exist. Optional —
+    /// scry-list can always rebuild the catalog from the bucket via
+    /// `reconcile_from_bucket`.
+    #[arg(long)]
+    catalog: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -75,6 +102,170 @@ struct Counters {
     payload_bytes_in:  AtomicU64, // compressed
     payload_bytes_out: AtomicU64, // decompressed
     rejected:          AtomicU64,
+}
+
+/// Process-scoped Dummy durability pipeline: a WAL, an active block
+/// builder, and the object store the builder uploads to. Shared
+/// across sessions via `Arc<Mutex<_>>`. Per `ARCHITECTURE.md § The WAL`
+/// — the WAL is per-writer, not per-session.
+struct DummyPipeline {
+    wal: Wal,
+    builder: DummyBlockBuilder,
+    store: Arc<dyn ObjectStore>,
+    /// Optional online catalog. Updates here are best-effort: a failed
+    /// insert (sqlite locked, disk full, etc.) is logged but does not
+    /// fail the ingest path, because the bucket is the source of
+    /// truth and a future `scry-list --reconcile` would re-derive the
+    /// row anyway.
+    catalog: Option<Catalog>,
+    writer_uuid: Uuid,
+    cfg: BlockBuilderConfig,
+}
+
+impl DummyPipeline {
+    /// Open the WAL, replay any leftover records into a fresh builder,
+    /// and return a pipeline ready to ingest. The replayed records
+    /// are *not* re-acked to the agent (agents will resend any
+    /// in-flight batches they hadn't yet seen an ack for, and dedup
+    /// is a v0.2 concern), but they are durable and will be uploaded
+    /// in the next flush.
+    async fn open(
+        wal_dir: PathBuf,
+        store: Arc<dyn ObjectStore>,
+        catalog: Option<Catalog>,
+        writer_uuid: Uuid,
+    ) -> Result<Self> {
+        let wal = Wal::open(WalConfig::new(wal_dir, "dummy"))
+            .await
+            .context("opening Dummy WAL")?;
+
+        let cfg = BlockBuilderConfig::default();
+        let mut builder = DummyBlockBuilder::new(writer_uuid, cfg);
+        let mut replayed_records = 0u64;
+        let mut replayed_frames = 0u64;
+        for frame in wal.replay().context("scanning WAL for replay")? {
+            let payload = frame.context("reading WAL frame")?;
+            let mut dec = BitStreamDecoder::new(&payload, BitOrder::MsbFirst);
+            let batch = DummyBatch::decode_with_decoder(&mut dec)
+                .map_err(|e| anyhow::anyhow!("WAL replay: decode DummyBatch: {e}"))?;
+            for rec in batch.records {
+                builder.append(rec);
+                replayed_records += 1;
+            }
+            replayed_frames += 1;
+        }
+        if replayed_records > 0 {
+            info!(
+                replayed_records,
+                replayed_frames, "WAL replay complete; records merged into next block"
+            );
+        }
+
+        let _ = replayed_records; // silence unused if we ever drop the log
+        Ok(Self {
+            wal,
+            builder,
+            store,
+            catalog,
+            writer_uuid,
+            cfg,
+        })
+    }
+
+    /// Append a single DummyBatch payload (already zstd-decoded, the
+    /// binschema-encoded form is what hits the WAL). On replay we
+    /// decode the same bytes back into records, so this is the unit
+    /// of crash-recovery atomicity. Auto-flushes if the builder hits
+    /// its close threshold.
+    async fn ingest(&mut self, payload: &[u8], batch: DummyBatch) -> Result<u64> {
+        // Order matters: WAL first, builder second. If the WAL append
+        // fails we never put the records into the in-memory builder
+        // — the agent will see the resulting BatchAck failure and
+        // retry. If the WAL append succeeds but builder.append
+        // somehow fails (it can't, today — Vec::push is infallible),
+        // the records are still durable and will appear via replay
+        // on next start.
+        self.wal.append(payload).await.context("WAL append")?;
+
+        let n = batch.records.len() as u64;
+        for rec in batch.records {
+            self.builder.append(rec);
+        }
+
+        if self.builder.should_close() {
+            self.flush().await?;
+        }
+        Ok(n)
+    }
+
+    /// Seal the active WAL segment, upload the active block, and
+    /// delete the uploaded WAL segments. A no-op if the builder is
+    /// empty (no segment to seal, nothing to upload).
+    async fn flush(&mut self) -> Result<()> {
+        if self.builder.is_empty() {
+            return Ok(());
+        }
+        // Rotate the WAL *before* we drain the builder. Everything we
+        // are about to upload is contained in (current segment & all
+        // earlier sealed-but-not-uploaded segments). After rotation,
+        // any subsequent appends go into a fresh segment that does
+        // not participate in this block.
+        let sealed = self.wal.rotate().await.context("WAL rotate on flush")?;
+
+        let new_builder = DummyBlockBuilder::new(self.writer_uuid, self.cfg);
+        let old_builder = std::mem::replace(&mut self.builder, new_builder);
+        match old_builder.finish_and_upload(self.store.as_ref()).await {
+            Ok(Some(meta)) => {
+                self.wal
+                    .mark_uploaded(sealed)
+                    .await
+                    .context("WAL mark_uploaded after block upload")?;
+                // Catalog update is best-effort by design: the bucket
+                // is the source of truth, and reconcile_from_bucket
+                // can always re-derive a missing row. We don't want a
+                // transient sqlite hiccup to fail the ingest path.
+                if let Some(cat) = self.catalog.as_ref() {
+                    match cat.insert_block(&meta) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            tracing::debug!(block_uuid = %meta.uuid, "catalog row already present");
+                        }
+                        Err(e) => {
+                            warn!(
+                                block_uuid = %meta.uuid,
+                                error = %e,
+                                "catalog insert failed; bucket has the data — recover via scry-list --reconcile"
+                            );
+                        }
+                    }
+                }
+                info!(
+                    block_uuid = %meta.uuid,
+                    row_count = meta.row_count,
+                    byte_size = meta.byte_size,
+                    "dummy block uploaded; WAL segments through {} released",
+                    sealed.0,
+                );
+            }
+            Ok(None) => {
+                // Builder was empty after rotation — vanishingly
+                // unlikely since we checked above, but possible if
+                // someone called flush() under tight races. Leave the
+                // sealed WAL segment in place; replay will pick it up
+                // next time.
+                warn!("flush() produced no block; WAL segment retained for replay");
+            }
+            Err(e) => {
+                // The upload failed. The sealed WAL segment is *not*
+                // marked uploaded, so a future flush (or next-start
+                // replay) will retry. Returning the error lets the
+                // caller decide whether the ingest path should fail
+                // the batch.
+                return Err(e.context("dummy block upload"));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[tokio::main]
@@ -92,18 +283,41 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| format!("noise-sink-{}", rand_short()));
     let writer_uuid = Uuid::now_v7();
 
-    // Open the object store up front if storage mode is on; failing
-    // fast here is much better than failing on the first Dummy batch.
-    let store: Option<Arc<dyn ObjectStore>> = if args.storage {
+    // Build the storage pipeline up front. Failing fast on a missing
+    // bucket or unreadable WAL dir is much better than failing on the
+    // first Dummy batch from an agent that's already mid-stream.
+    let pipeline: Option<Arc<Mutex<DummyPipeline>>> = if args.storage {
+        let wal_dir = args
+            .wal_dir
+            .clone()
+            .context("--storage requires --wal-dir")?;
         let cfg = ObjStoreConfig::from_env()
             .context("loading SCRY_OBJSTORE_* env (try `source docker/garage/.env`)")?;
+        let bucket = cfg.bucket.clone();
         info!(
             endpoint = %cfg.endpoint,
-            bucket   = %cfg.bucket,
-            "storage mode: writing Dummy blocks to object storage"
+            bucket   = %bucket,
+            wal_dir  = %wal_dir.display(),
+            catalog  = ?args.catalog,
+            "storage mode: WAL + parquet blocks → object storage"
         );
-        Some(open_objstore(&cfg)?)
+        let store = open_objstore(&cfg)?;
+        let catalog = match args.catalog.as_ref() {
+            Some(p) => Some(
+                Catalog::open(p, &bucket)
+                    .with_context(|| format!("opening catalog at {}", p.display()))?,
+            ),
+            None => None,
+        };
+        let pipe = DummyPipeline::open(wal_dir, store, catalog, writer_uuid).await?;
+        Some(Arc::new(Mutex::new(pipe)))
     } else {
+        if args.wal_dir.is_some() {
+            warn!("--wal-dir set but --storage is not; ignoring WAL");
+        }
+        if args.catalog.is_some() {
+            warn!("--catalog set but --storage is not; ignoring catalog");
+        }
         None
     };
 
@@ -114,17 +328,43 @@ async fn main() -> Result<()> {
 
     let next_session_id = Arc::new(AtomicU64::new(1));
 
-    loop {
-        let (sock, peer) = listener.accept().await?;
-        let session_id = next_session_id.fetch_add(1, Ordering::Relaxed);
-        let writer_id = writer_id.clone();
-        let store = store.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle(sock, peer, writer_id, writer_uuid, session_id, store).await {
-                warn!(peer = %peer, error = %e, "connection ended with error");
-            }
-        });
+    // Accept loop. Ctrl-C breaks out of the loop and triggers a
+    // graceful flush of the in-progress block (if any).
+    let accept_loop = async {
+        loop {
+            let (sock, peer) = listener.accept().await?;
+            let session_id = next_session_id.fetch_add(1, Ordering::Relaxed);
+            let writer_id = writer_id.clone();
+            let pipeline = pipeline.clone();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    handle(sock, peer, writer_id, writer_uuid, session_id, pipeline).await
+                {
+                    warn!(peer = %peer, error = %e, "connection ended with error");
+                }
+            });
+        }
+        #[allow(unreachable_code)]
+        Ok::<(), anyhow::Error>(())
+    };
+
+    tokio::select! {
+        r = accept_loop => { r?; }
+        _ = tokio::signal::ctrl_c() => {
+            info!("ctrl-c received; flushing");
+        }
     }
+
+    if let Some(pipe) = pipeline.as_ref() {
+        let mut guard = pipe.lock().await;
+        if let Err(e) = guard.flush().await {
+            warn!(error = %e, "final flush failed");
+        } else {
+            info!("final flush complete");
+        }
+    }
+
+    Ok(())
 }
 
 async fn handle(
@@ -133,14 +373,14 @@ async fn handle(
     writer_id: String,
     writer_uuid: Uuid,
     session_id: u64,
-    store: Option<Arc<dyn ObjectStore>>,
+    pipeline: Option<Arc<Mutex<DummyPipeline>>>,
 ) -> Result<()> {
     sock.set_nodelay(true)?;
     let (rd, wr) = sock.into_split();
     let mut rd = BufReader::new(rd);
     let mut wr = BufWriter::new(wr);
 
-    info!(%peer, session_id, "accept");
+    info!(%peer, session_id, %writer_uuid, "accept");
 
     // ── Handshake ──────────────────────────────────────────────────────
     let first = match read_frame(&mut rd).await {
@@ -205,12 +445,6 @@ async fn handle(
     // ── Message loop ───────────────────────────────────────────────────
     let counters = Counters::default();
     let signals_announced = hello.signals;
-
-    // Per-session block builder for Dummy records. `None` either
-    // because storage mode is off or because the session has not yet
-    // received a Dummy batch — lazy so non-Dummy sessions don't
-    // allocate arrow buffers they'll never use.
-    let mut dummy_block: Option<DummyBlockBuilder> = None;
 
     loop {
         let frame = match read_frame(&mut rd).await {
@@ -348,43 +582,27 @@ async fn handle(
 
                 let signal = sig.unwrap();
 
-                // Dummy gets a custom path: decode to records, push
-                // each into the per-session DummyBlockBuilder when
-                // storage is on, then count.
+                // Dummy gets the WAL+block path; other signals just
+                // get counted (v0.1 storage is Dummy-only). If the
+                // storage pipeline is enabled we run the whole
+                // WAL-append + builder-append + maybe-flush sequence
+                // under the pipeline mutex.
                 let decode_result: Result<u64> = if signal == Signal::Dummy {
                     let mut decoder = BitStreamDecoder::new(&decompressed, BitOrder::MsbFirst);
-                    DummyBatch::decode_with_decoder(&mut decoder)
-                        .map_err(|e| anyhow::anyhow!("DummyBatch: {e}"))
-                        .map(|d| {
-                            let n = d.records.len() as u64;
-                            if store.is_some() {
-                                let builder = dummy_block.get_or_insert_with(|| {
-                                    DummyBlockBuilder::new(
-                                        writer_uuid,
-                                        BlockBuilderConfig::default(),
-                                    )
-                                });
-                                for rec in d.records {
-                                    builder.append(rec);
-                                }
+                    match DummyBatch::decode_with_decoder(&mut decoder) {
+                        Ok(batch) => {
+                            if let Some(pipe) = pipeline.as_ref() {
+                                let mut guard = pipe.lock().await;
+                                guard.ingest(&decompressed, batch).await
+                            } else {
+                                Ok(batch.records.len() as u64)
                             }
-                            n
-                        })
+                        }
+                        Err(e) => Err(anyhow::anyhow!("DummyBatch: {e}")),
+                    }
                 } else {
                     decode_payload(signal, &decompressed)
                 };
-
-                // If the builder filled up, flush it now so a long
-                // session doesn't accumulate a giant block in RAM.
-                if let (Some(store), Some(builder)) = (store.as_ref(), dummy_block.as_ref()) {
-                    if builder.should_close() {
-                        // Take ownership to consume `finish_and_upload`.
-                        let b = dummy_block.take().unwrap();
-                        if let Err(e) = b.finish_and_upload(store.as_ref()).await {
-                            warn!(%peer, error = %e, "dummy block upload failed mid-session");
-                        }
-                    }
-                }
 
                 match decode_result {
                     Ok(records) => {
@@ -451,24 +669,6 @@ async fn handle(
         }
     }
 
-    // Flush any in-progress Dummy block before tearing the session
-    // down. Failure here is logged but does not propagate — the peer
-    // is already gone and there's nothing useful we can do about it.
-    if let (Some(store), Some(b)) = (store.as_ref(), dummy_block.take()) {
-        if !b.is_empty() {
-            match b.finish_and_upload(store.as_ref()).await {
-                Ok(Some(meta)) => info!(
-                    session_id,
-                    block_uuid = %meta.uuid,
-                    row_count = meta.row_count,
-                    "dummy block flushed on session close"
-                ),
-                Ok(None) => {}
-                Err(e) => warn!(%peer, error = %e, "dummy block flush failed"),
-            }
-        }
-    }
-
     let summary = format!(
         "session_id={} batches={} samples={} log_entries={} spans={} profiles={} dummy={} \
          bytes_in={} bytes_out={} rejected={}",
@@ -514,6 +714,8 @@ fn decode_payload(signal: Signal, bytes: &[u8]) -> Result<u64> {
             p.samples.len() as u64
         }
         Signal::Dummy => {
+            // Reachable only when storage mode is off (the storage
+            // branch decodes inline). Cheap to keep the symmetry.
             let d = DummyBatch::decode_with_decoder(&mut decoder)
                 .map_err(|e| anyhow::anyhow!("DummyBatch: {e}"))?;
             d.records.len() as u64

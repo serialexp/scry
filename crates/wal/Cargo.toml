@@ -1,0 +1,19 @@
+[package]
+name        = "scry-wal"
+version     = "0.0.1"
+edition.workspace = true
+license.workspace = true
+description = "Local SSD write-ahead log for scry. Per-writer, per-signal segments framed with crc32. Records become durable on segment rotation (fsync)."
+
+[dependencies]
+anyhow    = { workspace = true }
+crc32fast = { workspace = true }
+tokio     = { workspace = true }
+tracing   = { workspace = true }
+
+[dev-dependencies]
+tempfile  = "3"
+tokio     = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true
