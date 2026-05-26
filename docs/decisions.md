@@ -120,6 +120,30 @@ decide between (a) a Grafana datasource adapter, (b) a small purpose-
 built web UI, or (c) both. None of those choices affect the storage or
 query design, so deferring costs nothing.
 
+## D-011: Aggressive caching because blocks are immutable
+
+**Date:** 2026-05-26
+**Status:** accepted
+
+Object storage round-trip (~30 ms) vs RAM access (~50 ns) is six
+orders of magnitude. A query that hits S3 for metadata once per block
+is unworkable; one that hits a local RAM cache for metadata and only
+S3 for actual data bytes is competitive.
+
+The architectural enabler is block immutability. Because a parquet
+file never changes after upload, every cache layer (catalog, footer,
+page index, decompressed pages) is invalidation-free except for
+deletion events, which we generate ourselves and can therefore
+propagate locally.
+
+This decision links to D-003 (multi-writer): writers never share a
+key prefix, so no writer ever invalidates another writer's cached
+metadata. Cross-instance cache invalidation reduces to "notify peers
+when I delete a block."
+
+Layers 1–3 (catalog, footer, page index) are mandatory from v0.1.
+Layer 4 (decompressed pages) is a later optimisation.
+
 ## D-010: Start with naming + repo + this doc
 
 **Date:** 2026-05-26
@@ -135,6 +159,86 @@ record type. No signals, no ingest agent, no query — just "can we write
 and read a parquet block through the WAL+catalog+object-store path."
 
 ---
+
+## D-012: Valkey pub/sub for block discovery, polling as backstop
+
+**Date:** 2026-05-26
+**Status:** accepted
+
+Multi-instance deployments need a way for peers to learn of new
+blocks. We chose **Valkey pub/sub** for low-latency notification with
+**`ListObjects` polling (5 s)** and **full bucket walks (30 min)** as
+defense-in-depth backstops.
+
+Why Valkey: it's an operational primitive we already understand, a
+single instance handles vastly more fan-out than we will ever need,
+and the failure mode is benign — if Valkey is unreachable, query
+staleness rises from ~0 ms to ≤5 s but correctness is unaffected
+because polling is always running. Bucket state is the source of
+truth; Valkey is a cache-invalidation hint.
+
+Alternatives considered and rejected: polling-only (5 s of staleness
+in the normal case is more than we'd like), peer-to-peer push (more
+code, no real benefit over Valkey at any scale), S3 event
+notifications / SQS (more moving parts, vendor-specific, only worth
+it at scale we won't reach).
+
+Single-instance deployments leave `[valkey]` unset and rely on
+polling alone.
+
+## D-013: Per-partition compaction leases via object-storage conditional writes
+
+**Date:** 2026-05-26
+**Status:** accepted
+
+Multiple instances run the compactor loop. For each `(signal, day)`
+partition, an instance acquires a short-lived lease by `PUT`ing a
+small lease object under `_compact_lease/...` with
+`If-None-Match: *`. Renewed periodically with `If-Match: <etag>`.
+Takeover after expiry uses `GET` + `PUT If-Match: <etag>`.
+
+This requires the object store to support conditional writes. S3 (as
+of 2020), R2, MinIO, and Garage all do. Backends that don't are
+unsupported.
+
+Correctness if the lease mechanism misbehaves: two instances do
+redundant work and produce two valid merged blocks. The next
+compaction round merges them. **We will not write defensive recovery
+logic for double-compaction**, because immutability + content
+addressing already preserves correctness.
+
+Alternative considered: single elected leader does all compaction.
+Rejected because per-partition leases distribute load evenly with no
+SPOF, and the mechanism is no more complex.
+
+## D-014: 10-minute deletion grace period, fixed
+
+**Date:** 2026-05-26
+**Status:** accepted
+
+After compaction uploads the merged block and supersedes the inputs
+in the catalog, the input blocks remain in the bucket for 10 minutes
+before deletion. This protects in-flight queries that planned against
+the inputs before they were superseded.
+
+Fixed value, no config knob. If the value ever proves wrong in
+practice we'll revisit, but the default behavior is "this is not
+something operators should be thinking about." Mimir exposes a
+`deletion-delay` knob; we deliberately don't.
+
+## D-015: writer_id auto-generated, optionally overridden
+
+**Date:** 2026-05-26
+**Status:** accepted
+
+Default: random v4 UUID generated on first startup, persisted at
+`<wal_dir>/writer_id`, used forever after. Optional config override
+(`writer_id = "ingest-eu-1"`) for operators who want human-readable
+block prefixes; uniqueness is then the operator's responsibility.
+
+This gives "no-config works fine" by default and "tidy named writers"
+when an operator cares. No coordination protocol either way — UUIDs
+don't collide, and explicit names are an operator concern.
 
 ## Deferred / open
 

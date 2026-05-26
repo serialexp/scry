@@ -238,6 +238,62 @@ Building our own query language is **explicitly deferred**. We keep the
 internal DataFusion plan as the stable interface and add language
 frontends on top.
 
+## Caching
+
+Object storage is roughly six orders of magnitude slower than RAM
+(~30 ms cross-network vs ~50 ns pointer-chase). Aggressive caching is
+not a "nice to have"; it's the difference between "works" and "fast."
+
+The load-bearing property that makes caching cheap here:
+
+> **Blocks are immutable.** A parquet file, once uploaded, is byte-for-
+> byte identical for the rest of its existence. The only state change
+> a block ever undergoes is deletion (by compaction or retention),
+> which is performed by us, so we always know it's coming.
+
+This means caches need no TTL, no stale-while-revalidate, no
+distributed invalidation protocol. The only invalidation event is
+"this block was deleted" and it's a local event in the process that
+performed the deletion.
+
+### Cache layers
+
+From cheapest/hottest to most expensive:
+
+| Layer                       | Size per entry | What it gives                                 | Backing |
+|-----------------------------|----------------|-----------------------------------------------|---------|
+| **1. Catalog**              | KB             | "which blocks exist, what's roughly in them"  | SQLite + RAM |
+| **2. Parquet footer**       | KB–~MB         | schema, row-group offsets, per-column stats   | RAM (LRU) |
+| **3. Page index**           | KB             | per-page min/max within a column chunk        | RAM (LRU, alongside footer) |
+| **4. Decompressed pages**   | MB–tens of MB  | actual data ready to feed the executor        | RAM bounded + optional local-SSD spill |
+| **5. OS page cache (WAL)**  | —              | hot WAL reads served from RAM                 | Linux, free |
+
+A footer cache hit is ~10⁶× faster than fetching the footer from S3,
+and *every* query that touches a block needs the footer. Layers 1–3
+are mandatory from v0.1. Layer 4 is a v0.5/v0.6 optimisation (likely
+via `liquid-cache` or a similar DataFusion extension).
+
+### Sizing
+
+Parquet footers run ~0.1–1% of file size. At 128 MiB target block size
+that's ~128 KB–1.3 MiB of footer per block. A 1 GiB RAM cache holds
+metadata for ~1,000–10,000 blocks — at Bart's projected ~5 TiB/yr
+that's "all of them, easily."
+
+### Implementation
+
+We provide a `ParquetMetadataCache` to `parquet-rs` keyed on
+`(bucket, path, etag)`. The ETag pin is belt-and-braces — since we
+upload with `If-None-Match: *` and blocks are immutable, a stale entry
+should be impossible by construction, but matching on ETag means a
+hypothetical overwrite would miss naturally rather than serve wrong
+metadata.
+
+Eviction: LRU bounded by total bytes (not entry count), with explicit
+eviction when retention or compaction deletes a block in this process.
+Other processes' deletions are observed via catalog updates (see
+[Synchronisation](#synchronisation)) and trigger eviction the same way.
+
 ## Compaction
 
 Background task in the same process. Per-signal-per-day:
@@ -263,6 +319,176 @@ only deleted after success.
 
 Compaction never touches the WAL. The WAL is purely the
 "recent-and-not-yet-uploaded" path.
+
+## Synchronisation
+
+`scry` is designed for 1–N identical instances sharing one object-store
+bucket. Each instance plays four roles simultaneously: **writer**
+(owns a WAL, uploads blocks under its own `writer_id` prefix),
+**reader** (serves queries from all blocks regardless of authorship),
+**compactor** (background work, contests for partition-scoped leases),
+and **retention-runner** (background work, no coordination needed).
+
+The two foundational properties that make multi-instance coordination
+tractable:
+
+1. **Writers never share a key prefix.** Block paths include
+   `writer_id`, so concurrent writes can never collide. There is no
+   such thing as a "write conflict" in this system.
+2. **Blocks are immutable.** A block, once uploaded, never changes.
+   The only state transition is deletion, and deletion is performed by
+   one of the instances themselves.
+
+Coordination is therefore only needed for three things: discovering
+peers' new blocks, agreeing who compacts a given partition, and
+avoiding deletion-during-read races.
+
+### Block discovery: Valkey pub/sub with polling backstop
+
+When an instance uploads a new block, peers need to know about it so
+their catalogs are fresh and their queries don't miss recent data.
+
+The design uses **Valkey pub/sub** as the low-latency notification path
+and **periodic `ListObjects` polling** as the source-of-truth backstop:
+
+- On block upload, the writer `PUBLISH`es to
+  `scry/blocks/<signal>` a message containing the block path and the
+  sidecar contents.
+- Every instance `SUBSCRIBE`s to those channels and updates its
+  catalog on receipt. Propagation latency is sub-millisecond.
+- Independently, every instance polls `ListObjects` (with a
+  `start-after` marker per prefix) every 5 seconds and reconciles
+  anything pub/sub missed.
+- Every 30 minutes, a full bucket walk reconciles drift end-to-end.
+
+This is a deliberate three-tier defense: pub/sub for normal-case
+latency, short polling for "Valkey was briefly down," full walks for
+"something we don't understand happened." All three converge on the
+bucket as the source of truth — Valkey is a cache-invalidation hint,
+not a system of record.
+
+A single Valkey instance handles enormous fan-out before becoming a
+bottleneck; at our scale (1–N small N) it's a non-issue. Failure
+modes:
+
+- **Valkey down:** instances fall back to polling. Query staleness
+  rises from ~0 ms to ≤5 s. No correctness impact.
+- **Peer disconnected from Valkey:** same as above for that peer.
+- **Network partition:** each partitioned side still serves queries
+  from blocks it knows about; new writes from the *other* side become
+  visible after partition heals (via polling reconciliation).
+
+### Compaction: per-partition object-storage leases
+
+Compaction work is scoped per `(signal, day)` partition. Multiple
+instances run the compactor loop; for each candidate partition, the
+instance attempts to acquire a short-lived lease before starting:
+
+```
+PUT s3://<bucket>/_compact_lease/<signal>/<yyyy-mm-dd>
+    If-None-Match: *
+    Body: { writer_id, expires_at: now() + 5min }
+```
+
+- **Acquire:** `PUT If-None-Match: *`. 412 means someone else has it.
+- **Renew:** `PUT If-Match: <etag>` periodically while working.
+- **Takeover after expiry:** `GET` to check `expires_at`, then
+  `PUT If-Match: <etag>` to atomically replace.
+- **Release:** `DELETE If-Match: <etag>` on clean exit.
+
+S3 (since 2020), R2, MinIO, and Garage all support conditional writes.
+Object stores that don't are explicitly unsupported.
+
+**Correctness if the lease is buggy or contested:** two instances do
+redundant work and produce two valid merged blocks (different UUIDs,
+same input data). The next compaction round merges those two into one.
+**Correctness is preserved by immutability + content addressing;** the
+lease is purely an efficiency optimisation. We will not write
+elaborate recovery logic for double-compaction because there's
+nothing to recover.
+
+### Compaction deletion: 10-minute grace period
+
+The compactor's output sequence:
+
+1. Upload the merged block (with `If-None-Match: *`).
+2. Insert the new catalog row in this instance and `PUBLISH` it.
+3. Mark the input blocks `superseded_by = <new_uuid>` in the catalog
+   (locally and via pub/sub). **New queries skip superseded blocks.**
+4. Wait 10 minutes.
+5. Delete the input blocks from object storage.
+6. Drop their catalog rows.
+
+The 10-minute grace period exists so that in-flight queries which
+already planned against the input blocks can complete their reads
+before the bytes disappear. This is fixed and not configurable. (If
+operational reality ever produces queries that take >10 min, we'll
+revisit; the architectural decision is "don't add a knob until forced
+to.")
+
+During the grace period, both the old inputs and the new merged block
+exist in the bucket. The `superseded_by` flag prevents double-reads:
+queries planned *after* the supersede event see only the merged block,
+queries planned *before* keep reading from the inputs they were
+already plumbed to.
+
+### Retention: no coordination
+
+Retention's only operation is "delete blocks older than cutoff" — an
+idempotent prefix-delete. Multiple instances racing to retire the same
+day produce no incorrect outcome; whichever DELETE lands first wins
+and the rest get 204 No Content. Each instance manages its own
+catalog rows for the deleted prefixes (drop them on observing the
+deletion via pub/sub or polling). No leases, no leader, no
+coordination.
+
+### writer_id
+
+Each instance has a stable `writer_id` that prefixes all its block
+paths. Default behavior: on first startup, generate a v4 UUID and
+persist it to `<wal_dir>/writer_id`. Operators who want
+human-readable prefixes (e.g. `ingest-eu-1`, `ingest-eu-2`) can set
+`writer_id` in the config; they're responsible for uniqueness.
+
+No coordination needed in either mode: UUIDs don't collide, and
+explicitly named writers are the operator's problem.
+
+### Catalog reconciliation and crash recovery
+
+Each instance has its own SQLite catalog mirroring "what blocks
+exist." Drift sources:
+
+- **Missed pub/sub messages** while the instance was offline or
+  partitioned from Valkey.
+- **Crashed mid-upload:** the parquet may exist without its sidecar,
+  or vice versa. We treat any block missing its sidecar as
+  not-uploaded; the WAL still has the data and the next start re-
+  uploads under a new UUID.
+- **Out-of-band bucket operations** by an operator.
+
+Defense:
+
+- **Short polling (5 s)** catches near-real-time misses.
+- **Full bucket walk (30 min)** catches everything else: add catalog
+  rows for blocks present in the bucket but not the catalog, drop
+  rows for blocks the catalog claims exist but `HEAD` says don't.
+- **On startup:** full walk before serving queries or accepting
+  writes.
+
+### Cache invalidation across instances
+
+Combined with the [Caching](#caching) layer: when an instance deletes
+a block (its own retention, its own compaction output), it evicts the
+block's catalog row, footer, page-index, and any cached pages
+locally. Peer instances learn of the deletion via pub/sub
+(`scry/blocks/deleted/<signal>` channel) and do the same.
+
+If a peer misses the deletion notice, its next attempt to read the
+block returns 404 from object storage and that triggers local
+eviction reactively. The combination of (a) proactive notification and
+(b) reactive cleanup on 404 means no instance ever serves stale
+metadata for long, and no instance ever crashes because metadata
+outlived its data.
 
 ## Retention
 
@@ -292,10 +518,19 @@ region   = "eu-west-1"
 [wal]
 dir         = "/var/lib/scry/wal"
 segment_mib = 256
+# writer_id auto-generated and persisted under wal.dir on first start;
+# set explicitly here to override (must be unique across instances).
+# writer_id = "ingest-eu-1"
 
 [listen]
 ingest = "0.0.0.0:4000"
 query  = "0.0.0.0:4001"
+
+[valkey]
+url = "redis://valkey.internal:6379"
+# Used for low-latency block-discovery pub/sub between instances.
+# Optional: omit for single-instance deployments. When set but
+# unreachable, scry falls back to ListObjects polling.
 
 [retention]
 metrics  = "90d"
