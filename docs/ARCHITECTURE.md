@@ -22,6 +22,37 @@ is marketing.
    only in (a) the agent's collector, (b) the parquet schema for that
    signal's payload, and (c) the query frontend that knows what
    questions to ask. Everything else is shared.
+6. **Memory and CPU are not free.** Every component that processes
+   data has a *structural* bound on its working set — not a config
+   knob the operator turns down after the first OOM, a property of
+   the code. The implications are concrete:
+   - **Bounded by construction, not by tuning.** WAL caps RAM at
+     the current building block. LRU caches are byte-bounded. The
+     coordinator's working set in scatter-gather is bounded by
+     distinct group keys, not by raw series count.
+   - **Backpressure over buffering.** When a downstream is slow,
+     the upstream stops, not buffers. Pressure surfaces where
+     it can be reasoned about (a slow agent, a lagging consumer),
+     not in growing RAM.
+   - **Sketches over sets** where exactness isn't a requirement.
+     HyperLogLog for distinct counts, bloom filters for membership,
+     count-min for frequency. A few KB of bounded state replaces
+     unbounded materialization.
+   - **Per-query memory budgets** at workers. A single bad query
+     cannot OOM a worker. The query either spills to disk
+     (DataFusion's MemoryPool handles this for sorts and
+     aggregates) or fails cleanly with "query exceeds budget."
+     **Failing gracefully is a feature; OOM-then-restart is a
+     defect.**
+   - **Streaming over materialization.** Where a result can be
+     computed incrementally — partial aggregation, Arrow Flight
+     streaming, parquet row-group iteration — it is.
+
+   This is the principle that most clearly distinguishes scry from
+   the Grafana stack, whose components assume an autoscaling cloud
+   environment where "throw more memory at it" is the response to
+   most failure modes. scry is designed to run within a known,
+   bounded resource envelope on hardware you actually own.
 
 ## System overview
 
@@ -763,6 +794,50 @@ This is ~7 orders of magnitude reduction in network bytes for
 typical aggregating queries. It's the single biggest reason for
 scatter-gather over "just run it on one instance with more cores."
 
+### Per-query memory budgets
+
+Every query carries a memory budget enforced at the worker, wired
+through DataFusion's `MemoryPool` abstraction. The contract:
+
+- Each worker is configured with a total memory budget for query
+  execution (separate from cache memory, separate from WAL
+  buffers).
+- That budget is divided among in-flight queries by the worker's
+  scheduler. New queries that would push the worker over budget
+  either wait in queue or are rejected with a clear error.
+- Within a query's allocation, DataFusion operators are aware:
+  aggregations build hash tables up to budget then **spill to
+  local disk**; sorts spill once they exceed budget; hash joins
+  do the same.
+- If spilling is exhausted or disabled, the query fails with
+  `Error: query exceeded memory budget of X MiB during <stage>`.
+  The worker continues serving other queries.
+
+This is the contract that turns "a single bad query OOMs the
+worker" into "a single bad query gets a clear error message."
+**Failing gracefully is the goal, not an exceptional case.**
+
+The coordinator's memory bound is implicit: it merges partial
+results, which by the partial-aggregation pushdown are small.
+For non-aggregating queries (raw log lines, raw spans), the
+coordinator streams results to the client as Arrow batches; it
+doesn't buffer the full result. The same per-query budget rule
+applies at the coordinator for the final merge.
+
+Spill directory and budgets are configurable:
+
+```toml
+[query]
+memory_per_worker     = "16 GiB"
+memory_per_query_max  = "4 GiB"    # one query can't grab more than this
+spill_dir             = "/var/lib/scry/spill"
+spill_disk_max        = "100 GiB"
+```
+
+If `spill_dir` is unset, queries simply fail when their budget is
+exceeded — preferable to silently degraded performance for
+deployments where spill latency would be worse than failure.
+
 ### Failure modes
 
 - **Worker dies mid-query.** Coordinator's RPC times out; coordinator
@@ -782,6 +857,10 @@ scatter-gather over "just run it on one instance with more cores."
   execution (or fails fast with a clear error if local-execution
   budget is exceeded). Better to fail clearly than to scatter and
   wait forever.
+- **Query exceeds memory budget.** Worker (or coordinator) fails
+  the query with a budget-exceeded error and continues serving
+  others. No OOM, no process restart. Client sees the error and
+  can refine the query.
 
 ### When to fan out
 
@@ -1614,6 +1693,17 @@ metrics  = "90d"
 logs     = "30d"
 traces   = "7d"
 profiles = "14d"
+
+[query]
+# Per-query memory discipline. A single bad query never OOMs the
+# worker; it spills or fails clearly.
+memory_per_worker    = "16 GiB"
+memory_per_query_max = "4 GiB"
+spill_dir            = "/var/lib/scry/spill"
+spill_disk_max       = "100 GiB"
+# Set spill_dir = "" to disable spilling (queries fail when budget
+# exceeded; preferable in deployments where spill latency would be
+# worse than failure).
 ```
 
 That's the whole thing. Anything we are tempted to add gets argued for

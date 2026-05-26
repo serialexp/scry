@@ -556,6 +556,54 @@ This decision resolves the last remaining "asterisk" on the metrics
 pillar from earlier scaling analysis. The metrics ceiling is now
 designed-for, not unknown.
 
+## D-026: Memory and CPU are not free — resource discipline as a first-class principle
+
+**Date:** 2026-05-26
+**Status:** accepted
+
+Resource discipline is added as Guiding Principle #6, raising it
+from an implicit property of various design choices to a stated
+rule that every future addition must justify itself against.
+
+The principle has five concrete implications, all already
+visible in the existing design but not previously named together:
+
+- **Bounded by construction, not by tuning.** WAL caps RAM at the
+  current building block. LRU caches are byte-bounded. Scatter-
+  gather's coordinator memory is bounded by group keys.
+- **Backpressure over buffering.** Upstream stops when downstream
+  is slow; pressure surfaces where reasonable, not in RAM growth.
+- **Sketches over sets.** HyperLogLog for distinct counts, bloom
+  filters for membership, count-min for frequency. Bounded
+  approximation replaces unbounded materialization.
+- **Per-query memory budgets** at workers, enforced via DataFusion's
+  `MemoryPool`. Queries that would exceed budget spill to disk or
+  fail with a clear error. The worker keeps serving other queries.
+- **Streaming over materialization.** Partial aggregation,
+  Arrow Flight streaming, parquet row-group iteration — wherever
+  incremental beats batch.
+
+This is the principle that most concretely distinguishes scry
+from the Grafana stack, which assumes Grafana-Cloud-style
+autoscaling infra where "throw memory at it" is the response to
+most failure modes. **scry is designed for known, bounded
+resource envelopes on hardware you own**, not for elastic clouds
+where memory is a slider.
+
+The principle was articulated after the design was largely
+complete, but auditing what we have shows we'd already been
+following it everywhere except one place: per-query memory
+budgets at workers. That gap is closed by the new "Per-query
+memory budgets" subsection in Query, with a configurable
+`[query]` block (`memory_per_worker`, `memory_per_query_max`,
+`spill_dir`, `spill_disk_max`).
+
+The cost of stating this principle now is zero — nothing in the
+design changes. The benefit is that future contributions
+(features, optimisations, refactors) get evaluated against the
+explicit bound, so we don't drift back into "we'll tune it later"
+thinking that makes operators' lives hard.
+
 ## Deferred / open
 
 These are not decisions yet; they're flagged for "we'll decide when the
