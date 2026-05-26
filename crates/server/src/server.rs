@@ -351,22 +351,26 @@ async fn handle(
                 let signal = sig.unwrap();
 
                 // Dummy gets the WAL+block path; other signals just
-                // get counted (v0.1 storage is Dummy-only). If the
-                // storage pipeline is enabled we run the whole
-                // WAL-append + builder-append + maybe-flush sequence
-                // under the pipeline mutex.
+                // get counted (v0.1 storage is Dummy-only). The
+                // Dummy decode is streaming — we never materialise
+                // a DummyBatch / Vec<DummyRecord> / per-record
+                // String + Vec<u8>. See `scry_proto::streaming` and
+                // CLAUDE.md § Performance.
                 let decode_result: Result<u64> = if signal == Signal::Dummy {
-                    let mut decoder = BitStreamDecoder::new(&decompressed, BitOrder::MsbFirst);
-                    match DummyBatch::decode_with_decoder(&mut decoder) {
-                        Ok(batch) => {
-                            if let Some(pipe) = pipeline.as_ref() {
-                                let mut guard = pipe.lock().await;
-                                guard.ingest(&decompressed, batch).await
-                            } else {
-                                Ok(batch.records.len() as u64)
-                            }
-                        }
-                        Err(e) => Err(anyhow::anyhow!("DummyBatch: {e}")),
+                    if let Some(pipe) = pipeline.as_ref() {
+                        let mut guard = pipe.lock().await;
+                        guard.ingest(&decompressed).await
+                    } else {
+                        // No storage: still validate the wire format
+                        // (so a malformed batch is rejected with a
+                        // useful code) but throw the records away.
+                        let mut counter = CountAppender(0);
+                        scry_proto::streaming::decode_dummy_batch_into(
+                            &decompressed,
+                            &mut counter,
+                        )
+                        .map(|_| counter.0)
+                        .map_err(|e| anyhow::anyhow!("DummyBatch: {e}"))
                     }
                 } else {
                     decode_payload(signal, &decompressed)
@@ -455,6 +459,18 @@ async fn handle(
 
     let _ = tokio::time::timeout(Duration::from_millis(200), wr.shutdown()).await;
     Ok(())
+}
+
+/// Trivial [`scry_proto::streaming::DummyAppender`] that just counts
+/// records and discards the bytes. Used by the no-storage path so we
+/// still validate the wire format on every Dummy batch.
+struct CountAppender(u64);
+
+impl scry_proto::streaming::DummyAppender for CountAppender {
+    #[inline]
+    fn append_raw(&mut self, _ts: u64, _key: &[u8], _value: &[u8]) {
+        self.0 += 1;
+    }
 }
 
 fn decode_payload(signal: Signal, bytes: &[u8]) -> Result<u64> {

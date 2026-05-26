@@ -37,7 +37,7 @@ use object_store::{path::Path, ObjectStore};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
-use scry_proto::DummyRecord;
+use scry_proto::streaming::DummyAppender;
 use uuid::Uuid;
 
 use crate::{block_path, BlockBuilderConfig, BlockMeta};
@@ -110,25 +110,31 @@ impl DummyBlockBuilder {
         self.row_count() >= self.cfg.max_rows || self.bytes_est >= self.cfg.target_bytes
     }
 
-    /// Append one record. Two memcpys (key bytes, value bytes) and
-    /// five pushes (one u64, two i32, two implicit via extend). No
-    /// heap allocation in the steady state once the four buffers
-    /// have grown to their working size — `rec`'s `String` /
-    /// `Vec<u8>` are freed as `rec` drops at the end of this call.
-    pub fn append(&mut self, rec: DummyRecord) {
-        self.ts_min = self.ts_min.min(rec.ts_unix_nano);
-        self.ts_max = self.ts_max.max(rec.ts_unix_nano);
+}
+
+/// Streaming-decode hookup: the wire decoder hands us borrowed
+/// `&[u8]` slices straight out of the source payload, and we absorb
+/// them into the CSR buffers with two `extend_from_slice` calls per
+/// record. No `String` / `Vec<u8>` ever materialises. See
+/// [`scry_proto::streaming`] for the per-batch decode entry point.
+impl DummyAppender for DummyBlockBuilder {
+    #[inline]
+    fn append_raw(&mut self, ts_unix_nano: u64, key: &[u8], value: &[u8]) {
+        self.ts_min = self.ts_min.min(ts_unix_nano);
+        self.ts_max = self.ts_max.max(ts_unix_nano);
         // Same estimate as before: payload bytes only. Real allocator
         // overhead is gone now that we're not storing per-record
         // mallocs, so the estimate is much closer to actual heap use.
-        self.bytes_est += 16 + rec.key.len() as u64 + rec.value.len() as u64;
-        self.ts.push(rec.ts_unix_nano);
-        self.key_data.extend_from_slice(rec.key.as_bytes());
+        self.bytes_est += 16 + key.len() as u64 + value.len() as u64;
+        self.ts.push(ts_unix_nano);
+        self.key_data.extend_from_slice(key);
         self.key_offsets.push(self.key_data.len() as i32);
-        self.value_data.extend_from_slice(&rec.value);
+        self.value_data.extend_from_slice(value);
         self.value_offsets.push(self.value_data.len() as i32);
     }
+}
 
+impl DummyBlockBuilder {
     /// Close the block: serialise to parquet, upload it and a
     /// metadata sidecar, return the [`BlockMeta`] for catalog
     /// insertion. Consumes `self`.

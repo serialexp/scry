@@ -7,11 +7,10 @@
 //! this process funnels Dummy ingest through the same pipeline.
 
 use anyhow::{Context, Result};
-use binschema_runtime::{BitOrder, BitStreamDecoder};
 use object_store::ObjectStore;
 use scry_block::{BlockBuilderConfig, DummyBlockBuilder};
 use scry_catalog::Catalog;
-use scry_proto::generated::DummyBatch;
+use scry_proto::streaming::decode_dummy_batch_into;
 use scry_wal::{Wal, WalConfig};
 use std::{path::PathBuf, sync::Arc};
 use tracing::{info, warn};
@@ -54,13 +53,9 @@ impl DummyPipeline {
         let mut replayed_frames = 0u64;
         for frame in wal.replay().context("scanning WAL for replay")? {
             let payload = frame.context("reading WAL frame")?;
-            let mut dec = BitStreamDecoder::new(&payload, BitOrder::MsbFirst);
-            let batch = DummyBatch::decode_with_decoder(&mut dec)
+            let n = decode_dummy_batch_into(&payload, &mut builder)
                 .map_err(|e| anyhow::anyhow!("WAL replay: decode DummyBatch: {e}"))?;
-            for rec in batch.records {
-                builder.append(rec);
-                replayed_records += 1;
-            }
+            replayed_records += n as u64;
             replayed_frames += 1;
         }
         if replayed_records > 0 {
@@ -70,7 +65,6 @@ impl DummyPipeline {
             );
         }
 
-        let _ = replayed_records; // silence unused if we ever drop the log
         Ok(Self {
             wal,
             builder,
@@ -81,25 +75,31 @@ impl DummyPipeline {
         })
     }
 
-    /// Append a single DummyBatch payload (already zstd-decoded, the
+    /// Append a single DummyBatch payload (already zstd-decoded; the
     /// binschema-encoded form is what hits the WAL). On replay we
     /// decode the same bytes back into records, so this is the unit
     /// of crash-recovery atomicity. Auto-flushes if the builder hits
     /// its close threshold.
-    pub async fn ingest(&mut self, payload: &[u8], batch: DummyBatch) -> Result<u64> {
+    ///
+    /// Decode is streaming: we never materialise a `DummyBatch` /
+    /// `Vec<DummyRecord>` / per-record `String` + `Vec<u8>`. See
+    /// [`scry_proto::streaming`] for the rationale.
+    pub async fn ingest(&mut self, payload: &[u8]) -> Result<u64> {
         // Order matters: WAL first, builder second. If the WAL append
         // fails we never put the records into the in-memory builder
         // — the agent will see the resulting BatchAck failure and
-        // retry. If the WAL append succeeds but builder.append
-        // somehow fails (it can't, today — Vec::push is infallible),
-        // the records are still durable and will appear via replay
-        // on next start.
+        // retry. If decode fails partway through, the builder has
+        // absorbed a prefix of the batch's records *and* the WAL has
+        // the whole payload — on next start, replay re-applies the
+        // full batch from the WAL, so the partial absorption here
+        // is overwritten by a clean re-decode. Net effect: a decode
+        // failure just gets a retry from the agent; no duplicate or
+        // missing records.
         self.wal.append(payload).await.context("WAL append")?;
 
-        let n = batch.records.len() as u64;
-        for rec in batch.records {
-            self.builder.append(rec);
-        }
+        let n = decode_dummy_batch_into(payload, &mut self.builder)
+            .map_err(|e| anyhow::anyhow!("DummyBatch: {e}"))?
+            as u64;
 
         if self.builder.should_close() {
             self.flush().await?;
