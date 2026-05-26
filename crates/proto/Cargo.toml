@@ -1,0 +1,20 @@
+[package]
+name        = "scry-proto"
+version     = "0.0.1"
+edition.workspace = true
+license.workspace = true
+description = "scry ingest wire protocol: generated binschema bindings + framing helpers."
+
+[lib]
+name = "scry_proto"
+path = "src/lib.rs"
+
+[dependencies]
+binschema-runtime = { workspace = true }
+thiserror = { workspace = true }
+tokio     = { workspace = true }
+twox-hash = { workspace = true }
+zstd      = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,23 @@
+[package]
+name        = "noise-sink"
+version     = "0.0.1"
+edition.workspace = true
+license.workspace = true
+description = "Test harness: minimal scry ingest server. Decodes batches, counts records per signal, replies with BatchAck. No WAL, no parquet, no durability."
+
+[[bin]]
+name = "noise-sink"
+path = "src/main.rs"
+
+[dependencies]
+anyhow            = { workspace = true }
+binschema-runtime = { workspace = true }
+clap              = { workspace = true }
+scry-proto        = { workspace = true }
+tokio             = { workspace = true }
+tracing           = { workspace = true }
+tracing-subscriber = { workspace = true }
+zstd              = { workspace = true }
+
+[lints]
+workspace = true
