@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow            = { workspace = true }
 clap              = { workspace = true }
+mimalloc          = { workspace = true }
 scry-catalog      = { workspace = true }
 scry-objstore     = { workspace = true }
 scry-server       = { workspace = true }
