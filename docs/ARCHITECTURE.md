@@ -53,6 +53,42 @@ is marketing.
    environment where "throw more memory at it" is the response to
    most failure modes. scry is designed to run within a known,
    bounded resource envelope on hardware you actually own.
+7. **Profile, don't guess.** Performance is a property we build in,
+   not one we hope for. Every hot path in scry — WAL append, block
+   build, postings lookup, scatter-gather merge, cache eviction —
+   ships with a benchmark, and the benchmark runs in CI. When a
+   benchmark regresses, that's a bug, treated like any other failing
+   test. Concretely:
+   - **Benchmarks alongside tests.** `cargo bench` (Criterion) for
+     the hot paths; flamegraphs (`pprof-rs` / `samply`) checked into
+     `bench/baselines/` so a regression is visible as a diff, not a
+     vibe.
+   - **Allocation discipline.** Per-item allocations in hot loops
+     are a defect class, not a style preference. Scratch buffers
+     live on long-lived structs and reset between iterations.
+     `Vec::with_capacity`, `format!`, `.clone()`, `.to_vec()`,
+     `.collect()` inside an inner loop are questions to answer in
+     review, not background noise.
+   - **Measure before optimising, but measure.** No "this should
+     be faster" without numbers; equally, no shipping a hot path
+     without ever having looked at its flamegraph.
+   - **Trust the query engine, verify everything else.** DataFusion
+     is a serious project and we assume its execution layer is
+     smart (predicate pushdown, vectorised aggregates, spill
+     correctness). What we *don't* assume is that our glue around
+     it — schema construction, projection lists, postings
+     application, scatter-gather coordination — is free. That's
+     where our profiling effort goes.
+   - **No `#[bench]` graveyard.** Benchmarks that no longer
+     compile or no longer reflect a real workload get deleted in
+     the same commit, not left to rot. Stale benchmarks are worse
+     than no benchmarks because they create false confidence.
+
+   Profiling is paired with the resource discipline of principle 6:
+   one tells you whether you're *fast enough*, the other tells you
+   whether you'll *stay within budget*. Together they're the
+   difference between "works on my laptop with one tenant" and
+   "works on the 50 TB/month deployment under sustained load."
 
 ## System overview
 

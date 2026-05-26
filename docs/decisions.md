@@ -678,6 +678,48 @@ protect. Better to fail at the subsystem level (a single query
 spills or fails; a single ingest batch gets backpressure) than
 at the process level.
 
+## D-028: Profiling and performance as a development principle
+
+**Date:** 2026-05-26
+**Status:** accepted
+
+Added as Guiding Principle #7. Paired with D-026 (resource
+discipline): #6 says "stay within the budget"; #7 says "and be
+fast enough within it." Neither holds up without the other —
+bounded memory doesn't help if a query takes ten minutes, and a
+fast query that OOMs the worker isn't fast.
+
+Concretely:
+
+- Hot paths ship with Criterion benchmarks that run in CI.
+  Regressions are bugs, not metrics drift.
+- Flamegraphs are checked into `bench/baselines/` so regressions
+  are visible as a diff. Without checked-in baselines, "the
+  flamegraph looks weird" is unfalsifiable.
+- Per-item allocation in hot loops is treated as a defect class,
+  not a style preference. The pattern shows up repeatedly across
+  hot-loop code (and is called out at length in CLAUDE.md);
+  baking it into the principles means every PR review can cite it.
+- The boundary between "ours to profile" and "trust the engine":
+  DataFusion's execution layer is treated as a black box that
+  does the right thing; the glue we write around it (projection
+  construction, postings application, scatter-gather merge) is
+  not. That's where the profiling effort goes.
+- Stale benchmarks get deleted, not preserved. A benchmark that
+  no longer reflects the real workload creates false confidence.
+
+We do not adopt a hard "no performance regressions ever" policy
+— sometimes the right design is slower in microbenchmarks and
+better in production (e.g. fewer allocations at the cost of one
+extra index). The policy is "regressions get *noticed* and
+*argued*," not "regressions get rejected."
+
+The cost is real: maintaining benchmarks is work, and CI time
+goes up. The alternative is the classic "ship, profile when
+users complain" loop, which for an observability system means
+the users complaining are the ones whose own observability is
+broken. We'd rather pay the development tax.
+
 ## Deferred / open
 
 These are not decisions yet; they're flagged for "we'll decide when the
