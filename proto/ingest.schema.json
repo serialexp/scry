@@ -1,0 +1,490 @@
+{
+  "meta": {
+    "title": "scry ingest wire protocol",
+    "description": "Agent ↔ server wire protocol for shipping metrics, logs, traces, and profiles to a scry ingest server. Long-lived TCP stream, length-framed messages, batch payloads compressed independently. Designed to be the only thing agents speak: the server's HTTP query surface is separate.",
+    "version": "0.1.0"
+  },
+
+  "config": {
+    "endianness": "big_endian",
+    "bit_order": "msb_first"
+  },
+
+  "types": {
+    "//": "----------------------------------------------------------------",
+    "//1": "Framing. Every message on the wire is `[len: u32][Frame]` where",
+    "//2": "Frame's first byte is the message-type discriminator. The length",
+    "//3": "covers Frame, not the length prefix itself.",
+    "//4": "----------------------------------------------------------------",
+
+    "Frame": {
+      "description": "Top-level discriminated union of all messages. Peek-discriminated on the message-type byte; each variant struct begins with a const-tagged uint8 that matches the discriminator.",
+      "sequence": [
+        {
+          "name": "msg",
+          "type": "discriminated_union",
+          "discriminator": { "peek": "uint8" },
+          "variants": [
+            { "type": "Hello",          "when": "value === 0x01" },
+            { "type": "HelloAck",       "when": "value === 0x02" },
+            { "type": "Batch",          "when": "value === 0x10" },
+            { "type": "BatchAck",       "when": "value === 0x11" },
+            { "type": "FlowControl",    "when": "value === 0x20" },
+            { "type": "Ping",           "when": "value === 0x30" },
+            { "type": "Pong",           "when": "value === 0x31" },
+            { "type": "Goodbye",        "when": "value === 0x40" },
+            { "type": "Error",          "when": "value === 0xF0" }
+          ]
+        }
+      ]
+    },
+
+    "//5": "----------------------------------------------------------------",
+    "//6": "Handshake.",
+    "//7": "----------------------------------------------------------------",
+
+    "Hello": {
+      "description": "First message from agent. Identifies agent, advertises capabilities and the signals it intends to send. Sent exactly once at connection open.",
+      "sequence": [
+        { "name": "tag", "type": "uint8", "const": 1 },
+        { "name": "protocol_version", "type": "uint16",
+          "//": "Major.minor packed: (major << 8) | minor. v0 = 0x0001." },
+        { "name": "agent_id", "type": "bytes", "kind": "fixed", "length": 16,
+          "//": "UUID v7 of the agent process; stable across reconnects, regenerated on reinstall." },
+        { "name": "agent_version", "type": "string", "kind": "length_prefixed", "length_type": "uint8", "encoding": "ascii",
+          "//": "Semver build of the scry-agent binary, e.g. '0.2.1-abc1234'." },
+        { "name": "hostname", "type": "string", "kind": "length_prefixed", "length_type": "uint8", "encoding": "utf8" },
+        { "name": "signals", "type": "uint8",
+          "//": "Bitmask: 0x01=metrics, 0x02=logs, 0x04=traces, 0x08=profiles. Agent only sends batches for signals it announces here." },
+        { "name": "capabilities", "type": "uint32",
+          "//": "Bitmask of optional features the agent supports. See protocol.constants.CAP_*." },
+        { "name": "resource_attrs", "type": "array", "kind": "length_prefixed", "length_type": "uint16",
+          "items": { "type": "LabelPair" },
+          "//": "OTel-style resource attributes that apply to every record from this agent unless overridden (host, service, env, region, …)." }
+      ]
+    },
+
+    "HelloAck": {
+      "description": "Server's response to Hello. Confirms protocol version, identifies the server's writer_id (D-015), and gives the agent its session_id for the lifetime of this connection.",
+      "sequence": [
+        { "name": "tag", "type": "uint8", "const": 2 },
+        { "name": "protocol_version", "type": "uint16",
+          "//": "Negotiated version. Server picks min(agent.version, server.max_supported). Agent disconnects if unsupported." },
+        { "name": "writer_id", "type": "string", "kind": "length_prefixed", "length_type": "uint8", "encoding": "ascii",
+          "//": "Server's stable writer_id. Goes into block paths and ack receipts so the agent can reason about which server holds which data." },
+        { "name": "session_id", "type": "uint64",
+          "//": "Opaque, server-assigned. Echoed in every Batch and every Ack for this connection so logs are correlatable." },
+        { "name": "capabilities", "type": "uint32",
+          "//": "Server's feature bitmask. Agent must not use a capability not present in this AND its own." },
+        { "name": "suggested_batch_bytes", "type": "uint32",
+          "//": "Soft hint: agent should aim for batches around this size (after compression) for best throughput. Default 4 MiB." },
+        { "name": "max_batch_bytes", "type": "uint32",
+          "//": "Hard limit: server will reject batches exceeding this size. Default 16 MiB." },
+        { "name": "max_inflight_batches", "type": "uint16",
+          "//": "Server-side per-connection inflight cap. Agent must not have more than this number of un-acked batches outstanding." }
+      ]
+    },
+
+    "//8": "----------------------------------------------------------------",
+    "//9": "Batches. The bulk of the protocol by byte count.",
+    "//10": "----------------------------------------------------------------",
+
+    "Batch": {
+      "description": "A compressed, signal-specific batch of records. The payload, after decompression, is a SignalBatch variant. Each batch carries its own compression: a connection may interleave compressed and uncompressed batches if the agent decides per-batch.",
+      "sequence": [
+        { "name": "tag", "type": "uint8", "const": 16 },
+        { "name": "session_id", "type": "uint64",
+          "//": "Must match HelloAck.session_id. A mismatch is a hard protocol error." },
+        { "name": "batch_id", "type": "uint64",
+          "//": "Monotonic per agent across the lifetime of the connection. Used by the agent to correlate BatchAcks." },
+        { "name": "signal", "type": "uint8",
+          "//": "1=metrics, 2=logs, 3=traces, 4=profiles. Must be one of the bits announced in Hello.signals." },
+        { "name": "ts_min_unix_nano", "type": "uint64",
+          "//": "Earliest timestamp in the batch. Lets the server pick the right (signal, day) block builder without inspecting the payload." },
+        { "name": "ts_max_unix_nano", "type": "uint64",
+          "//": "Latest timestamp in the batch." },
+        { "name": "record_count", "type": "uint32",
+          "//": "Number of records inside the (decompressed) payload. Lets the server reject suspicious batches before decompressing." },
+        { "name": "compression", "type": "uint8",
+          "//": "0=none, 1=zstd. zstd is the only compression we'll bother shipping in v1; future codecs go here." },
+        { "name": "uncompressed_size", "type": "uint32",
+          "//": "Decompressed payload size in bytes. Lets the server pre-size buffers and refuse to allocate if it would blow ingest_buffers budget (see Resource isolation)." },
+        { "name": "payload", "type": "bytes", "kind": "length_prefixed", "length_type": "uint32",
+          "//": "Compressed bytes of a SignalBatch variant. After decompression, decode according to `signal`: 1=MetricsBatch, 2=LogsBatch, 3=TracesBatch, 4=ProfilesBatch." }
+      ]
+    },
+
+    "BatchAck": {
+      "description": "Server's response per Batch. Either accepted (durable in WAL), throttled (agent should slow down before retrying), or rejected (do not retry — fix or drop).",
+      "sequence": [
+        { "name": "tag", "type": "uint8", "const": 17 },
+        { "name": "session_id", "type": "uint64" },
+        { "name": "batch_id", "type": "uint64",
+          "//": "Echoed from the Batch this acks." },
+        { "name": "status", "type": "uint8",
+          "//": "0=accepted, 1=throttled, 2=rejected." },
+        { "name": "retry_after_ms", "type": "uint32",
+          "//": "When status=throttled: agent should wait at least this long before retrying. When accepted/rejected: 0." },
+        { "name": "reason_code", "type": "uint16",
+          "//": "When status=rejected: a stable numeric reason (see protocol.constants.REJECT_*). 0 otherwise." },
+        { "name": "message", "type": "string", "kind": "length_prefixed", "length_type": "uint16", "encoding": "utf8",
+          "//": "Optional human-readable detail. Empty on accept. Used for operator-visible logs, not for programmatic decisions." }
+      ]
+    },
+
+    "//11": "----------------------------------------------------------------",
+    "//12": "Out-of-band flow control. Server can push an asynchronous rate",
+    "//13": "hint at any time (e.g. when a signal's token bucket is draining,",
+    "//14": "or when the dynamic compaction throttle pauses).",
+    "//15": "----------------------------------------------------------------",
+
+    "FlowControl": {
+      "description": "Asynchronous server→agent rate hint. Not a response to any specific Batch. Per-signal so the server can throttle (say) traces without affecting metrics.",
+      "sequence": [
+        { "name": "tag", "type": "uint8", "const": 32 },
+        { "name": "session_id", "type": "uint64" },
+        { "name": "signal", "type": "uint8",
+          "//": "Signal this hint applies to; 0xFF = all signals." },
+        { "name": "max_bytes_per_sec", "type": "uint32",
+          "//": "Suggested sustained ceiling. 0 = clear any prior throttle." },
+        { "name": "max_batches_inflight", "type": "uint16",
+          "//": "Suggested per-signal inflight cap, overrides HelloAck.max_inflight_batches for this signal. 0 = no signal-specific cap." },
+        { "name": "valid_for_ms", "type": "uint32",
+          "//": "Hint's validity window. After this elapses with no fresh FlowControl, agent reverts to defaults." }
+      ]
+    },
+
+    "//16": "----------------------------------------------------------------",
+    "//17": "Liveness.",
+    "//18": "----------------------------------------------------------------",
+
+    "Ping": {
+      "description": "Either side may send. Receiver MUST reply with a Pong carrying the same nonce.",
+      "sequence": [
+        { "name": "tag", "type": "uint8", "const": 48 },
+        { "name": "nonce", "type": "uint64" }
+      ]
+    },
+
+    "Pong": {
+      "sequence": [
+        { "name": "tag", "type": "uint8", "const": 49 },
+        { "name": "nonce", "type": "uint64" }
+      ]
+    },
+
+    "//19": "----------------------------------------------------------------",
+    "//20": "Shutdown.",
+    "//21": "----------------------------------------------------------------",
+
+    "Goodbye": {
+      "description": "Graceful close. Either side may send. After sending Goodbye, the sender must not send any new Batch; it may still send/receive BatchAcks for already-inflight batches.",
+      "sequence": [
+        { "name": "tag", "type": "uint8", "const": 64 },
+        { "name": "reason_code", "type": "uint16",
+          "//": "See GOODBYE_* constants. 0 = normal shutdown." },
+        { "name": "message", "type": "string", "kind": "length_prefixed", "length_type": "uint16", "encoding": "utf8" }
+      ]
+    },
+
+    "Error": {
+      "description": "Protocol-level error. Receiving an Error MUST close the connection. Distinct from BatchAck.rejected, which is a per-batch decision the connection survives.",
+      "sequence": [
+        { "name": "tag", "type": "uint8", "const": 240 },
+        { "name": "code", "type": "uint16",
+          "//": "See protocol.constants.ERR_*." },
+        { "name": "message", "type": "string", "kind": "length_prefixed", "length_type": "uint16", "encoding": "utf8" }
+      ]
+    },
+
+    "//22": "================================================================",
+    "//23": "Payload types. These are the *decompressed* contents of",
+    "//24": "Batch.payload, selected by Batch.signal.",
+    "//25": "================================================================",
+
+    "LabelPair": {
+      "description": "A key-value label. Used by every signal. UTF-8 throughout.",
+      "sequence": [
+        { "name": "key",   "type": "string", "kind": "length_prefixed", "length_type": "uint8",  "encoding": "utf8" },
+        { "name": "value", "type": "string", "kind": "length_prefixed", "length_type": "uint16", "encoding": "utf8" }
+      ]
+    },
+
+    "//26": "----------------------------------------------------------------",
+    "//27": "Metrics. Series-dictionary compression: full labels appear once",
+    "//28": "per (series_fingerprint) per batch, samples reference fingerprint.",
+    "//29": "----------------------------------------------------------------",
+
+    "MetricsBatch": {
+      "description": "Body of a metrics Batch after decompression.",
+      "sequence": [
+        { "name": "series", "type": "array", "kind": "length_prefixed", "length_type": "uint32",
+          "items": { "type": "SeriesDictEntry" },
+          "//": "Dictionary entries for series first introduced in this batch. Agents maintain a per-session seen-set; servers reject Sample references to fingerprints never declared." },
+        { "name": "samples", "type": "array", "kind": "length_prefixed", "length_type": "uint32",
+          "items": { "type": "MetricSample" } }
+      ]
+    },
+
+    "SeriesDictEntry": {
+      "description": "Declares a series (set of labels) and its xxh3-64 fingerprint. The agent computes the fingerprint; the server validates it on receipt and rejects mismatches.",
+      "sequence": [
+        { "name": "fingerprint", "type": "uint64",
+          "//": "xxh3-64 of canonically-sorted labels. Stable across agents." },
+        { "name": "metric_type", "type": "uint8",
+          "//": "0=unknown, 1=counter, 2=gauge, 3=histogram, 4=summary. Cheap hint, not authoritative — the query engine treats series as untyped." },
+        { "name": "labels", "type": "array", "kind": "length_prefixed", "length_type": "uint16",
+          "items": { "type": "LabelPair" } }
+      ]
+    },
+
+    "MetricSample": {
+      "description": "One scalar observation. Histograms and summaries explode into multiple samples (one per bucket / one per quantile) before serialisation; the wire knows only scalars.",
+      "sequence": [
+        { "name": "fingerprint",   "type": "uint64",
+          "//": "Reference to a SeriesDictEntry from this batch or any earlier batch in this session." },
+        { "name": "ts_unix_nano",  "type": "uint64" },
+        { "name": "value",         "type": "float64" }
+      ]
+    },
+
+    "//30": "----------------------------------------------------------------",
+    "//31": "Logs.",
+    "//32": "----------------------------------------------------------------",
+
+    "LogsBatch": {
+      "sequence": [
+        { "name": "streams", "type": "array", "kind": "length_prefixed", "length_type": "uint32",
+          "items": { "type": "LogStream" },
+          "//": "Records are pre-grouped by (label set) at the agent so labels aren't repeated per line. Within a stream, entries share the same labels." }
+      ]
+    },
+
+    "LogStream": {
+      "sequence": [
+        { "name": "fingerprint", "type": "uint64",
+          "//": "Same fingerprint discipline as metrics (xxh3-64 of sorted labels). Lets the server pre-bucket by stream cheaply." },
+        { "name": "labels", "type": "array", "kind": "length_prefixed", "length_type": "uint16",
+          "items": { "type": "LabelPair" } },
+        { "name": "entries", "type": "array", "kind": "length_prefixed", "length_type": "uint32",
+          "items": { "type": "LogEntry" } }
+      ]
+    },
+
+    "LogEntry": {
+      "sequence": [
+        { "name": "ts_unix_nano", "type": "uint64" },
+        { "name": "severity", "type": "uint8",
+          "//": "OTel SeverityNumber: 0=unspecified, 1-4=trace, 5-8=debug, 9-12=info, 13-16=warn, 17-20=error, 21-24=fatal." },
+        { "name": "body", "type": "string", "kind": "length_prefixed", "length_type": "uint32", "encoding": "utf8",
+          "//": "uint32 length because individual log lines can legitimately exceed 64KB (stack traces, JSON dumps)." },
+        { "name": "attributes", "type": "array", "kind": "length_prefixed", "length_type": "uint16",
+          "items": { "type": "LabelPair" },
+          "//": "Per-entry attributes that aren't part of the stream's stable label set (request id, user id, …). Indexed but not used for stream partitioning." }
+      ]
+    },
+
+    "//33": "----------------------------------------------------------------",
+    "//34": "Traces. OTel-aligned but stripped of the wire-format pain points",
+    "//35": "(no protobuf, no oneof gymnastics).",
+    "//36": "----------------------------------------------------------------",
+
+    "TracesBatch": {
+      "sequence": [
+        { "name": "resources", "type": "array", "kind": "length_prefixed", "length_type": "uint16",
+          "items": { "type": "ResourceEntry" },
+          "//": "Per-batch resource dictionary. Spans reference an index, not the labels directly." },
+        { "name": "scopes", "type": "array", "kind": "length_prefixed", "length_type": "uint16",
+          "items": { "type": "ScopeEntry" } },
+        { "name": "spans", "type": "array", "kind": "length_prefixed", "length_type": "uint32",
+          "items": { "type": "Span" } }
+      ]
+    },
+
+    "ResourceEntry": {
+      "sequence": [
+        { "name": "labels", "type": "array", "kind": "length_prefixed", "length_type": "uint16",
+          "items": { "type": "LabelPair" } }
+      ]
+    },
+
+    "ScopeEntry": {
+      "sequence": [
+        { "name": "name",    "type": "string", "kind": "length_prefixed", "length_type": "uint8",  "encoding": "utf8" },
+        { "name": "version", "type": "string", "kind": "length_prefixed", "length_type": "uint8",  "encoding": "ascii" }
+      ]
+    },
+
+    "Span": {
+      "sequence": [
+        { "name": "resource_idx", "type": "uint16",
+          "//": "Index into TracesBatch.resources." },
+        { "name": "scope_idx",    "type": "uint16",
+          "//": "Index into TracesBatch.scopes." },
+        { "name": "trace_id", "type": "bytes", "kind": "fixed", "length": 16 },
+        { "name": "span_id",  "type": "bytes", "kind": "fixed", "length": 8 },
+        { "name": "parent_span_id", "type": "optional", "value_type": {
+            "type": "bytes", "kind": "fixed", "length": 8
+          },
+          "//": "Absent for root spans." },
+        { "name": "name", "type": "string", "kind": "length_prefixed", "length_type": "uint16", "encoding": "utf8" },
+        { "name": "kind", "type": "uint8",
+          "//": "OTel SpanKind: 0=unspecified, 1=internal, 2=server, 3=client, 4=producer, 5=consumer." },
+        { "name": "start_unix_nano", "type": "uint64" },
+        { "name": "end_unix_nano",   "type": "uint64" },
+        { "name": "status_code", "type": "uint8",
+          "//": "OTel StatusCode: 0=unset, 1=ok, 2=error." },
+        { "name": "status_message", "type": "string", "kind": "length_prefixed", "length_type": "uint16", "encoding": "utf8" },
+        { "name": "attributes", "type": "array", "kind": "length_prefixed", "length_type": "uint16",
+          "items": { "type": "LabelPair" } },
+        { "name": "events", "type": "array", "kind": "length_prefixed", "length_type": "uint16",
+          "items": { "type": "SpanEvent" } },
+        { "name": "links", "type": "array", "kind": "length_prefixed", "length_type": "uint8",
+          "items": { "type": "SpanLink" } }
+      ]
+    },
+
+    "SpanEvent": {
+      "sequence": [
+        { "name": "ts_unix_nano", "type": "uint64" },
+        { "name": "name",         "type": "string", "kind": "length_prefixed", "length_type": "uint16", "encoding": "utf8" },
+        { "name": "attributes",   "type": "array", "kind": "length_prefixed", "length_type": "uint8",
+          "items": { "type": "LabelPair" } }
+      ]
+    },
+
+    "SpanLink": {
+      "sequence": [
+        { "name": "trace_id",   "type": "bytes", "kind": "fixed", "length": 16 },
+        { "name": "span_id",    "type": "bytes", "kind": "fixed", "length": 8 },
+        { "name": "attributes", "type": "array", "kind": "length_prefixed", "length_type": "uint8",
+          "items": { "type": "LabelPair" } }
+      ]
+    },
+
+    "//37": "----------------------------------------------------------------",
+    "//38": "Profiles. v0.1: opaque pprof bytes per sample-set; structured",
+    "//39": "schema lives in `## Open questions` of ARCHITECTURE.md and will",
+    "//40": "land in v0.4. We keep the framing so the wire doesn't change",
+    "//41": "when the payload format does.",
+    "//42": "----------------------------------------------------------------",
+
+    "ProfilesBatch": {
+      "sequence": [
+        { "name": "samples", "type": "array", "kind": "length_prefixed", "length_type": "uint32",
+          "items": { "type": "ProfileBlob" } }
+      ]
+    },
+
+    "ProfileBlob": {
+      "sequence": [
+        { "name": "ts_unix_nano", "type": "uint64",
+          "//": "Wall-clock when the profile window ended." },
+        { "name": "duration_nano", "type": "uint64",
+          "//": "Profiling window length." },
+        { "name": "labels", "type": "array", "kind": "length_prefixed", "length_type": "uint16",
+          "items": { "type": "LabelPair" },
+          "//": "Identifies the profiled subject: service, instance, profile type (cpu/heap/goroutine/…)." },
+        { "name": "format", "type": "uint8",
+          "//": "1=pprof_gz (gzip-compressed pprof). Other formats reserved." },
+        { "name": "data", "type": "bytes", "kind": "length_prefixed", "length_type": "uint32",
+          "//": "The opaque blob. Server stores it as-is in v0.1; v0.4 will denormalise on ingest." }
+      ]
+    }
+  },
+
+  "protocol": {
+    "name": "scry-ingest",
+    "version": "0.1.0",
+    "description": "Agent → server ingest protocol. Long-lived TCP stream, length-framed messages (`[len: u32][Frame]`), per-batch zstd compression on the payload only.",
+    "header": null,
+    "notes": [
+      "Framing: every message on the wire is preceded by a `uint32` length covering the Frame bytes (not the length itself).",
+      "Compression: applied per Batch.payload only. Frame, headers, and acks are always uncompressed so observers can read framing without zstd state.",
+      "Endianness: big-endian throughout. We accept the trivial cost for the readability/debuggability win.",
+      "Ordering: BatchAcks are not required to be in batch_id order. Agents must correlate by batch_id, not by arrival order.",
+      "Concurrency: at most HelloAck.max_inflight_batches Batch messages without their ack. Agent must apply backpressure to its collectors when this cap is reached.",
+      "Fingerprints: xxh3-64 over canonically-sorted (UTF-8 NFC) label pairs encoded as `key\\0value\\0` repeated. Server validates on receipt. Agents that send mismatched fingerprints get a hard Error.",
+      "Versioning: a server that does not support the agent's announced protocol_version replies with an Error(code=ERR_PROTOCOL_VERSION) and closes. Agents fall back to a lower advertised version, not silently retry."
+    ],
+
+    "messages": [
+      { "code": "0x01", "name": "Hello",        "direction": "client_to_server", "payload_type": "Hello",
+        "description": "Open the session." },
+      { "code": "0x02", "name": "HelloAck",     "direction": "server_to_client", "payload_type": "HelloAck",
+        "description": "Confirm session, return server identity and per-connection limits." },
+      { "code": "0x10", "name": "Batch",        "direction": "client_to_server", "payload_type": "Batch",
+        "description": "Compressed batch of records for one signal." },
+      { "code": "0x11", "name": "BatchAck",     "direction": "server_to_client", "payload_type": "BatchAck",
+        "description": "Per-batch durability ack (accepted / throttled / rejected)." },
+      { "code": "0x20", "name": "FlowControl",  "direction": "server_to_client", "payload_type": "FlowControl",
+        "description": "Asynchronous rate hint, per signal." },
+      { "code": "0x30", "name": "Ping",         "direction": "bidirectional",    "payload_type": "Ping",
+        "description": "Keepalive request." },
+      { "code": "0x31", "name": "Pong",         "direction": "bidirectional",    "payload_type": "Pong",
+        "description": "Keepalive response, echoes nonce." },
+      { "code": "0x40", "name": "Goodbye",      "direction": "bidirectional",    "payload_type": "Goodbye",
+        "description": "Graceful close request." },
+      { "code": "0xF0", "name": "Error",        "direction": "bidirectional",    "payload_type": "Error",
+        "description": "Protocol-level error; receipt closes the connection." }
+    ],
+
+    "message_groups": [
+      { "name": "Handshake",    "messages": ["0x01", "0x02"] },
+      { "name": "Data plane",   "messages": ["0x10", "0x11"] },
+      { "name": "Flow control", "messages": ["0x20"] },
+      { "name": "Liveness",     "messages": ["0x30", "0x31"] },
+      { "name": "Lifecycle",    "messages": ["0x40", "0xF0"] }
+    ],
+
+    "constants": {
+      "PROTOCOL_VERSION_V0":  { "value": "0x0001", "description": "Initial wire version." },
+
+      "SIGNAL_METRICS":       { "value": 1, "description": "metrics signal" },
+      "SIGNAL_LOGS":          { "value": 2, "description": "logs signal" },
+      "SIGNAL_TRACES":        { "value": 3, "description": "traces signal" },
+      "SIGNAL_PROFILES":      { "value": 4, "description": "profiles signal" },
+      "SIGNAL_ALL":           { "value": 255, "description": "FlowControl: applies to every signal" },
+
+      "SIGNAL_BIT_METRICS":   { "value": "0x01", "description": "Hello.signals bit" },
+      "SIGNAL_BIT_LOGS":      { "value": "0x02" },
+      "SIGNAL_BIT_TRACES":    { "value": "0x04" },
+      "SIGNAL_BIT_PROFILES":  { "value": "0x08" },
+
+      "COMPRESSION_NONE":     { "value": 0 },
+      "COMPRESSION_ZSTD":     { "value": 1 },
+
+      "ACK_ACCEPTED":         { "value": 0, "description": "Batch is durable in the WAL." },
+      "ACK_THROTTLED":        { "value": 1, "description": "Server is overloaded; retry after retry_after_ms." },
+      "ACK_REJECTED":         { "value": 2, "description": "Permanent failure; do not retry. See reason_code." },
+
+      "REJECT_BAD_SCHEMA":           { "value": 1, "description": "Payload could not be decoded against the announced signal's schema." },
+      "REJECT_BAD_FINGERPRINT":      { "value": 2, "description": "A SeriesDictEntry.fingerprint did not match its labels." },
+      "REJECT_UNKNOWN_SERIES":       { "value": 3, "description": "MetricSample referenced a fingerprint never declared this session." },
+      "REJECT_TIMESTAMP_OUT_OF_RANGE": { "value": 4, "description": "Records older than retention or further into the future than the server's clock-skew budget." },
+      "REJECT_BATCH_TOO_LARGE":      { "value": 5, "description": "uncompressed_size > HelloAck.max_batch_bytes." },
+      "REJECT_SIGNAL_NOT_ANNOUNCED": { "value": 6, "description": "Batch.signal not present in Hello.signals." },
+      "REJECT_CARDINALITY_LIMIT":    { "value": 7, "description": "Series introduction would breach a per-tenant cardinality cap (if configured)." },
+      "REJECT_INTERNAL":             { "value": 99, "description": "Server-side bug or transient internal failure; agent may retry after a backoff." },
+
+      "ERR_PROTOCOL_VERSION":   { "value": 1, "description": "Agent's protocol_version is not supported." },
+      "ERR_BAD_FRAMING":        { "value": 2, "description": "Length prefix or message tag is malformed." },
+      "ERR_DUPLICATE_HELLO":    { "value": 3, "description": "Second Hello on the same connection." },
+      "ERR_HELLO_REQUIRED":     { "value": 4, "description": "Non-Hello message received before Hello." },
+      "ERR_SESSION_MISMATCH":   { "value": 5, "description": "Batch carried a session_id other than this connection's." },
+      "ERR_INFLIGHT_EXCEEDED":  { "value": 6, "description": "Agent exceeded HelloAck.max_inflight_batches." },
+      "ERR_AUTH":               { "value": 7, "description": "Authentication / authorization failure (reserved; auth model is an open question)." },
+      "ERR_INTERNAL":           { "value": 255, "description": "Unexpected server-side error; connection is closed." },
+
+      "GOODBYE_NORMAL":         { "value": 0, "description": "Clean shutdown." },
+      "GOODBYE_SERVER_DRAINING":{ "value": 1, "description": "Server is shutting down; agent should reconnect to a different server (re-resolve via discovery)." },
+      "GOODBYE_AGENT_RELOAD":   { "value": 2, "description": "Agent is reloading config and will reconnect." },
+
+      "CAP_RESERVED":           { "value": "0x00000000", "description": "No capabilities defined in v0.1; bitmask reserved for future use." },
+
+      "DEFAULT_SUGGESTED_BATCH_BYTES": { "value": "4 MiB" },
+      "DEFAULT_MAX_BATCH_BYTES":       { "value": "16 MiB" },
+      "DEFAULT_MAX_INFLIGHT_BATCHES":  { "value": 64 }
+    }
+  }
+}

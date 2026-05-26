@@ -65,9 +65,10 @@ of it. That's `scry`.
 ## Status
 
 Pre-zero. We're writing the architecture down before any code. See
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design and
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design,
 [`docs/decisions.md`](docs/decisions.md) for the choices that got us
-here.
+here, and [`proto/`](proto/) for the binschema wire-protocol
+definitions (currently: agent→server ingest).
 
 ## Scope (v0 → v1)
 
