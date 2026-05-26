@@ -346,6 +346,21 @@ impl From<HelloOutput> for HelloInput {
     }
 }
 
+impl From<HelloInput> for HelloOutput {
+    fn from(i: HelloInput) -> Self {
+        Self {
+            tag: 1u8,
+            protocol_version: i.protocol_version,
+            agent_id: i.agent_id,
+            agent_version: i.agent_version,
+            hostname: i.hostname,
+            signals: i.signals,
+            capabilities: i.capabilities,
+            resource_attrs: i.resource_attrs,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct HelloAckInput {
     pub protocol_version: u16,
@@ -445,6 +460,21 @@ impl From<HelloAckOutput> for HelloAckInput {
             suggested_batch_bytes: o.suggested_batch_bytes,
             max_batch_bytes: o.max_batch_bytes,
             max_inflight_batches: o.max_inflight_batches,
+        }
+    }
+}
+
+impl From<HelloAckInput> for HelloAckOutput {
+    fn from(i: HelloAckInput) -> Self {
+        Self {
+            tag: 2u8,
+            protocol_version: i.protocol_version,
+            writer_id: i.writer_id,
+            session_id: i.session_id,
+            capabilities: i.capabilities,
+            suggested_batch_bytes: i.suggested_batch_bytes,
+            max_batch_bytes: i.max_batch_bytes,
+            max_inflight_batches: i.max_inflight_batches,
         }
     }
 }
@@ -566,6 +596,23 @@ impl From<BatchOutput> for BatchInput {
     }
 }
 
+impl From<BatchInput> for BatchOutput {
+    fn from(i: BatchInput) -> Self {
+        Self {
+            tag: 16u8,
+            session_id: i.session_id,
+            batch_id: i.batch_id,
+            signal: i.signal,
+            ts_min_unix_nano: i.ts_min_unix_nano,
+            ts_max_unix_nano: i.ts_max_unix_nano,
+            record_count: i.record_count,
+            compression: i.compression,
+            uncompressed_size: i.uncompressed_size,
+            payload: i.payload,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct BatchAckInput {
     pub session_id: u64,
@@ -663,6 +710,20 @@ impl From<BatchAckOutput> for BatchAckInput {
     }
 }
 
+impl From<BatchAckInput> for BatchAckOutput {
+    fn from(i: BatchAckInput) -> Self {
+        Self {
+            tag: 17u8,
+            session_id: i.session_id,
+            batch_id: i.batch_id,
+            status: i.status,
+            retry_after_ms: i.retry_after_ms,
+            reason_code: i.reason_code,
+            message: i.message,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct FlowControlInput {
     pub session_id: u64,
@@ -748,6 +809,19 @@ impl From<FlowControlOutput> for FlowControlInput {
     }
 }
 
+impl From<FlowControlInput> for FlowControlOutput {
+    fn from(i: FlowControlInput) -> Self {
+        Self {
+            tag: 32u8,
+            session_id: i.session_id,
+            signal: i.signal,
+            max_bytes_per_sec: i.max_bytes_per_sec,
+            max_batches_inflight: i.max_batches_inflight,
+            valid_for_ms: i.valid_for_ms,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct PingInput {
     pub nonce: u64,
@@ -809,6 +883,15 @@ impl From<PingOutput> for PingInput {
     }
 }
 
+impl From<PingInput> for PingOutput {
+    fn from(i: PingInput) -> Self {
+        Self {
+            tag: 48u8,
+            nonce: i.nonce,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct PongInput {
     pub nonce: u64,
@@ -866,6 +949,15 @@ impl From<PongOutput> for PongInput {
     fn from(o: PongOutput) -> Self {
         Self {
             nonce: o.nonce,
+        }
+    }
+}
+
+impl From<PongInput> for PongOutput {
+    fn from(i: PongInput) -> Self {
+        Self {
+            tag: 49u8,
+            nonce: i.nonce,
         }
     }
 }
@@ -943,6 +1035,16 @@ impl From<GoodbyeOutput> for GoodbyeInput {
     }
 }
 
+impl From<GoodbyeInput> for GoodbyeOutput {
+    fn from(i: GoodbyeInput) -> Self {
+        Self {
+            tag: 64u8,
+            reason_code: i.reason_code,
+            message: i.message,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ErrorInput {
     pub code: u16,
@@ -1012,6 +1114,16 @@ impl From<ErrorOutput> for ErrorInput {
         Self {
             code: o.code,
             message: o.message,
+        }
+    }
+}
+
+impl From<ErrorInput> for ErrorOutput {
+    fn from(i: ErrorInput) -> Self {
+        Self {
+            tag: 240u8,
+            code: i.code,
+            message: i.message,
         }
     }
 }
