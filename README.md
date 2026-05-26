@@ -1,0 +1,86 @@
+# scry
+
+> One observability backend. Four signals. One screen of config.
+
+`scry` is an opinionated, single-binary replacement for the Grafana
+observability stack (Loki + Tempo + Mimir + Pyroscope). It stores
+**metrics, logs, traces, and profiles** as immutable parquet blocks in
+S3-compatible object storage, and serves queries from the same bucket.
+
+## Why
+
+Running the Grafana stack in production means standing up four services,
+each with its own ring, distributor, ingester, querier, compactor, and
+store-gateway, each with its own schema/index format, each with its own
+retention story, and a per-tenant config matrix on top. The config
+surface is enormous and most of it exists to serve scaling concerns that
+do not apply to a homelab or a small team.
+
+The observation underneath the four pillars is that they are the same
+thing in different costumes:
+
+> A timestamped record with a set of labels and a payload, stored in an
+> immutable block in object storage, queried by `(time range, label
+> predicate, payload predicate)`.
+
+If you accept that, you get one storage engine, one block format, one
+compactor, one retention loop, and four thin query frontends sharing all
+of it. That's `scry`.
+
+## What `scry` is
+
+- **One binary** for the server. Ingest, query, compaction, and
+  retention are subsystems of one process, not separate services.
+- **One binary** for the agent. It scrapes Prometheus endpoints, tails
+  log files / journald, pulls pprof endpoints, and ships everything to
+  the server in one batched, compressed stream over a single wire
+  protocol (defined in [binschema](../binschema)).
+- **Parquet on S3-compatible object storage** as the single source of
+  truth. No separate index store, no Cassandra, no Bigtable, no boltdb.
+- **WAL on local SSD** as the ingestion buffer and crash-safety
+  mechanism. RAM cannot grow unboundedly under load.
+- **DataFusion** as the query engine. We don't reinvent column pruning,
+  predicate pushdown, or vectorised execution.
+- **Multi-writer capable.** Writers never coordinate; the bucket layout
+  makes collisions impossible by construction.
+
+## What `scry` is not
+
+- **Not a planetary-scale system.** No hash ring. No memberlist. No
+  distributor/ingester/querier/store-gateway split. If you are running
+  hundreds of TB/day, `scry` is not the answer; Mimir is.
+- **Not multi-tenant.** One deployment, one tenant. Run more deployments
+  if you need more tenants.
+- **Not backwards-compatible with Prom/Loki/Tempo/Pyroscope wire
+  protocols.** The agent is ours. The reason their protocols are messy
+  is precisely the kind of accidental complexity we're escaping.
+- **Not a UI.** Grafana adapters and/or our own UI come later, on top of
+  a clean storage and query foundation. The first milestone has no UI
+  at all.
+- **Not configurable for the sake of being configurable.** Every knob
+  added is a knob someone has to understand, document, and defend. The
+  total config file should fit on one screen. If it grows past that
+  without a *very* good reason, we've failed.
+
+## Status
+
+Pre-zero. We're writing the architecture down before any code. See
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design and
+[`docs/decisions.md`](docs/decisions.md) for the choices that got us
+here.
+
+## Scope (v0 → v1)
+
+| Milestone | Deliverable |
+|-----------|-------------|
+| **v0.1**  | Storage layer: parquet block writer + WAL + S3 backend + catalog, with a dummy record type. No signals, no query. |
+| **v0.2**  | Logs end-to-end: agent tails a file, server ingests, query returns matching lines for `(time range, label match, substring)`. |
+| **v0.3**  | Traces: trace-by-id lookup + simple span attribute filtering. |
+| **v0.4**  | Profiles: pprof ingest, flamegraph aggregation over a time range. |
+| **v0.5**  | Metrics: the hard one. PromQL-ish surface, hopefully via an existing parser crate. |
+| **v0.6**  | Compaction, retention, and operational hardening across all four. |
+| **v1.0**  | Grafana datasource adapters (or our own minimal UI — TBD). |
+
+## License
+
+TBD.
