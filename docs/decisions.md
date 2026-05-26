@@ -720,6 +720,52 @@ users complain" loop, which for an observability system means
 the users complaining are the ones whose own observability is
 broken. We'd rather pay the development tax.
 
+## D-029: v0.1 storage layer — minimum viable scope
+
+**Date:** 2026-05-26
+**Status:** accepted
+
+The full storage layer in `ARCHITECTURE.md` (bucket pool, sealing,
+Valkey convergence, signal-specific paths, postings index, catalog
+snapshots) is too much to land in one milestone. v0.1 ships the
+**smallest pipeline that exercises the architecture end-to-end**:
+one dummy record type, one bucket, one writer, no signals, no query.
+Details in [`v0.1-storage.md`](./v0.1-storage.md).
+
+Three sub-choices pinned here because they're the language-level ones
+future readers will want the rationale for:
+
+- **Object-store client: apache `object_store` (arrow-rs).** Speaks
+  S3-compatible out of the box (works with Garage), includes a local
+  filesystem backend for unit tests, and means we don't write S3
+  retry / multipart / signing logic ourselves. The cost is one more
+  large dependency and an opinion about async-trait-shape we don't
+  fully control. Acceptable; the alternative (rolling our own `trait
+  ObjectStore` over `aws-sdk-s3`) is more code we'd have to keep
+  correct against every provider's quirks.
+
+- **SQLite client: `rusqlite` (bundled feature).** Synchronous, no
+  compile-time SQL checks, no `.sqlx/` cache to commit, no system
+  sqlite required. The catalog is four tables and a handful of
+  queries; `sqlx`'s compile-time guarantees aren't worth the build
+  complexity at this size. The catalog API hides the choice — we
+  can swap to `sqlx` later if a real reason appears.
+
+- **Crate split: four crates per concern (`scry-objstore`,
+  `scry-wal`, `scry-block`, `scry-catalog`).** Each owns one piece
+  of the architecture, none depends on another except through narrow
+  type seams. Composition lives in the existing `noise-sink` for
+  v0.1; an eventual `scry-server` crate gathers them in v0.2 when
+  the first real signal arrives. The alternative — a single
+  `scry-storage` crate with submodules — is fewer Cargo.tomls but
+  worse for isolated testing and harder to reason about ownership
+  in. Four small crates is the right grain.
+
+The dummy record itself (`{ ts_unix_nano, key, value }`) is a v0.1-only
+artefact. It does not appear in any wire-protocol decision; the
+spewer reuses the existing `Batch` frame with a `Signal::Dummy = 0xFF`
+sentinel that is removed when real signals come online.
+
 ## Deferred / open
 
 These are not decisions yet; they're flagged for "we'll decide when the

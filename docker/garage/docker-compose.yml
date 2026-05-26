@@ -1,0 +1,16 @@
+services:
+  garage:
+    image: dxflrs/garage:v1.0.1
+    container_name: scry-garage
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./garage.toml:/etc/garage.toml:ro
+      - garage-meta:/var/lib/garage/meta
+      - garage-data:/var/lib/garage/data
+    # Garage listens on 3900 (S3), 3901 (RPC), 3902 (web), 3903 (admin)
+    # via host networking so the dev machine can hit it without DNS games.
+
+volumes:
+  garage-meta:
+  garage-data:

@@ -14,6 +14,16 @@ pub const SIGNAL_BIT_TRACES:   u8 = 0x04;
 pub const SIGNAL_BIT_PROFILES: u8 = 0x08;
 
 // ── Batch.signal ───────────────────────────────────────────────────────
+//
+// `Dummy = 0xFE` is a v0.1-only placeholder used by the storage layer
+// to exercise the pipeline before any real signal lands. The wire
+// protocol carries `DummyBatch` records under this discriminator. The
+// variant goes away when the first real signal arrives (no protocol
+// version bump needed — earlier servers will simply reject 0xFE as
+// REJECT_SIGNAL_NOT_ANNOUNCED).
+//
+// `0xFF` is reserved for `SIGNAL_ALL` in `FlowControl.signal` and must
+// not be reused here.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Signal {
@@ -21,6 +31,7 @@ pub enum Signal {
     Logs     = 2,
     Traces   = 3,
     Profiles = 4,
+    Dummy    = 0xFE,
 }
 
 impl Signal {
@@ -28,10 +39,11 @@ impl Signal {
 
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
-            1 => Some(Signal::Metrics),
-            2 => Some(Signal::Logs),
-            3 => Some(Signal::Traces),
-            4 => Some(Signal::Profiles),
+            1    => Some(Signal::Metrics),
+            2    => Some(Signal::Logs),
+            3    => Some(Signal::Traces),
+            4    => Some(Signal::Profiles),
+            0xFE => Some(Signal::Dummy),
             _ => None,
         }
     }
@@ -42,6 +54,7 @@ impl Signal {
             Signal::Logs     => "logs",
             Signal::Traces   => "traces",
             Signal::Profiles => "profiles",
+            Signal::Dummy    => "dummy",
         }
     }
 }

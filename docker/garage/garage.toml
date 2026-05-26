@@ -1,0 +1,35 @@
+# Garage single-node dev configuration for scry.
+# v0.1: one node, replication 1, on the dev machine. Not for production.
+
+metadata_dir = "/var/lib/garage/meta"
+data_dir     = "/var/lib/garage/data"
+db_engine    = "lmdb"
+
+replication_factor = 1
+consistency_mode   = "consistent"
+
+# RPC is what Garage nodes use to talk to each other. With one node it
+# only needs to bind locally, but the secret is required regardless.
+rpc_bind_addr   = "127.0.0.1:3901"
+rpc_public_addr = "127.0.0.1:3901"
+# 64 hex chars. Re-generate for a fresh deployment via:
+#   openssl rand -hex 32
+rpc_secret      = "5b9c0e0b9c5e0b9c5e0b9c5e0b9c5e0b9c5e0b9c5e0b9c5e0b9c5e0b9c5e0b9c"
+
+[s3_api]
+s3_region    = "garage"
+api_bind_addr = "127.0.0.1:3900"
+# We don't use path-style vs virtual-hosted-style routing in v0.1; the
+# `object_store` crate against `endpoint = http://127.0.0.1:3900` and
+# `region = garage` does path-style by default.
+root_domain  = ".s3.garage.local"
+
+[s3_web]
+bind_addr   = "127.0.0.1:3902"
+root_domain = ".web.garage.local"
+index       = "index.html"
+
+[admin]
+api_bind_addr = "127.0.0.1:3903"
+admin_token   = "scry-dev-admin-token"
+metrics_token = "scry-dev-metrics-token"

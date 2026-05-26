@@ -15,6 +15,9 @@
 use anyhow::{Context, Result};
 use binschema_runtime::{BitOrder, BitStreamDecoder};
 use clap::Parser;
+use object_store::ObjectStore;
+use scry_block::{BlockBuilderConfig, DummyBlockBuilder};
+use scry_objstore::{open as open_objstore, ObjStoreConfig};
 use scry_proto::{
     build,
     constants::{
@@ -27,7 +30,7 @@ use scry_proto::{
     },
     framing::{FrameError, read_frame, write_frame},
     generated::{
-        FrameMsg, HelloOutput, LogsBatch, MetricsBatch, ProfilesBatch, TracesBatch,
+        DummyBatch, FrameMsg, HelloOutput, LogsBatch, MetricsBatch, ProfilesBatch, TracesBatch,
     },
 };
 use std::{
@@ -41,6 +44,7 @@ use tokio::{
     net::{TcpListener, TcpStream},
 };
 use tracing::{info, warn};
+use uuid::Uuid;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -52,6 +56,12 @@ struct Args {
     /// writer_id reported in HelloAck. Default: random per-process.
     #[arg(long)]
     writer_id: Option<String>,
+
+    /// Enable the v0.1 storage path: Dummy batches are accumulated
+    /// into parquet blocks and uploaded to object storage. Requires
+    /// `SCRY_OBJSTORE_*` env vars (see `docker/garage/.env`).
+    #[arg(long)]
+    storage: bool,
 }
 
 #[derive(Default)]
@@ -61,6 +71,7 @@ struct Counters {
     log_entries:       AtomicU64,
     spans:             AtomicU64,
     profile_blobs:     AtomicU64,
+    dummy_records:     AtomicU64,
     payload_bytes_in:  AtomicU64, // compressed
     payload_bytes_out: AtomicU64, // decompressed
     rejected:          AtomicU64,
@@ -79,10 +90,27 @@ async fn main() -> Result<()> {
     let writer_id = args
         .writer_id
         .unwrap_or_else(|| format!("noise-sink-{}", rand_short()));
+    let writer_uuid = Uuid::now_v7();
+
+    // Open the object store up front if storage mode is on; failing
+    // fast here is much better than failing on the first Dummy batch.
+    let store: Option<Arc<dyn ObjectStore>> = if args.storage {
+        let cfg = ObjStoreConfig::from_env()
+            .context("loading SCRY_OBJSTORE_* env (try `source docker/garage/.env`)")?;
+        info!(
+            endpoint = %cfg.endpoint,
+            bucket   = %cfg.bucket,
+            "storage mode: writing Dummy blocks to object storage"
+        );
+        Some(open_objstore(&cfg)?)
+    } else {
+        None
+    };
+
     let listener = TcpListener::bind(&args.listen)
         .await
         .with_context(|| format!("binding {}", args.listen))?;
-    info!(addr = %args.listen, writer_id, "noise-sink listening");
+    info!(addr = %args.listen, writer_id, %writer_uuid, "noise-sink listening");
 
     let next_session_id = Arc::new(AtomicU64::new(1));
 
@@ -90,8 +118,9 @@ async fn main() -> Result<()> {
         let (sock, peer) = listener.accept().await?;
         let session_id = next_session_id.fetch_add(1, Ordering::Relaxed);
         let writer_id = writer_id.clone();
+        let store = store.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle(sock, peer, writer_id, session_id).await {
+            if let Err(e) = handle(sock, peer, writer_id, writer_uuid, session_id, store).await {
                 warn!(peer = %peer, error = %e, "connection ended with error");
             }
         });
@@ -102,7 +131,9 @@ async fn handle(
     sock: TcpStream,
     peer: SocketAddr,
     writer_id: String,
+    writer_uuid: Uuid,
     session_id: u64,
+    store: Option<Arc<dyn ObjectStore>>,
 ) -> Result<()> {
     sock.set_nodelay(true)?;
     let (rd, wr) = sock.into_split();
@@ -175,6 +206,12 @@ async fn handle(
     let counters = Counters::default();
     let signals_announced = hello.signals;
 
+    // Per-session block builder for Dummy records. `None` either
+    // because storage mode is off or because the session has not yet
+    // received a Dummy batch — lazy so non-Dummy sessions don't
+    // allocate arrow buffers they'll never use.
+    let mut dummy_block: Option<DummyBlockBuilder> = None;
+
     loop {
         let frame = match read_frame(&mut rd).await {
             Ok(f) => f,
@@ -201,14 +238,18 @@ async fn handle(
                 }
 
                 let sig = Signal::from_u8(b.signal);
-                let signal_bit = match b.signal {
-                    1 => SIGNAL_BIT_METRICS,
-                    2 => SIGNAL_BIT_LOGS,
-                    3 => SIGNAL_BIT_TRACES,
-                    4 => SIGNAL_BIT_PROFILES,
-                    _ => 0,
+                // Dummy is v0.1-only and has no Hello.signals bit; we
+                // accept it unconditionally as long as it decodes.
+                // Every real signal must be in the announce mask.
+                let announced_ok = match sig {
+                    Some(Signal::Dummy) => true,
+                    Some(Signal::Metrics)  => signals_announced & SIGNAL_BIT_METRICS  != 0,
+                    Some(Signal::Logs)     => signals_announced & SIGNAL_BIT_LOGS     != 0,
+                    Some(Signal::Traces)   => signals_announced & SIGNAL_BIT_TRACES   != 0,
+                    Some(Signal::Profiles) => signals_announced & SIGNAL_BIT_PROFILES != 0,
+                    None => false,
                 };
-                if sig.is_none() || signals_announced & signal_bit == 0 {
+                if !announced_ok {
                     counters.rejected.fetch_add(1, Ordering::Relaxed);
                     write_frame(
                         &mut wr,
@@ -305,14 +346,54 @@ async fn handle(
                     .payload_bytes_out
                     .fetch_add(decompressed.len() as u64, Ordering::Relaxed);
 
-                let decode_result = decode_payload(sig.unwrap(), &decompressed);
+                let signal = sig.unwrap();
+
+                // Dummy gets a custom path: decode to records, push
+                // each into the per-session DummyBlockBuilder when
+                // storage is on, then count.
+                let decode_result: Result<u64> = if signal == Signal::Dummy {
+                    let mut decoder = BitStreamDecoder::new(&decompressed, BitOrder::MsbFirst);
+                    DummyBatch::decode_with_decoder(&mut decoder)
+                        .map_err(|e| anyhow::anyhow!("DummyBatch: {e}"))
+                        .map(|d| {
+                            let n = d.records.len() as u64;
+                            if store.is_some() {
+                                let builder = dummy_block.get_or_insert_with(|| {
+                                    DummyBlockBuilder::new(
+                                        writer_uuid,
+                                        BlockBuilderConfig::default(),
+                                    )
+                                });
+                                for rec in d.records {
+                                    builder.append(rec);
+                                }
+                            }
+                            n
+                        })
+                } else {
+                    decode_payload(signal, &decompressed)
+                };
+
+                // If the builder filled up, flush it now so a long
+                // session doesn't accumulate a giant block in RAM.
+                if let (Some(store), Some(builder)) = (store.as_ref(), dummy_block.as_ref()) {
+                    if builder.should_close() {
+                        // Take ownership to consume `finish_and_upload`.
+                        let b = dummy_block.take().unwrap();
+                        if let Err(e) = b.finish_and_upload(store.as_ref()).await {
+                            warn!(%peer, error = %e, "dummy block upload failed mid-session");
+                        }
+                    }
+                }
+
                 match decode_result {
                     Ok(records) => {
-                        match sig.unwrap() {
+                        match signal {
                             Signal::Metrics  => counters.metric_samples.fetch_add(records, Ordering::Relaxed),
                             Signal::Logs     => counters.log_entries   .fetch_add(records, Ordering::Relaxed),
                             Signal::Traces   => counters.spans         .fetch_add(records, Ordering::Relaxed),
                             Signal::Profiles => counters.profile_blobs .fetch_add(records, Ordering::Relaxed),
+                            Signal::Dummy    => counters.dummy_records .fetch_add(records, Ordering::Relaxed),
                         };
                         write_frame(
                             &mut wr,
@@ -370,8 +451,26 @@ async fn handle(
         }
     }
 
+    // Flush any in-progress Dummy block before tearing the session
+    // down. Failure here is logged but does not propagate — the peer
+    // is already gone and there's nothing useful we can do about it.
+    if let (Some(store), Some(b)) = (store.as_ref(), dummy_block.take()) {
+        if !b.is_empty() {
+            match b.finish_and_upload(store.as_ref()).await {
+                Ok(Some(meta)) => info!(
+                    session_id,
+                    block_uuid = %meta.uuid,
+                    row_count = meta.row_count,
+                    "dummy block flushed on session close"
+                ),
+                Ok(None) => {}
+                Err(e) => warn!(%peer, error = %e, "dummy block flush failed"),
+            }
+        }
+    }
+
     let summary = format!(
-        "session_id={} batches={} samples={} log_entries={} spans={} profiles={} \
+        "session_id={} batches={} samples={} log_entries={} spans={} profiles={} dummy={} \
          bytes_in={} bytes_out={} rejected={}",
         session_id,
         counters.batches.load(Ordering::Relaxed),
@@ -379,6 +478,7 @@ async fn handle(
         counters.log_entries.load(Ordering::Relaxed),
         counters.spans.load(Ordering::Relaxed),
         counters.profile_blobs.load(Ordering::Relaxed),
+        counters.dummy_records.load(Ordering::Relaxed),
         counters.payload_bytes_in.load(Ordering::Relaxed),
         counters.payload_bytes_out.load(Ordering::Relaxed),
         counters.rejected.load(Ordering::Relaxed),
@@ -412,6 +512,11 @@ fn decode_payload(signal: Signal, bytes: &[u8]) -> Result<u64> {
             let p = ProfilesBatch::decode_with_decoder(&mut decoder)
                 .map_err(|e| anyhow::anyhow!("ProfilesBatch: {e}"))?;
             p.samples.len() as u64
+        }
+        Signal::Dummy => {
+            let d = DummyBatch::decode_with_decoder(&mut decoder)
+                .map_err(|e| anyhow::anyhow!("DummyBatch: {e}"))?;
+            d.records.len() as u64
         }
     };
     Ok(n)

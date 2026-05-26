@@ -1,0 +1,22 @@
+[package]
+name        = "scry-objstore"
+version     = "0.0.1"
+edition.workspace = true
+license.workspace = true
+description = "Thin wrapper around the apache object_store crate for scry: config + factory + a couple of helpers."
+
+[lib]
+name = "scry_objstore"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow       = { workspace = true }
+object_store = { workspace = true, features = ["aws"] }
+
+[dev-dependencies]
+bytes   = { workspace = true }
+futures = { workspace = true }
+tokio   = { workspace = true }
+
+[lints]
+workspace = true

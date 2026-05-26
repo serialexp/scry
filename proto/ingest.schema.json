@@ -269,6 +269,22 @@
         { "name": "format",        "type": "uint8" },
         { "name": "data",          "type": "bytes", "kind": "length_prefixed", "length_type": "uint32" }
       ]
+    },
+
+    "DummyBatch": {
+      "description": "Body of a Batch whose signal is Dummy (0xFF). v0.1-only placeholder used to exercise the storage pipeline before any real signal lands. Goes away when the first real signal arrives.",
+      "sequence": [
+        { "name": "records", "type": "array", "kind": "length_prefixed", "length_type": "uint32", "items": { "type": "DummyRecord" } }
+      ]
+    },
+
+    "DummyRecord": {
+      "description": "v0.1-only record type. A timestamp, an arbitrary key, and an opaque value. The storage layer treats this as the single record shape until real signals come online.",
+      "sequence": [
+        { "name": "ts_unix_nano", "type": "uint64" },
+        { "name": "key",          "type": "string", "kind": "length_prefixed", "length_type": "uint16", "encoding": "utf8" },
+        { "name": "value",        "type": "bytes",  "kind": "length_prefixed", "length_type": "uint32" }
+      ]
     }
   }
 }

@@ -1959,3 +1959,93 @@ impl ProfileBlob {
         })
     }
 }
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DummyBatch {
+    pub records: Vec<DummyRecord>,
+}
+
+impl DummyBatch {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u32_be(self.records.len() as u32);
+        for item in &self.records {
+            item.encode_into(encoder)?;
+        }
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let length = decoder.read_u32_be()? as usize;
+        let mut records = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = DummyRecord::decode_with_decoder(decoder)?;
+            records.push(item);
+        }
+        Ok(Self {
+            records,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DummyRecord {
+    pub ts_unix_nano: u64,
+    pub key: std::string::String,
+    pub value: Vec<u8>,
+}
+
+impl DummyRecord {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u64_be(self.ts_unix_nano);
+        encoder.write_u16_be(self.key.len() as u16);
+        let string_bytes: &[u8] = self.key.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u32_be(self.value.len() as u32);
+        for item in &self.value {
+            encoder.write_byte(*item);
+        }
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let ts_unix_nano = decoder.read_u64_be()?;
+        let length = decoder.read_u16_be()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let key = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u32_be()? as usize;
+        let mut value = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = decoder.read_byte()?;
+            value.push(item);
+        }
+        Ok(Self {
+            ts_unix_nano,
+            key,
+            value,
+        })
+    }
+}

@@ -13,10 +13,14 @@ path = "src/main.rs"
 anyhow            = { workspace = true }
 binschema-runtime = { workspace = true }
 clap              = { workspace = true }
+object_store      = { workspace = true }
+scry-block        = { workspace = true }
+scry-objstore     = { workspace = true }
 scry-proto        = { workspace = true }
 tokio             = { workspace = true }
 tracing           = { workspace = true }
 tracing-subscriber = { workspace = true }
+uuid              = { workspace = true }
 zstd              = { workspace = true }
 
 [lints]

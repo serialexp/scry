@@ -13,8 +13,9 @@ use scry_proto::{
     constants::{COMPRESSION_ZSTD, Signal},
     fingerprint::fingerprint,
     generated::{
-        LogEntry, LogStream, LogsBatch, MetricSample, MetricsBatch, ProfileBlob, ProfilesBatch,
-        ResourceEntry, ScopeEntry, SeriesDictEntry, Span, SpanEvent, SpanLink, TracesBatch,
+        DummyBatch, DummyRecord, LogEntry, LogStream, LogsBatch, MetricSample, MetricsBatch,
+        ProfileBlob, ProfilesBatch, ResourceEntry, ScopeEntry, SeriesDictEntry, Span, SpanEvent,
+        SpanLink, TracesBatch,
     },
     Frame,
 };
@@ -29,6 +30,7 @@ pub fn make_batch<R: Rng>(rng: &mut R, signal: Signal, session_id: u64, batch_id
         Signal::Logs     => render_logs(rng, now_ns),
         Signal::Traces   => render_traces(rng, now_ns),
         Signal::Profiles => render_profiles(rng, now_ns),
+        Signal::Dummy    => render_dummy(rng, now_ns),
     };
 
     let payload = zstd::encode_all(payload_uncompressed.as_slice(), ZSTD_LEVEL)
@@ -281,6 +283,34 @@ fn render_profiles<R: Rng>(rng: &mut R, now_ns: u64) -> (u32, Vec<u8>, u64, u64)
     let payload = ProfilesBatch { samples: vec![blob] };
     let bytes = encode(&payload, |b, e| b.encode_into(e));
     (1, bytes, now_ns, now_ns)
+}
+
+// ── Dummy (v0.1-only) ──────────────────────────────────────────────────
+
+fn render_dummy<R: Rng>(rng: &mut R, now_ns: u64) -> (u32, Vec<u8>, u64, u64) {
+    // 256 records per batch, 50 ms apart, random key/value. Small enough
+    // to keep the WAL/block builder honest under load; large enough that
+    // a single batch produces a non-trivial parquet row group.
+    const N: u32 = 256;
+    let mut records = Vec::with_capacity(N as usize);
+    let mut ts_min = u64::MAX;
+    let mut ts_max = 0u64;
+    for i in 0..N {
+        let ts = now_ns - ((N - 1 - i) as u64) * 50 * 1_000_000;
+        ts_min = ts_min.min(ts);
+        ts_max = ts_max.max(ts);
+        let value_len = rng.gen_range(8..64);
+        let mut value = vec![0u8; value_len];
+        rng.fill(&mut value[..]);
+        records.push(DummyRecord {
+            ts_unix_nano: ts,
+            key: format!("k.{}", rand_string(rng, 6)),
+            value,
+        });
+    }
+    let payload = DummyBatch { records };
+    let bytes = encode(&payload, |b, e| b.encode_into(e));
+    (N, bytes, ts_min, ts_max)
 }
 
 // ── Encode helper ──────────────────────────────────────────────────────

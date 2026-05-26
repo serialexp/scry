@@ -92,8 +92,11 @@ async fn main() -> Result<()> {
     let seed = args.seed.unwrap_or_else(rand::random);
     info!(seed, "noise-spewer starting");
 
-    let signal_mask = parse_signal_mask(&args.signals)?;
-    let signals = expand_mask(signal_mask);
+    let (signal_mask, dummy_enabled) = parse_signal_selection(&args.signals)?;
+    let mut signals = expand_mask(signal_mask);
+    if dummy_enabled {
+        signals.push(Signal::Dummy);
+    }
     if signals.is_empty() {
         bail!("at least one signal must be enabled (--signals=metrics,…)");
     }
@@ -255,18 +258,23 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn parse_signal_mask(s: &str) -> Result<u8> {
+/// Parse the comma-separated `--signals` list into (Hello.signals bitmask,
+/// dummy-enabled). `dummy` is recognised but has no bitmask bit — it's a
+/// v0.1-only sentinel that doesn't appear in the wire-level signals field.
+fn parse_signal_selection(s: &str) -> Result<(u8, bool)> {
     let mut mask = 0u8;
+    let mut dummy = false;
     for sig in s.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        mask |= match sig {
-            "metrics"  => SIGNAL_BIT_METRICS,
-            "logs"     => SIGNAL_BIT_LOGS,
-            "traces"   => SIGNAL_BIT_TRACES,
-            "profiles" => SIGNAL_BIT_PROFILES,
+        match sig {
+            "metrics"  => mask |= SIGNAL_BIT_METRICS,
+            "logs"     => mask |= SIGNAL_BIT_LOGS,
+            "traces"   => mask |= SIGNAL_BIT_TRACES,
+            "profiles" => mask |= SIGNAL_BIT_PROFILES,
+            "dummy"    => dummy = true,
             other      => bail!("unknown signal {other:?}"),
-        };
+        }
     }
-    Ok(mask)
+    Ok((mask, dummy))
 }
 
 fn expand_mask(mask: u8) -> Vec<Signal> {

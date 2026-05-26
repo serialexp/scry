@@ -39,4 +39,5 @@ pub use generated::{
     LogsBatch, LogStream, LogEntry,
     TracesBatch, ResourceEntry, ScopeEntry, Span, SpanEvent, SpanLink,
     ProfilesBatch, ProfileBlob,
+    DummyBatch, DummyRecord,
 };
