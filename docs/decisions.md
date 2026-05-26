@@ -500,6 +500,62 @@ the design lands now so coordinator/worker split, partial/final
 plan threading, and the queriers registry channel are baked in
 from the start.
 
+## D-025: Per-block postings index + intra-block sort for metrics
+
+**Date:** 2026-05-26
+**Status:** accepted (schema seam in v0.1, full implementation in v0.5)
+
+Metrics blocks get treatment beyond the generic record/storage
+layer: a per-block postings index (`<block>.postings.parquet`)
+mapping `(label_name, label_value) → series_fingerprints`, plus
+intra-block sort by `(series_fingerprint, ts)` so that
+fingerprint-based row-group pruning is effective.
+
+The combined pruning hierarchy for metric queries:
+
+1. Catalog → blocks in time range (ms).
+2. Bloom → coarse "might this block contain this label?" (μs/block).
+3. Postings → exact series fingerprints in this block matching the
+   label predicate (ms/block).
+4. Parquet row-group min/max on `series_fingerprint` → skip ~99%
+   of row groups within matched blocks.
+5. Parquet page index → skip pages within matched row groups.
+
+Without postings + intra-block sort, the bloom-only approach
+catastrophically degrades past ~500k active series because (a)
+common labels defeat the bloom and (b) time-ordered rows defeat
+intra-block pruning. With them, scry's metrics layer comfortably
+targets the 30–60M-active-series envelope.
+
+Sized concretely: at 60M active series with ~50k distinct (label,
+value) pairs globally, per-block postings files are 100 KB to a few
+MB — a small fraction of the main parquet's size.
+
+Series fingerprint is xxh3-64 of the canonicalised label set. At
+60M series, birthday-collision probability is ~10⁻⁵, acceptable; the
+parquet rows carry the full label set so collisions are
+post-hoc detectable.
+
+Other signals (logs, traces, profiles) do not use postings; their
+query patterns don't benefit. Logs are time + label + substring
+search; traces are by trace-id; profiles are by `(profile_type,
+time_range)`. Bloom-only is sufficient for all three.
+
+The `has_postings` and `postings_size_bytes` columns are added to
+the `blocks` table in v0.1 so the index can land in v0.5 metrics
+work without a schema migration. The `.postings.parquet` sidecar
+path is reserved in the block layout from v0.1.
+
+Optional cardinality safeguards (`max_series_per_metric_name`,
+`max_total_active_series`, per-label cardinality-explosion
+exclusion from the index) are *opt-in* — disabled by default,
+configurable for deployments worried about runaway exporter
+cardinality.
+
+This decision resolves the last remaining "asterisk" on the metrics
+pillar from earlier scaling analysis. The metrics ceiling is now
+designed-for, not unknown.
+
 ## Deferred / open
 
 These are not decisions yet; they're flagged for "we'll decide when the

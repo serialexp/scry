@@ -141,7 +141,13 @@ Within any bucket, the path layout is:
 ```
 <signal>/<yyyy>/<mm>/<dd>/<writer_id>/<block_uuid>.parquet
 <signal>/<yyyy>/<mm>/<dd>/<writer_id>/<block_uuid>.meta.json
+<signal>/<yyyy>/<mm>/<dd>/<writer_id>/<block_uuid>.postings.parquet  # metrics only
 ```
+
+The `.postings.parquet` sidecar is signal-specific — present for
+metrics, absent for logs/traces/profiles (whose query patterns don't
+benefit from an inverted index). See [Metrics](#metrics) for the
+postings design.
 
 - `signal` ∈ `{metrics, logs, traces, profiles}`. Each signal is a
   totally independent prefix; nothing crosses.
@@ -406,20 +412,22 @@ CREATE TABLE buckets (
 
 -- All blocks (mirrors object-store sidecars).
 CREATE TABLE blocks (
-  uuid           TEXT PRIMARY KEY,      -- UUID v7
-  bucket         TEXT NOT NULL REFERENCES buckets(name),
-  signal         TEXT NOT NULL,         -- metrics | logs | traces | profiles
-  date           TEXT NOT NULL,         -- yyyy-mm-dd of ts_min
-  writer_id      TEXT NOT NULL,         -- producer
-  level          INTEGER NOT NULL DEFAULT 0,  -- compaction level; 0 = freshly written
-  ts_min         INTEGER NOT NULL,      -- unix nanos
-  ts_max         INTEGER NOT NULL,
-  row_count      INTEGER NOT NULL,
-  byte_size      INTEGER NOT NULL,      -- parquet on-disk size
-  schema_version INTEGER NOT NULL,
-  fingerprint    BLOB,                  -- xxh3 label-fingerprint bloom
-  superseded_by  TEXT REFERENCES blocks(uuid),   -- set during compaction grace
-  deleted_at     INTEGER                -- soft-delete during grace period
+  uuid                TEXT PRIMARY KEY,    -- UUID v7
+  bucket              TEXT NOT NULL REFERENCES buckets(name),
+  signal              TEXT NOT NULL,       -- metrics | logs | traces | profiles
+  date                TEXT NOT NULL,       -- yyyy-mm-dd of ts_min
+  writer_id           TEXT NOT NULL,       -- producer
+  level               INTEGER NOT NULL DEFAULT 0,  -- compaction level; 0 = freshly written
+  ts_min              INTEGER NOT NULL,    -- unix nanos
+  ts_max              INTEGER NOT NULL,
+  row_count           INTEGER NOT NULL,
+  byte_size           INTEGER NOT NULL,    -- main parquet on-disk size
+  postings_size_bytes INTEGER,             -- size of .postings.parquet, NULL if absent
+  has_postings        INTEGER NOT NULL DEFAULT 0,  -- bool; metrics-only currently
+  schema_version      INTEGER NOT NULL,
+  fingerprint         BLOB,                -- xxh3 label-fingerprint bloom (coarse pruning)
+  superseded_by       TEXT REFERENCES blocks(uuid),  -- set during compaction grace
+  deleted_at          INTEGER              -- soft-delete during grace period
 );
 
 CREATE INDEX idx_blocks_query   ON blocks(signal, date, ts_min, ts_max)
@@ -822,6 +830,180 @@ The split between `scry/servers/<region>` (ingest registry) and
 `scry/queriers/<region>` (query worker pool) means a `full` node
 appears in both, an `ingest-only` node appears only in the
 first, and a `query-only` node appears only in the second.
+
+## Metrics
+
+Metrics get specific treatment beyond the generic record/storage
+layer because their access pattern stresses cardinality in a way the
+other three signals don't. A `rate(metric{label=value}[5m])` query
+needs to find the small subset of series matching the label
+predicate across a potentially large block range, and then read just
+those series' samples. Without extra indexing, the bloom-only
+pruning we have for other signals degrades sharply past a few
+hundred thousand active series.
+
+### The cardinality problem
+
+A series is a unique combination of metric name and labels. "Active
+series" is the count being updated in the recent window (5–15 min,
+roughly). Real-world envelopes:
+
+| Deployment | Active series |
+|------------|---------------|
+| Personal/homelab | 1k–10k |
+| Single team prod | 50k–200k |
+| Mid-size company | 200k–1M |
+| Large org | 1M–10M |
+| Hyperscale | 10M–100M+ |
+
+scry's target envelope tops out at the **30M–60M active series**
+range — a whole-company kube fleet, not a hyperscale operator.
+
+The two failure modes that emerge past ~500k active series:
+
+1. **Common labels defeat the bloom.** `__name__=http_requests_total`
+   lives in every block; the bloom always says yes; we read every
+   block in the time range.
+2. **Intra-block pruning fails.** Parquet rows are time-ordered, so
+   any given label value (e.g. `service=api`) is interleaved across
+   every row group. Parquet's row-group min/max stats on the
+   `service` column give nearly zero pruning. The entire block gets
+   read even when only 200 of its 100k series match.
+
+The cost at 60M active series with bloom-only pruning is
+catastrophic — a single multi-hour `rate()` query can scan
+terabytes.
+
+### Series fingerprint as the canonical identifier
+
+Every metric record carries a `series_fingerprint: u64`, computed as
+xxh3-64 over the canonicalised label set (labels sorted by name,
+joined with a null separator, including the metric name as the
+implicit `__name__` label).
+
+The fingerprint is stable across blocks and across compactions
+because it's purely derived from the label set. This is the
+identifier used everywhere: in the postings index as the value, in
+the parquet block as a row column, in cross-block series joining for
+range queries.
+
+Collisions: at 60M active series, birthday probability of a 64-bit
+collision is ~10⁻⁵ — acceptable. The cost of a collision is two
+different label sets returning rows for one query, which queriers
+detect and surface (the parquet rows carry the full label set
+anyway, so collisions are detectable post-fetch).
+
+### Per-block postings index
+
+Alongside `<block>.parquet` and `<block>.meta.json`, metric blocks
+write a third file: `<block>.postings.parquet`.
+
+Schema:
+
+```
+| label_name TEXT | label_value TEXT | series_fingerprints LIST<u64> |
+sorted by (label_name, label_value)
+```
+
+Each row maps one `(name, value)` pair to the set of series
+fingerprints in this block matching it. The file is queryable by
+parquet's own predicate pushdown, so finding postings for
+`service=api` is a cheap range scan over a sorted parquet file.
+
+Sizing at scale: at 60M active series and ~50 distinct labels per
+series with ~1000 values each, there are ~50k distinct `(name,
+value)` pairs globally. Per block (5 min, ~100k unique active series
+present), maybe 5k–10k pairs. **Per-block postings file: 100 KB to
+a few MB.**
+
+### Intra-block sort by series fingerprint
+
+The block builder sorts metric records by `(series_fingerprint, ts)`
+before writing parquet. Effect: all samples for one series are
+contiguous in the file, occupying a small contiguous range of row
+groups. Parquet's row-group min/max stats on the
+`series_fingerprint` column then enable aggressive row-group
+pruning once a query has resolved its target fingerprint set.
+
+This is the layout decision that makes the postings index pay off.
+Without sorted blocks, knowing the fingerprints doesn't help you
+skip much — they're scattered uniformly across all row groups. With
+sorted blocks, knowing 200 fingerprints out of 100k means reading
+~0.2% of the block.
+
+### Query path for metrics
+
+For `rate(http_requests_total{service="api", env="prod"}[5m])` over
+a 6-hour range, walked through with concrete numbers at the 60M-
+active-series scale:
+
+1. **Catalog plan** → ~72 candidate blocks (6 h ÷ 5 min) for the
+   `metrics` signal in the time range.
+2. **Bloom prune** → still ~72 (those labels are common across
+   every block; bloom can't help).
+3. **Scatter-gather dispatch** → coordinator partitions blocks
+   across query workers as normal.
+4. **Workers fetch each block's `.postings.parquet`** with the
+   filter `(label_name='service' AND label_value='api') OR
+   (label_name='env' AND label_value='prod')`. Parquet pushdown
+   returns ~2 rows per block. Worker intersects the two fingerprint
+   sets to get ~200 matching fingerprints per block.
+5. **Workers issue parquet reads against `<block>.parquet`** with
+   the predicate `series_fingerprint IN (200 values)`. Row-group
+   min/max on `series_fingerprint` skips ~99% of row groups.
+6. **Workers compute partial `rate()`** per matching series.
+7. **Coordinator merges** the partial rates and returns the result.
+
+A query that would have scanned 72 × 128 MiB ≈ 9 GiB now scans
+~90 MiB. Two orders of magnitude reduction from postings + intra-
+block sort, on top of the parallelism from scatter-gather.
+
+### Compaction interplay
+
+When metric blocks merge, their postings files merge too: union the
+fingerprint sets per `(name, value)` pair and rewrite a merged
+postings file. Fingerprints are stable hashes; no remapping needed.
+
+The intra-block sort by `series_fingerprint` is preserved through
+the streaming merge — it's a sort-by-fingerprint merge sort using
+the same fingerprint as the merge key.
+
+Total extra compaction cost: one additional parquet file written
+per merge, sized by cardinality rather than row count. At the 60M
+scale, postings files are 0.1–5% of main block size, so compaction
+cost rises by a similar fraction.
+
+### What the other signals don't need
+
+Logs, traces, and profiles continue with bloom-only pruning because
+their query shapes don't benefit from an inverted index over labels:
+
+- **Logs:** time-range + label match + substring search. The
+  substring search dominates cost; postings on labels would help
+  little.
+- **Traces:** trace-by-id is a primary-key lookup (already cheap
+  via row-group stats on `trace_id`). Attribute search across
+  spans is rare and small.
+- **Profiles:** queries are `(profile_type, time_range)`. Already
+  well-pruned by existing block-level stats.
+
+### Cardinality safeguards (optional)
+
+Bad exporters can blow up cardinality (e.g. emitting `user_id` or
+`request_id` as a label). scry will support optional per-deployment
+caps:
+
+- `max_series_per_metric_name` — a single metric exceeding this
+  limit produces new series to be dropped with a counter increment
+  (not a hard error).
+- `max_total_active_series` — global cap, same dropping behavior.
+- `cardinality_explosion_labels` — operator-configured list of
+  label names that, if their per-block distinct-value count
+  exceeds a threshold, are excluded from the postings index. Data
+  still stored; just not indexed. Queries on those labels degrade
+  gracefully to full-block scan rather than failing.
+
+These are opt-in safety rails, not enforced by default.
 
 ## Caching
 
@@ -1280,18 +1462,18 @@ hash-partitioned walks: each `(bucket, signal, date)` partition is
 assigned to one instance based on `hash(partition) % N_servers`;
 that instance walks it and publishes results. Not v0.1.
 
-#### Metrics cardinality — separate index layer
+#### Metrics cardinality — postings index + intra-block sort
 
-The single biggest scaling unknown in the design. Per-block label-
-fingerprint blooms prune well at modest cardinality but lose
-effectiveness as the number of distinct label combinations grows.
-Above some threshold, a separate **postings-list index**
-(Prometheus-TSDB style, or simpler "labels-to-block-set"
-materialised view) is required. This is the topic of a dedicated
-metrics design conversation, deliberately deferred from the
-generic-storage-layer design captured here. **Until this is
-resolved, scry's metrics ceiling is unproven**, even though the
-other three pillars scale predictably.
+Already addressed: see [Metrics](#metrics). Per-block label-
+fingerprint blooms (in sidecar) handle coarse pruning; per-block
+postings index (`<block>.postings.parquet`) handles fine pruning
+within matched blocks; intra-block sort by `series_fingerprint`
+makes postings-driven row-group skipping effective. The combination
+keeps metrics queries efficient at the 60M-active-series target.
+
+The catalog schema carries `has_postings` and `postings_size_bytes`
+columns from v0.1 so the indexing can land in v0.5 metrics work
+without migration.
 
 ### What's deliberately out of scope
 
@@ -1402,13 +1584,6 @@ them. Items that are "deferred to a known plan" (tiered compaction
 policy, channel sharding, distributed walks) live in
 [Scaling](#scaling) rather than here.
 
-- **Metrics cardinality and indexing.** The biggest scaling unknown.
-  Per-block label-fingerprint blooms prune well at modest cardinality
-  but degrade as the number of distinct label combinations grows. A
-  postings-list index (Prometheus-TSDB-style) or simpler
-  labels-to-block-set materialised view is likely needed past some
-  threshold. Deserves a dedicated design conversation before any
-  serious metrics workload is loaded.
 - **Profiles payload schema.** Native pprof is the obvious answer,
   but pprof-in-parquet has nontrivial schema questions (deeply
   nested, shared symbol tables). We may want to denormalise on
