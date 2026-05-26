@@ -683,33 +683,145 @@ The block builder's lifecycle is described under
 
 ## Query
 
-DataFusion is the query engine. The flow:
+DataFusion is the query engine. Queries fan out across the live
+query worker pool so the work scales with cluster size rather than
+single-instance CPU.
 
-1. Query frontend (per-signal) parses the user query into a logical
-   plan over a virtual `(signal, ts, labels..., payload...)` table.
-2. Planner consults the catalog: enumerate candidate blocks by time
-   range, then prune by label-fingerprint bloom and per-column min/max
-   from sidecars.
-3. DataFusion executes the plan against the surviving parquet files
-   via `object_store`. Predicate pushdown into parquet row groups
-   handles intra-block pruning.
-4. Frontend post-processes the result into signal-shaped output (a
-   PromQL-style matrix, a list of log lines, a trace tree, a
-   flamegraph).
+### Roles in a query
 
-For query *languages*, we will prefer existing Rust parser crates over
-writing our own:
+- **Coordinator.** The instance the client (or query LB) routed to.
+  Plans the query, partitions block scans across workers, merges
+  partial results, returns the final response.
+- **Worker.** Any node with `role.query = true`. Receives an
+  `(execute plan, block list)` RPC from a coordinator, reads the
+  assigned blocks from object storage, runs the partial plan,
+  streams Arrow record batches back.
+
+The coordinator role is implicit — whichever node first receives the
+client query coordinates it. Any query node can play either role on
+any query. `query-only` topology nodes are perfect workers (no
+ingest contention); `full` nodes can serve as either.
+
+### Query execution flow
+
+1. **Parse and plan.** Query frontend (per-signal) parses the user
+   query into a logical plan over a virtual
+   `(signal, ts, labels..., payload...)` table.
+2. **Plan against catalog.** Coordinator enumerates candidate blocks
+   by time range, prunes by label-fingerprint bloom and per-column
+   min/max from sidecars.
+3. **Decide local vs distributed.** If the surviving block count is
+   below a threshold (~20 blocks, cache-hot dominates), the
+   coordinator executes locally — fan-out overhead would exceed the
+   parallelism gain. Otherwise, scatter-gather.
+4. **Split the plan.** DataFusion's logical plan is decomposed into
+   a *partial plan* (runs at workers: filter, project, partial
+   aggregate) and a *final plan* (runs at coordinator: merge, final
+   aggregate, sort, limit). DataFusion's existing partial/final
+   `Aggregate` modes do most of the work; we add a thin planner pass
+   to identify the split point.
+5. **Partition blocks across workers.** Live workers come from the
+   `scry/queriers/<region>` Valkey sorted set. Block partitioning is
+   round-robin (or hash-by-`block.uuid` for stable assignment that
+   benefits warm worker caches). Each worker receives roughly
+   `total_blocks / num_workers` blocks.
+6. **Dispatch via Arrow Flight.** Coordinator sends each worker an
+   `Execute(plan_id, partial_plan, blocks)` request. Arrow Flight is
+   the transport — designed for moving Arrow `RecordBatch`es between
+   processes, zero-copy receive, already integrated with DataFusion.
+7. **Workers execute.** Each reads its assigned blocks from object
+   storage (parallel within a worker, parallel across workers), runs
+   the partial plan, streams `RecordBatch`es back to the coordinator
+   as they're produced.
+8. **Coordinator merges.** Final plan runs on the union of incoming
+   partial streams. Result returned to client. Frontend post-
+   processes into signal-shaped output (PromQL matrix, log lines,
+   trace tree, flamegraph).
+
+### Why pre-aggregation pushdown matters
+
+For a query like
+`SELECT service, count(*) FROM logs WHERE level='error' GROUP BY service`
+over 1B matching rows across 1000 blocks:
+
+- **Without pushdown:** workers (or coordinator alone) read 1B rows,
+  send 1B rows over the network for the coordinator to aggregate.
+  Network and CPU dominated.
+- **With pushdown:** each worker pre-aggregates to one row per
+  service (say 50 services), sends ~500 rows total (10 workers × 50
+  services), coordinator merges to 50 final rows.
+
+This is ~7 orders of magnitude reduction in network bytes for
+typical aggregating queries. It's the single biggest reason for
+scatter-gather over "just run it on one instance with more cores."
+
+### Failure modes
+
+- **Worker dies mid-query.** Coordinator's RPC times out; coordinator
+  reassigns those blocks to another worker and retries that
+  partition. Idempotent — the same blocks read by two workers
+  produces the same partial result; only one is used.
+- **Worker has a stale catalog.** Doesn't matter. Workers don't
+  *plan* — they execute against the explicit block list the
+  coordinator gave them, fetching from object storage by exact path.
+  Catalog freshness on workers is irrelevant for correctness; only
+  the coordinator's catalog freshness affects plan correctness.
+- **Coordinator dies.** Client's request fails; client retries via
+  query LB to a different coordinator. No partial state to recover.
+- **Network partition between coordinator and worker.** RPC
+  timeout → reassignment, same as worker death.
+- **All workers slow / saturated.** Coordinator falls back to local
+  execution (or fails fast with a clear error if local-execution
+  budget is exceeded). Better to fail clearly than to scatter and
+  wait forever.
+
+### When to fan out
+
+Internal heuristic (not a config knob):
+
+- Block count below ~20: local execution.
+- Block count above ~20: scatter-gather.
+- Point lookups by block UUID (e.g. trace-by-id): forward whole
+  query to a single worker by hash; no merge needed.
+- "Top-K" queries (e.g. "100 most recent error logs"): scatter-
+  gather with top-K pushed to workers and a final top-K merge at
+  the coordinator. Each worker returns at most K rows.
+
+### Query languages
+
+We prefer existing Rust parser crates over writing our own:
 
 - `promql-parser` for metrics.
-- `logql-parser` / similar for logs (evaluate what's actually
-  maintained).
+- A maintained LogQL parser if one exists; otherwise a small
+  purpose-built one for our subset.
 - TraceQL grammar can be hand-lifted (it's small).
 - For profiles, the query surface is small enough that a fixed REST
   endpoint is probably enough.
 
-Building our own query language is **explicitly deferred**. We keep the
-internal DataFusion plan as the stable interface and add language
-frontends on top.
+Building our own query language is **explicitly deferred**. The
+internal stable interface is a DataFusion logical plan over the
+record model; language frontends layer on top.
+
+### Worker pool registration
+
+Identical mechanism to the agent-server discovery, on a separate
+channel:
+
+```
+ZADD scry/queriers/<region> <now_ms> <addr:port:weight>
+EXPIRE scry/queriers/<region> 30
+```
+
+A node with `role.query = true` registers itself; reapers prune
+stale entries. Coordinators pull the live worker set from Valkey
+(cached, refreshed every 5 s — much shorter than the agent-side
+30 s because we want fast failure detection during query
+dispatch).
+
+The split between `scry/servers/<region>` (ingest registry) and
+`scry/queriers/<region>` (query worker pool) means a `full` node
+appears in both, an `ingest-only` node appears only in the
+first, and a `query-only` node appears only in the second.
 
 ## Caching
 
@@ -1183,12 +1295,15 @@ other three pillars scale predictably.
 
 ### What's deliberately out of scope
 
-- **Distributed query execution.** Splitting one query across N
-  reader instances (Ballista-style) is real work and adds a
-  coordination protocol. Single-instance DataFusion reading parquet
-  from object storage scales very far — Trino and Athena run this
-  same model at petabyte scale. If we ever measure a real ceiling,
-  we add Ballista or roll our own. Not in the foreseeable plan.
+- **Full distributed query execution.** Ballista / Trino-style
+  multi-stage execution with shuffles, joins between distributed
+  tables, and a true distributed planner is out of scope.
+  Observability queries are overwhelmingly scan + filter +
+  aggregate, which our [scatter-gather](#query-execution-flow)
+  handles directly. If we ever measure a real ceiling that
+  scatter-gather can't address (large distributed joins, complex
+  windowing across the cluster), we'd consider Ballista, but
+  there's no current plan.
 - **Cross-region replication.** Geographic distribution is a
   separate problem from scaling within a region. The intended
   pattern is "run regional scry deployments, query each

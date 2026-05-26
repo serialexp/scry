@@ -447,6 +447,59 @@ regardless of bucket size. Without it, a fresh instance walking
 Small deployments can skip the snapshot writer entirely and rely
 on the full-walk fallback.
 
+## D-024: Scatter-gather query execution across the worker pool
+
+**Date:** 2026-05-26
+**Status:** accepted
+
+Queries fan out across the live query worker pool rather than being
+served end-to-end by a single instance. A coordinator (the instance
+the client routed to) plans the query, partitions block scans across
+workers, dispatches `Execute(partial_plan, blocks)` RPCs over Arrow
+Flight, and merges streaming Arrow `RecordBatch`es into the final
+result. Workers run the partial plan (filter, project, partial
+aggregate); coordinator runs the final plan (merge, final aggregate,
+sort, limit).
+
+This is **scatter-gather (MPP-lite), not full distributed query
+execution.** Ballista / Trino-style multi-stage execution with
+shuffles and distributed joins is rejected as out of scope.
+Observability queries are overwhelmingly scan + filter + aggregate,
+which scatter-gather handles directly. We get ~95% of the benefit
+at ~5% of the complexity.
+
+The key property that makes the design simple: **workers don't
+plan, only execute against the explicit block list the coordinator
+hands them.** Worker catalog freshness is irrelevant for query
+correctness; cold workers serve queries immediately; failed workers
+are replaced by reassigning their blocks. This is only possible
+because blocks are immutable and content-addressed by full path.
+
+Pre-aggregation pushdown via DataFusion's existing partial/final
+`Aggregate` modes is where most of the win lives. For typical
+aggregating queries (which is most of them), partial results sent
+over the network are 6–7 orders of magnitude smaller than the raw
+matched rows.
+
+Threshold for fan-out (~20 blocks) is internal behavior, not a
+config knob. Below threshold the coordinator executes locally;
+above, it scatters. Point lookups (trace-by-id) forward the whole
+query to one worker by hash with no merge.
+
+Worker pool discovery uses the same Valkey-sorted-set mechanism as
+agent → ingest server discovery, on a separate channel
+(`scry/queriers/<region>`). A `full` node appears in both
+registries; `ingest-only` only in ingest; `query-only` only in
+queriers.
+
+Arrow Flight is the chosen transport: zero-copy receive, designed
+for this exact use case, already integrated with DataFusion.
+
+Implementation is a v0.6+ milestone (after v0.5 metrics ships), but
+the design lands now so coordinator/worker split, partial/final
+plan threading, and the queriers registry channel are baked in
+from the start.
+
 ## Deferred / open
 
 These are not decisions yet; they're flagged for "we'll decide when the
