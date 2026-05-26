@@ -604,6 +604,80 @@ design changes. The benefit is that future contributions
 explicit bound, so we don't drift back into "we'll tune it later"
 thinking that makes operators' lives hard.
 
+## D-027: Resource isolation between workloads and signals
+
+**Date:** 2026-05-26
+**Status:** accepted
+
+The single-binary architecture (D-001) means ingest, query,
+compaction, retention, and four signals all share one process.
+That's an operational win — one config, one set of metrics, one
+deploy — but contention between those workloads is now our
+problem to solve rather than the kernel's. The Grafana stack
+side-steps this by splitting workloads into separate services
+that can be scaled and resource-bounded independently; we keep
+the unified process and enforce isolation inside it.
+
+Five mechanisms, all reflected in the new "Resource isolation"
+section of ARCHITECTURE.md and the corresponding config blocks:
+
+- **Named Tokio runtimes per workload class** (`query`, `ingest`,
+  `background`, `control`). Cross-runtime calls go through
+  channels. A pegged compaction loop cannot stall query workers
+  because they're on different schedulers.
+- **Named memory pools with hard caps** (`query`, `caches`,
+  `wal_builders`, `ingest_buffers`). A pool that hits its
+  ceiling does not steal from another — it spills, evicts, or
+  applies backpressure. The process cannot OOM from one
+  subsystem saturating, because every allocator has a named
+  home with a known cap.
+- **Per-signal WAL subdirectories.** Each signal gets its own
+  segment sequence so fsync on a fat trace segment doesn't
+  delay a metric append, and a stuck logs builder cannot pin
+  trace segments.
+- **Token-bucket fair scheduler across signals at ingest.**
+  Default is equal-weight fair share (no effect under normal
+  load, prevents monopolisation under contention); explicit
+  byte-rate caps and `unlimited` exemptions are configurable.
+- **Compaction throttled by self-observed query P99.** Instead
+  of operators sizing compaction parallelism in advance, each
+  server tracks its own rolling P99 query latency and pauses
+  new compactions when latency exceeds a threshold. Reactive,
+  not predictive, but it has the "no knob" property: compaction
+  uses whatever headroom queries leave it.
+
+The compaction throttle deserves a note on the decision itself.
+Two reasonable options exist: a *static* concurrency cap, or a
+*dynamic* feedback loop on observed latency. A combined "static
+ceiling + dynamic backoff under the ceiling" is technically
+strictly more conservative, but it forces operators to size the
+ceiling — which is exactly the kind of "you must understand and
+tune this" knob the project exists to avoid. The dynamic-only
+path has one knob (`pause_if_query_p99_above`) whose meaning
+("how much query latency are you willing to trade for faster
+compaction catch-up") is a product decision, not a hardware
+sizing exercise. We accept the worst case where idle servers
+might run a lot of parallel compactions; bound that with a small
+`max_concurrent` floor (default 2) sized to avoid saturating
+object-store connection pools rather than to throttle CPU.
+
+The cost of this whole section is real: more config surface
+(`[runtime]`, `[memory]`, `[ingest.rate_limits]`, `[compaction]`),
+more code to keep workloads on the right scheduler, and a P99
+tracking loop with its own correctness properties. It's still
+within the "one screen of config" target, and every block has a
+direct user-visible failure mode it prevents.
+
+The alternative we rejected: rely on cgroups and the OOM killer
+as the backstop. That works in the abstract — Linux is happy to
+kill a process that misbehaves — but a server that dies during a
+compaction is one that has to recover its WAL, re-warm its
+caches, and re-establish its place in the worker pool, all of
+which add latency to the queries the kill was supposed to
+protect. Better to fail at the subsystem level (a single query
+spills or fails; a single ingest batch gets backpressure) than
+at the process level.
+
 ## Deferred / open
 
 These are not decisions yet; they're flagged for "we'll decide when the

@@ -522,6 +522,12 @@ WAL design:
 
 - Append-only segments of fixed max size (e.g. 256 MiB), named
   `wal-<u64-seq>.log`.
+- **Per-signal subdirectories** (`wal/metrics/`, `wal/logs/`,
+  `wal/traces/`, `wal/profiles/`). Each signal has its own sequence
+  space and its own segment files. A burst of trace traffic cannot
+  delay a metric append; a stuck logs block builder cannot pin a
+  trace segment from being recycled. See [Resource
+  isolation](#resource-isolation).
 - Each record framed by `[len: u32][crc32: u32][binschema payload]`.
 - `fsync` on segment rotation, not per record. We accept "last few ms of
   records on a crash" as the durability boundary; if you need
@@ -1630,6 +1636,191 @@ without migration.
   clients query directly. This is one reason we keep queries
   *server-side* (clients receive results, not raw parquet).
 
+## Resource isolation
+
+A scry server runs ingest, query, compaction, and retention in one
+process. That's a deliberate operational simplification (one
+binary, one config, one set of metrics), but it means contention
+*between* those workloads is a problem we own. Likewise, four
+signals share the same WAL disk, the same object-store bandwidth,
+and the same RAM. Without explicit isolation, a single noisy
+neighbour — a 10× traffic spike on traces, a heavy compaction, a
+runaway query — can starve everything else.
+
+This section pins down the mechanisms.
+
+### CPU isolation via thread pools
+
+The process runs **four named Tokio runtimes**, each with its own
+worker thread count. Tasks are spawned onto the runtime that
+matches their workload class; cross-runtime calls go through
+channels.
+
+| Runtime | Workload | Default size |
+|---------|----------|--------------|
+| `query` | DataFusion execution, scatter/gather coordinator, Arrow Flight serialisation | `num_cpus / 2` |
+| `ingest` | Wire-protocol decode, WAL append, block builder | `num_cpus / 4` |
+| `background` | Compaction, retention, catalog reconciliation, snapshot upload | `num_cpus / 4` |
+| `control` | Discovery, Valkey pub/sub, health, admin API | 2 |
+
+Operators tune the sizes in `[runtime]`. The default split is
+biased toward query because that's where users feel latency;
+ingest gets less because the WAL absorbs spikes (the runtime
+doesn't need to be sized for peak burst, only sustained throughput).
+
+The split also defends against pathological cases: a compaction
+loop that pegs CPU cannot stall query workers, because they're on
+different schedulers. Ingest's `fsync` calls block their own
+runtime's threads, not the query runtime's.
+
+### Memory budget allocation
+
+Total RAM is partitioned into named pools, declared in `[memory]`.
+Each pool is enforced separately:
+
+| Pool | What it covers | Default share |
+|------|----------------|---------------|
+| `query` | DataFusion `MemoryPool` for all in-flight queries (see [Per-query memory budgets](#per-query-memory-budgets)) | 50 % |
+| `caches` | Footer cache, page-index cache, postings cache | 25 % |
+| `wal_builders` | In-flight block builders (one per active `(signal, day)`) | 12.5 % |
+| `ingest_buffers` | Wire decode buffers, agent batch staging | 6.25 % |
+| (unallocated) | Slack for OS page cache, transient allocations, jemalloc fragmentation | 6.25 % |
+
+A pool that hits its ceiling **does not steal** from another pool.
+Caches evict LRU. Query spills (or fails). Block builders apply
+backpressure to ingest. Ingest buffers reject and ask the agent to
+retry. This is what "bounded by construction" looks like in
+practice — every allocator has a named home with a known cap, so
+"out of memory" is impossible for the process even when one
+subsystem is saturated.
+
+We do **not** rely on `cgroups` or kernel OOM to enforce these.
+Those are useful as a final backstop, but a process that gets
+killed by the OOM killer is one that already failed at resource
+discipline.
+
+### Per-signal WAL segments
+
+The WAL is already per-writer (D-015); it's also **per-signal**.
+Each signal gets its own subdirectory and sequence space:
+
+```
+/var/lib/scry/wal/
+  metrics/wal-0000000123.log
+  logs/wal-0000000089.log
+  traces/wal-0000000456.log
+  profiles/wal-0000000012.log
+```
+
+This buys us several properties:
+
+- **Independent rotation and fsync.** A `fsync` on a fat trace
+  segment does not delay an in-flight metric append; they hit
+  different files on (typically) different blocks of the SSD.
+- **Independent recovery.** On startup, signal replays run in
+  parallel rather than serialising on one log.
+- **Independent retention.** Segments are recycled per signal as
+  their blocks finalise; a stuck logs block builder cannot pin
+  trace segments.
+
+The same SSD is still shared, of course. If a single signal is
+genuinely IOPS-starved by another, the answer is either a faster
+disk or signal-level rate limiting (next subsection).
+
+### Per-signal ingest fairness
+
+The ingest pipeline applies a **token-bucket fair scheduler**
+across signals. Each signal has an optional rate ceiling in
+`[ingest.rate_limits]`; the scheduler refills tokens in proportion
+to configured shares (default: equal shares).
+
+Behaviour:
+
+- **No limits configured** (default): equal weights, scheduler
+  prevents one signal from monopolising WAL append throughput
+  under contention. No effect under normal load.
+- **Explicit caps** (`traces = "100 MB/s"`): signal is hard-
+  capped; agents get backpressure when the bucket is empty.
+- **`unlimited`**: signal is exempt from the fair scheduler — use
+  this for the signal that genuinely is your primary load (often
+  metrics).
+
+Backpressure surfaces to the agent as a wire-protocol "slow down"
+response (D-006), which feeds the agent's local spool. The agent
+spills to its own disk and retries; data isn't lost on a
+saturated server.
+
+### Compaction throttling: dynamic backoff on query latency
+
+Compaction is the only background workload that's both CPU- *and*
+I/O-heavy *and* runs continuously. Static throttles ("at most N
+compactions in parallel") are too crude — they over-throttle when
+query load is light and under-throttle when it's heavy.
+
+scry uses **self-observed P99 query latency** as the throttle
+signal:
+
+- Every server tracks rolling P99 of its own query worker
+  responses (a tdigest, evicted on a sliding window — 5 minutes
+  by default).
+- If P99 exceeds `pause_if_query_p99_above`, in-flight
+  compactions finish their current merge but no new ones start
+  for `pause_duration`.
+- After the pause expires, compaction resumes if P99 has
+  recovered. Otherwise it extends the pause.
+- A floor of `max_concurrent` (default 2) caps compaction even
+  when P99 is fine — this prevents runaway parallelism on idle
+  servers that would still saturate object-store bandwidth.
+
+This is reactive, not predictive, but it has the property we want:
+**operators do not need to size compaction parallelism in
+advance**. The server discovers its own headroom from live query
+behaviour and uses it. When query load is low, compaction catches
+up; when query load spikes, compaction yields. No knob.
+
+The same loop applies to **retention** (a much cheaper background
+task — it's mostly catalog updates and `DELETE` calls), but
+retention's natural cadence is slow enough (once per minute, per
+signal) that the throttle rarely engages.
+
+### Background task pacing
+
+Other periodic background work — catalog snapshot uploads (D-023),
+full-walk reconciliations, cache warm-up after restart — is
+scheduled on the `background` runtime and explicitly *single-
+threaded per task class*. There is at most one snapshot upload
+in flight, at most one full-walk in flight per signal, at most
+one bucket-pool reconciliation in flight. These are all sized
+correctly at one because they're not throughput-bound; they're
+correctness-bound.
+
+### Network contention
+
+A few notes that don't fit the pool model:
+
+- **TCP send buffers.** A query response that streams 50 MB of
+  Arrow over a slow client connection can pin a worker thread
+  waiting on `write`. We bound this by setting per-connection
+  send-buffer ceilings and giving each query a wall-clock deadline
+  (`query_timeout`, default 60s). A slow client never holds a
+  worker indefinitely.
+- **Object-store concurrency.** S3 connection pools are *per
+  bucket*, not global, so a heavy compaction on one bucket cannot
+  exhaust the connection pool used by queries on another. Single-
+  bucket deployments are the contention case; we mitigate it with
+  separate pools per workload (ingest writes, compaction reads,
+  compaction writes, query reads).
+- **Arrow Flight.** The flight server uses the `query` runtime;
+  the flight client (used by coordinators to talk to other
+  workers' query servers) also uses the `query` runtime. Ingest
+  never touches Flight; compaction never touches Flight. The
+  scatter-gather path is fully isolated from background load.
+
+The summary: every shared resource — CPU, RAM, WAL disk, object
+store, network — has either a named pool with a fixed cap, or a
+feedback loop that backs off when contention shows up. Nothing
+is "best effort, hope it works under load."
+
 ## Configuration
 
 The entire config file:
@@ -1663,9 +1854,47 @@ max_bytes    = "90 TiB"  # seal at ~90% of the provider's hard limit
 [wal]
 dir         = "/var/lib/scry/wal"
 segment_mib = 256
+# Per-signal subdirectories (metrics/, logs/, traces/, profiles/)
+# are created under dir; segments rotate independently per signal.
 # writer_id auto-generated and persisted under wal.dir on first start;
 # set explicitly here to override (must be unique across instances).
 # writer_id = "ingest-eu-1"
+
+[runtime]
+# Named Tokio runtimes. Each workload class is isolated on its own
+# scheduler so a saturated compaction loop cannot stall queries.
+# Defaults derived from num_cpus if omitted.
+query_threads      = 8   # DataFusion, scatter-gather, Arrow Flight
+ingest_threads     = 4   # wire decode, WAL append, block builder
+background_threads = 4   # compaction, retention, reconciliation
+control_threads    = 2   # discovery, pub/sub, admin
+
+[memory]
+# Named pools with hard caps. A pool that fills does not steal from
+# another. See "Resource isolation" → "Memory budget allocation".
+total          = "32 GiB"
+query          = "16 GiB"   # DataFusion MemoryPool, all queries
+caches         = "8 GiB"    # footer, page-index, postings caches
+wal_builders   = "4 GiB"    # in-flight block builders
+ingest_buffers = "2 GiB"    # wire decode + agent batch staging
+# Remainder is slack for the OS page cache and allocator overhead.
+
+[ingest.rate_limits]
+# Token-bucket fair scheduler across signals. Omit a signal to leave
+# it on equal-share fairness; set "unlimited" to exempt it from the
+# scheduler entirely (your primary load); set a byte rate to cap it.
+fair_share = true
+# metrics  = "unlimited"
+# traces   = "100 MB/s"
+
+[compaction]
+# Dynamic throttle: compaction yields when this server's own
+# rolling-P99 query latency exceeds the threshold. No need to size
+# parallelism in advance; the server discovers its own headroom.
+max_concurrent           = 2
+pause_if_query_p99_above = "5s"
+pause_duration           = "30s"
+query_p99_window         = "5m"
 
 [listen]
 ingest = "0.0.0.0:4000"
