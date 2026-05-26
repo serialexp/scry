@@ -228,6 +228,116 @@ sealed bucket reaches zero remaining blocks, scry logs a notice and
 marks it `drained` in the catalog. The operator removes it from
 config and deletes the underlying bucket out-of-band.
 
+#### Auto-provisioning (optional)
+
+A scry deployment can opt into having scry create new buckets itself
+when it needs them, instead of requiring operator config edits.
+Configured via a `[storage.template]` block:
+
+```toml
+[storage.template]
+enabled      = true
+name_pattern = "scry-{installation}-{date:%Y%m}"  # e.g. scry-prod-202605
+installation = "prod"
+backend      = "s3"
+endpoint     = "https://fsn1.your-objectstorage.com"
+region       = "eu-central"
+max_bytes    = "90 TiB"
+# credentials need s3:CreateBucket and s3:ListAllMyBuckets in addition
+# to data-plane permissions
+```
+
+When the template is enabled:
+
+- **Bootstrap.** First startup with no buckets in the catalog: scry
+  resolves the pattern, calls `CreateBucket`, and starts writing. No
+  `[[storage.buckets]]` seed needed.
+- **Existing deployments.** `[[storage.buckets]]` still works as a
+  seed (buckets that existed before scry was managing them). Anything
+  scry creates at runtime is recorded in the catalog, not in the
+  config file — scry never modifies user files.
+
+##### Naming pattern
+
+`name_pattern` accepts placeholders:
+
+- `{installation}` — verbatim from `installation = "..."`.
+- `{date:<strftime>}` — strftime-formatted current date at creation
+  time. `{date:%Y%m}` for monthly, `{date:%Y}` for yearly, etc.
+
+If the resolved name collides with an existing bucket (either an
+older scry-created one whose date overlaps, or someone else's), scry
+appends `-2`, `-3`, ... until it finds a free name. Concretely: if
+the active bucket fills twice in May, the second creation resolves to
+`scry-prod-202605` (taken), then `scry-prod-202605-2`.
+
+Note that the date in the name reflects *when scry decided to
+provision the bucket*, not necessarily the date range of data inside
+it (pre-provisioning means a bucket created in May may not start
+receiving data until June). The catalog records the precise creation
+timestamp; the name is a human-friendly hint.
+
+##### Pre-provisioning at a watermark
+
+The next bucket is created **proactively** when the active bucket
+reaches **70% of `max_bytes`**, not at the moment of sealing. The
+pre-provisioned bucket sits open-but-unused (writers still prefer the
+earlier-in-pool active bucket) until the active one seals, at which
+point the switch is a local flag flip with no API calls in the hot
+path.
+
+Rationale: bucket creation can fail (provider quota, IAM eventual
+consistency, transient network issues). Decoupling creation from
+sealing means failures are retried calmly under no time pressure;
+the sealing path itself is purely local state changes plus a Valkey
+publish.
+
+Watermark and pre-provision are baked-in behavior, not config knobs.
+
+##### Coordination
+
+`CreateBucket` is idempotent at the protocol level: a second writer
+attempting the same name gets "already owned by you" and treats it
+as success. No lease is needed for creation — racing writers
+converge on the same bucket, and at worst one extra empty bucket
+ends up provisioned (cheap, harmless).
+
+The seal step still uses the seal lease (see [Automatic
+sealing](#automatic-sealing)). The new bucket simply already exists
+when seal fires.
+
+##### Bucket-pool discovery
+
+A new writer (cold start, or recovering from a long partition) needs
+to discover all buckets in the pool, including ones created by peers
+while it was absent. The mechanism:
+
+1. **Config seed** — any `[[storage.buckets]]` entries.
+2. **Valkey** — query `scry/buckets/list` for the live pool snapshot
+   from peers.
+3. **Provider `ListBuckets` filtered by `name_pattern`** — if the
+   template is enabled, scry can list the provider account's buckets
+   and pick up anything matching the configured pattern. This is the
+   recovery mechanism for "Valkey was unreachable when peers created
+   new buckets." Requires `s3:ListAllMyBuckets`.
+
+All three sources are merged into the catalog; runtime updates flow
+in via `bucket-created` events on Valkey.
+
+##### Failure modes
+
+- **`CreateBucket` fails (quota, permissions, network):** scry does
+  *not* seal the active bucket. Writes continue past `max_bytes` —
+  this is why `max_bytes` must be well below the provider's hard
+  limit. Logged loudly, retried on next pre-provision cycle.
+  Operator alerted via metrics/logs.
+- **Template misconfigured at startup** (bad credentials, pattern
+  doesn't resolve, region unreachable): startup fails fast with a
+  clear error rather than running degraded.
+- **Drained buckets** are *never* auto-deleted. Even empty buckets
+  have audit/compliance value. scry surfaces them in status output;
+  destruction is operator-driven.
+
 ### The catalog
 
 The catalog is **derived state**: a SQLite database mirroring "what
@@ -674,20 +784,30 @@ prefix-delete. No partial-block resurrection logic. No
 The entire config file:
 
 ```toml
-# Bucket pool, in order. Writers always target the earliest open
-# bucket. Add a new entry when getting close to the active bucket's
-# max_bytes; scry will auto-seal the old one when it fills.
-[[storage.buckets]]
-name      = "scry-2026"
-backend   = "s3"             # s3 | fs
-endpoint  = "https://fsn1.your-objectstorage.com"
-bucket    = "scry-prod-2026"
-region    = "eu-central"
-max_bytes = "90 TiB"         # seal at ~90% of the provider's hard limit
-# credentials via standard AWS env vars
+# Recommended shape: let scry manage the bucket pool itself. On
+# bootstrap and when buckets fill, scry creates new ones from the
+# template. Catalog tracks them; no config edits required at runtime.
+[storage.template]
+enabled      = true
+name_pattern = "scry-{installation}-{date:%Y%m}"
+installation = "prod"
+backend      = "s3"
+endpoint     = "https://fsn1.your-objectstorage.com"
+region       = "eu-central"
+max_bytes    = "90 TiB"  # seal at ~90% of the provider's hard limit
+# credentials need s3:CreateBucket and s3:ListAllMyBuckets in
+# addition to data-plane perms; via standard AWS env vars
 
-# Single-bucket deployments use exactly one entry above; nothing else
-# needs to change. Multi-bucket adds further [[storage.buckets]] blocks.
+# Alternative / supplemental: hand-listed buckets. Use this when you
+# want operator-managed buckets (no template), or when migrating
+# existing buckets into a scry-managed deployment.
+# [[storage.buckets]]
+# name      = "legacy-imported-2025"
+# backend   = "s3"
+# endpoint  = "https://fsn1.your-objectstorage.com"
+# bucket    = "scry-prod-2025"
+# region    = "eu-central"
+# max_bytes = "90 TiB"
 
 [wal]
 dir         = "/var/lib/scry/wal"

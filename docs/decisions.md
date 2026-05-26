@@ -305,6 +305,47 @@ propagates the seal event.
 Multi-bucket-per-signal (one pool per signal, so logs and traces
 don't share quota) is a future extension; not in v0.1.
 
+## D-018: Auto-provisioning of buckets from a template
+
+**Date:** 2026-05-26
+**Status:** accepted
+
+When the operator opts in via `[storage.template]`, scry creates new
+buckets itself rather than requiring config edits. Bootstrap and
+pool-extension both flow through the template. Runtime-created
+buckets are recorded in the catalog; scry never modifies the
+operator's config file.
+
+Name pattern is date-based with collision suffix:
+`scry-{installation}-{date:%Y%m}`, falling back to `-2`, `-3`, ... on
+collision. Matches the operator's mental model of "this bucket holds
+data from around month X."
+
+The next bucket is **pre-provisioned at a 70% watermark**, not at
+the moment of sealing. This keeps the seal path free of API calls
+that can fail or be slow, and turns `CreateBucket` failures into
+calmly-retried background events rather than write-stalling crises.
+
+`CreateBucket` is idempotent — concurrent writers attempting the
+same name converge on the same bucket. No lease needed for creation;
+only sealing uses the lease.
+
+Bucket-pool discovery for a writer joining late uses, in order:
+config seed, peer state from Valkey, and a provider `ListBuckets`
+filtered by the template's name pattern. The last is permission-
+cheap (one extra IAM action) and removes the need for any custom
+pool-coherence protocol.
+
+We **never auto-delete** even drained buckets — destruction of data
+is operator-driven. We **never modify** the user's config file —
+runtime state lives in the catalog. Both are non-negotiable
+guardrails on a system that takes a lot of automated actions.
+
+Required permissions when template is enabled: `s3:CreateBucket`
+and `s3:ListAllMyBuckets` in addition to the data-plane ones. If the
+operator doesn't want to grant these, they leave `template.enabled =
+false` and manage `[[storage.buckets]]` manually.
+
 ## Deferred / open
 
 These are not decisions yet; they're flagged for "we'll decide when the
