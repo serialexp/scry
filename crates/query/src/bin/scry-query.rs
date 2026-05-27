@@ -59,6 +59,9 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use anyhow::{Context, Result};
 use arrow::util::pretty::pretty_format_batches;
+use arrow_flight::decode::FlightRecordBatchStream;
+use arrow_flight::flight_service_client::FlightServiceClient;
+use arrow_flight::Ticket;
 use clap::Parser;
 use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::metrics::MetricValue;
@@ -68,14 +71,25 @@ use datafusion::physical_plan::{
 use futures::StreamExt;
 use scry_catalog::Catalog;
 use scry_objstore::{open_with_pool_config, BufPool, BufPoolConfig, ObjStoreConfig};
-use scry_query::{register_metrics_table, MetricsQuery, METRICS_TABLE_NAME};
+use scry_query::{register_metrics_table, MetricsQuery, QueryRequest, METRICS_TABLE_NAME};
+use tonic::transport::Channel;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
-    /// Path to the SQLite catalog file.
+    /// Path to the SQLite catalog file. Required for local mode;
+    /// ignored when `--remote` is set (the daemon owns the catalog).
+    #[arg(long, conflicts_with = "remote", required_unless_present = "remote")]
+    catalog: Option<PathBuf>,
+
+    /// `host:port` of a running `scry-queryd`. When set, the query is
+    /// sent over Arrow Flight instead of evaluated locally. The
+    /// matcher/from/until/limit/sql flags get serialised into the
+    /// request; pool flags are ignored (the daemon owns the pool).
+    /// The local trailer collapses to "rows total (via remote)" — the
+    /// per-block scan stats live in the daemon's logs.
     #[arg(long)]
-    catalog: PathBuf,
+    remote: Option<String>,
 
     /// Equality matcher in `name=value` form. Repeatable; AND'd.
     /// Resolves via the postings sidecar before SQL/DataFrame eval.
@@ -167,6 +181,22 @@ async fn main() -> Result<()> {
         .init();
     let args = Args::parse();
 
+    let q = MetricsQuery {
+        matchers: args.matchers.clone(),
+        ts_min: args.from,
+        ts_max: args.until,
+    };
+
+    // ── Remote mode short-circuit ──────────────────────────────────
+    //
+    // The daemon owns everything (catalog, store, pool). We just
+    // serialize the request into a Flight ticket, drain the result
+    // stream, and print a degenerate trailer. Per-block scan stats
+    // live in the daemon's `scan_complete` log event.
+    if let Some(addr) = args.remote.as_deref() {
+        return run_remote(addr, q, args.sql.clone(), args.limit).await;
+    }
+
     let cfg = ObjStoreConfig::from_env()
         .context("loading SCRY_OBJSTORE_* env (try `source docker/garage/.env`)")?;
 
@@ -190,14 +220,14 @@ async fn main() -> Result<()> {
     }
     let (store, pool) = open_with_pool_config(&cfg, pool_cfg)?;
 
-    let catalog = Catalog::open(&args.catalog, &cfg.bucket)
-        .with_context(|| format!("opening catalog at {}", args.catalog.display()))?;
-
-    let q = MetricsQuery {
-        matchers: args.matchers.clone(),
-        ts_min: args.from,
-        ts_max: args.until,
-    };
+    // Local mode requires `--catalog` (enforced via clap's
+    // `required_unless_present = "remote"`).
+    let catalog_path = args
+        .catalog
+        .as_ref()
+        .expect("clap guarantees catalog is set in local mode");
+    let catalog = Catalog::open(catalog_path, &cfg.bucket)
+        .with_context(|| format!("opening catalog at {}", catalog_path.display()))?;
 
     // ── Register `metrics` on a fresh SessionContext ──────────────
     //
@@ -276,6 +306,60 @@ async fn main() -> Result<()> {
         );
     }
 
+    Ok(())
+}
+
+/// Send the query to a remote `scry-queryd` over Arrow Flight, drain
+/// the resulting `FlightData` stream into `RecordBatch`es, and print
+/// a degenerate trailer. The per-block scan stats and pool deltas
+/// live in the daemon's `scan_complete` log event — we don't have
+/// access to them here.
+async fn run_remote(
+    addr: &str,
+    metrics_query: MetricsQuery,
+    sql: Option<String>,
+    limit: Option<usize>,
+) -> Result<()> {
+    // `addr` is host:port; we synthesise an `http://` URL since
+    // `tonic::transport::Channel` needs a scheme. No auth/TLS for v0.3.
+    let endpoint = if addr.starts_with("http://") || addr.starts_with("https://") {
+        addr.to_string()
+    } else {
+        format!("http://{addr}")
+    };
+    let channel = Channel::from_shared(endpoint.clone())
+        .with_context(|| format!("parsing remote endpoint `{endpoint}`"))?
+        .connect()
+        .await
+        .with_context(|| format!("connecting to {endpoint}"))?;
+    let mut client = FlightServiceClient::new(channel);
+
+    let req = QueryRequest {
+        metrics_query,
+        sql,
+        limit,
+        request_id: None,
+    };
+    let ticket = Ticket {
+        ticket: req.to_ticket_bytes()?,
+    };
+
+    let stream = client
+        .do_get(ticket)
+        .await
+        .with_context(|| format!("DoGet against {endpoint}"))?
+        .into_inner()
+        .map(|r| r.map_err(|e| arrow_flight::error::FlightError::Tonic(Box::new(e))));
+
+    let mut batch_stream = FlightRecordBatchStream::new_from_flight_data(stream);
+    let mut total_rows: usize = 0;
+    while let Some(batch) = batch_stream.next().await {
+        let batch = batch.context("decoding Flight batch")?;
+        total_rows += batch.num_rows();
+    }
+
+    eprintln!();
+    eprintln!("# scan: {total_rows} rows total (via remote {endpoint})");
     Ok(())
 }
 
@@ -359,14 +443,32 @@ fn print_pool_stats(pool: &BufPool) {
     );
 }
 
+/// Walk the plan tree, merging every leaf node's `MetricsSet` into
+/// `out`. v0.3 step 4 changed `MetricsTable::scan` to emit one
+/// `DataSourceExec` per block under a `UnionExec` — N branches each
+/// carry their own pruning + bytes-scanned counters, and we want the
+/// sum across all of them. `MetricsSet::aggregate_by_name` (the
+/// caller of this fn) then collapses same-named metrics from
+/// different leaves into one summed row.
 fn walk_for_metrics(
     plan: &dyn ExecutionPlan,
     out: &mut Option<datafusion::physical_plan::metrics::MetricsSet>,
 ) {
-    if let Some(m) = plan.metrics() {
-        *out = Some(m);
-    }
-    for child in plan.children() {
-        walk_for_metrics(child.as_ref(), out);
+    let children = plan.children();
+    if children.is_empty() {
+        if let Some(m) = plan.metrics() {
+            match out.as_mut() {
+                None => *out = Some(m),
+                Some(acc) => {
+                    for v in m.iter() {
+                        acc.push(v.clone());
+                    }
+                }
+            }
+        }
+    } else {
+        for child in children {
+            walk_for_metrics(child.as_ref(), out);
+        }
     }
 }

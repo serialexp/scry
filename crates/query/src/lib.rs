@@ -30,7 +30,9 @@
 //! results stream as `RecordBatch`es and pruning stats come from
 //! DataFusion's `MetricsSet` on the produced `ExecutionPlan`.
 
-mod postings;
+pub mod flight_proto;
+pub mod postings;
+pub mod postings_cache;
 mod table;
 
 use std::sync::Arc;
@@ -39,10 +41,16 @@ use anyhow::{Context, Result};
 use datafusion::execution::context::SessionContext;
 use datafusion::prelude::DataFrame;
 use object_store::ObjectStore;
-use scry_catalog::Catalog;
+use scry_catalog::{Catalog, CatalogEntry};
+use serde::{Deserialize, Serialize};
 
+pub use flight_proto::QueryRequest;
 pub use postings::resolve_fingerprints;
-pub use table::{time_overlaps, MetricsTable};
+pub use postings_cache::{
+    PostingsCache, PostingsCacheConfig, PostingsCacheStats, PostingsIndex,
+    DEFAULT_BUDGET_BYTES as DEFAULT_POSTINGS_CACHE_BYTES,
+};
+pub use table::{time_overlaps, BlockEntry, MetricsTable};
 
 /// AND of equality matchers over a metrics block. An empty matcher
 /// set returns every series in every overlapping block — useful as a
@@ -51,7 +59,7 @@ pub use table::{time_overlaps, MetricsTable};
 /// (sidecar JSON) rather than from a postings scan, since the
 /// postings file is keyed by `(label_name, label_value)` and has no
 /// natural "all series" row.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MetricsQuery {
     pub matchers: Vec<(String, String)>,
     pub ts_min: Option<u64>,
@@ -77,15 +85,41 @@ pub async fn build_metrics_table(
     store: Arc<dyn ObjectStore>,
     q: &MetricsQuery,
 ) -> Result<MetricsTable> {
-    // ── Step 1: catalog plan ──────────────────────────────────────
-    let candidates: Vec<_> = catalog
+    // Two-phase split: list_metrics_candidates is pure sync work over
+    // the catalog handle; the rest is the async postings-resolve dance.
+    // Splitting them lets callers that wrap the catalog in a mutex
+    // (the Flight daemon) lock once for the sync part, drop the lock,
+    // and run the async path under no lock at all.
+    let candidates = list_metrics_candidates(catalog, q)?;
+    build_metrics_table_from_candidates(candidates, store, None, q).await
+}
+
+/// Synchronous step: list catalog blocks, filter by signal=`"metrics"`
+/// and the query's time bounds. Pure compute over the connection +
+/// returns owned data, so callers wrapping the catalog in a mutex
+/// can drop the guard before doing any async work.
+pub fn list_metrics_candidates(
+    catalog: &Catalog,
+    q: &MetricsQuery,
+) -> Result<Vec<CatalogEntry>> {
+    Ok(catalog
         .list_blocks()
         .context("listing blocks from catalog")?
         .into_iter()
         .filter(|e| e.meta.signal == "metrics")
         .filter(|e| table::time_overlaps(&e.meta, q.ts_min, q.ts_max))
-        .collect();
+        .collect())
+}
 
+/// Async step: take the already-narrowed catalog list (per
+/// [`list_metrics_candidates`]), run postings resolve per block, and
+/// produce a ready-to-register [`MetricsTable`].
+pub async fn build_metrics_table_from_candidates(
+    candidates: Vec<CatalogEntry>,
+    store: Arc<dyn ObjectStore>,
+    cache: Option<&PostingsCache>,
+    q: &MetricsQuery,
+) -> Result<MetricsTable> {
     // All candidates must share a bucket — otherwise the single
     // `object_store_url` we pick is wrong. The catalog can in
     // principle hold rows for multiple buckets (compaction across
@@ -105,13 +139,7 @@ pub async fn build_metrics_table(
         None => {
             // No overlapping blocks at all. Return an empty table so
             // SQL like `SELECT count(*) FROM metrics` still works.
-            return Ok(MetricsTable::new(
-                "",
-                Vec::new(),
-                None,
-                q.ts_min,
-                q.ts_max,
-            )?);
+            return Ok(MetricsTable::new("", Vec::new(), q.ts_min, q.ts_max)?);
         }
     };
 
@@ -122,12 +150,24 @@ pub async fn build_metrics_table(
     // postings GETs. If postings start dominating a query, the v0.2
     // querier's `buffer_unordered` is the template — but the right
     // answer is probably to cache the sidecar contents (blocks are
-    // immutable).
-    let mut blocks = Vec::with_capacity(candidates.len());
-    let mut union_fps: Option<std::collections::HashSet<u64>> = None;
+    // immutable; v0.3 step 3 does exactly that via `PostingsCache`).
+    //
+    // v0.3 step 4: we keep each block's fingerprint set *separately*
+    // rather than unioning them. `MetricsTable::scan` emits one
+    // `DataSourceExec` per block with that block's own fp predicate,
+    // which lets row-group pruning fire against the tightest possible
+    // set per file.
+    let mut blocks: Vec<BlockEntry> = Vec::with_capacity(candidates.len());
     let matchers_empty = q.matchers.is_empty();
     for entry in candidates {
-        match postings::resolve_fingerprints(store.clone(), &entry.meta, &q.matchers).await? {
+        // Use the cache when one is provided. The cache resolves
+        // empty matchers via the un-cached fallback path so callers
+        // don't have to branch on `matchers.is_empty()` themselves.
+        let resolved = match cache {
+            Some(c) => c.resolve(store.clone(), &entry.meta, &q.matchers).await?,
+            None => postings::resolve_fingerprints(store.clone(), &entry.meta, &q.matchers).await?,
+        };
+        match resolved {
             None => {
                 // Postings intersect was empty → block fully pruned;
                 // don't even add it to `blocks`. Preserves the v0.2
@@ -135,32 +175,28 @@ pub async fn build_metrics_table(
                 // — DataFusion never opens the parquet.
             }
             Some(set) => {
-                blocks.push(entry);
-                if !matchers_empty {
-                    union_fps.get_or_insert_with(Default::default).extend(set);
-                }
-                // Empty matcher set deliberately skips accumulating a
-                // fingerprint filter — the v0.2 contract is "return
-                // every sample in every overlapping block".
+                let fp_set = if matchers_empty {
+                    // Empty matcher set deliberately skips attaching a
+                    // fingerprint filter — the v0.2 contract is "return
+                    // every sample in every overlapping block".
+                    None
+                } else {
+                    // Sort once for stable test output and slightly
+                    // tighter physical-eval (DataFusion's `InListExpr`
+                    // handles either shape, but sorted means
+                    // predictable + better row-group min/max
+                    // alignment).
+                    let mut v: Vec<u64> = set.into_iter().collect();
+                    v.sort_unstable();
+                    Some(Arc::new(v))
+                };
+                blocks.push(BlockEntry { entry, fp_set });
             }
         }
     }
 
-    MetricsTable::new(
-        &bucket,
-        blocks,
-        union_fps.map(|set| {
-            // Sort once for stable test output and slightly tighter
-            // physical-eval (DataFusion's InListExpr handles either
-            // shape, but sorted means predictable).
-            let mut v: Vec<u64> = set.into_iter().collect();
-            v.sort_unstable();
-            Arc::new(v)
-        }),
-        q.ts_min,
-        q.ts_max,
-    )
-    .map_err(|e| anyhow::anyhow!("constructing MetricsTable: {e}"))
+    MetricsTable::new(&bucket, blocks, q.ts_min, q.ts_max)
+        .map_err(|e| anyhow::anyhow!("constructing MetricsTable: {e}"))
 }
 
 /// Build the table (postings resolve + catalog narrow) and register
@@ -172,7 +208,23 @@ pub async fn register_metrics_table(
     store: Arc<dyn ObjectStore>,
     q: &MetricsQuery,
 ) -> Result<()> {
-    let table = build_metrics_table(catalog, store.clone(), q).await?;
+    let candidates = list_metrics_candidates(catalog, q)?;
+    register_metrics_table_from_candidates(ctx, candidates, store, None, q).await
+}
+
+/// Same as [`register_metrics_table`] but accepts pre-listed catalog
+/// entries — for callers that need to take the catalog lock for the
+/// sync `list_metrics_candidates` call themselves (e.g. the Flight
+/// daemon, where the `Catalog` lives behind a `Mutex` so the service
+/// can be `Sync`).
+pub async fn register_metrics_table_from_candidates(
+    ctx: &SessionContext,
+    candidates: Vec<CatalogEntry>,
+    store: Arc<dyn ObjectStore>,
+    cache: Option<&PostingsCache>,
+    q: &MetricsQuery,
+) -> Result<()> {
+    let table = build_metrics_table_from_candidates(candidates, store.clone(), cache, q).await?;
 
     // Register the object store under the URL the table will query.
     // `register_object_store` routes on (scheme, host).

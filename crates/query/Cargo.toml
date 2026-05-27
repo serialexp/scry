@@ -16,19 +16,23 @@ path = "src/bin/scry-query.rs"
 [dependencies]
 anyhow             = { workspace = true }
 arrow              = { workspace = true }
+arrow-flight       = { workspace = true }
 async-trait        = { workspace = true }
 bytes              = { workspace = true }
 clap               = { workspace = true }
 datafusion         = { workspace = true }
 futures            = { workspace = true }
+hashlink           = "0.9"
 mimalloc           = { workspace = true }
 object_store       = { workspace = true }
 parquet            = { workspace = true, features = ["arrow", "async", "object_store"] }
 scry-block         = { workspace = true }
 scry-catalog       = { workspace = true }
 scry-objstore      = { workspace = true }
+serde              = { workspace = true, features = ["derive"] }
 serde_json         = { workspace = true }
 tokio              = { workspace = true }
+tonic              = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 url                = { workspace = true }

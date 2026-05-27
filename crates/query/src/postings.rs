@@ -24,6 +24,8 @@ use object_store::{path::Path as ObjPath, ObjectStore, ObjectStoreExt};
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 use scry_block::{block_path, BlockMeta};
 
+use crate::postings_cache::PostingsIndex;
+
 /// Resolve the AND'd matcher set to the fingerprint set that overlaps
 /// every matcher in this block.
 ///
@@ -78,6 +80,23 @@ pub async fn resolve_fingerprints(
         return Ok(if set.is_empty() { None } else { Some(set) });
     }
 
+    let index = fetch_and_parse_postings(store, meta).await?;
+    Ok(intersect_matchers(&index, matchers))
+}
+
+/// Fetch `<block>.postings.parquet` from object storage and decode it
+/// into a fully-indexed in-memory [`PostingsIndex`]. The expensive
+/// step (GET + parquet decode + `StringArray`/`ListArray` downcasts +
+/// `Vec<u64>` materialisation) — split out so the `PostingsCache` can
+/// invoke it on a miss and stash the result.
+///
+/// Re-running this against the same block returns identical data
+/// (blocks are immutable), which is why caching the result is sound
+/// without invalidation.
+pub async fn fetch_and_parse_postings(
+    store: Arc<dyn ObjectStore>,
+    meta: &BlockMeta,
+) -> Result<PostingsIndex> {
     let path = ObjPath::from(block_path(
         "metrics",
         meta.ts_min_unix_nano,
@@ -99,19 +118,15 @@ pub async fn resolve_fingerprints(
         .head(&path)
         .await
         .with_context(|| format!("HEAD postings parquet {path}"))?;
-    let reader =
-        ParquetObjectReader::new(store, path.clone()).with_file_size(object_meta.size);
+    let reader = ParquetObjectReader::new(store, path.clone()).with_file_size(object_meta.size);
     let mut stream = ParquetRecordBatchStreamBuilder::new(reader)
         .await
         .with_context(|| format!("opening postings parquet {path}"))?
         .build()
         .with_context(|| format!("building postings reader {path}"))?;
 
-    // One Vec<u64> per matcher, in the same order as `matchers`. We
-    // collect into Vecs first (cheap appends) and convert to HashSet
-    // only at intersection time — saves a hash insert per fingerprint
-    // for matchers whose row never appears.
-    let mut per_matcher: Vec<Vec<u64>> = vec![Vec::new(); matchers.len()];
+    let mut entries: std::collections::HashMap<String, std::collections::HashMap<String, Arc<Vec<u64>>>> =
+        std::collections::HashMap::new();
 
     while let Some(batch) = stream.try_next().await.context("postings batch")? {
         let names = batch
@@ -133,47 +148,53 @@ pub async fn resolve_fingerprints(
         for row in 0..batch.num_rows() {
             let name = names.value(row);
             let value = values.value(row);
-            // Linear scan of matchers per row. With N matchers ≤ ~10
-            // and postings rows in the thousands, this is far below
-            // the cost of the parquet decode itself. A HashMap-keyed
-            // lookup over `(name, value)` would shave it but adds
-            // allocator churn we don't need.
-            for (i, (mname, mvalue)) in matchers.iter().enumerate() {
-                if name == mname && value == mvalue {
-                    let fps_arr = lists.value(row);
-                    let fps = fps_arr
-                        .as_any()
-                        .downcast_ref::<UInt64Array>()
-                        .context("postings list inner not UInt64Array")?;
-                    per_matcher[i].reserve(fps.len());
-                    for j in 0..fps.len() {
-                        per_matcher[i].push(fps.value(j));
-                    }
-                }
-            }
+            let fps_arr = lists.value(row);
+            let fps = fps_arr
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .context("postings list inner not UInt64Array")?;
+            let vec: Vec<u64> = fps.values().iter().copied().collect();
+            entries
+                .entry(name.to_string())
+                .or_default()
+                .insert(value.to_string(), Arc::new(vec));
         }
     }
 
-    // Intersect. At v0.2 scale (≤ thousands of fingerprints per
-    // matcher) HashSet is simpler than the sorted-merge approach;
-    // the asymptotic difference doesn't matter.
-    if per_matcher.iter().any(|v| v.is_empty()) {
-        // At least one matcher matched zero postings rows → AND is
-        // empty → block fully pruned.
-        return Ok(None);
+    Ok(PostingsIndex::new(entries))
+}
+
+/// Intersect AND'd matchers against an already-loaded
+/// [`PostingsIndex`]. Returns `None` if any matcher's posting list is
+/// missing or empty — that's the "block fully pruned" signal.
+///
+/// Same algorithm as the original inline loop: seed with the
+/// smallest list, retain in-place against each other matcher's set,
+/// short-circuit on an empty accumulator.
+pub fn intersect_matchers(
+    index: &PostingsIndex,
+    matchers: &[(String, String)],
+) -> Option<HashSet<u64>> {
+    let mut per_matcher: Vec<&Arc<Vec<u64>>> = Vec::with_capacity(matchers.len());
+    for (name, value) in matchers {
+        match index.lookup(name, value) {
+            Some(fps) if !fps.is_empty() => per_matcher.push(fps),
+            _ => return None,
+        }
+    }
+    if per_matcher.is_empty() {
+        // Caller passes non-empty matchers; reaching here means every
+        // matcher matched but contributed an empty Vec — equivalent
+        // to "no candidate fingerprints".
+        return None;
     }
 
-    // Seed with the smallest matcher's set; intersect each remaining
-    // matcher in place. Avoids materialising every matcher's full
-    // set when one of them is selective (the common case for queries
-    // like `__name__=foo AND env=prod` where `__name__` is the
-    // narrowest predicate).
     let smallest_idx = per_matcher
         .iter()
         .enumerate()
         .min_by_key(|(_, v)| v.len())
         .map(|(i, _)| i)
-        .expect("matchers non-empty");
+        .expect("non-empty");
     let mut acc: HashSet<u64> = per_matcher[smallest_idx].iter().copied().collect();
     for (i, fps) in per_matcher.iter().enumerate() {
         if i == smallest_idx {
@@ -182,8 +203,8 @@ pub async fn resolve_fingerprints(
         let other: HashSet<u64> = fps.iter().copied().collect();
         acc.retain(|fp| other.contains(fp));
         if acc.is_empty() {
-            return Ok(None);
+            return None;
         }
     }
-    Ok(Some(acc))
+    Some(acc)
 }

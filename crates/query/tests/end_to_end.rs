@@ -256,7 +256,7 @@ async fn querier_end_to_end() {
         1,
         "block B should be postings-pruned and dropped before scan"
     );
-    assert_eq!(table.blocks()[0].meta.uuid, meta_a.uuid);
+    assert_eq!(table.blocks()[0].entry.meta.uuid, meta_a.uuid);
 
     let (batches, _plan) = run_query(&catalog, store.clone(), &q3).await;
     assert_eq!(total_rows(&batches), 100);
@@ -292,7 +292,7 @@ async fn querier_end_to_end() {
         1,
         "block A should be catalog-pruned by ts overlap"
     );
-    assert_eq!(table.blocks()[0].meta.uuid, meta_b.uuid);
+    assert_eq!(table.blocks()[0].entry.meta.uuid, meta_b.uuid);
 
     let (batches, _plan) = run_query(&catalog, store.clone(), &q6).await;
     // B1: ts 2_000_000..2_000_099 → 2_000_050..=2_000_099 = 50 rows

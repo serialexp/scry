@@ -12,6 +12,7 @@ members = [
     "crates/noise-sink",
     "crates/scry-list",
     "crates/query",
+    "crates/scry-queryd",
 ]
 
 [workspace.package]
@@ -32,8 +33,11 @@ scry-query        = { path = "crates/query" }
 
 anyhow    = "1"
 arrow     = "58"
+arrow-flight = "58"
 async-trait = "0.1"
 datafusion = "53"
+tonic     = "0.14"
+tokio-stream = "0.1"
 bytes     = "1"
 chrono    = { version = "0.4", default-features = false, features = ["clock"] }
 clap      = { version = "4", features = ["derive"] }

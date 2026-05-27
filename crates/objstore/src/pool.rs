@@ -98,6 +98,39 @@ pub struct BufPoolConfig {
     pub autoscale_headroom: usize,
 }
 
+/// Point-in-time snapshot of [`BufPool`] counters. All `Copy`, all
+/// `pub` for cheap subtraction in delta reporting.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PoolStats {
+    pub allocs: usize,
+    pub reuses: usize,
+    pub misses: usize,
+    pub in_flight: usize,
+    pub peak_in_flight: usize,
+    pub grows: usize,
+    pub free_count: usize,
+    pub capacity: usize,
+}
+
+impl PoolStats {
+    /// Field-wise `self - other` for the cumulative counters. Fields
+    /// that aren't cumulative (in_flight, free_count, capacity,
+    /// peak_in_flight) carry through `self`'s value unchanged — the
+    /// "delta" of an instantaneous gauge is meaningless.
+    pub fn delta(self, other: Self) -> Self {
+        Self {
+            allocs: self.allocs.saturating_sub(other.allocs),
+            reuses: self.reuses.saturating_sub(other.reuses),
+            misses: self.misses.saturating_sub(other.misses),
+            grows: self.grows.saturating_sub(other.grows),
+            in_flight: self.in_flight,
+            peak_in_flight: self.peak_in_flight,
+            free_count: self.free_count,
+            capacity: self.capacity,
+        }
+    }
+}
+
 impl Default for BufPoolConfig {
     fn default() -> Self {
         Self {
@@ -260,6 +293,25 @@ impl BufPool {
     /// Number of times autoscale fired (capacity grew).
     pub fn grows(&self) -> usize {
         self.inner.grows.load(Ordering::Relaxed)
+    }
+
+    /// Take a snapshot of all six counters in one go. Useful for
+    /// per-query delta reporting — capture at request start, subtract
+    /// at request end, log the delta. Note that this is race-y under
+    /// concurrent queries (two overlapping queries each see the other's
+    /// allocs in their deltas); fine for v0.3 single-query development,
+    /// per-query-tagged counters are a later v0.3.x item.
+    pub fn stats(&self) -> PoolStats {
+        PoolStats {
+            allocs: self.allocs(),
+            reuses: self.reuses(),
+            misses: self.misses(),
+            in_flight: self.in_flight(),
+            peak_in_flight: self.peak_in_flight(),
+            grows: self.grows(),
+            free_count: self.free_count(),
+            capacity: self.capacity(),
+        }
     }
 
     /// Check out a buffer with `capacity() >= min_cap`. Reuses a

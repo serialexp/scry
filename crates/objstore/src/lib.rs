@@ -31,8 +31,8 @@ mod pool;
 mod store;
 
 pub use pool::{
-    BufPool, BufPoolConfig, PooledBuf, DEFAULT_POOL_AUTOSCALE_HEADROOM, DEFAULT_POOL_CAPACITY,
-    DEFAULT_POOL_MAX_CAPACITY, DEFAULT_POOL_WARMUP_SIZE,
+    BufPool, BufPoolConfig, PoolStats, PooledBuf, DEFAULT_POOL_AUTOSCALE_HEADROOM,
+    DEFAULT_POOL_CAPACITY, DEFAULT_POOL_MAX_CAPACITY, DEFAULT_POOL_WARMUP_SIZE,
 };
 pub use store::PooledStore;
 

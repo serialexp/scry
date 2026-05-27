@@ -9,33 +9,34 @@
 //! filter pushdown.
 //!
 //! Where this differs from a plain `ListingTable` of parquet files
-//! is the postings layer: callers pass an optional **pre-resolved
-//! fingerprint set** at construction time, derived from the postings
-//! sidecars of the candidate blocks. That set becomes a
-//! `series_fingerprint IN (...)` predicate handed to `ParquetSource`,
-//! which combines with row-group min/max stats (sharp because blocks
-//! are sorted by `(fp, ts)`) to skip most row groups before any byte
-//! is read.
+//! is the postings layer: each [`BlockEntry`] carries the
+//! pre-resolved fingerprint set derived from *its own* postings
+//! sidecar. That set becomes a `series_fingerprint IN (...)`
+//! predicate handed to a per-block `ParquetSource`, which combines
+//! with row-group min/max stats (sharp because blocks are sorted by
+//! `(fp, ts)`) to skip most row groups before any byte is read.
 //!
 //! The postings resolution itself happens in `register_metrics_table`
 //! (see `lib.rs`) before this struct is built — `scan()` is planning
 //! and must not do I/O.
 //!
-//! ## v0.3 limitation: union-of-blocks fingerprint predicate
+//! ## Per-block fingerprint pushdown (v0.3 step 4)
 //!
-//! Because the predicate handed to `ParquetSource` is one
-//! `PhysicalExpr` shared across every `PartitionedFile`, we pass the
-//! **union** of per-block fingerprint sets, not per-block. A block
-//! whose postings resolved to `{A, B}` may end up reading a row group
-//! whose `[min, max]` fingerprint range overlaps some `C` that belongs
-//! to another block's postings. Correctness is preserved (the row
-//! filter drops the false positives), but a small amount of extra
-//! decode happens. Blocks whose postings resolved to the empty set
-//! are still dropped entirely — they never make it into `blocks`.
+//! `scan()` emits one [`datafusion::datasource::memory::DataSourceExec`]
+//! *per block*, each with its own narrow fingerprint predicate, and
+//! wraps them in a [`datafusion::physical_plan::union::UnionExec`].
+//! `UnionExec::try_new` collapses single-input plans automatically, so
+//! the 1-block case has no UnionExec overhead. The win versus the
+//! older union-of-fingerprint-sets shape: row groups in block A whose
+//! `[min_fp, max_fp]` overlapped a fingerprint that only existed in
+//! block B's postings used to survive row-group pruning; now each
+//! block's row-group pruning sees only its own fingerprint set.
+//! Correctness was already preserved by the row filter in both
+//! designs; this just sharpens pruning before any rows are decoded.
 //!
-//! Fix path (v0.3.1): per-partition `PhysicalExpr`, or a custom
-//! optimizer rule that splits the scan along fingerprint-set
-//! boundaries. Measure with `scripts/profile-query.sh` first.
+//! Blocks whose postings resolved to the empty set are still dropped
+//! upstream — they never make it into `blocks` and so contribute no
+//! `DataSourceExec`.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -51,6 +52,7 @@ use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::logical_expr::utils::conjunction;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::physical_expr::expressions::lit as physical_lit;
+use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::ExecutionPlan;
 use scry_block::{block_path, BlockMeta};
 use scry_catalog::CatalogEntry;
@@ -77,21 +79,36 @@ pub(crate) fn object_store_url_for(bucket: &str) -> DfResult<ObjectStoreUrl> {
     ObjectStoreUrl::parse(format!("s3://{bucket}"))
 }
 
+/// One catalog row plus its postings-resolved fingerprint set. The
+/// builder in `lib.rs` produces one of these per surviving block;
+/// `scan()` turns each into its own `DataSourceExec`.
+#[derive(Debug, Clone)]
+pub struct BlockEntry {
+    /// Catalog row for this block. `entry.meta` carries the path
+    /// pieces (`signal`, `ts_min_unix_nano`, `writer_id`, `uuid`) and
+    /// `entry.meta.byte_size` for bounded range requests.
+    pub entry: CatalogEntry,
+    /// Pre-resolved fingerprint set for *this block*. Sorted for
+    /// stable test output. `None` means "no label matchers were
+    /// given — scan every fingerprint in this block". `Some(empty)`
+    /// is avoided upstream (the builder drops blocks whose postings
+    /// intersect to nothing before they ever reach here).
+    pub fp_set: Option<Arc<Vec<u64>>>,
+}
+
 /// `TableProvider` for the metrics signal. One instance per call to
-/// `register_metrics_table` — it carries a snapshot of the catalog +
-/// resolved fingerprint set, so `scan()` stays pure CPU.
+/// `register_metrics_table` — it carries a snapshot of the catalog
+/// rows plus their per-block resolved fingerprint sets, so `scan()`
+/// stays pure CPU.
 pub struct MetricsTable {
     schema: SchemaRef,
     object_store_url: ObjectStoreUrl,
     /// Pre-narrowed by signal + time-overlap + postings (any block
     /// whose postings resolved to the empty set is already excluded
-    /// here). Each becomes one `PartitionedFile` in the scan plan.
-    blocks: Vec<CatalogEntry>,
-    /// Union-of-blocks fingerprint set, sorted for stable test
-    /// output. `None` = "no label matchers were given, return every
-    /// fingerprint in every overlapping block". `Some(empty)` is
-    /// avoided upstream (caller turns it into "no scan at all").
-    fp_filter: Option<Arc<Vec<u64>>>,
+    /// here). Each becomes one `DataSourceExec` in the scan plan,
+    /// unioned by `UnionExec::try_new` (which collapses the 1-input
+    /// case automatically).
+    blocks: Vec<BlockEntry>,
     ts_min: Option<u64>,
     ts_max: Option<u64>,
 }
@@ -100,7 +117,14 @@ impl std::fmt::Debug for MetricsTable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MetricsTable")
             .field("blocks", &self.blocks.len())
-            .field("fp_filter", &self.fp_filter.as_ref().map(|s| s.len()))
+            .field(
+                "fp_sets",
+                &self
+                    .blocks
+                    .iter()
+                    .map(|b| b.fp_set.as_ref().map(|s| s.len()))
+                    .collect::<Vec<_>>(),
+            )
             .field("ts_min", &self.ts_min)
             .field("ts_max", &self.ts_max)
             .finish()
@@ -108,13 +132,14 @@ impl std::fmt::Debug for MetricsTable {
 }
 
 impl MetricsTable {
-    /// Build a new table from a pre-narrowed block list + optional
-    /// fingerprint pre-filter. The caller is responsible for catalog
-    /// listing, time-overlap pruning, and postings resolution.
+    /// Build a new table from a pre-narrowed list of `(CatalogEntry,
+    /// per-block fingerprint set)` pairs. The caller (
+    /// [`crate::build_metrics_table_from_candidates`]) is responsible
+    /// for catalog listing, time-overlap pruning, and per-block
+    /// postings resolution.
     pub fn new(
         bucket: &str,
-        blocks: Vec<CatalogEntry>,
-        fp_filter: Option<Arc<Vec<u64>>>,
+        blocks: Vec<BlockEntry>,
         ts_min: Option<u64>,
         ts_max: Option<u64>,
     ) -> DfResult<Self> {
@@ -122,7 +147,6 @@ impl MetricsTable {
             schema: metrics_schema(),
             object_store_url: object_store_url_for(bucket)?,
             blocks,
-            fp_filter,
             ts_min,
             ts_max,
         })
@@ -135,9 +159,10 @@ impl MetricsTable {
         &self.object_store_url
     }
 
-    /// Snapshot of the catalog rows this table will scan. Useful for
-    /// per-block reporting (CLI trailer, tests).
-    pub fn blocks(&self) -> &[CatalogEntry] {
+    /// Snapshot of the per-block entries this table will scan. Useful
+    /// for per-block reporting (CLI trailer, tests). Each element
+    /// carries its `entry: CatalogEntry` plus the per-block `fp_set`.
+    pub fn blocks(&self) -> &[BlockEntry] {
         &self.blocks
     }
 }
@@ -163,81 +188,126 @@ impl TableProvider for MetricsTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        // ── Build the conjunctive predicate ───────────────────────
+        // ── Per-block plan emission ───────────────────────────────
         //
-        // Two predicate sources:
+        // We emit one `DataSourceExec` per block, each with a
+        // predicate AND-ing:
         //   1. `filters` from DataFusion — anything the planner could
         //      lift out of the surrounding query (`WHERE ts > X`,
-        //      `WHERE fp = Y`, etc.). Pushed through as-is.
-        //   2. Our own pre-resolved fingerprint + time predicates.
-        //      These are the *real* selectivity at v0.3 — the
-        //      `fp IN (..)` set built from postings, plus the
-        //      `BETWEEN` on ts that mirrors the catalog-time prune.
+        //      `WHERE fp = Y`, etc.). Pushed through as-is to every
+        //      branch.
+        //   2. *This block's* pre-resolved fingerprint set as
+        //      `fp IN (...)`. v0.3 step 4: each branch sees only its
+        //      own fingerprints, so row-group min/max stats prune
+        //      against the tightest set possible (rather than the
+        //      union across all blocks, which let cross-block false
+        //      positives survive pruning).
+        //   3. The table-wide `ts_min`/`ts_max` bounds.
         //
-        // `ParquetSource` takes one `PhysicalExpr`; we conjunct
-        // everything together with `conjunction(...).create_physical_expr(...)`.
+        // The branches are wrapped in `UnionExec::try_new`, which
+        // collapses the single-branch case automatically — the 1-block
+        // query pays no UnionExec overhead.
+        //
+        // Empty-`blocks` case: keep a single empty `DataSourceExec`
+        // with the schema preserved. `UnionExec::try_new` rejects an
+        // empty input list, and "no blocks overlap" is a legitimate
+        // result that needs to keep the schema for downstream
+        // operators (e.g. `SELECT count(*) FROM metrics` returns 0).
         let df_schema = DFSchema::try_from(self.schema())?;
-        let mut all_filters: Vec<Expr> = filters.to_vec();
 
-        if let Some(fp_set) = self.fp_filter.as_ref() {
-            // Materialise the IN-list. DataFusion's `InListExpr`
-            // physical-eval switches to a hash-based check above a
-            // size threshold, so a thousand-element list is fine.
-            let lits: Vec<Expr> = fp_set
-                .iter()
-                .map(|fp| Expr::Literal(ScalarValue::UInt64(Some(*fp)), None))
-                .collect();
-            all_filters.push(datafusion::logical_expr::col("series_fingerprint").in_list(lits, false));
-        }
-        if let Some(min) = self.ts_min {
-            all_filters.push(
-                datafusion::logical_expr::col("ts_unix_nano")
-                    .gt_eq(Expr::Literal(ScalarValue::UInt64(Some(min)), None)),
+        let make_branch = |fp_set: Option<&Arc<Vec<u64>>>,
+                           file_path: String,
+                           file_size: u64|
+         -> DfResult<Arc<dyn ExecutionPlan>> {
+            let mut block_filters: Vec<Expr> = filters.to_vec();
+            if let Some(fp_set) = fp_set {
+                // Materialise the IN-list. DataFusion's `InListExpr`
+                // physical-eval switches to a hash-based check above a
+                // size threshold, so a thousand-element list is fine.
+                let lits: Vec<Expr> = fp_set
+                    .iter()
+                    .map(|fp| Expr::Literal(ScalarValue::UInt64(Some(*fp)), None))
+                    .collect();
+                block_filters.push(
+                    datafusion::logical_expr::col("series_fingerprint").in_list(lits, false),
+                );
+            }
+            if let Some(min) = self.ts_min {
+                block_filters.push(
+                    datafusion::logical_expr::col("ts_unix_nano")
+                        .gt_eq(Expr::Literal(ScalarValue::UInt64(Some(min)), None)),
+                );
+            }
+            if let Some(max) = self.ts_max {
+                block_filters.push(
+                    datafusion::logical_expr::col("ts_unix_nano")
+                        .lt_eq(Expr::Literal(ScalarValue::UInt64(Some(max)), None)),
+                );
+            }
+
+            let predicate = conjunction(block_filters)
+                .map(|p| state.create_physical_expr(p, &df_schema))
+                .transpose()?
+                .unwrap_or_else(|| physical_lit(true));
+
+            // `with_pushdown_filters(true)` makes ParquetSource
+            // evaluate the predicate against decoded rows (row
+            // filter), not just use it for row-group stats. Without
+            // this our ts bounds + fp IN-list would prune row groups
+            // but still hand back every row in the surviving groups.
+            let source = Arc::new(
+                ParquetSource::new(self.schema())
+                    .with_predicate(predicate)
+                    .with_pushdown_filters(true),
             );
-        }
-        if let Some(max) = self.ts_max {
-            all_filters.push(
-                datafusion::logical_expr::col("ts_unix_nano")
-                    .lt_eq(Expr::Literal(ScalarValue::UInt64(Some(max)), None)),
+            // One file per branch. We use the catalog's `byte_size`
+            // for `file_size` so ParquetObjectReader can use bounded
+            // range requests rather than suffix-range probes. Limit
+            // is propagated to every branch — DataFusion's planner
+            // adds a `GlobalLimitExec` above the union that terminates
+            // the stream early once enough rows arrive.
+            let builder = FileScanConfigBuilder::new(self.object_store_url.clone(), source)
+                .with_projection_indices(projection.cloned())?
+                .with_limit(limit)
+                .with_file(PartitionedFile::new(file_path, file_size));
+
+            Ok(DataSourceExec::from_data_source(builder.build()))
+        };
+
+        if self.blocks.is_empty() {
+            // No overlapping blocks. Emit a single empty
+            // `DataSourceExec` (no files) with the schema preserved
+            // so downstream operators have a typed input —
+            // `SELECT count(*) FROM metrics` with no blocks returns
+            // 0 cleanly. We bypass `make_branch` here since there's
+            // no fingerprint set to apply and no file to attach.
+            let source = Arc::new(
+                ParquetSource::new(self.schema()).with_pushdown_filters(true),
             );
+            let builder = FileScanConfigBuilder::new(self.object_store_url.clone(), source)
+                .with_projection_indices(projection.cloned())?
+                .with_limit(limit);
+            return Ok(DataSourceExec::from_data_source(builder.build()));
         }
 
-        let predicate = conjunction(all_filters)
-            .map(|p| state.create_physical_expr(p, &df_schema))
-            .transpose()?
-            .unwrap_or_else(|| physical_lit(true));
-
-        // ── Build the file scan ───────────────────────────────────
-        //
-        // One `PartitionedFile` per block. We use the catalog's
-        // `byte_size` for `file_size` so ParquetObjectReader can use
-        // bounded range requests rather than suffix-range probes.
-        // `with_pushdown_filters(true)` makes ParquetSource actually
-        // evaluate the predicate against decoded rows (row filter),
-        // not just use it for row-group stats. Without this our
-        // ts_min/ts_max + fp IN-list would prune row groups but still
-        // hand back every row in the surviving groups.
-        let source = Arc::new(
-            ParquetSource::new(self.schema())
-                .with_predicate(predicate)
-                .with_pushdown_filters(true),
-        );
-        let mut builder = FileScanConfigBuilder::new(self.object_store_url.clone(), source)
-            .with_projection_indices(projection.cloned())?
-            .with_limit(limit);
-
-        for entry in &self.blocks {
+        let mut branches: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(self.blocks.len());
+        for block in &self.blocks {
+            let meta = &block.entry.meta;
             let path = block_path(
-                &entry.meta.signal,
-                entry.meta.ts_min_unix_nano,
-                entry.meta.writer_id,
-                entry.meta.uuid,
+                &meta.signal,
+                meta.ts_min_unix_nano,
+                meta.writer_id,
+                meta.uuid,
                 "parquet",
             );
-            builder = builder.with_file(PartitionedFile::new(path, entry.meta.byte_size));
+            branches.push(make_branch(block.fp_set.as_ref(), path, meta.byte_size)?);
         }
 
-        Ok(DataSourceExec::from_data_source(builder.build()))
+        // `try_new` returns the single branch directly when there's
+        // only one, so we don't gain a UnionExec layer for 1-block
+        // queries. For ≥2 branches the planner can later parallelise
+        // them across partitions if it chooses.
+        UnionExec::try_new(branches)
     }
 
     fn supports_filters_pushdown(
