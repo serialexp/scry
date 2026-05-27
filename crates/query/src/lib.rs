@@ -30,9 +30,9 @@
 //! results stream as `RecordBatch`es and pruning stats come from
 //! DataFusion's `MetricsSet` on the produced `ExecutionPlan`.
 
-pub mod flight_proto;
 pub mod postings;
 pub mod postings_cache;
+pub mod wire;
 mod table;
 
 use std::sync::Arc;
@@ -44,8 +44,8 @@ use object_store::ObjectStore;
 use scry_catalog::{Catalog, CatalogEntry};
 use serde::{Deserialize, Serialize};
 
-pub use flight_proto::QueryRequest;
 pub use postings::resolve_fingerprints;
+pub use wire::QueryRequest;
 pub use postings_cache::{
     PostingsCache, PostingsCacheConfig, PostingsCacheStats, PostingsIndex,
     DEFAULT_BUDGET_BYTES as DEFAULT_POSTINGS_CACHE_BYTES,

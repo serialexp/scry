@@ -194,7 +194,7 @@ async fn handle(
     info!(%peer, session_id, writer_uuid = %config.writer_uuid, "accept");
 
     // ── Handshake ──────────────────────────────────────────────────────
-    let first = match read_frame(&mut rd).await {
+    let first = match read_frame::<scry_proto::Frame, _>(&mut rd).await {
         Ok(f) => f,
         Err(e) => {
             warn!(%peer, error = %e, "no frame before handshake");
@@ -258,7 +258,7 @@ async fn handle(
     let signals_announced = hello.signals;
 
     loop {
-        let frame = match read_frame(&mut rd).await {
+        let frame = match read_frame::<scry_proto::Frame, _>(&mut rd).await {
             Ok(f) => f,
             Err(FrameError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 info!(%peer, session_id, "peer closed");

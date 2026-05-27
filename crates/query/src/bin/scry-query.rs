@@ -59,9 +59,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use anyhow::{Context, Result};
 use arrow::util::pretty::pretty_format_batches;
-use arrow_flight::decode::FlightRecordBatchStream;
-use arrow_flight::flight_service_client::FlightServiceClient;
-use arrow_flight::Ticket;
+use arrow_buffer::Buffer;
+use arrow_ipc::reader::StreamDecoder;
 use clap::Parser;
 use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::metrics::MetricValue;
@@ -71,8 +70,14 @@ use datafusion::physical_plan::{
 use futures::StreamExt;
 use scry_catalog::Catalog;
 use scry_objstore::{open_with_pool_config, BufPool, BufPoolConfig, ObjStoreConfig};
+use scry_proto::{
+    constants::query_err_name,
+    framing::{read_frame, write_frame},
+    QueryFrame, QueryFrameMsg,
+};
 use scry_query::{register_metrics_table, MetricsQuery, QueryRequest, METRICS_TABLE_NAME};
-use tonic::transport::Channel;
+use tokio::io::{BufReader as TokioBufReader, BufWriter as TokioBufWriter};
+use tokio::net::TcpStream;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -309,57 +314,116 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Send the query to a remote `scry-queryd` over Arrow Flight, drain
-/// the resulting `FlightData` stream into `RecordBatch`es, and print
-/// a degenerate trailer. The per-block scan stats and pool deltas
-/// live in the daemon's `scan_complete` log event — we don't have
-/// access to them here.
+/// Send the query to a remote `scry-queryd` over the binschema query
+/// protocol, drain the resulting Arrow IPC stream into `RecordBatch`es,
+/// and print a degenerate trailer. The per-block scan stats and pool
+/// deltas live in the daemon's `scan_complete` log event — we don't
+/// have access to them here.
+///
+/// Wire shape (see `proto/query.schema.json`):
+///   client → server: QueryFrame::QueryRequest
+///   server → client: QueryFrame::SchemaMsg { ipc_bytes }
+///                    QueryFrame::BatchMsg  { ipc_bytes }* (zero or more)
+///                    QueryFrame::EndOfStream { total_rows } OR
+///                    QueryFrame::StreamError { code, message }
 async fn run_remote(
     addr: &str,
     metrics_query: MetricsQuery,
     sql: Option<String>,
     limit: Option<usize>,
 ) -> Result<()> {
-    // `addr` is host:port; we synthesise an `http://` URL since
-    // `tonic::transport::Channel` needs a scheme. No auth/TLS for v0.3.
-    let endpoint = if addr.starts_with("http://") || addr.starts_with("https://") {
-        addr.to_string()
-    } else {
-        format!("http://{addr}")
-    };
-    let channel = Channel::from_shared(endpoint.clone())
-        .with_context(|| format!("parsing remote endpoint `{endpoint}`"))?
-        .connect()
-        .await
-        .with_context(|| format!("connecting to {endpoint}"))?;
-    let mut client = FlightServiceClient::new(channel);
+    // `addr` is host:port. No URL scheme — this is a raw TCP wire
+    // protocol, not HTTP/gRPC. Accept `http://` / `https://` prefixes
+    // for ergonomic continuity with the previous Flight-based shape
+    // but strip them.
+    let host_port = addr
+        .strip_prefix("http://")
+        .or_else(|| addr.strip_prefix("https://"))
+        .unwrap_or(addr);
 
+    let sock = TcpStream::connect(host_port)
+        .await
+        .with_context(|| format!("connecting to {host_port}"))?;
+    let (r, w) = sock.into_split();
+    let mut r = TokioBufReader::new(r);
+    let mut w = TokioBufWriter::new(w);
+
+    // Send the request frame.
     let req = QueryRequest {
         metrics_query,
         sql,
         limit,
         request_id: None,
     };
-    let ticket = Ticket {
-        ticket: req.to_ticket_bytes()?,
+    let request_frame = QueryFrame {
+        msg: QueryFrameMsg::QueryRequest(req.to_wire().into()),
+    };
+    write_frame(&mut w, &request_frame)
+        .await
+        .context("writing QueryRequest frame")?;
+    tokio::io::AsyncWriteExt::flush(&mut w)
+        .await
+        .context("flushing QueryRequest frame")?;
+
+    // Drain the response stream. StreamDecoder is fed every ipc_bytes
+    // payload from SchemaMsg / BatchMsg verbatim; the server's
+    // `write_message` calls produced exactly the IPC stream framing
+    // StreamDecoder expects (continuation marker + length + flatbuf
+    // + body), so no client-side reframing is needed.
+    let mut decoder = StreamDecoder::new();
+    let mut total_rows: usize = 0;
+
+    let server_total_rows: u64 = loop {
+        let frame: QueryFrame = read_frame(&mut r).await.context("reading response frame")?;
+        match frame.msg {
+            QueryFrameMsg::SchemaMsg(s) => {
+                let mut buf = Buffer::from(s.ipc_bytes);
+                // Schema messages don't yield a RecordBatch but they
+                // do populate `decoder.schema()`. Calling `decode`
+                // until the buffer is empty advances the state machine.
+                while !buf.is_empty() {
+                    let maybe = decoder
+                        .decode(&mut buf)
+                        .context("decoding schema IPC bytes")?;
+                    if let Some(batch) = maybe {
+                        total_rows += batch.num_rows();
+                    }
+                }
+            }
+            QueryFrameMsg::BatchMsg(b) => {
+                let mut buf = Buffer::from(b.ipc_bytes);
+                while !buf.is_empty() {
+                    let maybe = decoder
+                        .decode(&mut buf)
+                        .context("decoding batch IPC bytes")?;
+                    if let Some(batch) = maybe {
+                        total_rows += batch.num_rows();
+                    }
+                }
+            }
+            QueryFrameMsg::EndOfStream(end) => break end.total_rows,
+            QueryFrameMsg::StreamError(err) => {
+                anyhow::bail!(
+                    "server returned {} (code={:#06x}): {}",
+                    query_err_name(err.code),
+                    err.code,
+                    err.message,
+                );
+            }
+            QueryFrameMsg::QueryRequest(_) => {
+                anyhow::bail!("server sent QueryRequest as response (protocol violation)");
+            }
+        }
     };
 
-    let stream = client
-        .do_get(ticket)
-        .await
-        .with_context(|| format!("DoGet against {endpoint}"))?
-        .into_inner()
-        .map(|r| r.map_err(|e| arrow_flight::error::FlightError::Tonic(Box::new(e))));
-
-    let mut batch_stream = FlightRecordBatchStream::new_from_flight_data(stream);
-    let mut total_rows: usize = 0;
-    while let Some(batch) = batch_stream.next().await {
-        let batch = batch.context("decoding Flight batch")?;
-        total_rows += batch.num_rows();
-    }
-
     eprintln!();
-    eprintln!("# scan: {total_rows} rows total (via remote {endpoint})");
+    if server_total_rows as usize != total_rows {
+        eprintln!(
+            "# scan: {total_rows} rows total (server reported {server_total_rows}; mismatch!) via remote {host_port}"
+        );
+    } else {
+        eprintln!("# scan: {server_total_rows} rows total (via remote {host_port})");
+    }
     Ok(())
 }
 

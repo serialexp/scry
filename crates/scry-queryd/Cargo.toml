@@ -3,7 +3,7 @@ name        = "scry-queryd"
 version     = "0.0.1"
 edition.workspace = true
 license.workspace = true
-description = "Long-running Arrow Flight query daemon. Wraps scry-server::QueryService — keeps the SessionContext, catalog handle, object store, and BufPool warm across queries so the CLI's per-process cold-start cost (~1.3 s) becomes a one-time daemon-startup cost."
+description = "Long-running query daemon speaking the binschema QueryFrame wire protocol over TCP. Wraps scry-server::QueryService — keeps the SessionContext, catalog handle, object store, and BufPool warm across queries so the CLI's per-process cold-start cost (~1.3 s) becomes a one-time daemon-startup cost."
 
 [[bin]]
 name = "scry-queryd"

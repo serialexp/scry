@@ -1,9 +1,13 @@
-//! scry-queryd — long-running Arrow Flight query daemon.
+//! scry-queryd — long-running query daemon (binschema-over-TCP).
 //!
 //! The architectural counterpart to `noise-sink`: where `noise-sink`
 //! exposes `scry-server::Server` (ingest) as a process, this binary
-//! exposes `scry-server::QueryService` (query) over Arrow Flight.
-//! Same shape end-to-end:
+//! exposes `scry-server::QueryService` (query) over the same length-
+//! prefixed binschema framing pattern as ingest — `QueryFrame`s
+//! defined in `proto/query.schema.json`, one TCP connection per
+//! query. (Arrow Flight was the v0.3 step 2 transport; step 5
+//! replaced it with binschema to keep one wire vocabulary across
+//! ingest + query.) Same shape end-to-end:
 //!
 //! 1. Parse flags + env (`SCRY_OBJSTORE_*` for store, `SCRY_OBJSTORE_POOL_*`
 //!    for buffer pool, `RUST_LOG` for tracing).
@@ -112,11 +116,11 @@ struct Args {
     /// request `SessionContext` shares the same `GreedyMemoryPool`
     /// behind a shared `RuntimeEnv`, so this cap is total across
     /// concurrent queries, not per-query. A query that asks for
-    /// more than the remaining budget returns
-    /// `tonic::Status::resource_exhausted` cleanly; the daemon
-    /// keeps running and the next query starts with the budget
-    /// freshly available (DataFusion drops reservations on plan
-    /// teardown).
+    /// more than the remaining budget returns a
+    /// `QueryFrame::StreamError` with code `QUERY_ERR_RESOURCES`
+    /// cleanly; the daemon keeps running and the next query starts
+    /// with the budget freshly available (DataFusion drops
+    /// reservations on plan teardown).
     ///
     /// Sizing rule of thumb: DataFusion only tracks "large"
     /// allocations (hash aggregates, sorts). Streaming operators

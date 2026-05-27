@@ -29,10 +29,10 @@
 //! ```
 
 pub mod decode;
-pub mod flight;
 mod pipeline;
+pub mod query_service;
 mod server;
 
-pub use flight::QueryService;
 pub use pipeline::{DecodeFn, Pipeline};
+pub use query_service::QueryService;
 pub use server::{DummyPipeline, MetricsPipeline, Server, ServerConfig};

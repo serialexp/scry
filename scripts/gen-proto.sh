@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
-# Regenerate Rust bindings from proto/ingest.schema.json.
+# Regenerate Rust bindings from the two scry wire-protocol schemas:
+#   * proto/ingest.schema.json -> crates/proto/src/generated.rs
+#   * proto/query.schema.json  -> crates/proto/src/generated_query.rs
 #
-# We commit the generated source (crates/proto/src/generated.rs) and the
+# We commit the generated source (both `generated*.rs`) and the
 # vendored binschema runtime (crates/binschema-runtime/src/*.rs) so the
 # normal build does not depend on node / binschema being installed. This
 # script is the only path that should touch those files.
+#
+# The binschema generator emits a fresh copy of the runtime alongside
+# each schema's generated.rs. The runtime is schema-independent, so the
+# two runs MUST produce byte-identical runtime files; the script
+# asserts that before copying so we don't accidentally diverge.
 #
 # Usage:
 #   scripts/gen-proto.sh                # uses default binschema location
@@ -14,7 +21,6 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BINSCHEMA_DIR="${BINSCHEMA_DIR:-$HOME/Projects/binschema}"
 CLI="$BINSCHEMA_DIR/packages/binschema/dist/cli/index.js"
-SCHEMA="$ROOT/proto/ingest.schema.json"
 
 if [[ ! -f "$CLI" ]]; then
   echo "error: binschema CLI not found at $CLI" >&2
@@ -22,21 +28,45 @@ if [[ ! -f "$CLI" ]]; then
   exit 1
 fi
 
-TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+INGEST_SCHEMA="$ROOT/proto/ingest.schema.json"
+QUERY_SCHEMA="$ROOT/proto/query.schema.json"
 
-echo "validating $SCHEMA"
-node "$CLI" validate --schema "$SCHEMA"
+TMP_INGEST="$(mktemp -d)"
+TMP_QUERY="$(mktemp -d)"
+trap 'rm -rf "$TMP_INGEST" "$TMP_QUERY"' EXIT
 
-echo "generating Rust into $TMP"
-node "$CLI" generate --language rust --schema "$SCHEMA" --out "$TMP"
+echo "validating $INGEST_SCHEMA"
+node "$CLI" validate --schema "$INGEST_SCHEMA"
+echo "validating $QUERY_SCHEMA"
+node "$CLI" validate --schema "$QUERY_SCHEMA"
+
+echo "generating Rust (ingest) into $TMP_INGEST"
+node "$CLI" generate --language rust --schema "$INGEST_SCHEMA" --out "$TMP_INGEST"
+
+echo "generating Rust (query) into $TMP_QUERY"
+node "$CLI" generate --language rust --schema "$QUERY_SCHEMA" --out "$TMP_QUERY"
+
+# The two runs must produce byte-identical runtime files. If they ever
+# diverge it's a bug in the generator (or a sign that the runtime has
+# acquired schema-specific knowledge); fail loudly rather than silently
+# overwriting one set with the other.
+for f in lib.rs bitstream.rs context.rs; do
+  if ! cmp -s "$TMP_INGEST/binschema_runtime/src/$f" "$TMP_QUERY/binschema_runtime/src/$f"; then
+    echo "error: binschema runtime ($f) differs between schemas — generator bug?" >&2
+    diff -u "$TMP_INGEST/binschema_runtime/src/$f" "$TMP_QUERY/binschema_runtime/src/$f" >&2 || true
+    exit 1
+  fi
+done
 
 echo "copying runtime  -> crates/binschema-runtime/src/"
-cp "$TMP/binschema_runtime/src/lib.rs"       "$ROOT/crates/binschema-runtime/src/lib.rs"
-cp "$TMP/binschema_runtime/src/bitstream.rs" "$ROOT/crates/binschema-runtime/src/bitstream.rs"
-cp "$TMP/binschema_runtime/src/context.rs"   "$ROOT/crates/binschema-runtime/src/context.rs"
+cp "$TMP_INGEST/binschema_runtime/src/lib.rs"       "$ROOT/crates/binschema-runtime/src/lib.rs"
+cp "$TMP_INGEST/binschema_runtime/src/bitstream.rs" "$ROOT/crates/binschema-runtime/src/bitstream.rs"
+cp "$TMP_INGEST/binschema_runtime/src/context.rs"   "$ROOT/crates/binschema-runtime/src/context.rs"
 
 echo "copying generated -> crates/proto/src/generated.rs"
-cp "$TMP/src/generated.rs" "$ROOT/crates/proto/src/generated.rs"
+cp "$TMP_INGEST/src/generated.rs" "$ROOT/crates/proto/src/generated.rs"
 
-echo "done. Review with: git diff crates/binschema-runtime crates/proto/src/generated.rs"
+echo "copying generated -> crates/proto/src/generated_query.rs"
+cp "$TMP_QUERY/src/generated.rs" "$ROOT/crates/proto/src/generated_query.rs"
+
+echo "done. Review with: git diff crates/binschema-runtime crates/proto/src/generated.rs crates/proto/src/generated_query.rs"

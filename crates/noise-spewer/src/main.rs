@@ -20,6 +20,7 @@ use scry_proto::{
     },
     framing::{read_frame, write_frame},
     generated::FrameMsg,
+    Frame,
 };
 use std::time::Duration;
 use tokio::{
@@ -134,7 +135,7 @@ async fn main() -> Result<()> {
     .await?;
     wr.flush().await?;
 
-    let hello_ack = match read_frame(&mut rd).await?.msg {
+    let hello_ack = match read_frame::<Frame, _>(&mut rd).await?.msg {
         FrameMsg::HelloAck(a) => a,
         FrameMsg::Error(e) => {
             bail!("server rejected handshake: code={} msg={:?}", e.code, e.message)
@@ -156,7 +157,7 @@ async fn main() -> Result<()> {
     let (ack_tx, mut ack_rx) = mpsc::channel::<()>(1024);
     let reader_handle = tokio::spawn(async move {
         loop {
-            match read_frame(&mut rd).await {
+            match read_frame::<Frame, _>(&mut rd).await {
                 Ok(f) => match f.msg {
                     FrameMsg::BatchAck(a) => {
                         if a.status != ACK_ACCEPTED {

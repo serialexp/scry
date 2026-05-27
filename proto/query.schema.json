@@ -1,0 +1,88 @@
+{
+  "meta": {
+    "title": "scry query wire protocol",
+    "description": "Client to query-daemon wire protocol for issuing DataFusion-backed metrics queries against a scry deployment. Long-lived TCP stream, length-framed messages, one request frame from client triggers a stream of response frames (schema + zero or more batches + end-of-stream). Arrow IPC payload carried verbatim inside the binschema envelope — binschema is purely the framing/control plane.",
+    "version": "0.1.0"
+  },
+
+  "config": {
+    "endianness": "big_endian",
+    "bit_order": "msb_first"
+  },
+
+  "types": {
+    "QueryFrame": {
+      "description": "Top-level discriminated union of all query-protocol messages. Peek-discriminated on the message-type byte; each variant struct begins with a const-tagged uint8 that matches the discriminator. Client → server: Request (exactly one). Server → client: SchemaMsg (exactly one), then BatchMsg* , then EndOfStream OR StreamError (exactly one terminator).",
+      "sequence": [
+        {
+          "name": "msg",
+          "type": "discriminated_union",
+          "discriminator": { "peek": "uint8" },
+          "variants": [
+            { "type": "QueryRequest",  "when": "value === 0x01" },
+            { "type": "SchemaMsg",     "when": "value === 0x10" },
+            { "type": "BatchMsg",      "when": "value === 0x11" },
+            { "type": "EndOfStream",   "when": "value === 0x1F" },
+            { "type": "StreamError",   "when": "value === 0xF0" }
+          ]
+        }
+      ]
+    },
+
+    "QueryRequest": {
+      "description": "Sent by the client at the start of every query connection. Carries the AND'd matcher set + time bounds (the postings preselect), optional SQL against the registered metrics table, an optional row limit, and an optional caller-supplied tracing correlation id. NOTE: 'optional' fields would be the natural shape here, but as of binschema 0.5.x the Rust generator emits NotImplemented when 'optional' appears inside a discriminated_union variant (works fine in plain structs — see ingest's Span.parent_span_id). We model each optional with an explicit '*_present: uint8' companion (0 = absent, 1 = present); when absent the value field is still serialised but should be ignored by the receiver. Switch back to 'optional' once binschema gains support.",
+      "sequence": [
+        { "name": "tag", "type": "uint8", "const": 1 },
+        { "name": "matchers", "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "Matcher" } },
+        { "name": "ts_min_present", "type": "uint8" },
+        { "name": "ts_min",         "type": "uint64" },
+        { "name": "ts_max_present", "type": "uint8" },
+        { "name": "ts_max",         "type": "uint64" },
+        { "name": "sql",        "type": "string", "kind": "length_prefixed", "length_type": "uint32", "encoding": "utf8" },
+        { "name": "limit",      "type": "uint64" },
+        { "name": "request_id", "type": "string", "kind": "length_prefixed", "length_type": "uint16", "encoding": "ascii" }
+      ]
+    },
+
+    "Matcher": {
+      "description": "One equality label matcher (name = value). The matcher set is AND'd on the server before postings resolve.",
+      "sequence": [
+        { "name": "name",  "type": "string", "kind": "length_prefixed", "length_type": "uint16", "encoding": "utf8" },
+        { "name": "value", "type": "string", "kind": "length_prefixed", "length_type": "uint16", "encoding": "utf8" }
+      ]
+    },
+
+    "SchemaMsg": {
+      "description": "Server → client. The Arrow IPC schema message, exactly one per query, sent before any BatchMsg. `ipc_bytes` is the output of arrow::ipc::writer::write_message for the schema EncodedData — continuation marker, length prefix, flatbuf, padding, body, all included — so the client can feed it directly into an arrow::ipc::reader::StreamDecoder without reconstructing the IPC framing.",
+      "sequence": [
+        { "name": "tag",       "type": "uint8", "const": 16 },
+        { "name": "ipc_bytes", "type": "bytes", "kind": "length_prefixed", "length_type": "uint32" }
+      ]
+    },
+
+    "BatchMsg": {
+      "description": "Server → client. One fully IPC-framed message (record batch or dictionary batch). Server produces these via arrow::ipc::writer::write_message; client feeds them to arrow::ipc::reader::StreamDecoder verbatim. Carries dictionary-batch messages too — they're indistinguishable on the wire and StreamDecoder routes by the IPC message header.",
+      "sequence": [
+        { "name": "tag",       "type": "uint8", "const": 17 },
+        { "name": "ipc_bytes", "type": "bytes", "kind": "length_prefixed", "length_type": "uint32" }
+      ]
+    },
+
+    "EndOfStream": {
+      "description": "Server → client. Signals normal completion of the query. total_rows is the server-computed row count across all emitted BatchMsg payloads; the client can cross-check its own count against this value.",
+      "sequence": [
+        { "name": "tag",        "type": "uint8", "const": 31 },
+        { "name": "total_rows", "type": "uint64" }
+      ]
+    },
+
+    "StreamError": {
+      "description": "Server → client. Signals abnormal termination. The connection is closed after this frame; the client should not expect any further frames. code is one of the QUERY_ERR_* constants; message is human-readable context for logging.",
+      "sequence": [
+        { "name": "tag",     "type": "uint8", "const": 240 },
+        { "name": "code",    "type": "uint16" },
+        { "name": "message", "type": "string", "kind": "length_prefixed", "length_type": "uint16", "encoding": "utf8" }
+      ]
+    }
+  }
+}

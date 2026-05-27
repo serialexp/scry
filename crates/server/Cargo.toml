@@ -8,7 +8,7 @@ description = "scry ingest server: TCP listener, handshake, batch dispatch. Owns
 [dependencies]
 anyhow            = { workspace = true }
 arrow             = { workspace = true }
-arrow-flight      = { workspace = true }
+arrow-ipc         = "58"
 async-trait       = { workspace = true }
 binschema-runtime = { workspace = true }
 bytes             = { workspace = true }
@@ -22,22 +22,19 @@ scry-proto        = { workspace = true }
 scry-query        = { workspace = true }
 scry-wal          = { workspace = true }
 tokio             = { workspace = true }
-tokio-stream      = { workspace = true }
-tonic             = { workspace = true }
 tracing           = { workspace = true }
 uuid              = { workspace = true }
 zstd              = { workspace = true }
 
 [dev-dependencies]
 arrow         = { workspace = true }
-arrow-flight  = { workspace = true }
+arrow-ipc     = "58"
 futures       = { workspace = true }
 object_store  = { workspace = true }
 scry-block    = { workspace = true }
 scry-proto    = { workspace = true }
 scry-query    = { workspace = true }
 tempfile      = "3"
-tonic         = { workspace = true }
 uuid          = { workspace = true }
 
 [lints]

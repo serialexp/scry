@@ -1,8 +1,8 @@
-//! Numeric constants from `proto/ingest.schema.json`.
+//! Numeric constants from `proto/{ingest,query}.schema.json`.
 //!
-//! Kept in sync by hand against the schema's `protocol.constants` block.
-//! When the schema gains a new constant, mirror it here. The bindings are
-//! generated from the binary structure only; constants are not.
+//! Kept in sync by hand against the schemas. When a schema gains a new
+//! constant, mirror it here. The binschema bindings are generated from
+//! the binary structure only; constants are not.
 
 /// Wire-format version. `(major << 8) | minor`.
 pub const PROTOCOL_VERSION_V0: u16 = 0x0001;
@@ -100,3 +100,45 @@ pub const GOODBYE_AGENT_RELOAD:    u16 = 2;
 pub const DEFAULT_SUGGESTED_BATCH_BYTES: u32 = 4 * 1024 * 1024;
 pub const DEFAULT_MAX_BATCH_BYTES:       u32 = 16 * 1024 * 1024;
 pub const DEFAULT_MAX_INFLIGHT_BATCHES:  u16 = 64;
+
+// ── Query protocol (proto/query.schema.json) ───────────────────────────
+//
+// StreamError.code values. The query daemon emits exactly one
+// StreamError before closing the connection on the failure paths
+// below; clients should treat receipt as terminal.
+
+/// Decoding the client's `QueryRequest` frame failed, or the request
+/// fields are invalid (e.g. a matcher with empty name).
+pub const QUERY_ERR_BAD_REQUEST: u16 = 0x0001;
+
+/// DataFusion's SQL parser rejected the request's `sql` text.
+pub const QUERY_ERR_SQL_PARSE: u16 = 0x0002;
+
+/// `create_physical_plan` (or earlier planning) failed for a reason
+/// other than SQL parse — e.g. an unknown column reference, an
+/// unsupported aggregate.
+pub const QUERY_ERR_PLAN: u16 = 0x0003;
+
+/// DataFusion's `MemoryPool` returned `ResourcesExhausted` while the
+/// query was running. Daemon stays up; the next query starts with
+/// the budget freshly available.
+pub const QUERY_ERR_RESOURCES: u16 = 0x0004;
+
+/// Catch-all for any other server-side failure (catalog mutex
+/// poisoned, unexpected DataFusion error, postings sidecar fetch
+/// failure mid-query, …). Message field carries human-readable
+/// context.
+pub const QUERY_ERR_INTERNAL: u16 = 0x00FF;
+
+/// Human-readable name for a query error code; used by the client to
+/// format error messages without re-doing the match in the call site.
+pub fn query_err_name(code: u16) -> &'static str {
+    match code {
+        QUERY_ERR_BAD_REQUEST => "QUERY_ERR_BAD_REQUEST",
+        QUERY_ERR_SQL_PARSE   => "QUERY_ERR_SQL_PARSE",
+        QUERY_ERR_PLAN        => "QUERY_ERR_PLAN",
+        QUERY_ERR_RESOURCES   => "QUERY_ERR_RESOURCES",
+        QUERY_ERR_INTERNAL    => "QUERY_ERR_INTERNAL",
+        _ => "QUERY_ERR_UNKNOWN",
+    }
+}

@@ -814,6 +814,53 @@ What's deferred to v0.2 (still applies as written in
 real signals land. Everything else (WAL framing, sidecar schema,
 catalog schema, object-storage path layout) is forward-compatible.
 
+## D-031: Query daemon speaks binschema, not Arrow Flight
+
+**Date:** 2026-05-27
+**Status:** accepted (reverses the client↔daemon portion of D-024)
+
+The v0.3 query daemon (`scry-queryd`) speaks the same length-prefixed
+binschema framing pattern as ingest, not Arrow Flight. `QueryFrame`
+is defined in `proto/query.schema.json` alongside the existing
+ingest schema; the wire shape is `client → server: QueryRequest`
+followed by `server → client: SchemaMsg, BatchMsg*, EndOfStream |
+StreamError`. The Arrow IPC payload itself (schema + record batches)
+is unchanged from D-024 — binschema is purely the envelope. We
+keep zero-copy decode (the client feeds `arrow_ipc::reader::Stream
+Decoder` directly), drop `arrow-flight`/`tonic`, and run one
+framing layer across the product instead of two.
+
+What we keep:
+- Same TCP transport pattern as ingest. One framing layer in the
+  codebase, one set of frame helpers (`scry-proto::framing::{
+  read_frame, write_frame}` generalised over a `Framed` trait).
+- The Arrow IPC payload itself, byte-for-byte. `IpcDataGenerator`
+  on the server, `StreamDecoder` on the client.
+- Per-batch streaming, mid-stream error mapping (DataFusion
+  `ResourcesExhausted` → `StreamError(QUERY_ERR_RESOURCES)`),
+  `scan_complete` observability surface unchanged.
+
+What we lose (acknowledged, deferred):
+- Plug-and-play with Arrow-native tools (`pyarrow.flight`,
+  `datafusion-cli --flight`, `arrow-js`). No current caller needs
+  them; if one shows up we can re-introduce a Flight gateway in
+  front of the binschema daemon later.
+
+**Scope.** This decision covers the client↔daemon transport (CLI
+talking to a single `scry-queryd`). The worker↔coordinator transport
+inside scatter-gather (D-024) is still hypothetical — v0.6+ work —
+and will be re-decided at that time. The binschema migration here is
+evidence in favour of also doing worker↔coordinator on binschema for
+the same one-vocabulary reason, but that's not a commitment.
+
+The migration also surfaced a real gap in binschema: the Rust
+generator emits `NotImplemented` for `optional` fields inside
+discriminated_union variants. We worked around it with explicit
+`*_present: uint8` companion fields in `QueryRequest`; the gap is
+filed for the binschema project to fix upstream. Doing the migration
+exposed this, which is one of the reasons we did it now rather than
+waiting.
+
 ## Deferred / open
 
 These are not decisions yet; they're flagged for "we'll decide when the

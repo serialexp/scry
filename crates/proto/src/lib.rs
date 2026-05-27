@@ -1,22 +1,32 @@
-//! scry ingest wire protocol.
+//! scry wire protocols (ingest + query).
 //!
-//! This crate exposes the generated binschema bindings for the agent ↔
-//! server ingest protocol plus a small amount of hand-written glue:
+//! This crate exposes the generated binschema bindings for both of
+//! scry's TCP wire protocols plus a small amount of hand-written glue:
 //!
-//! - [`framing`] — length-prefixed framing over an async stream.
-//! - [`constants`] — the numeric constants from the schema (signals,
-//!   ack statuses, reject/error codes), defined as `const` so call
-//!   sites can match on them.
-//! - [`fingerprint`] — xxh3-64 over canonically-sorted labels.
+//! - [`generated`] — agent ↔ ingest-server protocol, from
+//!   `proto/ingest.schema.json`.
+//! - [`generated_query`] — client ↔ query-daemon protocol, from
+//!   `proto/query.schema.json`.
+//! - [`framing`] — length-prefixed framing over an async stream;
+//!   generic over the framed type via the [`framing::Framed`] trait,
+//!   so the same helpers serve both protocols.
+//! - [`constants`] — numeric constants from both schemas (signals,
+//!   ack statuses, reject / error codes, query error codes), defined
+//!   as `const` so call sites can match on them.
+//! - [`fingerprint`] — xxh3-64 over canonically-sorted labels (ingest).
 //!
-//! The protocol design lives in `docs/ARCHITECTURE.md` (Ingest section)
-//! and `proto/README.md`. The wire format itself is in
-//! `proto/ingest.schema.json`; everything in [`generated`] is mechanically
-//! derived from that file via `scripts/gen-proto.sh`.
+//! The protocol designs live in `docs/ARCHITECTURE.md`. The wire
+//! formats themselves are in `proto/{ingest,query}.schema.json`;
+//! everything in [`generated`] / [`generated_query`] is mechanically
+//! derived from those files via `scripts/gen-proto.sh`.
 
 #[allow(clippy::all)]
 #[rustfmt::skip]
 pub mod generated;
+
+#[allow(clippy::all)]
+#[rustfmt::skip]
+pub mod generated_query;
 
 pub mod build;
 pub mod constants;
@@ -41,4 +51,14 @@ pub use generated::{
     TracesBatch, ResourceEntry, ScopeEntry, Span, SpanEvent, SpanLink,
     ProfilesBatch, ProfileBlob,
     DummyBatch, DummyRecord,
+};
+
+pub use generated_query::{
+    QueryFrame, QueryFrameMsg,
+    QueryRequest, QueryRequestInput, QueryRequestOutput,
+    Matcher,
+    SchemaMsg, SchemaMsgInput, SchemaMsgOutput,
+    BatchMsg, BatchMsgInput, BatchMsgOutput,
+    EndOfStream, EndOfStreamInput, EndOfStreamOutput,
+    StreamError, StreamErrorInput, StreamErrorOutput,
 };
