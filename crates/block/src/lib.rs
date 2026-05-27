@@ -16,11 +16,49 @@
 
 mod dummy;
 mod meta;
+pub mod metrics;
 
 pub use dummy::DummyBlockBuilder;
 pub use meta::BlockMeta;
+pub use metrics::MetricsBlockBuilder;
 
+use anyhow::Result;
+use object_store::ObjectStore;
+use std::future::Future;
 use uuid::Uuid;
+
+/// A signal-specific in-memory block builder. The pipeline machinery in
+/// `scry-server` is generic over this trait so the WAL → builder →
+/// upload → catalog plumbing is written once per process, not once per
+/// signal.
+///
+/// The trait is intentionally small: the pipeline only needs to know
+/// "is there anything to upload yet," "should I close now," and "give
+/// me the upload future + the meta to insert into the catalog." Decode
+/// is *not* on this trait — each signal has its own wire shape and its
+/// own appender trait (see [`scry_proto::streaming`]), and the pipeline
+/// receives the decode function as a closure / fn-pointer at call sites
+/// so the trait stays object-safe-shaped (even though we use it as a
+/// generic bound, not a dyn).
+pub trait BlockBuilder: Send + 'static {
+    /// WAL subdirectory name for this signal. Must match the value
+    /// passed to `WalConfig::new(dir, signal)` so replay finds the
+    /// right segments.
+    const SIGNAL: &'static str;
+
+    fn new(writer_id: Uuid, cfg: BlockBuilderConfig) -> Self;
+    fn is_empty(&self) -> bool;
+    fn should_close(&self) -> bool;
+    /// Consume the builder, encode to parquet (+ any sidecars), upload
+    /// to object storage, and return a `BlockMeta` ready for catalog
+    /// insertion. Returns `Ok(None)` if the builder turned out to be
+    /// empty after a race with rotation (vanishingly rare; the pipeline
+    /// checks `is_empty()` before calling this).
+    fn finish_and_upload(
+        self,
+        store: &dyn ObjectStore,
+    ) -> impl Future<Output = Result<Option<BlockMeta>>> + Send;
+}
 
 /// Block close triggers. Defaults match `ARCHITECTURE.md § The block
 /// builder`. v0.1 doesn't need a `max_block_age` because the spewer
@@ -29,6 +67,13 @@ use uuid::Uuid;
 pub struct BlockBuilderConfig {
     pub max_rows: u64,
     pub target_bytes: u64,
+    /// Parquet `set_max_row_group_row_count` for the main data file.
+    /// Production default is 1M rows, which yields a handful of
+    /// groups per ~128 MiB block — small enough to make row-group
+    /// pruning a sharp filter, large enough to keep per-group
+    /// overhead negligible. Tests that need to exercise row-group
+    /// pruning at small data sizes override this.
+    pub row_group_size: usize,
 }
 
 impl Default for BlockBuilderConfig {
@@ -36,6 +81,7 @@ impl Default for BlockBuilderConfig {
         Self {
             max_rows: 1_000_000,
             target_bytes: 128 * 1024 * 1024, // 128 MiB before compression
+            row_group_size: 1024 * 1024,     // ~1M rows
         }
     }
 }

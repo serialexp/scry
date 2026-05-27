@@ -1,0 +1,42 @@
+[package]
+name        = "scry-query"
+version     = "0.0.1"
+edition.workspace = true
+license.workspace = true
+description = "DataFusion-backed metrics querier. Exposes blocks as a TableProvider; postings sidecars pre-filter the fingerprint set; DataFusion's ParquetSource handles row-group pruning + row-level predicate pushdown."
+
+[lib]
+name = "scry_query"
+path = "src/lib.rs"
+
+[[bin]]
+name = "scry-query"
+path = "src/bin/scry-query.rs"
+
+[dependencies]
+anyhow             = { workspace = true }
+arrow              = { workspace = true }
+async-trait        = { workspace = true }
+bytes              = { workspace = true }
+clap               = { workspace = true }
+datafusion         = { workspace = true }
+futures            = { workspace = true }
+mimalloc           = { workspace = true }
+object_store       = { workspace = true }
+parquet            = { workspace = true, features = ["arrow", "async", "object_store"] }
+scry-block         = { workspace = true }
+scry-catalog       = { workspace = true }
+scry-objstore      = { workspace = true }
+serde_json         = { workspace = true }
+tokio              = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+url                = { workspace = true }
+uuid               = { workspace = true }
+
+[dev-dependencies]
+scry-proto = { workspace = true }
+tempfile   = "3"
+
+[lints]
+workspace = true

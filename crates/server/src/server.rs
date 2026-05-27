@@ -8,6 +8,7 @@
 
 use anyhow::{Context, Result};
 use binschema_runtime::{BitOrder, BitStreamDecoder};
+use scry_block::{DummyBlockBuilder, MetricsBlockBuilder};
 use scry_proto::{
     build,
     constants::{
@@ -19,9 +20,7 @@ use scry_proto::{
         SIGNAL_BIT_TRACES, Signal,
     },
     framing::{FrameError, read_frame, write_frame},
-    generated::{
-        DummyBatch, FrameMsg, HelloOutput, LogsBatch, MetricsBatch, ProfilesBatch, TracesBatch,
-    },
+    generated::{FrameMsg, HelloOutput, LogsBatch, ProfilesBatch, TracesBatch},
 };
 use std::{
     future::Future,
@@ -38,7 +37,17 @@ use tokio::{
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::pipeline::DummyPipeline;
+use crate::pipeline::Pipeline;
+
+/// Type alias for the Dummy storage pipeline. Same generic machinery
+/// every signal uses; the type alias just spares call sites from
+/// repeating the builder parameter.
+pub type DummyPipeline = Pipeline<DummyBlockBuilder>;
+
+/// Type alias for the Metrics storage pipeline. Same generic
+/// machinery as Dummy — only the builder, the WAL signal subdir, and
+/// the decode function differ.
+pub type MetricsPipeline = Pipeline<MetricsBlockBuilder>;
 
 /// Static configuration for a [`Server`]. Cheap to construct, cloned
 /// into each spawned connection task.
@@ -57,14 +66,27 @@ pub struct ServerConfig {
 
 /// The ingest server. Constructed with [`Server::new`], driven to
 /// completion with [`Server::serve_with_shutdown`].
+///
+/// One pipeline per signal — at N=2 the two `Option` fields are
+/// clearer than a `HashMap<Signal, Box<dyn ErasedPipeline>>`. Revisit
+/// the erased trait approach once N ≥ ~5.
 pub struct Server {
     config: ServerConfig,
-    pipeline: Option<Arc<Mutex<DummyPipeline>>>,
+    dummy_pipeline: Option<Arc<Mutex<DummyPipeline>>>,
+    metrics_pipeline: Option<Arc<Mutex<MetricsPipeline>>>,
 }
 
 impl Server {
-    pub fn new(config: ServerConfig, pipeline: Option<Arc<Mutex<DummyPipeline>>>) -> Self {
-        Self { config, pipeline }
+    pub fn new(
+        config: ServerConfig,
+        dummy_pipeline: Option<Arc<Mutex<DummyPipeline>>>,
+        metrics_pipeline: Option<Arc<Mutex<MetricsPipeline>>>,
+    ) -> Self {
+        Self {
+            config,
+            dummy_pipeline,
+            metrics_pipeline,
+        }
     }
 
     /// Bind the listener, accept connections until `shutdown`
@@ -94,9 +116,19 @@ impl Server {
                 let (sock, peer) = listener.accept().await?;
                 let session_id = next_session_id.fetch_add(1, Ordering::Relaxed);
                 let config = config.clone();
-                let pipeline = self.pipeline.clone();
+                let dummy_pipeline = self.dummy_pipeline.clone();
+                let metrics_pipeline = self.metrics_pipeline.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle(sock, peer, config, session_id, pipeline).await {
+                    if let Err(e) = handle(
+                        sock,
+                        peer,
+                        config,
+                        session_id,
+                        dummy_pipeline,
+                        metrics_pipeline,
+                    )
+                    .await
+                    {
                         warn!(peer = %peer, error = %e, "connection ended with error");
                     }
                 });
@@ -110,12 +142,22 @@ impl Server {
             _ = shutdown    => { info!("shutdown signalled; flushing"); }
         }
 
-        if let Some(pipe) = self.pipeline.as_ref() {
+        // Flush every active pipeline. Order doesn't matter; each one
+        // owns its own JoinSet of inflight uploads.
+        if let Some(pipe) = self.dummy_pipeline.as_ref() {
             let mut guard = pipe.lock().await;
             if let Err(e) = guard.flush().await {
-                warn!(error = %e, "final flush failed");
+                warn!(error = %e, "final dummy flush failed");
             } else {
-                info!("final flush complete");
+                info!("final dummy flush complete");
+            }
+        }
+        if let Some(pipe) = self.metrics_pipeline.as_ref() {
+            let mut guard = pipe.lock().await;
+            if let Err(e) = guard.flush().await {
+                warn!(error = %e, "final metrics flush failed");
+            } else {
+                info!("final metrics flush complete");
             }
         }
 
@@ -141,7 +183,8 @@ async fn handle(
     peer: SocketAddr,
     config: Arc<ServerConfig>,
     session_id: u64,
-    pipeline: Option<Arc<Mutex<DummyPipeline>>>,
+    dummy_pipeline: Option<Arc<Mutex<DummyPipeline>>>,
+    metrics_pipeline: Option<Arc<Mutex<MetricsPipeline>>>,
 ) -> Result<()> {
     sock.set_nodelay(true)?;
     let (rd, wr) = sock.into_split();
@@ -350,30 +393,45 @@ async fn handle(
 
                 let signal = sig.unwrap();
 
-                // Dummy gets the WAL+block path; other signals just
-                // get counted (v0.1 storage is Dummy-only). The
-                // Dummy decode is streaming — we never materialise
-                // a DummyBatch / Vec<DummyRecord> / per-record
-                // String + Vec<u8>. See `scry_proto::streaming` and
-                // CLAUDE.md § Performance.
-                let decode_result: Result<u64> = if signal == Signal::Dummy {
-                    if let Some(pipe) = pipeline.as_ref() {
-                        let mut guard = pipe.lock().await;
-                        guard.ingest(&decompressed).await
-                    } else {
-                        // No storage: still validate the wire format
-                        // (so a malformed batch is rejected with a
-                        // useful code) but throw the records away.
-                        let mut counter = CountAppender(0);
-                        scry_proto::streaming::decode_dummy_batch_into(
-                            &decompressed,
-                            &mut counter,
-                        )
-                        .map(|_| counter.0)
-                        .map_err(|e| anyhow::anyhow!("DummyBatch: {e}"))
+                // Each signal that has a pipeline configured gets the
+                // WAL+block path; the rest fall back to streaming
+                // validate-and-count. Wire decode never materialises a
+                // typed `*Batch` / per-record allocation — see
+                // `scry_proto::streaming` and CLAUDE.md § Performance.
+                let decode_result: Result<u64> = match signal {
+                    Signal::Dummy => {
+                        if let Some(pipe) = dummy_pipeline.as_ref() {
+                            let mut guard = pipe.lock().await;
+                            guard.ingest(&decompressed).await
+                        } else {
+                            let mut counter = CountDummyAppender(0);
+                            scry_proto::streaming::decode_dummy_batch_into(
+                                &decompressed,
+                                &mut counter,
+                            )
+                            .map(|_| counter.0)
+                            .map_err(|e| anyhow::anyhow!("DummyBatch: {e}"))
+                        }
                     }
-                } else {
-                    decode_payload(signal, &decompressed)
+                    Signal::Metrics => {
+                        if let Some(pipe) = metrics_pipeline.as_ref() {
+                            let mut guard = pipe.lock().await;
+                            guard.ingest(&decompressed).await
+                        } else {
+                            // No metrics pipeline: validate + count
+                            // samples (series are dictionary entries,
+                            // not records — same accounting as the
+                            // pipeline path).
+                            let mut counter = CountMetricsAppender::default();
+                            scry_proto::streaming::decode_metrics_batch_into(
+                                &decompressed,
+                                &mut counter,
+                            )
+                            .map(|(_series, samples)| samples as u64)
+                            .map_err(|e| anyhow::anyhow!("MetricsBatch: {e}"))
+                        }
+                    }
+                    _ => decode_payload(signal, &decompressed),
                 };
 
                 match decode_result {
@@ -464,24 +522,46 @@ async fn handle(
 /// Trivial [`scry_proto::streaming::DummyAppender`] that just counts
 /// records and discards the bytes. Used by the no-storage path so we
 /// still validate the wire format on every Dummy batch.
-struct CountAppender(u64);
+struct CountDummyAppender(u64);
 
-impl scry_proto::streaming::DummyAppender for CountAppender {
+impl scry_proto::streaming::DummyAppender for CountDummyAppender {
     #[inline]
     fn append_raw(&mut self, _ts: u64, _key: &[u8], _value: &[u8]) {
         self.0 += 1;
     }
 }
 
+/// Counter-only `MetricsAppender` for the no-metrics-pipeline case.
+/// Series observations are dropped wholesale; only sample counts are
+/// kept to match what the configured-pipeline path reports back
+/// (`samples = records`).
+#[derive(Default)]
+struct CountMetricsAppender {
+    samples: u64,
+}
+
+impl scry_proto::streaming::MetricsAppender for CountMetricsAppender {
+    #[inline]
+    fn observe_series(
+        &mut self,
+        _fingerprint: u64,
+        _metric_type: u8,
+        _labels: Vec<(Vec<u8>, Vec<u8>)>,
+    ) {
+    }
+    #[inline]
+    fn append_sample(&mut self, _fingerprint: u64, _ts_unix_nano: u64, _value: f64) {
+        self.samples += 1;
+    }
+}
+
+/// Validate-and-count fallback for signals the server has no
+/// streaming decoder for yet (Logs/Traces/Profiles). Dummy and
+/// Metrics route through their streaming appenders upstream and
+/// never reach here.
 fn decode_payload(signal: Signal, bytes: &[u8]) -> Result<u64> {
     let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
     let n: u64 = match signal {
-        Signal::Metrics => {
-            let m = MetricsBatch::decode_with_decoder(&mut decoder)
-                .map_err(|e| anyhow::anyhow!("MetricsBatch: {e}"))?;
-            // Records = samples (series are dictionary entries, not records).
-            m.samples.len() as u64
-        }
         Signal::Logs => {
             let l = LogsBatch::decode_with_decoder(&mut decoder)
                 .map_err(|e| anyhow::anyhow!("LogsBatch: {e}"))?;
@@ -497,12 +577,10 @@ fn decode_payload(signal: Signal, bytes: &[u8]) -> Result<u64> {
                 .map_err(|e| anyhow::anyhow!("ProfilesBatch: {e}"))?;
             p.samples.len() as u64
         }
-        Signal::Dummy => {
-            // Reachable only when storage mode is off (the storage
-            // branch decodes inline). Cheap to keep the symmetry.
-            let d = DummyBatch::decode_with_decoder(&mut decoder)
-                .map_err(|e| anyhow::anyhow!("DummyBatch: {e}"))?;
-            d.records.len() as u64
+        Signal::Dummy | Signal::Metrics => {
+            // Routed through streaming appenders upstream; should
+            // never reach `decode_payload`.
+            anyhow::bail!("BUG: decode_payload called for {signal:?}")
         }
     };
     Ok(n)

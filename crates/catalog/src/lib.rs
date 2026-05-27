@@ -27,7 +27,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
-use object_store::{path::Path as ObjPath, ObjectStore};
+use object_store::{path::Path as ObjPath, ObjectStore, ObjectStoreExt};
 use rusqlite::{params, Connection, OptionalExtension};
 use scry_block::BlockMeta;
 use uuid::Uuid;
@@ -157,8 +157,8 @@ impl Catalog {
             ) VALUES (
               ?1, ?2, ?3, ?4, ?5, 0,
               ?6, ?7, ?8, ?9,
-              NULL, 0,
-              ?10, ?11, NULL, NULL
+              ?10, ?11,
+              ?12, ?13, NULL, NULL
             )
             "#,
             params![
@@ -174,6 +174,8 @@ impl Catalog {
                 meta.ts_max_unix_nano as i64,
                 meta.row_count as i64,
                 meta.byte_size as i64,
+                meta.postings_size_bytes.map(|v| v as i64),
+                if meta.has_postings { 1i64 } else { 0i64 },
                 meta.schema_version as i64,
                 meta.label_fingerprint_bloom.as_deref(),
             ],
@@ -188,7 +190,8 @@ impl Catalog {
             r#"
             SELECT uuid, bucket, signal, date, writer_id, level,
                    ts_min, ts_max, row_count, byte_size,
-                   schema_version, fingerprint
+                   schema_version, fingerprint,
+                   has_postings, postings_size_bytes
             FROM blocks
             WHERE deleted_at IS NULL
             ORDER BY date, ts_min, uuid
@@ -208,7 +211,8 @@ impl Catalog {
             r#"
             SELECT uuid, bucket, signal, date, writer_id, level,
                    ts_min, ts_max, row_count, byte_size,
-                   schema_version, fingerprint
+                   schema_version, fingerprint,
+                   has_postings, postings_size_bytes
             FROM blocks
             WHERE uuid = ?1
             "#,
@@ -320,6 +324,8 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<CatalogEntry> {
     let byte_size: i64 = row.get(9)?;
     let schema_version: i64 = row.get(10)?;
     let fingerprint: Option<Vec<u8>> = row.get(11)?;
+    let has_postings_raw: i64 = row.get(12)?;
+    let postings_size_bytes: Option<i64> = row.get(13)?;
 
     let uuid = Uuid::parse_str(&uuid_str)
         .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
@@ -341,6 +347,13 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<CatalogEntry> {
             // the conventional "unknown" sentinel.
             producer_version: String::new(),
             label_fingerprint_bloom: fingerprint,
+            has_postings: has_postings_raw != 0,
+            postings_size_bytes: postings_size_bytes.map(|v| v as u64),
+            // series_types lives only in the sidecar JSON; not promoted
+            // to a catalog column because the catalog query patterns
+            // don't filter on it. Callers that want type metadata go
+            // through `reconcile_from_bucket` / read the sidecar.
+            series_types: None,
         },
         bucket,
         date,

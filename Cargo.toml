@@ -11,6 +11,7 @@ members = [
     "crates/noise-spewer",
     "crates/noise-sink",
     "crates/scry-list",
+    "crates/query",
 ]
 
 [workspace.package]
@@ -27,17 +28,20 @@ scry-wal          = { path = "crates/wal" }
 scry-block        = { path = "crates/block" }
 scry-catalog      = { path = "crates/catalog" }
 scry-server       = { path = "crates/server" }
+scry-query        = { path = "crates/query" }
 
 anyhow    = "1"
-arrow     = "53"
+arrow     = "58"
+async-trait = "0.1"
+datafusion = "53"
 bytes     = "1"
 chrono    = { version = "0.4", default-features = false, features = ["clock"] }
 clap      = { version = "4", features = ["derive"] }
 crc32fast = "1"
 futures   = "0.3"
 mimalloc  = { version = "0.1", default-features = false }
-object_store = "0.11"
-parquet   = "53"
+object_store = "0.13"
+parquet   = "58"
 rand      = "0.8"
 rand_distr = "0.4"
 serde     = "1"
@@ -57,3 +61,13 @@ unsafe_code = "forbid"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# Profiling profile: release-quality optimizations with full debug info
+# so flamegraphs show real function names (not `??`) and inlined frames.
+# Use via `cargo build --profile profiling` or `cargo flamegraph
+# --profile profiling`. Binaries land in `target/profiling/`. See
+# `scripts/profile-query.sh` for the canned harness.
+[profile.profiling]
+inherits = "release"
+debug = "full"
+strip = false

@@ -2,7 +2,9 @@
 //! reconcile against an in-memory object store.
 
 use bytes::Bytes;
-use object_store::{memory::InMemory, path::Path as ObjPath, ObjectStore, PutPayload};
+use object_store::{
+    memory::InMemory, path::Path as ObjPath, ObjectStore, ObjectStoreExt, PutPayload,
+};
 use scry_block::BlockMeta;
 use scry_catalog::Catalog;
 use tempfile::TempDir;
@@ -20,6 +22,9 @@ fn meta(uuid: Uuid, writer: Uuid, ts_min: u64, rows: u64) -> BlockMeta {
         schema_version: 1,
         producer_version: "test".into(),
         label_fingerprint_bloom: None,
+        has_postings: false,
+        postings_size_bytes: None,
+        series_types: None,
     }
 }
 

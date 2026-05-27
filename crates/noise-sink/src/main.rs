@@ -16,7 +16,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use scry_catalog::Catalog;
 use scry_objstore::{open as open_objstore, ObjStoreConfig};
-use scry_server::{DummyPipeline, Server, ServerConfig};
+use scry_server::{decode, DummyPipeline, MetricsPipeline, Server, ServerConfig};
 use std::{path::PathBuf, sync::Arc};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -84,10 +84,16 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| format!("noise-sink-{}", rand_short()));
     let writer_uuid = Uuid::now_v7();
 
-    // Build the storage pipeline up front. Failing fast on a missing
+    // Build the storage pipelines up front. Failing fast on a missing
     // bucket or unreadable WAL dir is much better than failing on the
-    // first Dummy batch from an agent that's already mid-stream.
-    let pipeline: Option<Arc<Mutex<DummyPipeline>>> = if args.storage {
+    // first batch from an agent that's already mid-stream. Both
+    // signals share the same object store + catalog; each gets its
+    // own WAL subdir (`<wal>/dummy/`, `<wal>/metrics/`) via the
+    // `BlockBuilder::SIGNAL` constant inside `Pipeline::open`.
+    let (dummy_pipeline, metrics_pipeline): (
+        Option<Arc<Mutex<DummyPipeline>>>,
+        Option<Arc<Mutex<MetricsPipeline>>>,
+    ) = if args.storage {
         let wal_dir = args
             .wal_dir
             .clone()
@@ -100,18 +106,36 @@ async fn main() -> Result<()> {
             bucket   = %bucket,
             wal_dir  = %wal_dir.display(),
             catalog  = ?args.catalog,
-            "storage mode: WAL + parquet blocks → object storage"
+            "storage mode: WAL + parquet blocks → object storage (dummy + metrics)"
         );
         let store = open_objstore(&cfg)?;
         let catalog = match args.catalog.as_ref() {
-            Some(p) => Some(
+            Some(p) => Some(Arc::new(Mutex::new(
                 Catalog::open(p, &bucket)
                     .with_context(|| format!("opening catalog at {}", p.display()))?,
-            ),
+            ))),
             None => None,
         };
-        let pipe = DummyPipeline::open(wal_dir, store, catalog, writer_uuid).await?;
-        Some(Arc::new(Mutex::new(pipe)))
+        let dummy = DummyPipeline::open(
+            wal_dir.clone(),
+            store.clone(),
+            catalog.clone(),
+            writer_uuid,
+            decode::dummy,
+        )
+        .await?;
+        let metrics = MetricsPipeline::open(
+            wal_dir,
+            store,
+            catalog,
+            writer_uuid,
+            decode::metrics,
+        )
+        .await?;
+        (
+            Some(Arc::new(Mutex::new(dummy))),
+            Some(Arc::new(Mutex::new(metrics))),
+        )
     } else {
         if args.wal_dir.is_some() {
             warn!("--wal-dir set but --storage is not; ignoring WAL");
@@ -119,7 +143,7 @@ async fn main() -> Result<()> {
         if args.catalog.is_some() {
             warn!("--catalog set but --storage is not; ignoring catalog");
         }
-        None
+        (None, None)
     };
 
     let server = Server::new(
@@ -128,7 +152,8 @@ async fn main() -> Result<()> {
             writer_id,
             writer_uuid,
         },
-        pipeline,
+        dummy_pipeline,
+        metrics_pipeline,
     );
 
     server

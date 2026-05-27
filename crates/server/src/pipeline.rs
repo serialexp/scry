@@ -1,10 +1,21 @@
-//! Process-scoped Dummy durability pipeline.
+//! Generic, process-scoped durability pipeline for one signal.
 //!
 //! Owns the per-writer WAL, the active block builder, the destination
 //! object store, and the optional online catalog. Shared across
 //! sessions via `Arc<Mutex<_>>`. Per `ARCHITECTURE.md § The WAL` the
-//! WAL is per-writer, not per-session — every connection that lands on
-//! this process funnels Dummy ingest through the same pipeline.
+//! WAL is per-writer (per-signal) — every connection that lands on
+//! this process funnels signal-X ingest through the same pipeline.
+//!
+//! ## Generic over the block builder
+//!
+//! The same WAL → builder → upload → catalog machinery applies to every
+//! signal that follows the v0.1 shape. The only signal-specific bits
+//! are (a) the builder type, (b) the WAL signal subdirectory name, and
+//! (c) the wire decoder that turns batch payloads into builder appends.
+//! [`Pipeline`] is generic over a [`BlockBuilder`] for (a) and (b), and
+//! [`Pipeline::ingest`] takes a decode-function pointer for (c). Each
+//! signal gets its own concrete `Pipeline<B>` instance; the rest of the
+//! file is signal-agnostic.
 //!
 //! ## Background upload
 //!
@@ -30,9 +41,8 @@
 
 use anyhow::{Context, Result};
 use object_store::ObjectStore;
-use scry_block::{BlockBuilderConfig, DummyBlockBuilder};
+use scry_block::{BlockBuilder, BlockBuilderConfig};
 use scry_catalog::Catalog;
-use scry_proto::streaming::decode_dummy_batch_into;
 use scry_wal::{SegmentId, Wal, WalConfig};
 use std::{path::PathBuf, sync::Arc};
 use tokio::{
@@ -44,17 +54,29 @@ use uuid::Uuid;
 
 /// Maximum number of block uploads in flight concurrently. Two gives
 /// us one block actively uploading while the next one finishes filling,
-/// without unbounded growth under a slow bucket. Hardcoded for v0.1;
+/// without unbounded growth under a slow bucket. Hardcoded for v0.2;
 /// promote to `BlockBuilderConfig` (or a dedicated `IngestConfig`) if
 /// a real workload ever justifies tuning it.
 const MAX_INFLIGHT_UPLOADS: usize = 2;
 
-pub struct DummyPipeline {
+/// Decoder function type: takes a (decompressed) batch payload + the
+/// active block builder, walks the wire format streaming-style, calls
+/// the builder's signal-specific appender for each record, and returns
+/// the record count for ack accounting.
+///
+/// Concrete instances live in `scry_proto::streaming` —
+/// `decode_dummy_batch_into` and (after this commit)
+/// `decode_metrics_batch_into`. Pulled in as a fn pointer rather than
+/// a generic so the pipeline stays decoder-agnostic and binaries can
+/// wire up whichever decoder matches their builder.
+pub type DecodeFn<B> = fn(&[u8], &mut B) -> anyhow::Result<usize>;
+
+pub struct Pipeline<B: BlockBuilder> {
     /// Shared with the upload task so it can call `mark_uploaded` after
     /// a successful upload without funnelling back through the ingest
     /// path.
     wal: Arc<Mutex<Wal>>,
-    builder: DummyBlockBuilder,
+    builder: B,
     store: Arc<dyn ObjectStore>,
     /// Optional online catalog. Updates here are best-effort: a failed
     /// insert (sqlite locked, disk full, etc.) is logged but does not
@@ -64,6 +86,7 @@ pub struct DummyPipeline {
     catalog: Option<Arc<Mutex<Catalog>>>,
     writer_uuid: Uuid,
     cfg: BlockBuilderConfig,
+    decode: DecodeFn<B>,
     /// Pending upload tasks. Each entry is a spawned task that owns the
     /// old builder + a semaphore permit. `flush()` drains this on
     /// shutdown; routine ingest only `try_join_next`s to reap finished
@@ -76,38 +99,41 @@ pub struct DummyPipeline {
     upload_sem: Arc<Semaphore>,
 }
 
-impl DummyPipeline {
-    /// Open the WAL, replay any leftover records into a fresh builder,
-    /// and return a pipeline ready to ingest. The replayed records
-    /// are *not* re-acked to the agent (agents will resend any
-    /// in-flight batches they hadn't yet seen an ack for, and dedup
-    /// is a v0.2 concern), but they are durable and will be uploaded
-    /// in the next flush.
+impl<B: BlockBuilder> Pipeline<B> {
+    /// Open the WAL (signal subdir = `B::SIGNAL`), replay any leftover
+    /// records into a fresh builder, and return a pipeline ready to
+    /// ingest. The replayed records are *not* re-acked to the agent
+    /// (agents will resend any in-flight batches they hadn't yet seen
+    /// an ack for, and dedup is a v0.3 concern), but they are durable
+    /// and will be uploaded in the next flush.
     pub async fn open(
         wal_dir: PathBuf,
         store: Arc<dyn ObjectStore>,
-        catalog: Option<Catalog>,
+        catalog: Option<Arc<Mutex<Catalog>>>,
         writer_uuid: Uuid,
+        decode: DecodeFn<B>,
     ) -> Result<Self> {
-        let wal = Wal::open(WalConfig::new(wal_dir, "dummy"))
+        let wal = Wal::open(WalConfig::new(wal_dir, B::SIGNAL))
             .await
-            .context("opening Dummy WAL")?;
+            .with_context(|| format!("opening {} WAL", B::SIGNAL))?;
 
         let cfg = BlockBuilderConfig::default();
-        let mut builder = DummyBlockBuilder::new(writer_uuid, cfg);
+        let mut builder = B::new(writer_uuid, cfg);
         let mut replayed_records = 0u64;
         let mut replayed_frames = 0u64;
         for frame in wal.replay().context("scanning WAL for replay")? {
             let payload = frame.context("reading WAL frame")?;
-            let n = decode_dummy_batch_into(&payload, &mut builder)
-                .map_err(|e| anyhow::anyhow!("WAL replay: decode DummyBatch: {e}"))?;
+            let n = (decode)(&payload, &mut builder)
+                .with_context(|| format!("WAL replay: decode {} batch", B::SIGNAL))?;
             replayed_records += n as u64;
             replayed_frames += 1;
         }
         if replayed_records > 0 {
             info!(
+                signal = B::SIGNAL,
                 replayed_records,
-                replayed_frames, "WAL replay complete; records merged into next block"
+                replayed_frames,
+                "WAL replay complete; records merged into next block"
             );
         }
 
@@ -115,23 +141,20 @@ impl DummyPipeline {
             wal: Arc::new(Mutex::new(wal)),
             builder,
             store,
-            catalog: catalog.map(|c| Arc::new(Mutex::new(c))),
+            catalog,
             writer_uuid,
             cfg,
+            decode,
             in_flight: JoinSet::new(),
             upload_sem: Arc::new(Semaphore::new(MAX_INFLIGHT_UPLOADS)),
         })
     }
 
-    /// Append a single DummyBatch payload (already zstd-decoded; the
+    /// Append a single batch payload (already zstd-decoded; the
     /// binschema-encoded form is what hits the WAL). On replay we
     /// decode the same bytes back into records, so this is the unit
     /// of crash-recovery atomicity. Auto-spawns a background upload
     /// task if the builder hits its close threshold.
-    ///
-    /// Decode is streaming: we never materialise a `DummyBatch` /
-    /// `Vec<DummyRecord>` / per-record `String` + `Vec<u8>`. See
-    /// [`scry_proto::streaming`] for the rationale.
     pub async fn ingest(&mut self, payload: &[u8]) -> Result<u64> {
         // Order matters: WAL first, builder second. If the WAL append
         // fails we never put the records into the in-memory builder
@@ -150,9 +173,7 @@ impl DummyPipeline {
             .await
             .context("WAL append")?;
 
-        let n = decode_dummy_batch_into(payload, &mut self.builder)
-            .map_err(|e| anyhow::anyhow!("DummyBatch: {e}"))?
-            as u64;
+        let n = (self.decode)(payload, &mut self.builder)? as u64;
 
         if self.builder.should_close() {
             self.spawn_upload().await?;
@@ -186,7 +207,7 @@ impl DummyPipeline {
             .await
             .context("WAL rotate on spawn_upload")?;
 
-        let new_builder = DummyBlockBuilder::new(self.writer_uuid, self.cfg);
+        let new_builder = B::new(self.writer_uuid, self.cfg);
         let old_builder = std::mem::replace(&mut self.builder, new_builder);
 
         let store = self.store.clone();
@@ -203,7 +224,7 @@ impl DummyPipeline {
                 .acquire_owned()
                 .await
                 .expect("upload semaphore is never closed");
-            run_upload(old_builder, sealed, store, wal, catalog).await;
+            run_upload::<B>(old_builder, sealed, store, wal, catalog).await;
         });
         Ok(())
     }
@@ -248,8 +269,8 @@ impl DummyPipeline {
 /// returns an error (so a single failed block doesn't poison the
 /// JoinSet), but a failed upload leaves the sealed WAL segment in
 /// place for the next process start to replay.
-async fn run_upload(
-    builder: DummyBlockBuilder,
+async fn run_upload<B: BlockBuilder>(
+    builder: B,
     sealed: SegmentId,
     store: Arc<dyn ObjectStore>,
     wal: Arc<Mutex<Wal>>,
@@ -263,6 +284,7 @@ async fn run_upload(
             // with us for a few microseconds.
             if let Err(e) = wal.lock().await.mark_uploaded(sealed).await {
                 warn!(
+                    signal = B::SIGNAL,
                     sealed_seq = sealed.0,
                     error = %e,
                     "WAL mark_uploaded after block upload"
@@ -280,6 +302,7 @@ async fn run_upload(
                     }
                     Err(e) => {
                         warn!(
+                            signal = B::SIGNAL,
                             block_uuid = %meta.uuid,
                             error = %e,
                             "catalog insert failed; bucket has the data — recover via scry-list --reconcile"
@@ -288,10 +311,11 @@ async fn run_upload(
                 }
             }
             info!(
+                signal = B::SIGNAL,
                 block_uuid = %meta.uuid,
                 row_count = meta.row_count,
                 byte_size = meta.byte_size,
-                "dummy block uploaded; WAL segments through {} released",
+                "block uploaded; WAL segments through {} released",
                 sealed.0,
             );
         }
@@ -300,7 +324,7 @@ async fn run_upload(
             // spawn_upload checks above, but possible if someone
             // called flush() under tight races. Leave the sealed WAL
             // segment in place; replay will pick it up next time.
-            warn!("upload produced no block; WAL segment retained for replay");
+            warn!(signal = B::SIGNAL, "upload produced no block; WAL segment retained for replay");
         }
         Err(e) => {
             // The upload failed. The sealed WAL segment is *not*
@@ -310,9 +334,10 @@ async fn run_upload(
             // because the JoinSet entry just records a returned unit.
             // Logging here is the recovery signal.
             warn!(
+                signal = B::SIGNAL,
                 sealed_seq = sealed.0,
                 error = %e,
-                "dummy block upload failed; WAL segment retained for replay"
+                "block upload failed; WAL segment retained for replay"
             );
         }
     }

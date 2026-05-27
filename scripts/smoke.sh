@@ -1,14 +1,27 @@
 #!/usr/bin/env bash
-# v0.1 storage exit criterion — end-to-end smoke test.
+# v0.1/v0.2 storage exit criterion — end-to-end smoke test.
 #
-# Sends a known number of DummyRecords through the wire path, runs the
+# Sends a known number of batches through the wire path, runs the
 # storage pipeline (WAL → block → object store → online catalog),
 # then bootstraps a fresh catalog from the bucket via scry-list and
 # asserts:
 #
 #   * the new catalog's total row count equals exactly the number of
-#     records the spewer generated, and
+#     records the sink accepted, and
 #   * at least one block landed in the bucket.
+#
+# Parameterised by `SIGNAL` (default `dummy`):
+#
+#   SIGNAL=dummy   ./scripts/smoke.sh    # v0.1 path
+#   SIGNAL=metrics ./scripts/smoke.sh    # v0.2 path (also asserts ≥1
+#                                        #  block with has_postings=1)
+#
+# Records-per-batch and the connection-summary counter parsed from
+# noise-sink's log are signal-specific. The per-signal record
+# definitions match the server.rs counters:
+#
+#   dummy   → records   = DummyRecord count        (256/batch)
+#   metrics → records   = MetricSample count       (400/batch — 8 series × 50 samples)
 #
 # The dev Garage bucket (`scry-dev`) is emptied at the start of the
 # run so the post-condition is unambiguous. Don't point this at any
@@ -20,6 +33,22 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 # ── Parameters ──────────────────────────────────────────────────────
+SIGNAL="${SIGNAL:-dummy}"
+case "$SIGNAL" in
+    dummy)
+        RECORDS_PER_BATCH=256        # crates/noise-spewer/src/gen.rs::render_dummy
+        SUMMARY_TAG="dummy"          # counter key in server.rs connection summary
+        ;;
+    metrics)
+        RECORDS_PER_BATCH=400        # crates/noise-spewer/src/gen.rs::render_metrics (8×50)
+        SUMMARY_TAG="samples"
+        ;;
+    *)
+        echo "[smoke] unsupported SIGNAL='$SIGNAL'; expected dummy|metrics" >&2
+        exit 2
+        ;;
+esac
+
 # DURATION_SECS is a generous upper bound; if the spewer can't reach
 # --max-batches in time it logs "duration reached" and we treat what
 # it actually sent as the source of truth (see assertions below).
@@ -29,7 +58,6 @@ cd "$ROOT"
 BATCHES="${BATCHES:-2000}"
 RATE="${RATE:-400}"
 DURATION_SECS="${DURATION_SECS:-300}"
-RECORDS_PER_BATCH=256              # see crates/noise-spewer/src/gen.rs::render_dummy
 EXPECTED_RECORDS=$(( BATCHES * RECORDS_PER_BATCH ))
 LISTEN="${LISTEN:-127.0.0.1:4099}"
 SMOKE_DIR="${SMOKE_DIR:-/tmp/scry-smoke}"
@@ -44,6 +72,10 @@ set -a; source docker/garage/.env; set +a
 
 if ! command -v aws >/dev/null; then
     echo "[smoke] aws CLI not on PATH — needed for bucket reset" >&2
+    exit 2
+fi
+if [[ "$SIGNAL" == "metrics" ]] && ! command -v sqlite3 >/dev/null; then
+    echo "[smoke] sqlite3 CLI not on PATH — needed for has_postings assertion" >&2
     exit 2
 fi
 
@@ -76,7 +108,7 @@ AWS_REGION="$SCRY_OBJSTORE_REGION" \
 # user/sys CPU across its whole lifetime, including the final flush.
 # Time does NOT forward SIGINT to its child, so we send the shutdown
 # signal directly to noise-sink via its PID (found with pgrep).
-echo "[smoke] starting noise-sink on $LISTEN..."
+echo "[smoke] starting noise-sink on $LISTEN (signal=$SIGNAL)..."
 RUST_LOG="${RUST_LOG:-info}" "$TIME_BIN" -v -o "$SMOKE_DIR/sink.time" \
     ./target/release/noise-sink \
         --listen "$LISTEN" \
@@ -127,7 +159,7 @@ RSS_PID=$!
 echo "[smoke] spewer: $BATCHES batches × $RECORDS_PER_BATCH records = $EXPECTED_RECORDS records expected (rate=$RATE b/s, duration cap=${DURATION_SECS}s)"
 ./target/release/noise-spewer \
     --addr "$LISTEN" \
-    --signals dummy \
+    --signals "$SIGNAL" \
     --rate "$RATE" \
     --duration "${DURATION_SECS}s" \
     --max-batches "$BATCHES" \
@@ -161,15 +193,20 @@ total_rows=$(awk -F'[= ]' '/^# total rows=/ { print $4; exit }' "$SMOKE_DIR/scry
 # in the catalog." We can't compare against EXPECTED_RECORDS directly
 # because the spewer may have hit the duration cap (see above). Use
 # the sink's session summary as the ground-truth count of records it
-# accepted — that's what we want to match against the bucket.
-sink_accepted=$(awk '
-    /session_id=.* dummy=/ {
-        for (i=1; i<=NF; i++) if ($i ~ /^dummy=/) { sub("dummy=","",$i); total += $i }
+# accepted — that's what we want to match against the bucket. The
+# summary tag (`dummy=` / `samples=`) is signal-specific because
+# different signals count different things as a "record."
+sink_accepted=$(awk -v tag="${SUMMARY_TAG}=" '
+    $0 ~ "session_id=.* " tag {
+        for (i=1; i<=NF; i++) if (index($i, tag) == 1) {
+            sub(tag, "", $i); total += $i
+        }
     }
     END { print total+0 }
 ' "$SMOKE_DIR/sink.log")
 
 echo "[smoke] ──── assertions ────"
+echo "[smoke] signal            : $SIGNAL"
 echo "[smoke] requested records : $EXPECTED_RECORDS"
 echo "[smoke] sink accepted     : $sink_accepted"
 echo "[smoke] catalog rows      : $total_rows"
@@ -187,14 +224,29 @@ if [[ -z "${block_count:-}" || "$block_count" -lt 1 ]]; then
     echo "[smoke] FAIL: catalog reports zero blocks"
     failed=1
 fi
+
+# Metrics-specific assertion: at least one block carries a postings
+# parquet. The catalog schema's `has_postings` / `postings_size_bytes`
+# columns are set by the metrics block builder; the dummy builder
+# leaves them false/0. If a metrics smoke run sees no postings the
+# inverted-index sidecar was never written — defeats the entire
+# purpose of the metrics-block shape.
+if [[ "$SIGNAL" == "metrics" ]]; then
+    postings_blocks=$(sqlite3 "$SMOKE_DIR/recon.sqlite" \
+        "SELECT COUNT(*) FROM blocks WHERE has_postings = 1 AND postings_size_bytes IS NOT NULL AND postings_size_bytes > 0;")
+    echo "[smoke] blocks w/ postings: $postings_blocks"
+    if [[ "${postings_blocks:-0}" -lt 1 ]]; then
+        echo "[smoke] FAIL: no metrics blocks carry a postings sidecar"
+        failed=1
+    fi
+fi
+
 # Throughput observation: the sink's accepted count below
 # EXPECTED_RECORDS means the spewer was rate-capped by sink-side
-# back-pressure (currently: parquet+S3 flush blocks the ingest
-# lock). Not a correctness failure, but worth flagging.
+# back-pressure. Not a correctness failure, but worth flagging.
 if [[ "${sink_accepted:-0}" -lt "$EXPECTED_RECORDS" ]]; then
     deficit=$(( EXPECTED_RECORDS - sink_accepted ))
     echo "[smoke] NOTE: sink throughput-capped; spewer fell ${deficit} records short of requested $EXPECTED_RECORDS"
-    echo "[smoke]       (parquet+S3 flush blocks the ingest lock — see DummyPipeline::flush)"
 fi
 
 # ── Service performance ────────────────────────────────────────────

@@ -1,2 +1,7 @@
 /target
 docker/garage/.env
+
+# Profiler output (scripts/profile-query.sh + cargo-flamegraph).
+/flamegraphs/
+perf.data
+perf.data.old

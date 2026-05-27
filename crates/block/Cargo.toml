@@ -24,7 +24,8 @@ tracing       = { workspace = true }
 uuid          = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
+futures = { workspace = true }
+tokio   = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

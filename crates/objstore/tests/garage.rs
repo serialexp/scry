@@ -14,7 +14,7 @@
 //! container into the pipeline.
 
 use bytes::Bytes;
-use object_store::{path::Path, ObjectStore};
+use object_store::{path::Path, ObjectStore, ObjectStoreExt};
 use scry_objstore::{open, ObjStoreConfig};
 
 fn cfg_or_skip() -> Option<ObjStoreConfig> {

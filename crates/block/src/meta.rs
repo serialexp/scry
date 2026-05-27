@@ -29,4 +29,28 @@ pub struct BlockMeta {
     /// `None` in v0.1 — the dummy record has no labels. Populated by
     /// real signals starting in v0.2.
     pub label_fingerprint_bloom: Option<Vec<u8>>,
+
+    /// Whether this block has a sibling `.postings.parquet` file.
+    /// True for metrics blocks (the inverted index that drives
+    /// cardinality-aware query pruning per ARCHITECTURE.md § Metrics
+    /// § Per-block postings index), false for every other signal.
+    #[serde(default)]
+    pub has_postings: bool,
+
+    /// On-disk size of the postings sidecar parquet, if present.
+    /// `None` when `has_postings` is false. Carried in the sidecar so
+    /// the catalog can surface "how much postings overhead does this
+    /// block carry" without opening the parquet itself.
+    #[serde(default)]
+    pub postings_size_bytes: Option<u64>,
+
+    /// Per-series metric type (counter / gauge / …), keyed by
+    /// fingerprint. The wire's `SeriesDictEntry.metric_type` has
+    /// nowhere to land in the canonical postings schema (which is
+    /// purely label → fingerprints), so we keep it here in the
+    /// sidecar JSON. Cheap (~9 bytes × N_series) and avoids
+    /// committing to a parquet schema we'd regret. `None` for
+    /// non-metrics signals.
+    #[serde(default)]
+    pub series_types: Option<Vec<(u64, u8)>>,
 }

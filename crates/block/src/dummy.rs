@@ -33,14 +33,14 @@ use arrow::array::{ArrayRef, BinaryArray, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
-use object_store::{path::Path, ObjectStore};
+use object_store::{path::Path, ObjectStore, ObjectStoreExt};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use scry_proto::streaming::DummyAppender;
 use uuid::Uuid;
 
-use crate::{block_path, BlockBuilderConfig, BlockMeta};
+use crate::{block_path, BlockBuilder, BlockBuilderConfig, BlockMeta};
 
 const SIGNAL: &str = "dummy";
 const SCHEMA_VERSION: u32 = 1;
@@ -66,7 +66,23 @@ pub struct DummyBlockBuilder {
 }
 
 impl DummyBlockBuilder {
-    pub fn new(writer_id: Uuid, cfg: BlockBuilderConfig) -> Self {
+    pub fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("ts_unix_nano", DataType::UInt64, false),
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Binary, false),
+        ]))
+    }
+
+    pub fn row_count(&self) -> u64 {
+        self.ts.len() as u64
+    }
+}
+
+impl BlockBuilder for DummyBlockBuilder {
+    const SIGNAL: &'static str = SIGNAL;
+
+    fn new(writer_id: Uuid, cfg: BlockBuilderConfig) -> Self {
         // Pre-seed offsets with the leading 0 sentinel that CSR (and
         // Arrow) always carries. After N appends, offsets has length
         // N+1; offsets[N+1] - offsets[N] is the length of slot N.
@@ -88,28 +104,22 @@ impl DummyBlockBuilder {
         }
     }
 
-    pub fn schema() -> SchemaRef {
-        Arc::new(Schema::new(vec![
-            Field::new("ts_unix_nano", DataType::UInt64, false),
-            Field::new("key", DataType::Utf8, false),
-            Field::new("value", DataType::Binary, false),
-        ]))
-    }
-
-    pub fn row_count(&self) -> u64 {
-        self.ts.len() as u64
-    }
-
-    pub fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.ts.is_empty()
     }
 
     /// Should the caller close this block now? Returns true once
     /// either the row-count or byte-estimate cap is reached.
-    pub fn should_close(&self) -> bool {
+    fn should_close(&self) -> bool {
         self.row_count() >= self.cfg.max_rows || self.bytes_est >= self.cfg.target_bytes
     }
 
+    fn finish_and_upload(
+        self,
+        store: &dyn ObjectStore,
+    ) -> impl std::future::Future<Output = Result<Option<BlockMeta>>> + Send {
+        self.finish_and_upload_impl(store)
+    }
 }
 
 /// Streaming-decode hookup: the wire decoder hands us borrowed
@@ -135,10 +145,12 @@ impl DummyAppender for DummyBlockBuilder {
 }
 
 impl DummyBlockBuilder {
-    /// Close the block: serialise to parquet, upload it and a
-    /// metadata sidecar, return the [`BlockMeta`] for catalog
-    /// insertion. Consumes `self`.
-    pub async fn finish_and_upload(
+    /// Body of the [`BlockBuilder::finish_and_upload`] impl. Split out
+    /// as an inherent helper because the trait method desugars to
+    /// `impl Future<Output = …>` and putting the body directly there
+    /// loses the `mut self` rebinding ergonomic — the inherent helper
+    /// is the easier reading of the same code.
+    async fn finish_and_upload_impl(
         mut self,
         store: &dyn ObjectStore,
     ) -> Result<Option<BlockMeta>> {
@@ -192,7 +204,7 @@ impl DummyBlockBuilder {
         // streaming multipart upload is a v0.2+ concern.
         let props = WriterProperties::builder()
             .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
-            .set_max_row_group_size(1024 * 1024) // ~1M rows; row-group bytes are roughly compressed payload
+            .set_max_row_group_row_count(Some(self.cfg.row_group_size))
             .build();
         let mut buf: Vec<u8> = Vec::with_capacity(self.bytes_est as usize);
         {
@@ -231,6 +243,10 @@ impl DummyBlockBuilder {
             schema_version: SCHEMA_VERSION,
             producer_version: env!("CARGO_PKG_VERSION").to_string(),
             label_fingerprint_bloom: None,
+            // Dummy is signal-less and has no labels to invert.
+            has_postings: false,
+            postings_size_bytes: None,
+            series_types: None,
         };
         let meta_bytes = Bytes::from(
             serde_json::to_vec_pretty(&meta).context("serialising BlockMeta")?,
