@@ -9,3 +9,5 @@ docker/garage/.env
 /tmp/
 **/*.log
 deploy/
+docker-bake.hcl
+depot.json

@@ -25,7 +25,7 @@ spec:
         - operator: Exists
       containers:
         - name: scry-agent
-          image: ghcr.io/serialexp/scry:latest
+          image: serialexp/scry:latest
           imagePullPolicy: IfNotPresent
           command:
             - scry-agent

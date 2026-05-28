@@ -23,7 +23,7 @@ spec:
       terminationGracePeriodSeconds: 30
       containers:
         - name: scry-server
-          image: ghcr.io/serialexp/scry:latest
+          image: serialexp/scry:latest
           imagePullPolicy: IfNotPresent
           command:
             - noise-sink
