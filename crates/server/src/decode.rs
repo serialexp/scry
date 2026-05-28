@@ -11,7 +11,7 @@
 //! to the pipeline's `DecodeFn<B>` function-pointer type.
 
 use anyhow::Result;
-use scry_block::{DummyBlockBuilder, MetricsBlockBuilder};
+use scry_block::{DummyBlockBuilder, LogsBlockBuilder, MetricsBlockBuilder};
 use scry_proto::streaming;
 
 /// Adapter for `decode_dummy_batch_into`, wired to [`DummyBlockBuilder`].
@@ -30,4 +30,13 @@ pub fn metrics(payload: &[u8], builder: &mut MetricsBlockBuilder) -> Result<usiz
     streaming::decode_metrics_batch_into(payload, builder)
         .map(|(_series, samples)| samples)
         .map_err(|e| anyhow::anyhow!("MetricsBatch: {e}"))
+}
+
+/// Adapter for `decode_logs_batch_into`, wired to
+/// [`LogsBlockBuilder`]. The streaming decoder returns the total
+/// entry count (streams are a dictionary, not records); the
+/// pipeline records that directly.
+pub fn logs(payload: &[u8], builder: &mut LogsBlockBuilder) -> Result<usize> {
+    streaming::decode_logs_batch_into(payload, builder)
+        .map_err(|e| anyhow::anyhow!("LogsBatch: {e}"))
 }

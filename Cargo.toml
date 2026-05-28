@@ -41,6 +41,7 @@ clap      = { version = "4", features = ["derive"] }
 crc32fast = "1"
 futures   = "0.3"
 mimalloc  = { version = "0.1", default-features = false }
+num_cpus  = "1"
 object_store = "0.13"
 parquet   = "58"
 rand      = "0.8"

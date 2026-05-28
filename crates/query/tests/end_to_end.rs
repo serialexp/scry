@@ -23,7 +23,7 @@ use object_store::{memory::InMemory, ObjectStore};
 use scry_block::{BlockBuilder, BlockBuilderConfig, MetricsBlockBuilder};
 use scry_catalog::Catalog;
 use scry_proto::streaming::MetricsAppender;
-use scry_query::{build_metrics_table, register_metrics_table, MetricsQuery, METRICS_TABLE_NAME};
+use scry_query::{build_metrics_table, register_metrics_table, Query, METRICS_TABLE_NAME};
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -59,7 +59,7 @@ fn samples_for(b: &mut MetricsBlockBuilder, fp: u64, ts_start: u64, n: u64, step
 async fn run_query(
     catalog: &Catalog,
     store: Arc<dyn ObjectStore>,
-    q: &MetricsQuery,
+    q: &Query,
 ) -> (Vec<arrow::record_batch::RecordBatch>, Arc<dyn ExecutionPlan>) {
     let ctx = SessionContext::new();
     register_metrics_table(&ctx, catalog, store, q).await.unwrap();
@@ -205,7 +205,7 @@ async fn querier_end_to_end() {
     assert_eq!(catalog.block_count().unwrap(), 2);
 
     // ── 1. __name__=foo → 300 rows; fps ⊆ {a1,a2,b2}; pruning ─────
-    let q1 = MetricsQuery {
+    let q1 = Query {
         matchers: vec![("__name__".into(), "foo".into())],
         ts_min: None,
         ts_max: None,
@@ -227,7 +227,7 @@ async fn querier_end_to_end() {
     );
 
     // ── 2. env=prod → 400 rows ────────────────────────────────────
-    let q2 = MetricsQuery {
+    let q2 = Query {
         matchers: vec![("env".into(), "prod".into())],
         ts_min: None,
         ts_max: None,
@@ -240,7 +240,7 @@ async fn querier_end_to_end() {
     // Block B has `foo` (B2) but no `stage` row, so its postings
     // intersect is empty → it never makes it into the block list at
     // all. Inspect that via `build_metrics_table` directly.
-    let q3 = MetricsQuery {
+    let q3 = Query {
         matchers: vec![
             ("__name__".into(), "foo".into()),
             ("env".into(), "stage".into()),
@@ -265,7 +265,7 @@ async fn querier_end_to_end() {
     }
 
     // ── 4. nonexistent=x → 0 rows ─────────────────────────────────
-    let q4 = MetricsQuery {
+    let q4 = Query {
         matchers: vec![("nonexistent".into(), "x".into())],
         ts_min: None,
         ts_max: None,
@@ -274,12 +274,12 @@ async fn querier_end_to_end() {
     assert_eq!(total_rows(&batches), 0);
 
     // ── 5. Empty matchers → all 500 rows ──────────────────────────
-    let q5 = MetricsQuery::default();
+    let q5 = Query::default();
     let (batches, _plan) = run_query(&catalog, store.clone(), &q5).await;
     assert_eq!(total_rows(&batches), 500, "300 (A) + 200 (B)");
 
     // ── 6. Time-bounded: block A skipped at catalog plan ──────────
-    let q6 = MetricsQuery {
+    let q6 = Query {
         matchers: vec![("env".into(), "prod".into())],
         ts_min: Some(2_000_050),
         ts_max: Some(2_000_150),

@@ -40,7 +40,7 @@ use parquet::file::properties::WriterProperties;
 use scry_proto::streaming::DummyAppender;
 use uuid::Uuid;
 
-use crate::{block_path, BlockBuilder, BlockBuilderConfig, BlockMeta};
+use crate::{block_path, BlockBuilder, BlockBuilderConfig, BlockMeta, EncodedBlock};
 
 const SIGNAL: &str = "dummy";
 const SCHEMA_VERSION: u32 = 1;
@@ -114,6 +114,52 @@ impl BlockBuilder for DummyBlockBuilder {
         self.row_count() >= self.cfg.max_rows || self.bytes_est >= self.cfg.target_bytes
     }
 
+    fn merge(&mut self, other: &mut Self) {
+        // Sample columns: a single bulk move each. `append` leaves
+        // `other`'s vec empty with its capacity intact for reuse.
+        self.ts.append(&mut other.ts);
+        // CSR key buffer: append the bytes, then rebase `other`'s
+        // offsets (which start at 0) by our current data length and
+        // push them on — skipping `other`'s leading-0 sentinel.
+        let key_base = self.key_data.len() as i32;
+        self.key_data.append(&mut other.key_data);
+        self.key_offsets
+            .extend(other.key_offsets[1..].iter().map(|&o| o + key_base));
+        // CSR value buffer: same rebase.
+        let val_base = self.value_data.len() as i32;
+        self.value_data.append(&mut other.value_data);
+        self.value_offsets
+            .extend(other.value_offsets[1..].iter().map(|&o| o + val_base));
+
+        self.bytes_est += other.bytes_est;
+        self.ts_min = self.ts_min.min(other.ts_min);
+        self.ts_max = self.ts_max.max(other.ts_max);
+
+        // Leave `other` empty and reusable: data vecs were drained by
+        // `append`; reset the offset vecs to the leading-0 sentinel and
+        // clear the scalar accumulators.
+        other.key_offsets.clear();
+        other.key_offsets.push(0);
+        other.value_offsets.clear();
+        other.value_offsets.push(0);
+        other.bytes_est = 0;
+        other.ts_min = u64::MAX;
+        other.ts_max = 0;
+    }
+
+    fn reset(&mut self) {
+        self.ts.clear();
+        self.key_data.clear();
+        self.key_offsets.clear();
+        self.key_offsets.push(0);
+        self.value_data.clear();
+        self.value_offsets.clear();
+        self.value_offsets.push(0);
+        self.bytes_est = 0;
+        self.ts_min = u64::MAX;
+        self.ts_max = 0;
+    }
+
     fn finish_and_upload(
         self,
         store: &dyn ObjectStore,
@@ -151,13 +197,41 @@ impl DummyBlockBuilder {
     /// loses the `mut self` rebinding ergonomic — the inherent helper
     /// is the easier reading of the same code.
     async fn finish_and_upload_impl(
-        mut self,
+        self,
         store: &dyn ObjectStore,
     ) -> Result<Option<BlockMeta>> {
         if self.is_empty() {
             return Ok(None);
         }
+        // Offload the CPU-heavy encode (permutation sort + Arrow build +
+        // zstd) onto the blocking pool so it doesn't monopolise an async
+        // worker thread; the PUTs run back here on the async side.
+        let enc = tokio::task::spawn_blocking(move || self.encode())
+            .await
+            .context("join dummy encode task")??;
+        for (path, bytes) in enc.puts {
+            store
+                .put(&path, bytes.into())
+                .await
+                .with_context(|| format!("upload {path}"))?;
+        }
+        let meta = enc.meta;
+        tracing::info!(
+            block_uuid = %meta.uuid,
+            row_count = meta.row_count,
+            byte_size = meta.byte_size,
+            ts_min = meta.ts_min_unix_nano,
+            ts_max = meta.ts_max_unix_nano,
+            "block uploaded"
+        );
+        Ok(Some(meta))
+    }
 
+    /// Encode buffered records into parquet + JSON-sidecar bytes. Pure
+    /// CPU, no I/O — runs on the blocking pool via `spawn_blocking` so
+    /// the zstd compression doesn't stall an async worker. The async
+    /// `finish_and_upload_impl` performs the PUTs.
+    fn encode(mut self) -> Result<EncodedBlock> {
         // Sort by ts ascending via a permutation vector. The CSR
         // buffers stay untouched; we walk them through the permutation
         // when building the Arrow arrays.
@@ -247,36 +321,20 @@ impl DummyBlockBuilder {
             has_postings: false,
             postings_size_bytes: None,
             series_types: None,
+            all_fingerprints: None,
         };
         let meta_bytes = Bytes::from(
             serde_json::to_vec_pretty(&meta).context("serialising BlockMeta")?,
         );
 
-        // Upload the parquet first; the sidecar is the catalog's
-        // signal that the parquet exists. If we crash between the two
-        // uploads, the parquet is orphaned and the reconciler will
-        // either ignore it (no sidecar) or a future writer will
-        // overwrite it with its own block on retry (different UUID,
-        // so no overwrite in practice — the orphan stays until
-        // retention sweeps it).
-        store
-            .put(&parquet_path, parquet_bytes.into())
-            .await
-            .with_context(|| format!("upload parquet {parquet_path}"))?;
-        store
-            .put(&meta_path, meta_bytes.into())
-            .await
-            .with_context(|| format!("upload sidecar {meta_path}"))?;
-
-        tracing::info!(
-            block_uuid = %block_uuid,
-            row_count = n,
-            byte_size,
-            ts_min = self.ts_min,
-            ts_max = self.ts_max,
-            "block uploaded"
-        );
-
-        Ok(Some(meta))
+        // Upload order: parquet first, meta.json last. The sidecar is
+        // the catalog's "block exists" signal; if we crash between the
+        // two PUTs the parquet is orphaned and the reconciler ignores it
+        // (no sidecar) until retention sweeps it. The async wrapper
+        // walks `puts` in this order.
+        Ok(EncodedBlock {
+            meta,
+            puts: vec![(parquet_path, parquet_bytes), (meta_path, meta_bytes)],
+        })
     }
 }

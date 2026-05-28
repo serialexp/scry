@@ -27,6 +27,7 @@ impl QueryFrameMsg {
         match self {
             QueryFrameMsg::QueryRequest(v) => {
                 encoder.write_uint8(1);
+                encoder.write_uint8(v.signal);
                 encoder.write_uint16(v.matchers.len() as u16, Endianness::BigEndian);
                 for item in &v.matchers {
                     item.encode_into(encoder)?;
@@ -151,6 +152,7 @@ impl QueryFrame {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueryRequestInput {
+    pub signal: u8,
     pub matchers: Vec<Matcher>,
     pub ts_min_present: u8,
     pub ts_min: u64,
@@ -164,6 +166,7 @@ pub struct QueryRequestInput {
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueryRequestOutput {
     pub tag: u8,
+    pub signal: u8,
     pub matchers: Vec<Matcher>,
     pub ts_min_present: u8,
     pub ts_min: u64,
@@ -185,6 +188,7 @@ impl QueryRequestInput {
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         encoder.write_byte(1);
+        encoder.write_byte(self.signal);
         encoder.write_u16_be(self.matchers.len() as u16);
         for item in &self.matchers {
             item.encode_into(encoder)?;
@@ -220,6 +224,7 @@ impl QueryRequestOutput {
         if tag != 1u8 {
             return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 1, got {}", tag)));
         }
+        let signal = decoder.read_byte()?;
         let length = decoder.read_u16_be()? as usize;
         let mut matchers = Vec::with_capacity(length);
         for _ in 0..length {
@@ -239,6 +244,7 @@ impl QueryRequestOutput {
         let request_id: std::string::String = bytes.iter().map(|&b| b as char).collect();
         Ok(Self {
             tag,
+            signal,
             matchers,
             ts_min_present,
             ts_min,
@@ -260,6 +266,7 @@ impl QueryRequestOutput {
 impl From<QueryRequestOutput> for QueryRequestInput {
     fn from(o: QueryRequestOutput) -> Self {
         Self {
+            signal: o.signal,
             matchers: o.matchers,
             ts_min_present: o.ts_min_present,
             ts_min: o.ts_min,
@@ -276,6 +283,7 @@ impl From<QueryRequestInput> for QueryRequestOutput {
     fn from(i: QueryRequestInput) -> Self {
         Self {
             tag: 1u8,
+            signal: i.signal,
             matchers: i.matchers,
             ts_min_present: i.ts_min_present,
             ts_min: i.ts_min,

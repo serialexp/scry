@@ -24,6 +24,7 @@
 //!     },
 //!     Some(dummy_pipeline.clone()),
 //!     None,
+//!     None,
 //! );
 //! server.serve_with_shutdown(tokio::signal::ctrl_c()).await?;
 //! ```
@@ -32,7 +33,9 @@ pub mod decode;
 mod pipeline;
 pub mod query_service;
 mod server;
+pub mod stats;
 
 pub use pipeline::{DecodeFn, Pipeline};
 pub use query_service::QueryService;
-pub use server::{DummyPipeline, MetricsPipeline, Server, ServerConfig};
+pub use server::{DummyPipeline, LogsPipeline, MetricsPipeline, Server, ServerConfig};
+pub use stats::{serve_stats, ServerMetrics, StatsProvider, UploadStats};

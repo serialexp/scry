@@ -861,6 +861,91 @@ filed for the binschema project to fix upstream. Doing the migration
 exposed this, which is one of the reasons we did it now rather than
 waiting.
 
+## D-032: Logs as the second real signal (v0.4 step 1)
+
+**Date:** 2026-05-28
+**Status:** accepted
+
+Until v0.4 there was exactly one fully-implemented signal end-to-end
+(metrics: ingest → block → catalog → query daemon → CLI, plus the
+postings cache and the binschema query transport). Until a second
+signal exists, every "signal-agnostic" boundary in the codebase is
+only ever exercised in one shape — which is to say, untested. This
+step lights up logs as the second real signal specifically to force
+out the abstractions that had been hardcoded "metrics" everywhere.
+
+The intent here is architectural validation, not feature parity with
+the logs ecosystem (Loki, ClickHouse, Elastic). v0 logs answer
+"what entries match these stream labels in this time window, plus
+optionally arbitrary SQL on the resulting table" — that's enough to
+exercise every per-signal seam.
+
+Four design choices, recorded so the v0.5/v0.6 work doesn't
+re-litigate them:
+
+1. **Log indexing mirrors metrics.** Postings sidecar on
+   `LogStream.labels` only — service, host, env — playing the same
+   role as a metrics series-label inverted index. Per-entry attributes
+   (`LogEntry.attributes`: trace_id, status, …) become a flat
+   `Map<Utf8,Utf8>` column on the main parquet, queryable through SQL
+   but not pushdown-eligible at the postings layer. This is the same
+   "per-series indexed, per-sample not" split metrics has, intentionally
+   — per-entry indexing is a different problem (per-entry attribute
+   cardinality is unbounded) and not blocking v0.4.
+
+2. **Body-substring search is deferred.** `body LIKE '%pat%'` works
+   today, but as a full column scan after time-range + label pruning.
+   Real substring / phrase / RE2 search will be a tantivy-backed phase
+   later (tantivy is already used elsewhere in the codebase and is
+   strong at this). Deliberately staged: v0.4 step 1 proves the
+   two-signal shape; the indexing answer can be its own decision when
+   we have a real query mix to size against.
+
+3. **Duplicate-first for signal-divergent code; share only the
+   genuinely-shared envelope.** `LogsBlockBuilder`, `LogsTable`, the
+   per-signal `decode::logs` adapter, and the postings-resolve dance
+   are all parallel-and-similar to their metrics counterparts rather
+   than abstracted behind a "signal-shaped trait." This is the right
+   v0 shape — once logs picks up body-search resolution, the
+   builder and table provider will diverge enough that an early
+   abstraction would have to be rewritten anyway. *But* the
+   `(matchers, ts_min, ts_max)` query envelope is genuinely the same
+   shape for both signals today, and the duplication would look like
+   a bug — so that one struct is shared (renamed from `MetricsQuery`
+   to `Query` in `scry-query::lib`). When a signal diverges, `Query`
+   either grows new optional fields (everyone ignores what they don't
+   need) or splits into a signal-tagged enum; today the share is
+   honest.
+
+4. **Wire dispatch via an explicit signal byte.** `QueryRequest`
+   gained a `signal: uint8` field (required, not present-gated; 0
+   is not a valid signal and the server rejects it with
+   `QUERY_ERR_BAD_REQUEST`). The CLI grew `--signal logs|metrics`
+   defaulting to `metrics`. The `Signal` enum in
+   `scry-proto::constants` already had the byte values from the
+   ingest path (`Metrics=1, Logs=2, …`) so the same constants serve
+   both directions.
+
+The single non-trivial architectural change this step required was a
+new `all_fingerprints: Option<Vec<u64>>` field on `BlockMeta`. The
+empty-matcher postings fallback used to read `meta.series_types`
+(metrics-specific, carries counter-vs-gauge metadata). That doesn't
+generalise — logs has no per-stream type metadata. `all_fingerprints`
+is the signal-agnostic shape both block builders populate, and
+`scry-query::postings::resolve_fingerprints` now drives off it. The
+old `series_types` field stays populated for metrics blocks (type-
+aware queries don't exist yet but will) but is no longer the
+empty-matcher read path.
+
+The catalog (`signal` is just a column; index already covers
+`(signal, date, ts_min, ts_max)`), the WAL (subdirectory is keyed off
+`B::SIGNAL` of the pipeline's block builder type), `scry-list`, the
+postings cache (keyed by block UUID, globally unique), and the
+ingest server's `Pipeline<B>` generic all needed zero changes — every
+abstraction that was claimed to be signal-agnostic actually was.
+That's the exit criterion this step was set up to test, and it
+passed.
+
 ## Deferred / open
 
 These are not decisions yet; they're flagged for "we'll decide when the

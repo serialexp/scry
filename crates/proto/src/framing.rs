@@ -148,6 +148,8 @@ mod tests {
         use crate::generated_query::{Matcher, QueryFrameMsg, QueryRequestInput};
 
         let req = QueryRequestInput {
+            // v0.4: explicit signal byte (1 = metrics).
+            signal: crate::constants::Signal::Metrics as u8,
             matchers: vec![Matcher {
                 name: "__name__".into(),
                 value: "scry_http_requests_total".into(),

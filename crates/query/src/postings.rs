@@ -36,11 +36,17 @@ use crate::postings_cache::PostingsIndex;
 /// - `Ok(Some(set))`    — non-empty intersection; pass to `scan_block`.
 ///
 /// Special case: an empty `matchers` list returns the block's full
-/// fingerprint set, derived from `meta.series_types` (which the
-/// metrics block builder populates). We avoid the postings scan
-/// because the postings file is keyed by `(label_name, label_value)`
-/// and has no natural "all series" row, while the sidecar already
-/// carries the complete fingerprint list.
+/// fingerprint set, derived from `meta.all_fingerprints` (which every
+/// real signal's block builder populates — metrics fills it from the
+/// series dictionary, logs from the stream dictionary). We avoid the
+/// postings scan because the postings file is keyed by `(label_name,
+/// label_value)` and has no natural "all fingerprints" row, while the
+/// sidecar already carries the complete list.
+///
+/// Signal-agnostic: the block's signal name lives on the [`BlockMeta`]
+/// itself (filled in by the catalog hydration from the `signal`
+/// column), so the same code path serves metrics and logs without
+/// branching.
 pub async fn resolve_fingerprints(
     store: Arc<dyn ObjectStore>,
     meta: &BlockMeta,
@@ -48,14 +54,13 @@ pub async fn resolve_fingerprints(
 ) -> Result<Option<HashSet<u64>>> {
     if matchers.is_empty() {
         // The catalog row carries a summary of the sidecar but not
-        // `series_types` itself (it's variable-length, only needed
-        // for type-aware queries). For the empty-matcher path we
-        // fetch the full sidecar JSON to recover the per-block
-        // fingerprint list. Empty-matcher queries are diagnostic
-        // ("scan everything") rather than hot, so the extra GET is
-        // fine.
+        // `all_fingerprints` itself (it's variable-length, only used
+        // for the empty-matcher path). Fetch the full sidecar JSON
+        // to recover the per-block fingerprint list. Empty-matcher
+        // queries are diagnostic ("scan everything") rather than
+        // hot, so the extra GET is fine.
         let sidecar_path = ObjPath::from(block_path(
-            "metrics",
+            &meta.signal,
             meta.ts_min_unix_nano,
             meta.writer_id,
             meta.uuid,
@@ -70,13 +75,14 @@ pub async fn resolve_fingerprints(
             .with_context(|| format!("read sidecar body {sidecar_path}"))?;
         let full_meta: BlockMeta = serde_json::from_slice(&bytes)
             .with_context(|| format!("parse sidecar {sidecar_path}"))?;
-        let Some(types) = full_meta.series_types.as_ref() else {
+        let Some(all) = full_meta.all_fingerprints.as_ref() else {
             anyhow::bail!(
-                "metrics block {} sidecar has no series_types; cannot resolve empty matcher set",
-                meta.uuid
+                "block {} ({}) sidecar has no all_fingerprints; cannot resolve empty matcher set",
+                meta.uuid,
+                meta.signal
             );
         };
-        let set: HashSet<u64> = types.iter().map(|(fp, _)| *fp).collect();
+        let set: HashSet<u64> = all.iter().copied().collect();
         return Ok(if set.is_empty() { None } else { Some(set) });
     }
 
@@ -98,7 +104,7 @@ pub async fn fetch_and_parse_postings(
     meta: &BlockMeta,
 ) -> Result<PostingsIndex> {
     let path = ObjPath::from(block_path(
-        "metrics",
+        &meta.signal,
         meta.ts_min_unix_nano,
         meta.writer_id,
         meta.uuid,

@@ -16,9 +16,12 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use scry_catalog::Catalog;
 use scry_objstore::{open as open_objstore, ObjStoreConfig};
-use scry_server::{decode, DummyPipeline, MetricsPipeline, Server, ServerConfig};
+use scry_server::{
+    decode, serve_stats, DummyPipeline, LogsPipeline, MetricsPipeline, Server, ServerConfig,
+    ServerMetrics,
+};
 use std::{path::PathBuf, sync::Arc};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -67,6 +70,16 @@ struct Args {
     /// `reconcile_from_bucket`.
     #[arg(long)]
     catalog: Option<PathBuf>,
+
+    /// Optional address for the live stats HTTP endpoint (e.g.
+    /// `127.0.0.1:4098`). Serves a self-updating dashboard at `/` and a
+    /// JSON snapshot at `/stats.json` (ingest rates, per-signal upload
+    /// state, RSS, and a bottleneck classification that flags when we're
+    /// bounded by S3 upload speed). When unset, no stats server runs and
+    /// the ingest path pays no metrics cost. Bind to loopback — there's
+    /// no auth.
+    #[arg(long)]
+    stats_listen: Option<String>,
 }
 
 #[tokio::main]
@@ -84,16 +97,42 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| format!("noise-sink-{}", rand_short()));
     let writer_uuid = Uuid::now_v7();
 
+    // Shared upload-concurrency cap = physical core count. The dominant
+    // cost of closing a block is the parquet encode (sort + Arrow build +
+    // zstd), which is CPU-bound and runs on the blocking pool. Sizing the
+    // pool to physical cores (not logical — hyperthreads don't scale for
+    // this kind of saturating compress) and sharing it across all signals
+    // lets one hot signal use every core while still bounding the number
+    // of blocks held in memory at once.
+    let upload_concurrency = num_cpus::get_physical().max(1);
+    info!(
+        physical_cores = upload_concurrency,
+        "upload concurrency cap (shared encode+upload pool across all signals)"
+    );
+
+    // Process-global ingest stats. Only built when the stats endpoint is
+    // enabled, so the no-stats path is byte-for-byte the old behaviour.
+    // When present, it's shared three ways: the ingest path bumps its
+    // counters, each signal's pipeline reports its upload gauges into
+    // it, and the stats HTTP server reads snapshots from it.
+    let stats_metrics: Option<Arc<ServerMetrics>> = args
+        .stats_listen
+        .as_ref()
+        .map(|_| Arc::new(ServerMetrics::new(upload_concurrency)));
+
     // Build the storage pipelines up front. Failing fast on a missing
     // bucket or unreadable WAL dir is much better than failing on the
-    // first batch from an agent that's already mid-stream. Both
-    // signals share the same object store + catalog; each gets its
-    // own WAL subdir (`<wal>/dummy/`, `<wal>/metrics/`) via the
+    // first batch from an agent that's already mid-stream. All signals
+    // share the same object store + catalog; each gets its own WAL
+    // subdir (`<wal>/dummy/`, `<wal>/metrics/`, `<wal>/logs/`) via the
     // `BlockBuilder::SIGNAL` constant inside `Pipeline::open`.
-    let (dummy_pipeline, metrics_pipeline): (
-        Option<Arc<Mutex<DummyPipeline>>>,
-        Option<Arc<Mutex<MetricsPipeline>>>,
-    ) = if args.storage {
+    type SharedPipeline<P> = Option<Arc<Mutex<P>>>;
+    type Pipelines = (
+        SharedPipeline<DummyPipeline>,
+        SharedPipeline<MetricsPipeline>,
+        SharedPipeline<LogsPipeline>,
+    );
+    let (dummy_pipeline, metrics_pipeline, logs_pipeline): Pipelines = if args.storage {
         let wal_dir = args
             .wal_dir
             .clone()
@@ -106,7 +145,7 @@ async fn main() -> Result<()> {
             bucket   = %bucket,
             wal_dir  = %wal_dir.display(),
             catalog  = ?args.catalog,
-            "storage mode: WAL + parquet blocks → object storage (dummy + metrics)"
+            "storage mode: WAL + parquet blocks → object storage (dummy + metrics + logs)"
         );
         let store = open_objstore(&cfg)?;
         let catalog = match args.catalog.as_ref() {
@@ -116,6 +155,9 @@ async fn main() -> Result<()> {
             ))),
             None => None,
         };
+        // One semaphore, shared by every signal's pipeline — the global
+        // encode+upload concurrency cap (see `upload_concurrency` above).
+        let upload_sem = Arc::new(Semaphore::new(upload_concurrency));
         let dummy = DummyPipeline::open(
             wal_dir.clone(),
             store.clone(),
@@ -123,18 +165,40 @@ async fn main() -> Result<()> {
             writer_uuid,
             decode::dummy,
         )
-        .await?;
+        .await?
+        .with_upload_sem(upload_sem.clone());
         let metrics = MetricsPipeline::open(
+            wal_dir.clone(),
+            store.clone(),
+            catalog.clone(),
+            writer_uuid,
+            decode::metrics,
+        )
+        .await?
+        .with_upload_sem(upload_sem.clone());
+        let logs = LogsPipeline::open(
             wal_dir,
             store,
             catalog,
             writer_uuid,
-            decode::metrics,
+            decode::logs,
         )
-        .await?;
+        .await?
+        .with_upload_sem(upload_sem.clone());
+        // Wire each pipeline's upload gauges into the shared stats, if
+        // the endpoint is enabled.
+        let (dummy, metrics, logs) = match stats_metrics.as_ref() {
+            Some(m) => (
+                dummy.with_upload_stats(m.dummy_upload()),
+                metrics.with_upload_stats(m.metrics_upload()),
+                logs.with_upload_stats(m.logs_upload()),
+            ),
+            None => (dummy, metrics, logs),
+        };
         (
             Some(Arc::new(Mutex::new(dummy))),
             Some(Arc::new(Mutex::new(metrics))),
+            Some(Arc::new(Mutex::new(logs))),
         )
     } else {
         if args.wal_dir.is_some() {
@@ -143,10 +207,10 @@ async fn main() -> Result<()> {
         if args.catalog.is_some() {
             warn!("--catalog set but --storage is not; ignoring catalog");
         }
-        (None, None)
+        (None, None, None)
     };
 
-    let server = Server::new(
+    let mut server = Server::new(
         ServerConfig {
             listen_addr: args.listen,
             writer_id,
@@ -154,13 +218,39 @@ async fn main() -> Result<()> {
         },
         dummy_pipeline,
         metrics_pipeline,
+        logs_pipeline,
     );
+    if let Some(m) = stats_metrics.as_ref() {
+        server = server.with_metrics(m.clone());
+    }
 
-    server
+    // Optional stats HTTP endpoint. It shares its shutdown signal with
+    // the ingest server: both listen for Ctrl-C independently (tokio's
+    // `ctrl_c()` resolves every pending future on SIGINT), so a single
+    // Ctrl-C drains the ingest pipeline *and* stops the stats server.
+    let stats_task = match (args.stats_listen.clone(), stats_metrics.clone()) {
+        (Some(addr), Some(metrics)) => Some(tokio::spawn(async move {
+            if let Err(e) = serve_stats(addr, metrics, async {
+                let _ = tokio::signal::ctrl_c().await;
+            })
+            .await
+            {
+                warn!(error = %e, "stats endpoint failed");
+            }
+        })),
+        _ => None,
+    };
+
+    let serve_result = server
         .serve_with_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })
-        .await
+        .await;
+
+    if let Some(task) = stats_task {
+        let _ = task.await;
+    }
+    serve_result
 }
 
 fn rand_short() -> String {

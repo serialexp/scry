@@ -52,7 +52,7 @@ use parquet::file::properties::WriterProperties;
 use scry_proto::streaming::MetricsAppender;
 use uuid::Uuid;
 
-use crate::{block_path, BlockBuilder, BlockBuilderConfig, BlockMeta};
+use crate::{block_path, BlockBuilder, BlockBuilderConfig, BlockMeta, EncodedBlock};
 
 const SIGNAL: &str = "metrics";
 const SCHEMA_VERSION: u32 = 1;
@@ -141,6 +141,45 @@ impl BlockBuilder for MetricsBlockBuilder {
         self.row_count() >= self.cfg.max_rows || self.bytes_est >= self.cfg.target_bytes
     }
 
+    fn merge(&mut self, other: &mut Self) {
+        // Sample columns: a bulk move each — `append` drains `other`'s
+        // vec and keeps its capacity for reuse.
+        self.fingerprints.append(&mut other.fingerprints);
+        self.ts.append(&mut other.ts);
+        self.values.append(&mut other.values);
+
+        // Series dictionary: dedup against the *shared* builder's
+        // `series_seen` so cross-batch dedup scope matches decoding
+        // straight into the shared builder. A fingerprint already
+        // accumulated here is dropped (labels are assumed identical for
+        // a given fingerprint — same trust as `observe_series`).
+        for s in other.series_dict.drain(..) {
+            if self.series_seen.insert(s.fingerprint) {
+                self.series_dict.push(s);
+            }
+        }
+        other.series_seen.clear();
+
+        self.bytes_est += other.bytes_est;
+        self.ts_min = self.ts_min.min(other.ts_min);
+        self.ts_max = self.ts_max.max(other.ts_max);
+
+        other.bytes_est = 0;
+        other.ts_min = u64::MAX;
+        other.ts_max = 0;
+    }
+
+    fn reset(&mut self) {
+        self.fingerprints.clear();
+        self.ts.clear();
+        self.values.clear();
+        self.series_seen.clear();
+        self.series_dict.clear();
+        self.bytes_est = 0;
+        self.ts_min = u64::MAX;
+        self.ts_max = 0;
+    }
+
     fn finish_and_upload(
         self,
         store: &dyn ObjectStore,
@@ -203,12 +242,43 @@ impl MetricsBlockBuilder {
     /// `mut self` rebinding ergonomic — see `dummy.rs` for the same
     /// pattern.
     async fn finish_and_upload_impl(
-        mut self,
+        self,
         store: &dyn ObjectStore,
     ) -> Result<Option<BlockMeta>> {
         if self.is_empty() {
             return Ok(None);
         }
+        // Offload the CPU-heavy encode (sort + Arrow build + zstd +
+        // postings) onto the blocking pool so it doesn't monopolise an
+        // async worker thread; the PUTs run back here on the async side.
+        let enc = tokio::task::spawn_blocking(move || self.encode())
+            .await
+            .context("join metrics encode task")??;
+        for (path, bytes) in enc.puts {
+            store
+                .put(&path, bytes.into())
+                .await
+                .with_context(|| format!("upload {path}"))?;
+        }
+        let meta = enc.meta;
+        tracing::info!(
+            block_uuid = %meta.uuid,
+            row_count = meta.row_count,
+            series_count = meta.series_types.as_ref().map_or(0, |v| v.len()),
+            byte_size = meta.byte_size,
+            postings_size = meta.postings_size_bytes.unwrap_or(0),
+            ts_min = meta.ts_min_unix_nano,
+            ts_max = meta.ts_max_unix_nano,
+            "metrics block uploaded"
+        );
+        Ok(Some(meta))
+    }
+
+    /// Encode buffered samples into the main + postings parquet and the
+    /// JSON sidecar. Pure CPU, no I/O — runs on the blocking pool via
+    /// `spawn_blocking`. The async `finish_and_upload_impl` performs the
+    /// PUTs.
+    fn encode(mut self) -> Result<EncodedBlock> {
         let n = self.fingerprints.len();
 
         // ── Main parquet ───────────────────────────────────────────
@@ -280,7 +350,11 @@ impl MetricsBlockBuilder {
             .iter()
             .map(|s| (s.fingerprint, s.metric_type))
             .collect();
-        let series_count = self.series_dict.len();
+        // `all_fingerprints` is the signal-agnostic view of
+        // `series_types`. Cheap to derive (one u64 per series) and
+        // lets `scry_query::postings::resolve_fingerprints` handle
+        // empty-matcher queries without a metrics-specific branch.
+        let all_fingerprints: Vec<u64> = series_types.iter().map(|(fp, _)| *fp).collect();
         let meta = BlockMeta {
             uuid: block_uuid,
             signal: SIGNAL.to_string(),
@@ -295,6 +369,7 @@ impl MetricsBlockBuilder {
             has_postings: true,
             postings_size_bytes: Some(postings_size),
             series_types: Some(series_types),
+            all_fingerprints: Some(all_fingerprints),
         };
         let meta_bytes = Bytes::from(
             serde_json::to_vec_pretty(&meta).context("serialising metrics BlockMeta")?,
@@ -331,31 +406,14 @@ impl MetricsBlockBuilder {
             "meta.json",
         ));
 
-        store
-            .put(&main_path, main_bytes.into())
-            .await
-            .with_context(|| format!("upload metrics parquet {main_path}"))?;
-        store
-            .put(&postings_path, postings_bytes.into())
-            .await
-            .with_context(|| format!("upload postings parquet {postings_path}"))?;
-        store
-            .put(&meta_path, meta_bytes.into())
-            .await
-            .with_context(|| format!("upload metrics sidecar {meta_path}"))?;
-
-        tracing::info!(
-            block_uuid = %block_uuid,
-            row_count = n,
-            series_count,
-            byte_size,
-            postings_size,
-            ts_min = self.ts_min,
-            ts_max = self.ts_max,
-            "metrics block uploaded"
-        );
-
-        Ok(Some(meta))
+        Ok(EncodedBlock {
+            meta,
+            puts: vec![
+                (main_path, main_bytes),
+                (postings_path, postings_bytes),
+                (meta_path, meta_bytes),
+            ],
+        })
     }
 
     /// Walk the series dictionary, building

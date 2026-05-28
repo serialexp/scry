@@ -15,6 +15,15 @@
 #   SIGNAL=dummy   ./scripts/smoke.sh    # v0.1 path
 #   SIGNAL=metrics ./scripts/smoke.sh    # v0.2 path (also asserts ≥1
 #                                        #  block with has_postings=1)
+#   SIGNAL=logs    ./scripts/smoke.sh    # v0.4 path (also asserts ≥1
+#                                        #  block with has_postings=1 —
+#                                        #  logs gets the same stream-
+#                                        #  level postings as metrics)
+#   SIGNAL=both    ./scripts/smoke.sh    # v0.4 cross-signal: spew
+#                                        #  metrics + logs through the
+#                                        #  same sink, assert both
+#                                        #  sink-accepted counts and
+#                                        #  the per-signal block count.
 #
 # Records-per-batch and the connection-summary counter parsed from
 # noise-sink's log are signal-specific. The per-signal record
@@ -22,6 +31,7 @@
 #
 #   dummy   → records   = DummyRecord count        (256/batch)
 #   metrics → records   = MetricSample count       (400/batch — 8 series × 50 samples)
+#   logs    → records   = LogEntry count           (60/batch  — 3 streams × 20 entries)
 #
 # The dev Garage bucket (`scry-dev`) is emptied at the start of the
 # run so the post-condition is unambiguous. Don't point this at any
@@ -43,8 +53,30 @@ case "$SIGNAL" in
         RECORDS_PER_BATCH=400        # crates/noise-spewer/src/gen.rs::render_metrics (8×50)
         SUMMARY_TAG="samples"
         ;;
+    logs)
+        RECORDS_PER_BATCH=60         # crates/noise-spewer/src/gen.rs::render_logs (3×20)
+        SUMMARY_TAG="log_entries"
+        ;;
+    both)
+        # Cross-signal mode: the spewer round-robins between metrics
+        # and logs at the configured RATE. Approximations:
+        #
+        # - The spewer's --signals flag picks one signal per batch in
+        #   round-robin order, so over a long run the per-signal batch
+        #   counts converge to half each (± 1).
+        # - EXPECTED_RECORDS isn't a single scalar in this mode; the
+        #   metrics + logs assertions each compare their own
+        #   sink-accepted count to (BATCHES/2) × that signal's records
+        #   per batch.
+        #
+        # The legacy EXPECTED_RECORDS variable below is computed for
+        # diagnostic reporting only (sum of both signals' expected
+        # totals).
+        RECORDS_PER_BATCH=0          # not meaningful in cross-signal mode
+        SUMMARY_TAG=""               # parsed per-signal below
+        ;;
     *)
-        echo "[smoke] unsupported SIGNAL='$SIGNAL'; expected dummy|metrics" >&2
+        echo "[smoke] unsupported SIGNAL='$SIGNAL'; expected dummy|metrics|logs|both" >&2
         exit 2
         ;;
 esac
@@ -58,7 +90,16 @@ esac
 BATCHES="${BATCHES:-2000}"
 RATE="${RATE:-400}"
 DURATION_SECS="${DURATION_SECS:-300}"
-EXPECTED_RECORDS=$(( BATCHES * RECORDS_PER_BATCH ))
+if [[ "$SIGNAL" == "both" ]]; then
+    # Round-robin distribution: half the batches each. Used only for
+    # diagnostic reporting in this mode; the real assertions live
+    # under the "── Verify ──" section below.
+    EXPECTED_METRICS=$(( (BATCHES / 2) * 400 ))
+    EXPECTED_LOGS=$(( (BATCHES / 2) * 60 ))
+    EXPECTED_RECORDS=$(( EXPECTED_METRICS + EXPECTED_LOGS ))
+else
+    EXPECTED_RECORDS=$(( BATCHES * RECORDS_PER_BATCH ))
+fi
 LISTEN="${LISTEN:-127.0.0.1:4099}"
 SMOKE_DIR="${SMOKE_DIR:-/tmp/scry-smoke}"
 
@@ -74,7 +115,8 @@ if ! command -v aws >/dev/null; then
     echo "[smoke] aws CLI not on PATH — needed for bucket reset" >&2
     exit 2
 fi
-if [[ "$SIGNAL" == "metrics" ]] && ! command -v sqlite3 >/dev/null; then
+if [[ "$SIGNAL" == "metrics" || "$SIGNAL" == "logs" || "$SIGNAL" == "both" ]] \
+   && ! command -v sqlite3 >/dev/null; then
     echo "[smoke] sqlite3 CLI not on PATH — needed for has_postings assertion" >&2
     exit 2
 fi
@@ -156,10 +198,21 @@ done
 ) > "$SMOKE_DIR/rss.csv" 2>/dev/null &
 RSS_PID=$!
 
-echo "[smoke] spewer: $BATCHES batches × $RECORDS_PER_BATCH records = $EXPECTED_RECORDS records expected (rate=$RATE b/s, duration cap=${DURATION_SECS}s)"
+# Map the smoke-level SIGNAL to the spewer's `--signals` CSV. "both"
+# round-robins between metrics and logs in the same connection.
+case "$SIGNAL" in
+    both) SPEWER_SIGNALS="metrics,logs" ;;
+    *)    SPEWER_SIGNALS="$SIGNAL" ;;
+esac
+
+if [[ "$SIGNAL" == "both" ]]; then
+    echo "[smoke] spewer: $BATCHES batches (round-robin metrics+logs) ≈ $EXPECTED_METRICS metric samples + $EXPECTED_LOGS log entries (rate=$RATE b/s, duration cap=${DURATION_SECS}s)"
+else
+    echo "[smoke] spewer: $BATCHES batches × $RECORDS_PER_BATCH records = $EXPECTED_RECORDS records expected (rate=$RATE b/s, duration cap=${DURATION_SECS}s)"
+fi
 ./target/release/noise-spewer \
     --addr "$LISTEN" \
-    --signals "$SIGNAL" \
+    --signals "$SPEWER_SIGNALS" \
     --rate "$RATE" \
     --duration "${DURATION_SECS}s" \
     --max-batches "$BATCHES" \
@@ -194,20 +247,39 @@ total_rows=$(awk -F'[= ]' '/^# total rows=/ { print $4; exit }' "$SMOKE_DIR/scry
 # because the spewer may have hit the duration cap (see above). Use
 # the sink's session summary as the ground-truth count of records it
 # accepted — that's what we want to match against the bucket. The
-# summary tag (`dummy=` / `samples=`) is signal-specific because
-# different signals count different things as a "record."
-sink_accepted=$(awk -v tag="${SUMMARY_TAG}=" '
-    $0 ~ "session_id=.* " tag {
-        for (i=1; i<=NF; i++) if (index($i, tag) == 1) {
-            sub(tag, "", $i); total += $i
+# summary tag (`dummy=` / `samples=` / `log_entries=`) is signal-
+# specific because different signals count different things as a
+# "record."
+parse_sink_count() {
+    local tag="$1"
+    awk -v tag="${tag}=" '
+        $0 ~ "session_id=.* " tag {
+            for (i=1; i<=NF; i++) if (index($i, tag) == 1) {
+                sub(tag, "", $i); total += $i
+            }
         }
-    }
-    END { print total+0 }
-' "$SMOKE_DIR/sink.log")
+        END { print total+0 }
+    ' "$SMOKE_DIR/sink.log"
+}
+
+if [[ "$SIGNAL" == "both" ]]; then
+    sink_metrics=$(parse_sink_count samples)
+    sink_logs=$(parse_sink_count log_entries)
+    sink_accepted=$(( sink_metrics + sink_logs ))
+else
+    sink_accepted=$(parse_sink_count "$SUMMARY_TAG")
+fi
 
 echo "[smoke] ──── assertions ────"
 echo "[smoke] signal            : $SIGNAL"
-echo "[smoke] requested records : $EXPECTED_RECORDS"
+if [[ "$SIGNAL" == "both" ]]; then
+    echo "[smoke] requested metrics : $EXPECTED_METRICS"
+    echo "[smoke] requested logs    : $EXPECTED_LOGS"
+    echo "[smoke] sink metrics      : $sink_metrics"
+    echo "[smoke] sink logs         : $sink_logs"
+else
+    echo "[smoke] requested records : $EXPECTED_RECORDS"
+fi
 echo "[smoke] sink accepted     : $sink_accepted"
 echo "[smoke] catalog rows      : $total_rows"
 echo "[smoke] catalog blocks    : $block_count"
@@ -215,7 +287,8 @@ echo "[smoke] catalog blocks    : $block_count"
 failed=0
 # Primary correctness assertion: every record the sink acked must
 # show up in the bucket. If this fails, records were lost between
-# WAL and parquet upload — a real durability bug.
+# WAL and parquet upload — a real durability bug. In `both` mode the
+# catalog totals across signals, so the sum is what we compare.
 if [[ "${total_rows:-}" != "${sink_accepted:-X}" ]]; then
     echo "[smoke] FAIL: catalog row count != sink-accepted (records lost between WAL and bucket)"
     failed=1
@@ -225,20 +298,32 @@ if [[ -z "${block_count:-}" || "$block_count" -lt 1 ]]; then
     failed=1
 fi
 
-# Metrics-specific assertion: at least one block carries a postings
-# parquet. The catalog schema's `has_postings` / `postings_size_bytes`
-# columns are set by the metrics block builder; the dummy builder
-# leaves them false/0. If a metrics smoke run sees no postings the
-# inverted-index sidecar was never written — defeats the entire
-# purpose of the metrics-block shape.
-if [[ "$SIGNAL" == "metrics" ]]; then
-    postings_blocks=$(sqlite3 "$SMOKE_DIR/recon.sqlite" \
-        "SELECT COUNT(*) FROM blocks WHERE has_postings = 1 AND postings_size_bytes IS NOT NULL AND postings_size_bytes > 0;")
-    echo "[smoke] blocks w/ postings: $postings_blocks"
-    if [[ "${postings_blocks:-0}" -lt 1 ]]; then
-        echo "[smoke] FAIL: no metrics blocks carry a postings sidecar"
-        failed=1
-    fi
+# Per-signal block-count + postings assertions. Metrics and logs both
+# write a postings sidecar; dummy doesn't. In `both` mode we want at
+# least one block of each signal *and* both must carry postings — the
+# whole point of v0.4 step 1 is that the postings path works for both
+# signals through the same plumbing.
+if [[ "$SIGNAL" == "metrics" || "$SIGNAL" == "logs" || "$SIGNAL" == "both" ]]; then
+    # Signals we expect postings for in this run.
+    case "$SIGNAL" in
+        both) expect_postings_for=("metrics" "logs") ;;
+        *)    expect_postings_for=("$SIGNAL") ;;
+    esac
+    for sig in "${expect_postings_for[@]}"; do
+        sig_blocks=$(sqlite3 "$SMOKE_DIR/recon.sqlite" \
+            "SELECT COUNT(*) FROM blocks WHERE signal = '$sig';")
+        sig_postings=$(sqlite3 "$SMOKE_DIR/recon.sqlite" \
+            "SELECT COUNT(*) FROM blocks WHERE signal = '$sig' AND has_postings = 1 AND postings_size_bytes IS NOT NULL AND postings_size_bytes > 0;")
+        echo "[smoke] $sig blocks         : $sig_blocks (with postings: $sig_postings)"
+        if [[ "${sig_blocks:-0}" -lt 1 ]]; then
+            echo "[smoke] FAIL: no $sig blocks landed in the bucket"
+            failed=1
+        fi
+        if [[ "${sig_postings:-0}" -lt 1 ]]; then
+            echo "[smoke] FAIL: no $sig blocks carry a postings sidecar"
+            failed=1
+        fi
+    done
 fi
 
 # Throughput observation: the sink's accepted count below
@@ -247,6 +332,21 @@ fi
 if [[ "${sink_accepted:-0}" -lt "$EXPECTED_RECORDS" ]]; then
     deficit=$(( EXPECTED_RECORDS - sink_accepted ))
     echo "[smoke] NOTE: sink throughput-capped; spewer fell ${deficit} records short of requested $EXPECTED_RECORDS"
+fi
+
+# In `both` mode the per-signal sink counts each get an additional
+# observation versus their own per-signal expectation. Differences
+# from the round-robin estimate are typically just the duration cap
+# clipping mid-RR cycle.
+if [[ "$SIGNAL" == "both" ]]; then
+    if [[ "${sink_metrics:-0}" -lt "$EXPECTED_METRICS" ]]; then
+        deficit=$(( EXPECTED_METRICS - sink_metrics ))
+        echo "[smoke] NOTE: metrics fell $deficit short of expected $EXPECTED_METRICS"
+    fi
+    if [[ "${sink_logs:-0}" -lt "$EXPECTED_LOGS" ]]; then
+        deficit=$(( EXPECTED_LOGS - sink_logs ))
+        echo "[smoke] NOTE: logs fell $deficit short of expected $EXPECTED_LOGS"
+    fi
 fi
 
 # ── Service performance ────────────────────────────────────────────

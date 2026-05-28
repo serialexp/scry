@@ -43,13 +43,14 @@ use arrow_ipc::reader::StreamDecoder;
 use datafusion::execution::memory_pool::GreedyMemoryPool;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use object_store::{memory::InMemory, ObjectStore};
-use scry_block::{BlockBuilder, BlockBuilderConfig, MetricsBlockBuilder};
+use scry_block::{BlockBuilder, BlockBuilderConfig, LogsBlockBuilder, MetricsBlockBuilder};
 use scry_catalog::Catalog;
 use scry_objstore::BufPool;
 use scry_proto::framing::{read_frame, write_frame};
-use scry_proto::streaming::MetricsAppender;
+use scry_proto::constants::Signal;
+use scry_proto::streaming::{LogsAppender, MetricsAppender};
 use scry_proto::{QueryFrame, QueryFrameMsg};
-use scry_query::{MetricsQuery, PostingsCache, QueryRequest};
+use scry_query::{PostingsCache, Query, QueryRequest};
 use scry_server::QueryService;
 use tempfile::TempDir;
 use tokio::io::{AsyncWriteExt, BufReader as TokioBufReader, BufWriter as TokioBufWriter};
@@ -266,7 +267,8 @@ async fn query_round_trip() {
 
     // ── Matcher-only query ─────────────────────────────────────────
     let req = QueryRequest {
-        metrics_query: MetricsQuery {
+        signal: Signal::Metrics as u8,
+        query: Query {
             matchers: vec![("__name__".into(), "foo".into())],
             ts_min: None,
             ts_max: None,
@@ -305,7 +307,8 @@ async fn query_round_trip() {
 
     // ── SQL query ──────────────────────────────────────────────────
     let req_sql = QueryRequest {
-        metrics_query: MetricsQuery::default(),
+        signal: Signal::Metrics as u8,
+        query: Query::default(),
         sql: Some("SELECT count(*) AS n FROM metrics".into()),
         limit: None,
         request_id: Some("test-sql".into()),
@@ -340,7 +343,8 @@ async fn query_round_trip() {
     // the Flight test had, transport-agnostic.
     let cache_before = postings_cache.stats();
     let req_replay = QueryRequest {
-        metrics_query: MetricsQuery {
+        signal: Signal::Metrics as u8,
+        query: Query {
             matchers: vec![("__name__".into(), "foo".into())],
             ts_min: None,
             ts_max: None,
@@ -369,6 +373,197 @@ async fn query_round_trip() {
         "replay should hit the cache for both blocks (got hits={})",
         delta.hits
     );
+
+    // ── Clean shutdown ─────────────────────────────────────────────
+    let _ = shutdown_tx.send(());
+    serve_handle.await.expect("serve task join").unwrap();
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Logs end-to-end. Symmetric structure with the metrics test above:
+// plant one block via `LogsBlockBuilder`, stand up the same
+// `QueryService` (which is signal-agnostic — the `Signal::Logs` arm
+// reaches into `register_logs_table_from_candidates` and produces an
+// identical `RecordBatch`-streaming response), drain matcher + SQL
+// responses through the same wire path. Catches any place that still
+// hardcodes "metrics" string-wise: the postings sidecar resolver, the
+// table-name default, the `scan_complete` field, etc.
+// ─────────────────────────────────────────────────────────────────────
+
+fn logs_labels(pairs: &[(&str, &str)]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    labels(pairs)
+}
+
+/// Helper: append `n` log entries for `fp` starting at `ts_start`,
+/// stepping by 1ns, with a fixed severity and trivial body/attribute
+/// shape. The body deliberately varies per-entry (`row {i}`) so a
+/// later substring-filter test would have something to match; today
+/// the body is just data.
+fn entries_for(
+    b: &mut LogsBlockBuilder,
+    fp: u64,
+    ts_start: u64,
+    n: u64,
+    severity: u8,
+) {
+    for i in 0..n {
+        let body = format!("row {i} fp={fp:#x}");
+        b.append_entry(
+            fp,
+            ts_start + i,
+            severity,
+            body.into_bytes(),
+            vec![
+                (b"trace_id".to_vec(), format!("t{i:04}").into_bytes()),
+                (b"status".to_vec(), b"ok".to_vec()),
+            ],
+        );
+    }
+}
+
+#[tokio::test]
+async fn logs_round_trip() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let writer = Uuid::now_v7();
+
+    // ── Plant one logs block: 3 streams × 20 entries = 60 rows ─────
+    let l_api: u64 = 0xA001; // service=api, env=prod
+    let l_db: u64 = 0xA002; // service=db, env=prod
+    let l_cache: u64 = 0xA003; // service=cache, env=stage
+    let mut block = LogsBlockBuilder::new(writer, test_cfg());
+    block.observe_stream(l_api, logs_labels(&[("service", "api"), ("env", "prod")]));
+    block.observe_stream(l_db, logs_labels(&[("service", "db"), ("env", "prod")]));
+    block.observe_stream(
+        l_cache,
+        logs_labels(&[("service", "cache"), ("env", "stage")]),
+    );
+    entries_for(&mut block, l_api, 3_000_000, 20, 9);
+    entries_for(&mut block, l_db, 3_000_100, 20, 6);
+    entries_for(&mut block, l_cache, 3_000_200, 20, 3);
+    let meta = block
+        .finish_and_upload(store.as_ref())
+        .await
+        .unwrap()
+        .expect("logs block non-empty");
+    assert_eq!(meta.row_count, 60);
+    assert_eq!(meta.signal, "logs");
+
+    // ── Catalog ────────────────────────────────────────────────────
+    let tmp = TempDir::new().unwrap();
+    let catalog = Catalog::open(&tmp.path().join("cat.sqlite"), BUCKET).unwrap();
+    assert!(catalog.insert_block(&meta).unwrap());
+
+    // ── Service ────────────────────────────────────────────────────
+    let pool = BufPool::new();
+    let postings_cache = Arc::new(PostingsCache::with_budget_bytes(16 * 1024 * 1024));
+    let memory_pool = Arc::new(GreedyMemoryPool::new(256 * 1024 * 1024));
+    let runtime_env = Arc::new(
+        RuntimeEnvBuilder::new()
+            .with_memory_pool(memory_pool.clone())
+            .build()
+            .expect("build RuntimeEnv"),
+    );
+    let service = Arc::new(QueryService::new(
+        Arc::new(Mutex::new(catalog)),
+        store.clone(),
+        pool,
+        postings_cache.clone(),
+        runtime_env,
+        memory_pool,
+    ));
+
+    let bind = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let svc_for_task = service.clone();
+
+    let probe = tokio::net::TcpListener::bind(bind).await.unwrap();
+    let listen_addr = probe.local_addr().unwrap();
+    drop(probe);
+
+    let serve_handle = tokio::spawn(async move {
+        svc_for_task
+            .serve_with_shutdown(listen_addr, async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // ── Matcher: service=api → 20 rows from L_api ──────────────────
+    let req = QueryRequest {
+        signal: Signal::Logs as u8,
+        query: Query {
+            matchers: vec![("service".into(), "api".into())],
+            ts_min: None,
+            ts_max: None,
+        },
+        sql: None,
+        limit: None,
+        request_id: Some("logs-matcher".into()),
+    };
+    let result = run_query(listen_addr, req).await;
+    assert_eq!(
+        total_rows(&result.batches),
+        20,
+        "service=api should yield 20 rows (only L_api matches)"
+    );
+    assert_eq!(result.server_total_rows, 20);
+    // Sanity: every returned stream_fingerprint is L_api.
+    for b in &result.batches {
+        let col = b.schema().index_of("stream_fingerprint").unwrap();
+        let arr = b
+            .column(col)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        for &fp in arr.values().iter() {
+            assert_eq!(fp, l_api, "service=api row carries unexpected fp {fp:#x}");
+        }
+    }
+
+    // ── SQL on logs: count(*) → 60 ─────────────────────────────────
+    let req_sql = QueryRequest {
+        signal: Signal::Logs as u8,
+        query: Query::default(),
+        sql: Some("SELECT count(*) AS n FROM logs".into()),
+        limit: None,
+        request_id: Some("logs-sql".into()),
+    };
+    let result_sql = run_query(listen_addr, req_sql).await;
+    assert_eq!(result_sql.batches.len(), 1, "count(*) returns one batch");
+    let batch = &result_sql.batches[0];
+    assert_eq!(batch.num_rows(), 1);
+    let n_col = batch.schema().index_of("n").unwrap();
+    let n_arr = batch
+        .column(n_col)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("count(*) column should be Int64");
+    assert_eq!(n_arr.value(0), 60, "count(*) across the logs block = 60");
+    assert_eq!(result_sql.server_total_rows, 1);
+
+    // ── Default SELECT * (no SQL, no matcher) → 60 rows ────────────
+    //
+    // Exercises the default-SQL path's `SELECT * FROM logs` resolution
+    // (i.e. the per-signal `default_table_name` branch in the
+    // service). Also confirms the empty-matcher postings fallback
+    // walks `meta.all_fingerprints` rather than the metrics-only
+    // `series_types`.
+    let req_all = QueryRequest {
+        signal: Signal::Logs as u8,
+        query: Query::default(),
+        sql: None,
+        limit: None,
+        request_id: Some("logs-default-sql".into()),
+    };
+    let result_all = run_query(listen_addr, req_all).await;
+    assert_eq!(
+        total_rows(&result_all.batches),
+        60,
+        "default SELECT * over the logs block must include every entry"
+    );
+    assert_eq!(result_all.server_total_rows, 60);
 
     // ── Clean shutdown ─────────────────────────────────────────────
     let _ = shutdown_tx.send(());

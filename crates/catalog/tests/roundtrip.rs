@@ -25,6 +25,7 @@ fn meta(uuid: Uuid, writer: Uuid, ts_min: u64, rows: u64) -> BlockMeta {
         has_postings: false,
         postings_size_bytes: None,
         series_types: None,
+        all_fingerprints: None,
     }
 }
 

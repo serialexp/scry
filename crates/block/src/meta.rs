@@ -53,4 +53,21 @@ pub struct BlockMeta {
     /// non-metrics signals.
     #[serde(default)]
     pub series_types: Option<Vec<(u64, u8)>>,
+
+    /// Every unique series/stream fingerprint that appears in this
+    /// block, in insertion order. Signal-agnostic: metrics blocks
+    /// fill it from the series dictionary, logs blocks from the
+    /// stream dictionary. Used by the query layer's empty-matcher
+    /// fallback path in `scry_query::postings::resolve_fingerprints`
+    /// — the postings sidecar has no natural "all fingerprints" row
+    /// (it's keyed by `(label_name, label_value)`), so empty-matcher
+    /// queries materialise the full fingerprint set from this field
+    /// without scanning the postings file.
+    ///
+    /// `series_types` is retained for metrics in addition to this
+    /// (it carries the per-fingerprint type byte for type-aware
+    /// queries that don't exist yet); logs only populate
+    /// `all_fingerprints`.
+    #[serde(default)]
+    pub all_fingerprints: Option<Vec<u64>>,
 }

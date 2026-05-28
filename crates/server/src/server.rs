@@ -8,7 +8,7 @@
 
 use anyhow::{Context, Result};
 use binschema_runtime::{BitOrder, BitStreamDecoder};
-use scry_block::{DummyBlockBuilder, MetricsBlockBuilder};
+use scry_block::{BlockBuilder, DummyBlockBuilder, LogsBlockBuilder, MetricsBlockBuilder};
 use scry_proto::{
     build,
     constants::{
@@ -20,7 +20,7 @@ use scry_proto::{
         SIGNAL_BIT_TRACES, Signal,
     },
     framing::{FrameError, read_frame, write_frame},
-    generated::{FrameMsg, HelloOutput, LogsBatch, ProfilesBatch, TracesBatch},
+    generated::{FrameMsg, HelloOutput, ProfilesBatch, TracesBatch},
 };
 use std::{
     future::Future,
@@ -37,7 +37,8 @@ use tokio::{
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::pipeline::Pipeline;
+use crate::pipeline::{DecodeFn, Pipeline};
+use crate::stats::ServerMetrics;
 
 /// Type alias for the Dummy storage pipeline. Same generic machinery
 /// every signal uses; the type alias just spares call sites from
@@ -48,6 +49,11 @@ pub type DummyPipeline = Pipeline<DummyBlockBuilder>;
 /// machinery as Dummy — only the builder, the WAL signal subdir, and
 /// the decode function differ.
 pub type MetricsPipeline = Pipeline<MetricsBlockBuilder>;
+
+/// Type alias for the Logs storage pipeline. Same generic machinery
+/// as Dummy / Metrics; the LogsBlockBuilder owns the per-signal
+/// parquet schema and postings layout.
+pub type LogsPipeline = Pipeline<LogsBlockBuilder>;
 
 /// Static configuration for a [`Server`]. Cheap to construct, cloned
 /// into each spawned connection task.
@@ -67,13 +73,18 @@ pub struct ServerConfig {
 /// The ingest server. Constructed with [`Server::new`], driven to
 /// completion with [`Server::serve_with_shutdown`].
 ///
-/// One pipeline per signal — at N=2 the two `Option` fields are
-/// clearer than a `HashMap<Signal, Box<dyn ErasedPipeline>>`. Revisit
-/// the erased trait approach once N ≥ ~5.
+/// One pipeline per signal — at N=3 the three `Option` fields are
+/// still clearer than a `HashMap<Signal, Box<dyn ErasedPipeline>>`.
+/// Revisit the erased trait approach once N ≥ ~5.
 pub struct Server {
     config: ServerConfig,
     dummy_pipeline: Option<Arc<Mutex<DummyPipeline>>>,
     metrics_pipeline: Option<Arc<Mutex<MetricsPipeline>>>,
+    logs_pipeline: Option<Arc<Mutex<LogsPipeline>>>,
+    /// Optional process-global stats. When present, the ingest path
+    /// bumps it at batch granularity and the connection count is
+    /// tracked; the stats HTTP endpoint reads from the same `Arc`.
+    metrics: Option<Arc<ServerMetrics>>,
 }
 
 impl Server {
@@ -81,12 +92,23 @@ impl Server {
         config: ServerConfig,
         dummy_pipeline: Option<Arc<Mutex<DummyPipeline>>>,
         metrics_pipeline: Option<Arc<Mutex<MetricsPipeline>>>,
+        logs_pipeline: Option<Arc<Mutex<LogsPipeline>>>,
     ) -> Self {
         Self {
             config,
             dummy_pipeline,
             metrics_pipeline,
+            logs_pipeline,
+            metrics: None,
         }
+    }
+
+    /// Attach process-global stats. Builder-style so `new` keeps its
+    /// signature; pass the same `Arc<ServerMetrics>` that's handed to
+    /// `serve_stats` so the endpoint and the ingest path share state.
+    pub fn with_metrics(mut self, metrics: Arc<ServerMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Bind the listener, accept connections until `shutdown`
@@ -118,6 +140,8 @@ impl Server {
                 let config = config.clone();
                 let dummy_pipeline = self.dummy_pipeline.clone();
                 let metrics_pipeline = self.metrics_pipeline.clone();
+                let logs_pipeline = self.logs_pipeline.clone();
+                let metrics = self.metrics.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle(
                         sock,
@@ -126,6 +150,8 @@ impl Server {
                         session_id,
                         dummy_pipeline,
                         metrics_pipeline,
+                        logs_pipeline,
+                        metrics,
                     )
                     .await
                     {
@@ -160,8 +186,39 @@ impl Server {
                 info!("final metrics flush complete");
             }
         }
+        if let Some(pipe) = self.logs_pipeline.as_ref() {
+            let mut guard = pipe.lock().await;
+            if let Err(e) = guard.flush().await {
+                warn!(error = %e, "final logs flush failed");
+            } else {
+                info!("final logs flush complete");
+            }
+        }
 
         Ok(())
+    }
+}
+
+/// RAII guard that increments the live connection gauge on accept and
+/// decrements it on drop — covering every early-return path through
+/// `handle` (handshake rejections, EOF, errors) without scattering
+/// `conn_close()` calls.
+struct ConnGuard(Option<Arc<ServerMetrics>>);
+
+impl ConnGuard {
+    fn new(metrics: Option<Arc<ServerMetrics>>) -> Self {
+        if let Some(m) = metrics.as_ref() {
+            m.conn_open();
+        }
+        Self(metrics)
+    }
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        if let Some(m) = self.0.as_ref() {
+            m.conn_close();
+        }
     }
 }
 
@@ -178,6 +235,7 @@ struct Counters {
     rejected:          AtomicU64,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle(
     sock: TcpStream,
     peer: SocketAddr,
@@ -185,8 +243,13 @@ async fn handle(
     session_id: u64,
     dummy_pipeline: Option<Arc<Mutex<DummyPipeline>>>,
     metrics_pipeline: Option<Arc<Mutex<MetricsPipeline>>>,
+    logs_pipeline: Option<Arc<Mutex<LogsPipeline>>>,
+    metrics: Option<Arc<ServerMetrics>>,
 ) -> Result<()> {
     sock.set_nodelay(true)?;
+    // Track this connection in the live gauge for as long as `handle`
+    // runs, regardless of which path returns.
+    let _conn_guard = ConnGuard::new(metrics.clone());
     let (rd, wr) = sock.into_split();
     let mut rd = BufReader::new(rd);
     let mut wr = BufWriter::new(wr);
@@ -257,6 +320,17 @@ async fn handle(
     let counters = Counters::default();
     let signals_announced = hello.signals;
 
+    // Per-connection private scratch builders for the decode-out-of-lock
+    // ingest path. Lazily initialised on the first batch of each signal:
+    // we lock the pipeline once to grab its decode fn pointer + a fresh
+    // scratch builder, then decode every subsequent batch into the
+    // scratch with no lock held and merge it under the lock via
+    // `ingest_decoded`. A connection can carry more than one signal, so
+    // there's one slot per signal.
+    let mut dummy_scratch: Option<(DecodeFn<DummyBlockBuilder>, DummyBlockBuilder)> = None;
+    let mut metrics_scratch: Option<(DecodeFn<MetricsBlockBuilder>, MetricsBlockBuilder)> = None;
+    let mut logs_scratch: Option<(DecodeFn<LogsBlockBuilder>, LogsBlockBuilder)> = None;
+
     loop {
         let frame = match read_frame::<scry_proto::Frame, _>(&mut rd).await {
             Ok(f) => f,
@@ -296,6 +370,7 @@ async fn handle(
                 };
                 if !announced_ok {
                     counters.rejected.fetch_add(1, Ordering::Relaxed);
+                    if let Some(m) = metrics.as_ref() { m.add_rejected(); }
                     write_frame(
                         &mut wr,
                         &build::batch_ack(
@@ -314,6 +389,7 @@ async fn handle(
 
                 if b.uncompressed_size > DEFAULT_MAX_BATCH_BYTES {
                     counters.rejected.fetch_add(1, Ordering::Relaxed);
+                    if let Some(m) = metrics.as_ref() { m.add_rejected(); }
                     write_frame(
                         &mut wr,
                         &build::batch_ack(
@@ -334,6 +410,9 @@ async fn handle(
                 counters
                     .payload_bytes_in
                     .fetch_add(b.payload.len() as u64, Ordering::Relaxed);
+                if let Some(m) = metrics.as_ref() {
+                    m.add_batch(b.payload.len() as u64);
+                }
 
                 let decompressed = match b.compression {
                     COMPRESSION_NONE => b.payload.clone(),
@@ -341,6 +420,7 @@ async fn handle(
                         Ok(d) => d,
                         Err(e) => {
                             counters.rejected.fetch_add(1, Ordering::Relaxed);
+                    if let Some(m) = metrics.as_ref() { m.add_rejected(); }
                             warn!(%peer, batch_id = b.batch_id, error = %e, "zstd decompress failed");
                             write_frame(
                                 &mut wr,
@@ -361,6 +441,7 @@ async fn handle(
                     other => {
                         warn!(%peer, batch_id = b.batch_id, compression = other, "unknown compression");
                         counters.rejected.fetch_add(1, Ordering::Relaxed);
+                    if let Some(m) = metrics.as_ref() { m.add_rejected(); }
                         write_frame(
                             &mut wr,
                             &build::batch_ack(
@@ -390,6 +471,9 @@ async fn handle(
                 counters
                     .payload_bytes_out
                     .fetch_add(decompressed.len() as u64, Ordering::Relaxed);
+                if let Some(m) = metrics.as_ref() {
+                    m.add_bytes_out(decompressed.len() as u64);
+                }
 
                 let signal = sig.unwrap();
 
@@ -401,8 +485,29 @@ async fn handle(
                 let decode_result: Result<u64> = match signal {
                     Signal::Dummy => {
                         if let Some(pipe) = dummy_pipeline.as_ref() {
-                            let mut guard = pipe.lock().await;
-                            guard.ingest(&decompressed).await
+                            if dummy_scratch.is_none() {
+                                let g = pipe.lock().await;
+                                dummy_scratch = Some((g.decode_fn(), g.new_scratch()));
+                            }
+                            let (decode_fn, scratch) = dummy_scratch.as_mut().unwrap();
+                            // Phase 1: decode into private scratch, no lock held.
+                            match decode_fn(&decompressed, scratch) {
+                                Ok(n) => {
+                                    // Phase 2: commit (WAL append + merge) under lock.
+                                    let mut guard = pipe.lock().await;
+                                    match guard.ingest_decoded(&decompressed, scratch).await {
+                                        Ok(()) => Ok(n as u64),
+                                        Err(e) => {
+                                            scratch.reset();
+                                            Err(e)
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    scratch.reset();
+                                    Err(e)
+                                }
+                            }
                         } else {
                             let mut counter = CountDummyAppender(0);
                             scry_proto::streaming::decode_dummy_batch_into(
@@ -415,8 +520,29 @@ async fn handle(
                     }
                     Signal::Metrics => {
                         if let Some(pipe) = metrics_pipeline.as_ref() {
-                            let mut guard = pipe.lock().await;
-                            guard.ingest(&decompressed).await
+                            if metrics_scratch.is_none() {
+                                let g = pipe.lock().await;
+                                metrics_scratch = Some((g.decode_fn(), g.new_scratch()));
+                            }
+                            let (decode_fn, scratch) = metrics_scratch.as_mut().unwrap();
+                            // Phase 1: decode into private scratch, no lock held.
+                            match decode_fn(&decompressed, scratch) {
+                                Ok(n) => {
+                                    // Phase 2: commit (WAL append + merge) under lock.
+                                    let mut guard = pipe.lock().await;
+                                    match guard.ingest_decoded(&decompressed, scratch).await {
+                                        Ok(()) => Ok(n as u64),
+                                        Err(e) => {
+                                            scratch.reset();
+                                            Err(e)
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    scratch.reset();
+                                    Err(e)
+                                }
+                            }
                         } else {
                             // No metrics pipeline: validate + count
                             // samples (series are dictionary entries,
@@ -431,6 +557,45 @@ async fn handle(
                             .map_err(|e| anyhow::anyhow!("MetricsBatch: {e}"))
                         }
                     }
+                    Signal::Logs => {
+                        if let Some(pipe) = logs_pipeline.as_ref() {
+                            if logs_scratch.is_none() {
+                                let g = pipe.lock().await;
+                                logs_scratch = Some((g.decode_fn(), g.new_scratch()));
+                            }
+                            let (decode_fn, scratch) = logs_scratch.as_mut().unwrap();
+                            // Phase 1: decode into private scratch, no lock held.
+                            match decode_fn(&decompressed, scratch) {
+                                Ok(n) => {
+                                    // Phase 2: commit (WAL append + merge) under lock.
+                                    let mut guard = pipe.lock().await;
+                                    match guard.ingest_decoded(&decompressed, scratch).await {
+                                        Ok(()) => Ok(n as u64),
+                                        Err(e) => {
+                                            scratch.reset();
+                                            Err(e)
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    scratch.reset();
+                                    Err(e)
+                                }
+                            }
+                        } else {
+                            // No logs pipeline: validate + count
+                            // entries (streams are dictionary entries,
+                            // not records — same accounting as the
+                            // pipeline path).
+                            let mut counter = CountLogsAppender::default();
+                            scry_proto::streaming::decode_logs_batch_into(
+                                &decompressed,
+                                &mut counter,
+                            )
+                            .map(|entries| entries as u64)
+                            .map_err(|e| anyhow::anyhow!("LogsBatch: {e}"))
+                        }
+                    }
                     _ => decode_payload(signal, &decompressed),
                 };
 
@@ -443,6 +608,9 @@ async fn handle(
                             Signal::Profiles => counters.profile_blobs .fetch_add(records, Ordering::Relaxed),
                             Signal::Dummy    => counters.dummy_records .fetch_add(records, Ordering::Relaxed),
                         };
+                        if let Some(m) = metrics.as_ref() {
+                            m.add_records(signal, records);
+                        }
                         write_frame(
                             &mut wr,
                             &build::batch_ack(session_id, b.batch_id, ACK_ACCEPTED, 0, 0, ""),
@@ -451,6 +619,7 @@ async fn handle(
                     }
                     Err(e) => {
                         counters.rejected.fetch_add(1, Ordering::Relaxed);
+                    if let Some(m) = metrics.as_ref() { m.add_rejected(); }
                         warn!(%peer, batch_id = b.batch_id, error = %e, "payload decode failed");
                         write_frame(
                             &mut wr,
@@ -555,18 +724,38 @@ impl scry_proto::streaming::MetricsAppender for CountMetricsAppender {
     }
 }
 
+/// Counter-only `LogsAppender` for the no-logs-pipeline case.
+/// Stream observations are dropped; only entry counts are kept to
+/// match the configured-pipeline path's accounting
+/// (`entries = records`).
+#[derive(Default)]
+struct CountLogsAppender {
+    entries: u64,
+}
+
+impl scry_proto::streaming::LogsAppender for CountLogsAppender {
+    #[inline]
+    fn observe_stream(&mut self, _fingerprint: u64, _labels: Vec<(Vec<u8>, Vec<u8>)>) {}
+    #[inline]
+    fn append_entry(
+        &mut self,
+        _fingerprint: u64,
+        _ts_unix_nano: u64,
+        _severity: u8,
+        _body: Vec<u8>,
+        _attributes: Vec<(Vec<u8>, Vec<u8>)>,
+    ) {
+        self.entries += 1;
+    }
+}
+
 /// Validate-and-count fallback for signals the server has no
-/// streaming decoder for yet (Logs/Traces/Profiles). Dummy and
-/// Metrics route through their streaming appenders upstream and
-/// never reach here.
+/// streaming decoder for yet (Traces/Profiles). Dummy, Metrics, and
+/// Logs route through their streaming appenders upstream and never
+/// reach here.
 fn decode_payload(signal: Signal, bytes: &[u8]) -> Result<u64> {
     let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
     let n: u64 = match signal {
-        Signal::Logs => {
-            let l = LogsBatch::decode_with_decoder(&mut decoder)
-                .map_err(|e| anyhow::anyhow!("LogsBatch: {e}"))?;
-            l.streams.iter().map(|s| s.entries.len() as u64).sum()
-        }
         Signal::Traces => {
             let t = TracesBatch::decode_with_decoder(&mut decoder)
                 .map_err(|e| anyhow::anyhow!("TracesBatch: {e}"))?;
@@ -577,7 +766,7 @@ fn decode_payload(signal: Signal, bytes: &[u8]) -> Result<u64> {
                 .map_err(|e| anyhow::anyhow!("ProfilesBatch: {e}"))?;
             p.samples.len() as u64
         }
-        Signal::Dummy | Signal::Metrics => {
+        Signal::Dummy | Signal::Metrics | Signal::Logs => {
             // Routed through streaming appenders upstream; should
             // never reach `decode_payload`.
             anyhow::bail!("BUG: decode_payload called for {signal:?}")

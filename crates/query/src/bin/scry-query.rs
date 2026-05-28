@@ -71,11 +71,14 @@ use futures::StreamExt;
 use scry_catalog::Catalog;
 use scry_objstore::{open_with_pool_config, BufPool, BufPoolConfig, ObjStoreConfig};
 use scry_proto::{
-    constants::query_err_name,
+    constants::{query_err_name, Signal},
     framing::{read_frame, write_frame},
     QueryFrame, QueryFrameMsg,
 };
-use scry_query::{register_metrics_table, MetricsQuery, QueryRequest, METRICS_TABLE_NAME};
+use scry_query::{
+    logs::{register_logs_table, LOGS_TABLE_NAME},
+    register_metrics_table, Query, QueryRequest, METRICS_TABLE_NAME,
+};
 use tokio::io::{BufReader as TokioBufReader, BufWriter as TokioBufWriter};
 use tokio::net::TcpStream;
 
@@ -98,9 +101,17 @@ struct Args {
 
     /// Equality matcher in `name=value` form. Repeatable; AND'd.
     /// Resolves via the postings sidecar before SQL/DataFrame eval.
-    /// Empty list = "scan every series in every overlapping block".
+    /// Empty list = "scan every series/stream in every overlapping
+    /// block".
     #[arg(long = "matcher", value_parser = parse_matcher)]
     matchers: Vec<(String, String)>,
+
+    /// Target signal: `metrics` (default) or `logs`. Drives the
+    /// table name (`metrics` vs `logs`) and the per-signal postings
+    /// layer. Required when querying logs; metrics is the default
+    /// because it's been the only signal until v0.4.
+    #[arg(long, value_parser = parse_signal, default_value = "metrics")]
+    signal: CliSignal,
 
     /// Lower bound on `ts_unix_nano` (inclusive). Both catalog-time
     /// (block overlap) and a `>=` row predicate.
@@ -116,9 +127,10 @@ struct Args {
     #[arg(long)]
     limit: Option<usize>,
 
-    /// Arbitrary SQL against the registered `metrics` table. The
-    /// matcher / time flags still apply as a *preselect* — the SQL
-    /// runs against the already-narrowed table.
+    /// Arbitrary SQL against the registered table for the chosen
+    /// signal (`metrics` or `logs`). The matcher / time flags
+    /// still apply as a *preselect* — the SQL runs against the
+    /// already-narrowed table.
     #[arg(long)]
     sql: Option<String>,
 
@@ -176,6 +188,43 @@ fn parse_matcher(raw: &str) -> Result<(String, String), String> {
     Ok((k.to_string(), v.to_string()))
 }
 
+/// Clap-parsed signal selector. Wrapper around [`Signal`] so we can
+/// give it a `Display` (used in the trailer) and a parser without
+/// touching the proto crate.
+#[derive(Debug, Clone, Copy)]
+struct CliSignal(Signal);
+
+impl CliSignal {
+    fn name(&self) -> &'static str {
+        match self.0 {
+            Signal::Metrics => "metrics",
+            Signal::Logs => "logs",
+            Signal::Traces => "traces",
+            Signal::Profiles => "profiles",
+            Signal::Dummy => "dummy",
+        }
+    }
+    fn table_name(&self) -> &'static str {
+        match self.0 {
+            Signal::Metrics => METRICS_TABLE_NAME,
+            Signal::Logs => LOGS_TABLE_NAME,
+            // Traces/profiles/dummy don't have query tables yet —
+            // parse_signal rejects them before we ever hit this.
+            _ => "<unsupported>",
+        }
+    }
+}
+
+fn parse_signal(raw: &str) -> Result<CliSignal, String> {
+    match raw.to_ascii_lowercase().as_str() {
+        "metrics" => Ok(CliSignal(Signal::Metrics)),
+        "logs" => Ok(CliSignal(Signal::Logs)),
+        other => Err(format!(
+            "unknown signal `{other}` (supported at v0.4: metrics, logs)"
+        )),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -186,7 +235,7 @@ async fn main() -> Result<()> {
         .init();
     let args = Args::parse();
 
-    let q = MetricsQuery {
+    let q = Query {
         matchers: args.matchers.clone(),
         ts_min: args.from,
         ts_max: args.until,
@@ -195,11 +244,11 @@ async fn main() -> Result<()> {
     // ── Remote mode short-circuit ──────────────────────────────────
     //
     // The daemon owns everything (catalog, store, pool). We just
-    // serialize the request into a Flight ticket, drain the result
-    // stream, and print a degenerate trailer. Per-block scan stats
-    // live in the daemon's `scan_complete` log event.
+    // serialize the request, drain the result stream, and print a
+    // degenerate trailer. Per-block scan stats live in the daemon's
+    // `scan_complete` log event.
     if let Some(addr) = args.remote.as_deref() {
-        return run_remote(addr, q, args.sql.clone(), args.limit).await;
+        return run_remote(addr, args.signal, q, args.sql.clone(), args.limit).await;
     }
 
     let cfg = ObjStoreConfig::from_env()
@@ -234,13 +283,20 @@ async fn main() -> Result<()> {
     let catalog = Catalog::open(catalog_path, &cfg.bucket)
         .with_context(|| format!("opening catalog at {}", catalog_path.display()))?;
 
-    // ── Register `metrics` on a fresh SessionContext ──────────────
+    // ── Register the chosen signal's table on a fresh ctx ─────────
     //
     // The postings GETs + per-block fingerprint resolve happen inside
-    // `register_metrics_table`; once it returns, the table is fully
-    // pre-narrowed and `scan()` is pure CPU.
+    // the register call; once it returns, the table is fully pre-
+    // narrowed and `scan()` is pure CPU. We branch on the requested
+    // signal so `scry-query --signal logs ...` registers `logs`
+    // instead of `metrics`.
     let ctx = SessionContext::new();
-    register_metrics_table(&ctx, &catalog, store, &q).await?;
+    let table_name = args.signal.table_name();
+    match args.signal.0 {
+        Signal::Metrics => register_metrics_table(&ctx, &catalog, store, &q).await?,
+        Signal::Logs => register_logs_table(&ctx, &catalog, store, &q).await?,
+        other => anyhow::bail!("CLI signal {other:?} has no query table yet"),
+    }
 
     // ── Produce a DataFrame ──────────────────────────────────────
     let df = if let Some(sql) = args.sql.as_deref() {
@@ -249,9 +305,9 @@ async fn main() -> Result<()> {
             .with_context(|| format!("parsing SQL `{sql}`"))?
     } else {
         let mut df = ctx
-            .table(METRICS_TABLE_NAME)
+            .table(table_name)
             .await
-            .with_context(|| format!("looking up table {METRICS_TABLE_NAME}"))?;
+            .with_context(|| format!("looking up table {table_name}"))?;
         if let Some(limit) = args.limit {
             df = df.limit(0, Some(limit))?;
         }
@@ -328,7 +384,8 @@ async fn main() -> Result<()> {
 ///                    QueryFrame::StreamError { code, message }
 async fn run_remote(
     addr: &str,
-    metrics_query: MetricsQuery,
+    signal: CliSignal,
+    query: Query,
     sql: Option<String>,
     limit: Option<usize>,
 ) -> Result<()> {
@@ -350,7 +407,8 @@ async fn run_remote(
 
     // Send the request frame.
     let req = QueryRequest {
-        metrics_query,
+        signal: signal.0 as u8,
+        query,
         sql,
         limit,
         request_id: None,
@@ -416,13 +474,16 @@ async fn run_remote(
         }
     };
 
+    let signal_name = signal.name();
     eprintln!();
     if server_total_rows as usize != total_rows {
         eprintln!(
-            "# scan: {total_rows} rows total (server reported {server_total_rows}; mismatch!) via remote {host_port}"
+            "# scan: {total_rows} {signal_name} rows total (server reported {server_total_rows}; mismatch!) via remote {host_port}"
         );
     } else {
-        eprintln!("# scan: {server_total_rows} rows total (via remote {host_port})");
+        eprintln!(
+            "# scan: {server_total_rows} {signal_name} rows total (via remote {host_port})"
+        );
     }
     Ok(())
 }

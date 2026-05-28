@@ -14,22 +14,31 @@
 //!
 //! ## Public shape
 //!
-//! - [`MetricsQuery`] — the same `Vec<(name, value)>` AND'd-equality
-//!   shape as v0.2. Stays as the entry-point because (a) it's the
-//!   right preselect for the postings sidecar, (b) it survives
-//!   whether a later layer adds SQL/PromQL on top.
-//! - [`register_metrics_table`] — async helper that does the
-//!   postings + catalog work *once*, builds a [`MetricsTable`], and
-//!   registers it under the name `"metrics"` on the caller's
-//!   `SessionContext`. After this returns, the caller can use
-//!   `ctx.sql(...)` / `ctx.table("metrics").await?` freely.
+//! - [`Query`] — `Vec<(name, value)>` AND'd-equality + optional
+//!   `ts_min`/`ts_max` bounds. Shared across signals because at v0
+//!   metrics and logs both want exactly this preselect shape
+//!   (postings on AND'd equality matchers, optional time-range).
+//!   When a signal eventually diverges (e.g. logs gains
+//!   body-substring predicates in the tantivy phase), `Query` either
+//!   grows new fields (kept simple, everyone ignores what they
+//!   don't need) or splits into a signal-tagged enum — but the
+//!   share is honest at v0.
+//! - [`register_metrics_table`] / [`register_logs_table`] — async
+//!   helpers that do the postings + catalog work *once*, build the
+//!   per-signal `TableProvider`, and register it under the table
+//!   name `"metrics"` / `"logs"` on the caller's `SessionContext`.
+//!   After this returns, the caller can use `ctx.sql(...)` /
+//!   `ctx.table("metrics" | "logs").await?` freely.
 //! - [`metrics_query`] — convenience that wraps the above and
-//!   returns a `DataFrame` for the common shape (no SQL desired).
+//!   returns a `DataFrame` for the common metrics shape (no SQL
+//!   desired). Logs callers go through [`register_logs_table`] +
+//!   `ctx.table(LOGS_TABLE_NAME)`.
 //!
 //! The v0.2 `Sample` and `BlockHit` structs are intentionally gone —
 //! results stream as `RecordBatch`es and pruning stats come from
 //! DataFusion's `MetricsSet` on the produced `ExecutionPlan`.
 
+pub mod logs;
 pub mod postings;
 pub mod postings_cache;
 pub mod wire;
@@ -51,16 +60,35 @@ pub use postings_cache::{
     DEFAULT_BUDGET_BYTES as DEFAULT_POSTINGS_CACHE_BYTES,
 };
 pub use table::{time_overlaps, BlockEntry, MetricsTable};
+// Logs symmetry: same convenience re-exports the metrics path has, so
+// CLI/server callers can `use scry_query::{register_logs_table, ...}`
+// without reaching into the submodule. Names are signal-prefixed
+// because the metrics symbols above already claim the bare names.
+pub use logs::{
+    build_logs_table_from_candidates, list_logs_candidates, logs_query,
+    register_logs_table, register_logs_table_from_candidates, LogsBlockEntry, LogsTable,
+    LOGS_TABLE_NAME,
+};
 
-/// AND of equality matchers over a metrics block. An empty matcher
-/// set returns every series in every overlapping block — useful as a
-/// "scan everything" sanity primitive. The fingerprint set for the
-/// empty-matcher case is derived from `BlockMeta::series_types`
-/// (sidecar JSON) rather than from a postings scan, since the
-/// postings file is keyed by `(label_name, label_value)` and has no
-/// natural "all series" row.
+/// AND of equality matchers + optional time-range bounds. Shared
+/// across signals: at v0 both metrics and logs want exactly this
+/// preselect shape (postings-on-AND'd-equality + a window).
+///
+/// An empty `matchers` set returns every series/stream in every
+/// overlapping block — useful as a "scan everything" sanity
+/// primitive. The fingerprint set for the empty-matcher case is
+/// derived from `BlockMeta::all_fingerprints` (sidecar JSON)
+/// rather than from a postings scan, since the postings file is
+/// keyed by `(label_name, label_value)` and has no natural
+/// "all-fingerprints" row.
+///
+/// When a signal eventually diverges (logs gaining body-substring
+/// predicates in the tantivy phase, traces gaining trace-id
+/// lookups), this struct either grows new optional fields
+/// (everyone ignores what they don't need) or splits into a
+/// signal-tagged enum. Today the share is honest.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct MetricsQuery {
+pub struct Query {
     pub matchers: Vec<(String, String)>,
     pub ts_min: Option<u64>,
     pub ts_max: Option<u64>,
@@ -83,7 +111,7 @@ pub const METRICS_TABLE_NAME: &str = "metrics";
 pub async fn build_metrics_table(
     catalog: &Catalog,
     store: Arc<dyn ObjectStore>,
-    q: &MetricsQuery,
+    q: &Query,
 ) -> Result<MetricsTable> {
     // Two-phase split: list_metrics_candidates is pure sync work over
     // the catalog handle; the rest is the async postings-resolve dance.
@@ -100,7 +128,7 @@ pub async fn build_metrics_table(
 /// can drop the guard before doing any async work.
 pub fn list_metrics_candidates(
     catalog: &Catalog,
-    q: &MetricsQuery,
+    q: &Query,
 ) -> Result<Vec<CatalogEntry>> {
     Ok(catalog
         .list_blocks()
@@ -118,7 +146,7 @@ pub async fn build_metrics_table_from_candidates(
     candidates: Vec<CatalogEntry>,
     store: Arc<dyn ObjectStore>,
     cache: Option<&PostingsCache>,
-    q: &MetricsQuery,
+    q: &Query,
 ) -> Result<MetricsTable> {
     // All candidates must share a bucket — otherwise the single
     // `object_store_url` we pick is wrong. The catalog can in
@@ -206,7 +234,7 @@ pub async fn register_metrics_table(
     ctx: &SessionContext,
     catalog: &Catalog,
     store: Arc<dyn ObjectStore>,
-    q: &MetricsQuery,
+    q: &Query,
 ) -> Result<()> {
     let candidates = list_metrics_candidates(catalog, q)?;
     register_metrics_table_from_candidates(ctx, candidates, store, None, q).await
@@ -222,7 +250,7 @@ pub async fn register_metrics_table_from_candidates(
     candidates: Vec<CatalogEntry>,
     store: Arc<dyn ObjectStore>,
     cache: Option<&PostingsCache>,
-    q: &MetricsQuery,
+    q: &Query,
 ) -> Result<()> {
     let table = build_metrics_table_from_candidates(candidates, store.clone(), cache, q).await?;
 
@@ -246,7 +274,7 @@ pub async fn register_metrics_table_from_candidates(
 pub async fn metrics_query(
     catalog: &Catalog,
     store: Arc<dyn ObjectStore>,
-    q: &MetricsQuery,
+    q: &Query,
 ) -> Result<DataFrame> {
     let ctx = SessionContext::new();
     register_metrics_table(&ctx, catalog, store, q).await?;

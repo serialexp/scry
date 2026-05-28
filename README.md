@@ -100,15 +100,23 @@ You'll see the sink report something like
 
 ## Scope (v0 → v1)
 
-| Milestone | Deliverable |
-|-----------|-------------|
-| **v0.1**  | Storage layer: parquet block writer + WAL + S3 backend + catalog, with a dummy record type. No signals, no query. |
-| **v0.2**  | Logs end-to-end: agent tails a file, server ingests, query returns matching lines for `(time range, label match, substring)`. |
-| **v0.3**  | Traces: trace-by-id lookup + simple span attribute filtering. |
-| **v0.4**  | Profiles: pprof ingest, flamegraph aggregation over a time range. |
-| **v0.5**  | Metrics: the hard one. PromQL-ish surface, hopefully via an existing parser crate. |
-| **v0.6**  | Compaction, retention, and operational hardening across all four. |
-| **v1.0**  | Grafana datasource adapters (or our own minimal UI — TBD). |
+Reconciled against what actually shipped: the original plan put logs
+first (v0.2) and metrics later (v0.5), but in practice metrics drove
+the early work — postings + DataFusion are easier to validate against
+a numeric workload — and logs are landing as the second real signal in
+v0.4. Order updated accordingly.
+
+| Milestone | Status | Deliverable |
+|-----------|--------|-------------|
+| **v0.1**  | ✅     | Storage layer: parquet block writer + WAL + S3 backend + catalog, with a dummy record type. No signals, no query. |
+| **v0.2**  | ✅     | Metrics ingest + query: per-block postings sidecar, ingest-side WAL+pipeline, DataFusion-backed CLI querier with row-group pruning, postings cache. |
+| **v0.3**  | ✅     | Query daemon (`scry-queryd`): binschema-framed remote query path (see D-031), shared between CLI and future tools. Streaming Arrow IPC batches with mid-stream resource errors. |
+| **v0.4**  | 🚧     | Logs as the second real signal: stream-label postings (same shape as metrics), per-entry attributes as a `Map<Utf8,Utf8>` column, CLI `--signal logs`, signal byte on the query wire. Body-substring search deferred to its own tantivy phase. |
+| **v0.5**  | —      | Traces: trace-by-id lookup + simple span attribute filtering. |
+| **v0.6**  | —      | Profiles: pprof ingest, flamegraph aggregation over a time range. |
+| **v0.7**  | —      | PromQL surface on top of the metrics path, plus the tantivy-backed full-text phase for logs. |
+| **v0.8**  | —      | Compaction, retention, and operational hardening across all signals. |
+| **v1.0**  | —      | Grafana datasource adapters (or our own minimal UI — TBD). |
 
 ## License
 

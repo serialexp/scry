@@ -354,6 +354,10 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<CatalogEntry> {
             // don't filter on it. Callers that want type metadata go
             // through `reconcile_from_bucket` / read the sidecar.
             series_types: None,
+            // Likewise: the full fingerprint list lives only in the
+            // sidecar. Callers that hit the empty-matcher fallback
+            // read the sidecar (see `scry_query::postings`).
+            all_fingerprints: None,
         },
         bucket,
         date,

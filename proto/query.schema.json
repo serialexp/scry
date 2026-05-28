@@ -30,9 +30,10 @@
     },
 
     "QueryRequest": {
-      "description": "Sent by the client at the start of every query connection. Carries the AND'd matcher set + time bounds (the postings preselect), optional SQL against the registered metrics table, an optional row limit, and an optional caller-supplied tracing correlation id. NOTE: 'optional' fields would be the natural shape here, but as of binschema 0.5.x the Rust generator emits NotImplemented when 'optional' appears inside a discriminated_union variant (works fine in plain structs — see ingest's Span.parent_span_id). We model each optional with an explicit '*_present: uint8' companion (0 = absent, 1 = present); when absent the value field is still serialised but should be ignored by the receiver. Switch back to 'optional' once binschema gains support.",
+      "description": "Sent by the client at the start of every query connection. Carries the target signal byte (1 = metrics, 2 = logs — values match scry_proto::constants::Signal), the AND'd matcher set + time bounds (the postings preselect), optional SQL against the registered table for that signal, an optional row limit, and an optional caller-supplied tracing correlation id. Receiver fails with QUERY_ERR_BAD_REQUEST if `signal` is 0 or names an unimplemented signal. NOTE: 'optional' fields would be the natural shape here, but as of binschema 0.5.x the Rust generator emits NotImplemented when 'optional' appears inside a discriminated_union variant (works fine in plain structs — see ingest's Span.parent_span_id). We model each optional with an explicit '*_present: uint8' companion (0 = absent, 1 = present); when absent the value field is still serialised but should be ignored by the receiver. Switch back to 'optional' once binschema gains support.",
       "sequence": [
         { "name": "tag", "type": "uint8", "const": 1 },
+        { "name": "signal", "type": "uint8" },
         { "name": "matchers", "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "Matcher" } },
         { "name": "ts_min_present", "type": "uint8" },
         { "name": "ts_min",         "type": "uint64" },

@@ -52,16 +52,21 @@ use scry_catalog::Catalog;
 use scry_objstore::{BufPool, PoolStats};
 use scry_proto::{
     constants::{
-        QUERY_ERR_BAD_REQUEST, QUERY_ERR_INTERNAL, QUERY_ERR_PLAN, QUERY_ERR_RESOURCES,
+        Signal, QUERY_ERR_BAD_REQUEST, QUERY_ERR_INTERNAL, QUERY_ERR_PLAN, QUERY_ERR_RESOURCES,
         QUERY_ERR_SQL_PARSE,
     },
     framing::{read_frame, write_frame},
     BatchMsgInput, EndOfStreamInput, QueryFrame, QueryFrameMsg, SchemaMsgInput, StreamErrorInput,
 };
 use scry_query::{
-    list_metrics_candidates, register_metrics_table_from_candidates, PostingsCache,
-    PostingsCacheStats, QueryRequest, METRICS_TABLE_NAME,
+    list_metrics_candidates,
+    logs::{
+        list_logs_candidates, register_logs_table_from_candidates, LOGS_TABLE_NAME,
+    },
+    register_metrics_table_from_candidates, PostingsCache, PostingsCacheStats, QueryRequest,
+    METRICS_TABLE_NAME,
 };
+use scry_catalog::CatalogEntry;
 use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, info_span, warn, Instrument, Span};
@@ -233,15 +238,44 @@ impl QueryService {
             format!("q-{}", self.next_request_id.fetch_add(1, Ordering::Relaxed))
         });
 
+        // Resolve the signal byte up-front. An unknown / zero byte
+        // is a client bug and we'd rather surface a clean
+        // QUERY_ERR_BAD_REQUEST than rope it through the rest of
+        // the pipeline.
+        let signal = match Signal::from_u8(req.signal) {
+            Some(s @ (Signal::Metrics | Signal::Logs)) => s,
+            Some(other) => {
+                let _ = emit_stream_error(
+                    &mut wr,
+                    QUERY_ERR_BAD_REQUEST,
+                    format!("signal {other:?} has no query table at v0.4 (expected metrics or logs)"),
+                )
+                .await;
+                let _ = wr.flush().await;
+                return Ok(());
+            }
+            None => {
+                let _ = emit_stream_error(
+                    &mut wr,
+                    QUERY_ERR_BAD_REQUEST,
+                    format!("unknown signal byte {} (expected 1=metrics, 2=logs)", req.signal),
+                )
+                .await;
+                let _ = wr.flush().await;
+                return Ok(());
+            }
+        };
+
         // Span is the parent for every event emitted while building
         // and executing the query. Field shapes match existing
         // codebase conventions (% for Display, ? for Debug).
         let span = info_span!(
             "query",
             request_id = %request_id,
-            matcher_count = req.metrics_query.matchers.len(),
-            ts_min = req.metrics_query.ts_min,
-            ts_max = req.metrics_query.ts_max,
+            signal = signal_name(signal),
+            matcher_count = req.query.matchers.len(),
+            ts_min = req.query.ts_min,
+            ts_max = req.query.ts_max,
             sql = req.sql.as_deref().unwrap_or(""),
             limit = req.limit,
         );
@@ -250,7 +284,7 @@ impl QueryService {
         // it emits (`register_metrics_table_done` etc.) land in the
         // right trace.
         let svc = self.clone();
-        async move { svc.run_query(req, wr).await }
+        async move { svc.run_query(signal, req, wr).await }
             .instrument(span)
             .await
     }
@@ -261,6 +295,7 @@ impl QueryService {
     /// losing the `scan_complete` emission.
     async fn run_query<W>(
         self: Arc<Self>,
+        signal: Signal,
         req: QueryRequest,
         mut wr: BufWriter<W>,
     ) -> Result<()>
@@ -297,9 +332,16 @@ impl QueryService {
         // Compute candidates synchronously and drop the guard before
         // any .await — MutexGuard isn't Send, so we can't hold it
         // across an await point in a tokio::spawn-ed future.
-        let candidates_result: Result<Vec<_>, String> = match self.catalog.lock() {
-            Ok(guard) => list_metrics_candidates(&guard, &req.metrics_query)
-                .map_err(|e| format!("list_metrics_candidates: {e:#}")),
+        let candidates_result: Result<Vec<CatalogEntry>, String> = match self.catalog.lock() {
+            Ok(guard) => match signal {
+                Signal::Metrics => list_metrics_candidates(&guard, &req.query)
+                    .map_err(|e| format!("list_metrics_candidates: {e:#}")),
+                Signal::Logs => list_logs_candidates(&guard, &req.query)
+                    .map_err(|e| format!("list_logs_candidates: {e:#}")),
+                // Unreachable: handle_connection rejects other signals
+                // before reaching run_query.
+                other => Err(format!("BUG: unsupported signal {other:?} reached run_query")),
+            },
             Err(e) => Err(format!("catalog mutex poisoned: {e}")),
         };
         let candidates = match candidates_result {
@@ -307,45 +349,69 @@ impl QueryService {
             Err(msg) => {
                 let _ = emit_stream_error(&mut wr, QUERY_ERR_INTERNAL, msg).await;
                 let _ = wr.flush().await;
-                self.emit_scan_complete(None, rows_total, pool_start, cache_start, t0.elapsed());
+                self.emit_scan_complete(signal, None, rows_total, pool_start, cache_start, t0.elapsed());
                 return Ok(());
             }
         };
 
-        if let Err(e) = register_metrics_table_from_candidates(
-            &ctx,
-            candidates,
-            self.store.clone(),
-            Some(self.postings_cache.as_ref()),
-            &req.metrics_query,
-        )
-        .await
-        {
+        let register_result = match signal {
+            Signal::Metrics => {
+                register_metrics_table_from_candidates(
+                    &ctx,
+                    candidates,
+                    self.store.clone(),
+                    Some(self.postings_cache.as_ref()),
+                    &req.query,
+                )
+                .await
+            }
+            Signal::Logs => {
+                register_logs_table_from_candidates(
+                    &ctx,
+                    candidates,
+                    self.store.clone(),
+                    Some(self.postings_cache.as_ref()),
+                    &req.query,
+                )
+                .await
+            }
+            other => {
+                Err(anyhow::anyhow!("BUG: unsupported signal {other:?} reached run_query"))
+            }
+        };
+        if let Err(e) = register_result {
             let _ = emit_stream_error(
                 &mut wr,
                 QUERY_ERR_INTERNAL,
-                format!("register_metrics_table: {e:#}"),
+                format!("register_{}_table: {e:#}", signal_name(signal)),
             )
             .await;
             let _ = wr.flush().await;
-            self.emit_scan_complete(None, rows_total, pool_start, cache_start, t0.elapsed());
+            self.emit_scan_complete(signal, None, rows_total, pool_start, cache_start, t0.elapsed());
             return Ok(());
         }
 
         let t_reg = t0.elapsed();
         info!(
+            signal = signal_name(signal),
             elapsed_ms = t_reg.as_millis() as u64,
-            "register_metrics_table_done"
+            "register_table_done"
         );
 
         // ── Build the DataFrame (SQL or default SELECT *) ────────────
+        let default_table = match signal {
+            Signal::Metrics => METRICS_TABLE_NAME,
+            Signal::Logs => LOGS_TABLE_NAME,
+            // Unreachable: see above guards.
+            _ => METRICS_TABLE_NAME,
+        };
         let df_res = if let Some(sql) = req.sql.as_deref() {
             match ctx.sql(sql).await {
                 Ok(df) => Ok(df),
                 Err(e) => Err((QUERY_ERR_SQL_PARSE, format!("SQL parse: {e:#}"))),
             }
         } else {
-            match ctx.table(METRICS_TABLE_NAME).await {
+            match ctx.table(default_table).await {
                 Ok(mut df) => {
                     if let Some(limit) = req.limit {
                         match df.limit(0, Some(limit)) {
@@ -360,6 +426,7 @@ impl QueryService {
                                             emit_stream_error(&mut wr, code, msg).await;
                                         let _ = wr.flush().await;
                                         self.emit_scan_complete(
+                                            signal,
                                             None,
                                             rows_total,
                                             pool_start,
@@ -383,7 +450,7 @@ impl QueryService {
             Err((code, msg)) => {
                 let _ = emit_stream_error(&mut wr, code, msg).await;
                 let _ = wr.flush().await;
-                self.emit_scan_complete(None, rows_total, pool_start, cache_start, t0.elapsed());
+                self.emit_scan_complete(signal, None, rows_total, pool_start, cache_start, t0.elapsed());
                 return Ok(());
             }
         };
@@ -398,7 +465,7 @@ impl QueryService {
                 )
                 .await;
                 let _ = wr.flush().await;
-                self.emit_scan_complete(None, rows_total, pool_start, cache_start, t0.elapsed());
+                self.emit_scan_complete(signal, None, rows_total, pool_start, cache_start, t0.elapsed());
                 return Ok(());
             }
         };
@@ -421,6 +488,7 @@ impl QueryService {
                 .await;
                 let _ = wr.flush().await;
                 self.emit_scan_complete(
+                    signal,
                     Some(physical.as_ref()),
                     rows_total,
                     pool_start,
@@ -449,6 +517,7 @@ impl QueryService {
             .await;
             let _ = wr.flush().await;
             self.emit_scan_complete(
+                signal,
                 Some(physical.as_ref()),
                 rows_total,
                 pool_start,
@@ -468,6 +537,7 @@ impl QueryService {
         if let Err(e) = write_frame(&mut wr, &schema_frame).await {
             warn!(error = %e, "client disconnected while writing SchemaMsg");
             self.emit_scan_complete(
+                signal,
                 Some(physical.as_ref()),
                 rows_total,
                 pool_start,
@@ -493,6 +563,7 @@ impl QueryService {
                     let _ = emit_stream_error(&mut wr, code, format!("DataFusion: {e}")).await;
                     let _ = wr.flush().await;
                     self.emit_scan_complete(
+                        signal,
                         Some(physical.as_ref()),
                         rows_total,
                         pool_start,
@@ -521,6 +592,7 @@ impl QueryService {
                     .await;
                     let _ = wr.flush().await;
                     self.emit_scan_complete(
+                        signal,
                         Some(physical.as_ref()),
                         rows_total,
                         pool_start,
@@ -535,6 +607,7 @@ impl QueryService {
                 if let Err(e) = write_one_batch(&mut wr, d, &options).await {
                     warn!(error = %e, "client disconnected while writing BatchMsg (dict)");
                     self.emit_scan_complete(
+                        signal,
                         Some(physical.as_ref()),
                         rows_total,
                         pool_start,
@@ -547,6 +620,7 @@ impl QueryService {
             if let Err(e) = write_one_batch(&mut wr, batch_enc, &options).await {
                 warn!(error = %e, "client disconnected while writing BatchMsg");
                 self.emit_scan_complete(
+                    signal,
                     Some(physical.as_ref()),
                     rows_total,
                     pool_start,
@@ -574,6 +648,7 @@ impl QueryService {
         let _ = wr.flush().await;
 
         self.emit_scan_complete(
+            signal,
             Some(physical.as_ref()),
             rows_total,
             pool_start,
@@ -584,10 +659,11 @@ impl QueryService {
     }
 
     /// Emit the per-query `scan_complete` event with the same field
-    /// shape as the pre-step-5 implementation, so existing log-parsing
-    /// (smoke tests, dashboards) keeps working.
+    /// shape as the pre-step-5 implementation, plus the v0.4 `signal`
+    /// field so dashboards / log-parsing can split per-signal cleanly.
     fn emit_scan_complete(
         &self,
+        signal: Signal,
         plan: Option<&dyn ExecutionPlan>,
         rows_total: u64,
         pool_start: PoolStats,
@@ -612,6 +688,7 @@ impl QueryService {
         let memory_reserved_bytes_end = self.memory_pool.reserved();
 
         info!(
+            signal = signal_name(signal),
             total_rows = rows_total,
             row_groups_matched,
             row_groups_pruned,
@@ -636,6 +713,19 @@ impl QueryService {
         // The Span wrapping the call site carries `request_id`; no
         // need to log it explicitly here.
         let _ = Span::current();
+    }
+}
+
+/// Stable, lowercase signal name for tracing fields. Matches the
+/// shape used by `crates/query/src/bin/scry-query.rs::CliSignal::name`,
+/// so dashboards filtering on `signal="metrics"` agree at both ends.
+fn signal_name(s: Signal) -> &'static str {
+    match s {
+        Signal::Metrics => "metrics",
+        Signal::Logs => "logs",
+        Signal::Traces => "traces",
+        Signal::Profiles => "profiles",
+        Signal::Dummy => "dummy",
     }
 }
 

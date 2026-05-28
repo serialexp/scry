@@ -15,17 +15,36 @@
 //! when real signals do.
 
 mod dummy;
+pub mod logs;
 mod meta;
 pub mod metrics;
 
 pub use dummy::DummyBlockBuilder;
+pub use logs::LogsBlockBuilder;
 pub use meta::BlockMeta;
 pub use metrics::MetricsBlockBuilder;
 
 use anyhow::Result;
-use object_store::ObjectStore;
+use bytes::Bytes;
+use object_store::{path::Path, ObjectStore};
 use std::future::Future;
 use uuid::Uuid;
+
+/// The CPU-bound product of encoding a block, handed back from the
+/// blocking encode task to the async upload path.
+///
+/// Each builder's `finish_and_upload` does its sort + Arrow build +
+/// zstd compression inside `tokio::task::spawn_blocking` (so the
+/// CPU-heavy encode doesn't monopolise an async worker thread), then
+/// performs the object-store PUTs back on the async side. This struct
+/// is what crosses that boundary: the catalog `meta` plus the already
+/// encoded `(path, body)` pairs to upload **in order** — the `meta.json`
+/// sidecar MUST be the last entry, since it's the "block exists" signal
+/// for catalog reconcile.
+pub(crate) struct EncodedBlock {
+    pub(crate) meta: BlockMeta,
+    pub(crate) puts: Vec<(Path, Bytes)>,
+}
 
 /// A signal-specific in-memory block builder. The pipeline machinery in
 /// `scry-server` is generic over this trait so the WAL → builder →
@@ -49,6 +68,33 @@ pub trait BlockBuilder: Send + 'static {
     fn new(writer_id: Uuid, cfg: BlockBuilderConfig) -> Self;
     fn is_empty(&self) -> bool;
     fn should_close(&self) -> bool;
+
+    /// Drain `other`'s buffered records into `self`, leaving `other`
+    /// empty (capacity retained) and reusable for the next batch.
+    ///
+    /// This is the heart of the decode-out-of-lock ingest path: a
+    /// connection decodes a batch into a *private* scratch builder with
+    /// no lock held (the CPU-heavy bit-level decode runs in parallel
+    /// across connections), then takes the pipeline lock only long
+    /// enough to `merge` that scratch into the shared builder. The merge
+    /// is a handful of column `Vec` appends plus a dictionary dedup —
+    /// orders of magnitude cheaper than the decode it replaces under the
+    /// lock.
+    ///
+    /// Any per-block dedup state (e.g. the series/stream "seen" set)
+    /// accumulates against `self`, so the dedup scope is identical to
+    /// decoding straight into the shared builder. After this returns
+    /// `other` is in the same empty state `new` produces.
+    fn merge(&mut self, other: &mut Self);
+
+    /// Empty all buffers in place (capacity retained), returning to the
+    /// just-constructed state. Used to discard a scratch builder after a
+    /// batch that failed to commit — a decode error (partial prefix
+    /// absorbed) or a WAL-append failure (records decoded but never
+    /// merged) — so the connection's next batch decodes into a clean
+    /// scratch. The happy path never calls this: a successful `merge`
+    /// already leaves the scratch empty.
+    fn reset(&mut self);
     /// Consume the builder, encode to parquet (+ any sidecars), upload
     /// to object storage, and return a `BlockMeta` ready for catalog
     /// insertion. Returns `Ok(None)` if the builder turned out to be
