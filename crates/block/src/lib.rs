@@ -27,6 +27,8 @@ pub use metrics::MetricsBlockBuilder;
 use anyhow::Result;
 use bytes::Bytes;
 use object_store::{path::Path, ObjectStore};
+use parquet::basic::{Compression, ZstdLevel};
+use parquet::file::properties::WriterProperties;
 use std::future::Future;
 use uuid::Uuid;
 
@@ -95,6 +97,18 @@ pub trait BlockBuilder: Send + 'static {
     /// scratch. The happy path never calls this: a successful `merge`
     /// already leaves the scratch empty.
     fn reset(&mut self);
+
+    /// Override the ZSTD level this builder will encode with, replacing
+    /// whatever `BlockBuilderConfig::compression_level` it was built with.
+    ///
+    /// The encode reads the level lazily (at `finish_and_upload` time, via
+    /// `cfg.main_writer_props()`), so the server can decide the level *at
+    /// block-close time* — when it actually knows whether uploads or CPU
+    /// are the current bottleneck — rather than being locked to the level
+    /// chosen when the builder was first constructed. See the adaptive
+    /// compression policy in `scry-server` (`--compression auto`).
+    fn set_compression_level(&mut self, level: i32);
+
     /// Consume the builder, encode to parquet (+ any sidecars), upload
     /// to object storage, and return a `BlockMeta` ready for catalog
     /// insertion. Returns `Ok(None)` if the builder turned out to be
@@ -120,6 +134,16 @@ pub struct BlockBuilderConfig {
     /// overhead negligible. Tests that need to exercise row-group
     /// pruning at small data sizes override this.
     pub row_group_size: usize,
+
+    /// ZSTD level for the parquet column data. Only two values are
+    /// supported as deployment settings: `3` (default, dense) and `1`
+    /// (fast). The encode is CPU-bound on zstd, so this is the dial
+    /// between ingest throughput and stored size — when the box is
+    /// CPU-bound, `1` buys ~1.5× encode throughput for ~+31% storage;
+    /// when uploads to object storage are the wall, `3` keeps bytes
+    /// down. Measured 2026-05. Other zstd levels are accepted by
+    /// parquet but untested here.
+    pub compression_level: i32,
 }
 
 impl Default for BlockBuilderConfig {
@@ -128,7 +152,46 @@ impl Default for BlockBuilderConfig {
             max_rows: 1_000_000,
             target_bytes: 128 * 1024 * 1024, // 128 MiB before compression
             row_group_size: 1024 * 1024,     // ~1M rows
+            compression_level: 3,            // dense by default
         }
+    }
+}
+
+impl BlockBuilderConfig {
+    /// `WriterProperties` for a block's **main columnar data file**:
+    /// the configured ZSTD level, the configured row-group size, and
+    /// the dictionary **disabled**.
+    ///
+    /// Dictionary encoding is turned off deliberately. Our main files
+    /// are numeric columns (fingerprint / ts / value, plus severities)
+    /// where the dictionary is *redundant* with zstd — on the
+    /// low-cardinality fingerprint column zstd already collapses the
+    /// repetition downstream, and on the high-cardinality ts/value
+    /// columns parquet hashes every value, finds the dictionary
+    /// useless, and falls back to PLAIN, so the dictionary pass is pure
+    /// wasted CPU. Disabling it measured ~1.09× faster *and* ~6%
+    /// smaller (2026-05).
+    pub fn main_writer_props(&self) -> Result<WriterProperties> {
+        Ok(WriterProperties::builder()
+            .set_compression(Compression::ZSTD(ZstdLevel::try_new(self.compression_level)?))
+            .set_max_row_group_row_count(Some(self.row_group_size))
+            .set_dictionary_enabled(false)
+            .build())
+    }
+
+    /// `WriterProperties` for a block's **postings index file**: same
+    /// ZSTD level and row-group size, but the dictionary **left on**.
+    ///
+    /// Unlike the main file, postings are `label_name` / `label_value`
+    /// string columns — low-cardinality repeated text where the
+    /// dictionary genuinely helps and zstd does *not* fully subsume it.
+    /// So the dictionary-off reasoning from `main_writer_props` does not
+    /// apply here; we keep parquet's default dictionary behaviour.
+    pub fn postings_writer_props(&self) -> Result<WriterProperties> {
+        Ok(WriterProperties::builder()
+            .set_compression(Compression::ZSTD(ZstdLevel::try_new(self.compression_level)?))
+            .set_max_row_group_row_count(Some(self.row_group_size))
+            .build())
     }
 }
 
@@ -155,4 +218,57 @@ pub fn block_path(
         block_uuid,
         kind,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use parquet::schema::types::ColumnPath;
+
+    /// The main columnar file encodes at the configured ZSTD level with
+    /// the dictionary **off** (numeric columns — zstd subsumes it; see
+    /// `main_writer_props`). This is the property the adaptive dial relies
+    /// on: whatever level the server sets via `set_compression_level`
+    /// flows straight into these props at encode time.
+    #[test]
+    fn main_writer_props_track_level_and_disable_dictionary() {
+        let col = ColumnPath::from("any");
+        for level in [1, 3, 7] {
+            let cfg = BlockBuilderConfig {
+                compression_level: level,
+                ..Default::default()
+            };
+            let props = cfg.main_writer_props().unwrap();
+            assert_eq!(
+                props.compression(&col),
+                Compression::ZSTD(ZstdLevel::try_new(level).unwrap()),
+                "main file should use the configured ZSTD level {level}"
+            );
+            assert!(
+                !props.dictionary_enabled(&col),
+                "main file dictionary must stay off"
+            );
+        }
+    }
+
+    /// The postings index keeps the dictionary **on** (low-cardinality
+    /// label strings benefit; zstd does not fully subsume it there), but
+    /// tracks the same configured ZSTD level as the main file.
+    #[test]
+    fn postings_writer_props_track_level_and_keep_dictionary() {
+        let col = ColumnPath::from("label_value");
+        let cfg = BlockBuilderConfig {
+            compression_level: 3,
+            ..Default::default()
+        };
+        let props = cfg.postings_writer_props().unwrap();
+        assert_eq!(
+            props.compression(&col),
+            Compression::ZSTD(ZstdLevel::try_new(3).unwrap())
+        );
+        assert!(
+            props.dictionary_enabled(&col),
+            "postings dictionary must stay on"
+        );
+    }
 }

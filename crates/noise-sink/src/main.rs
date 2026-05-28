@@ -13,12 +13,12 @@
 //!   noise-sink --listen 127.0.0.1:4000 --storage --wal-dir ./wal
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use scry_catalog::Catalog;
 use scry_objstore::{open as open_objstore, ObjStoreConfig};
 use scry_server::{
-    decode, serve_stats, DummyShards, LogsShards, MetricsShards, Server, ServerConfig,
-    ServerMetrics, ShardedPipeline, INGEST_SHARDS,
+    decode, serve_stats, BlockBuilderConfig, DummyShards, LogsShards, MetricsShards, Server,
+    ServerConfig, ServerMetrics, ShardedPipeline, INGEST_SHARDS,
 };
 use std::{path::PathBuf, sync::Arc};
 use tokio::sync::{Mutex, Semaphore};
@@ -80,6 +80,50 @@ struct Args {
     /// no auth.
     #[arg(long)]
     stats_listen: Option<String>,
+
+    /// Block compression mode (only meaningful with `--storage`). The
+    /// parquet encode is CPU-bound on zstd, so this is the dial between
+    /// ingest throughput and stored size:
+    ///   `dense` = zstd-3 (default) — smallest blocks; right when the
+    ///             object-store upload is the bottleneck.
+    ///   `fast`  = zstd-1 — ~1.5× encode throughput for ~+31% bytes;
+    ///             right when the box is CPU-bound on encode.
+    ///   `auto`  = pick per block from live load: when the upload pool is
+    ///             full the bucket is the wall, so compress dense; when
+    ///             uploads have slack but the box is CPU-busy, drop to
+    ///             fast; when there's CPU headroom, dense.
+    #[arg(long, value_enum, default_value_t = Compression::Dense)]
+    compression: Compression,
+}
+
+/// Block compression mode. Maps to a zstd level; see `--compression`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum Compression {
+    /// zstd-3: smallest blocks (default).
+    Dense,
+    /// zstd-1: faster encode, larger blocks.
+    Fast,
+    /// Pick per block from live load (see `--compression`).
+    Auto,
+}
+
+impl Compression {
+    /// The static ZSTD level. For `Auto` this is the baseline the active
+    /// builder is constructed with; the real level is chosen per block at
+    /// close time (see `ShardedPipeline` adaptive compression), so the
+    /// baseline only matters until the first rotation — `3` (dense) is the
+    /// safe default there.
+    fn zstd_level(self) -> i32 {
+        match self {
+            Compression::Dense | Compression::Auto => 3,
+            Compression::Fast => 1,
+        }
+    }
+
+    /// Whether the server should choose each block's level from live load.
+    fn is_adaptive(self) -> bool {
+        matches!(self, Compression::Auto)
+    }
 }
 
 #[tokio::main]
@@ -160,45 +204,64 @@ async fn main() -> Result<()> {
         // keeps total in-flight encodes bounded even with N×signals
         // independent ingest pipelines.
         let upload_sem = Arc::new(Semaphore::new(upload_concurrency));
+        // Block config: default close triggers, plus the chosen zstd
+        // level (see `--compression`). Shared by every signal/shard.
+        let block_cfg = BlockBuilderConfig {
+            compression_level: args.compression.zstd_level(),
+            ..Default::default()
+        };
+        // Adaptive mode (`--compression auto`): every shard picks its
+        // closing block's ZSTD level from live load instead of the static
+        // baseline above.
+        let adaptive_compression = args.compression.is_adaptive();
         info!(
             shards = INGEST_SHARDS,
+            compression = ?args.compression,
+            zstd_level = block_cfg.compression_level,
+            adaptive_compression,
             "per-signal ingest sharding (connections striped across shards by session id)"
         );
         // Each signal becomes INGEST_SHARDS independent pipelines, one
         // WAL subtree per shard, all sharing store/catalog/sem and the
         // per-signal upload-stats gauge (so the endpoint aggregates
         // across shards).
-        let dummy = ShardedPipeline::open(
+        let dummy = ShardedPipeline::open_with_config(
             INGEST_SHARDS,
             wal_dir.clone(),
             store.clone(),
             catalog.clone(),
             writer_uuid,
             decode::dummy,
+            block_cfg,
             upload_sem.clone(),
             stats_metrics.as_ref().map(|m| m.dummy_upload()),
+            adaptive_compression,
         )
         .await?;
-        let metrics = ShardedPipeline::open(
+        let metrics = ShardedPipeline::open_with_config(
             INGEST_SHARDS,
             wal_dir.clone(),
             store.clone(),
             catalog.clone(),
             writer_uuid,
             decode::metrics,
+            block_cfg,
             upload_sem.clone(),
             stats_metrics.as_ref().map(|m| m.metrics_upload()),
+            adaptive_compression,
         )
         .await?;
-        let logs = ShardedPipeline::open(
+        let logs = ShardedPipeline::open_with_config(
             INGEST_SHARDS,
             wal_dir,
             store,
             catalog,
             writer_uuid,
             decode::logs,
+            block_cfg,
             upload_sem.clone(),
             stats_metrics.as_ref().map(|m| m.logs_upload()),
+            adaptive_compression,
         )
         .await?;
         (Some(dummy), Some(metrics), Some(logs))

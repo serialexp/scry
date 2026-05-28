@@ -35,6 +35,7 @@ fn test_cfg() -> BlockBuilderConfig {
         max_rows: 1_000_000,
         target_bytes: 128 * 1024 * 1024,
         row_group_size: 100,
+        ..Default::default()
     }
 }
 

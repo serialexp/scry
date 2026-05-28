@@ -60,7 +60,6 @@ use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use object_store::{path::Path, ObjectStore, ObjectStoreExt};
 use parquet::arrow::ArrowWriter;
-use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use scry_proto::streaming::LogsAppender;
 use uuid::Uuid;
@@ -234,6 +233,10 @@ impl BlockBuilder for LogsBlockBuilder {
         self.bytes_est = 0;
         self.ts_min = u64::MAX;
         self.ts_max = 0;
+    }
+
+    fn set_compression_level(&mut self, level: i32) {
+        self.cfg.compression_level = level;
     }
 
     fn finish_and_upload(
@@ -412,10 +415,7 @@ impl LogsBlockBuilder {
         )
         .context("constructing logs main RecordBatch")?;
 
-        let props = WriterProperties::builder()
-            .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
-            .set_max_row_group_row_count(Some(self.cfg.row_group_size))
-            .build();
+        let props = self.cfg.main_writer_props()?;
         let mut main_buf: Vec<u8> = Vec::with_capacity(self.bytes_est as usize);
         {
             let mut w = ArrowWriter::try_new(&mut main_buf, main_schema, Some(props.clone()))
@@ -433,7 +433,8 @@ impl LogsBlockBuilder {
         // metrics applies one-for-one — see the TODO there about
         // dictionary-interning if cardinality ever climbs.
         let postings = self.build_postings();
-        let postings_bytes = self.encode_postings(postings, &props)?;
+        let postings_props = self.cfg.postings_writer_props()?;
+        let postings_bytes = self.encode_postings(postings, &postings_props)?;
         let postings_size = postings_bytes.len() as u64;
 
         // ── Sidecar JSON ───────────────────────────────────────────

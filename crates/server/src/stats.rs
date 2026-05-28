@@ -201,6 +201,23 @@ pub fn rss_kib() -> Option<u64> {
     None
 }
 
+/// System 1-minute load average, read from `/proc/loadavg` (the first
+/// whitespace-separated field). `None` on non-Linux or if the file can't
+/// be read/parsed.
+///
+/// Used by the adaptive-compression policy (`--compression auto`) to tell
+/// whether the host has spare CPU: normalised by physical core count, a
+/// low ratio means we can afford the denser (slower) ZSTD level, a high
+/// ratio means encode is the active constraint and we should drop to the
+/// fast level. See `Pipeline::adaptive_level`.
+pub fn load_avg_1m() -> Option<f64> {
+    let loadavg = std::fs::read_to_string("/proc/loadavg").ok()?;
+    loadavg
+        .split_whitespace()
+        .next()
+        .and_then(|v| v.parse().ok())
+}
+
 // ─────────────────────────── ingest metrics ───────────────────────────────
 
 /// Per-signal upload pipeline gauges. Shared (`Arc`) between

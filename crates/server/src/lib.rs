@@ -38,6 +38,7 @@ pub mod stats;
 
 pub use pipeline::{DecodeFn, Pipeline, ShardedPipeline, INGEST_SHARDS};
 pub use query_service::QueryService;
+pub use scry_block::BlockBuilderConfig;
 pub use server::{
     DummyPipeline, DummyShards, LogsPipeline, LogsShards, MetricsPipeline, MetricsShards, Server,
     ServerConfig,

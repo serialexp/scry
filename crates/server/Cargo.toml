@@ -14,6 +14,7 @@ binschema-runtime = { workspace = true }
 bytes             = { workspace = true }
 datafusion        = { workspace = true }
 futures           = { workspace = true }
+num_cpus          = { workspace = true }
 object_store      = { workspace = true }
 scry-block        = { workspace = true }
 scry-catalog      = { workspace = true }

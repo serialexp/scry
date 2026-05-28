@@ -35,8 +35,6 @@ use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use object_store::{path::Path, ObjectStore, ObjectStoreExt};
 use parquet::arrow::ArrowWriter;
-use parquet::basic::{Compression, ZstdLevel};
-use parquet::file::properties::WriterProperties;
 use scry_proto::streaming::DummyAppender;
 use uuid::Uuid;
 
@@ -160,6 +158,10 @@ impl BlockBuilder for DummyBlockBuilder {
         self.ts_max = 0;
     }
 
+    fn set_compression_level(&mut self, level: i32) {
+        self.cfg.compression_level = level;
+    }
+
     fn finish_and_upload(
         self,
         store: &dyn ObjectStore,
@@ -276,10 +278,7 @@ impl DummyBlockBuilder {
         // Encode to in-memory parquet. v0.1 blocks are small enough
         // (≤ 128 MiB) that an in-RAM buffer is fine; switching to
         // streaming multipart upload is a v0.2+ concern.
-        let props = WriterProperties::builder()
-            .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
-            .set_max_row_group_row_count(Some(self.cfg.row_group_size))
-            .build();
+        let props = self.cfg.main_writer_props()?;
         let mut buf: Vec<u8> = Vec::with_capacity(self.bytes_est as usize);
         {
             let mut w = ArrowWriter::try_new(&mut buf, schema, Some(props))

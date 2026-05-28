@@ -3199,6 +3199,7 @@ dependencies = [
  "bytes",
  "datafusion",
  "futures",
+ "num_cpus",
  "object_store",
  "scry-block",
  "scry-catalog",

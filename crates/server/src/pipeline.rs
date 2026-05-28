@@ -133,6 +133,53 @@ pub const INGEST_SHARDS: usize = 8;
 /// wire up whichever decoder matches their builder.
 pub type DecodeFn<B> = fn(&[u8], &mut B) -> anyhow::Result<usize>;
 
+/// ZSTD level for the "dense" end of the adaptive dial: smallest blocks,
+/// slowest encode. Picked when uploads are the bottleneck (spend CPU to
+/// shrink bytes the bucket has to swallow) *or* when the box has CPU
+/// headroom (we can afford to compress hard). Matches `--compression dense`.
+const ADAPTIVE_DENSE_LEVEL: i32 = 3;
+
+/// ZSTD level for the "fast" end: ~1.5× encode throughput for ~+31%
+/// bytes. Picked only when uploads have slack *and* the host is CPU-busy
+/// — i.e. encode is the active constraint and storage can absorb the
+/// larger blocks. Matches `--compression fast`.
+const ADAPTIVE_FAST_LEVEL: i32 = 1;
+
+/// 1-minute load average **per physical core** at or above which the host
+/// counts as "busy" for the adaptive decision. 0.85 trips us into fast
+/// encode a little before full saturation, so we shed encode cost *as* the
+/// box fills rather than only once it's pinned.
+const ADAPTIVE_LOAD_BUSY_PER_CORE: f64 = 0.85;
+
+/// Host physical core count, detected once. Used to normalise the system
+/// load average for the adaptive-compression decision (the upload pool is
+/// also sized to physical cores, so a per-physical-core ratio of ~1.0 is
+/// "encode pool full").
+fn physical_cores() -> usize {
+    use std::sync::OnceLock;
+    static CORES: OnceLock<usize> = OnceLock::new();
+    *CORES.get_or_init(|| num_cpus::get_physical().max(1))
+}
+
+/// The pure adaptive-compression policy, factored out of
+/// [`Pipeline::adaptive_level`] so it can be unit-tested without a live
+/// semaphore or `/proc`.
+///
+/// * `upload_saturated` — the upload pool is full (no free permits): the
+///   bucket is the wall, so compress as hard as possible.
+/// * otherwise look at `load_per_core` (1-min load average ÷ physical
+///   cores): busy → fast encode (CPU is the wall, save it); comfortable
+///   or unknown → dense.
+fn decide_adaptive_level(upload_saturated: bool, load_per_core: Option<f64>) -> i32 {
+    if upload_saturated {
+        return ADAPTIVE_DENSE_LEVEL;
+    }
+    match load_per_core {
+        Some(lpc) if lpc >= ADAPTIVE_LOAD_BUSY_PER_CORE => ADAPTIVE_FAST_LEVEL,
+        _ => ADAPTIVE_DENSE_LEVEL,
+    }
+}
+
 pub struct Pipeline<B: BlockBuilder> {
     /// Shared with the upload task so it can call `mark_uploaded` after
     /// a successful upload without funnelling back through the ingest
@@ -165,6 +212,11 @@ pub struct Pipeline<B: BlockBuilder> {
     /// observed" — every update is a no-op, so tests and the
     /// no-stats-server path pay nothing.
     upload_stats: Option<Arc<UploadStats>>,
+    /// When `true`, pick each closing block's ZSTD level from current load
+    /// at `spawn_upload` time (see [`Pipeline::adaptive_level`]) instead of
+    /// using the static `cfg.compression_level`. Set via
+    /// [`Pipeline::with_adaptive_compression`] (`--compression auto`).
+    adaptive_compression: bool,
 }
 
 impl<B: BlockBuilder> Pipeline<B> {
@@ -238,6 +290,7 @@ impl<B: BlockBuilder> Pipeline<B> {
             in_flight: JoinSet::new(),
             upload_sem: Arc::new(Semaphore::new(MAX_INFLIGHT_UPLOADS)),
             upload_stats: None,
+            adaptive_compression: false,
         })
     }
 
@@ -259,6 +312,26 @@ impl<B: BlockBuilder> Pipeline<B> {
     pub fn with_upload_sem(mut self, sem: Arc<Semaphore>) -> Self {
         self.upload_sem = sem;
         self
+    }
+
+    /// Enable adaptive per-block compression (`--compression auto`).
+    /// Builder-style so `open` keeps its signature; off by default, so the
+    /// static-level path is byte-for-byte unchanged.
+    pub fn with_adaptive_compression(mut self, on: bool) -> Self {
+        self.adaptive_compression = on;
+        self
+    }
+
+    /// Choose the ZSTD level for the block about to be encoded, from the
+    /// live load picture. Called from [`Pipeline::spawn_upload`] *after*
+    /// the upload permit has been acquired, so `available_permits() == 0`
+    /// means this block took the last slot — the upload pool is full and
+    /// the bucket is the bottleneck. See [`decide_adaptive_level`].
+    fn adaptive_level(&self) -> i32 {
+        let upload_saturated = self.upload_sem.available_permits() == 0;
+        let load_per_core =
+            crate::stats::load_avg_1m().map(|load1| load1 / physical_cores() as f64);
+        decide_adaptive_level(upload_saturated, load_per_core)
     }
 
     /// Append a single batch payload (already zstd-decoded; the
@@ -410,7 +483,16 @@ impl<B: BlockBuilder> Pipeline<B> {
             .context("WAL rotate on spawn_upload")?;
 
         let new_builder = B::new(self.writer_uuid, self.cfg);
-        let old_builder = std::mem::replace(&mut self.builder, new_builder);
+        let mut old_builder = std::mem::replace(&mut self.builder, new_builder);
+
+        // Adaptive compression: decide *this* block's ZSTD level from the
+        // current load now that we hold a permit and know the upload pool's
+        // occupancy. The encode reads the level lazily, so overriding it
+        // here (before the builder moves into the upload task) is what makes
+        // the level reflect close-time load rather than open-time config.
+        if self.adaptive_compression {
+            old_builder.set_compression_level(self.adaptive_level());
+        }
 
         let store = self.store.clone();
         let wal = self.wal.clone();
@@ -524,6 +606,7 @@ impl<B: BlockBuilder> ShardedPipeline<B> {
             BlockBuilderConfig::default(),
             upload_sem,
             upload_stats,
+            false,
         )
         .await
     }
@@ -535,7 +618,9 @@ impl<B: BlockBuilder> ShardedPipeline<B> {
     /// records from its own subtree. All shards share `store`, `catalog`,
     /// `writer_uuid`, the global `upload_sem`, and — when observed — the
     /// per-signal `upload_stats` gauge (so the stats endpoint sees the
-    /// signal's totals aggregated across shards).
+    /// signal's totals aggregated across shards). `adaptive_compression`
+    /// (from `--compression auto`) is applied to every shard so each picks
+    /// its closing block's ZSTD level from live load.
     #[allow(clippy::too_many_arguments)]
     pub async fn open_with_config(
         n: usize,
@@ -547,6 +632,7 @@ impl<B: BlockBuilder> ShardedPipeline<B> {
         cfg: BlockBuilderConfig,
         upload_sem: Arc<Semaphore>,
         upload_stats: Option<Arc<UploadStats>>,
+        adaptive_compression: bool,
     ) -> Result<Self> {
         assert!(n >= 1, "ShardedPipeline needs at least one shard");
         let mut shards = Vec::with_capacity(n);
@@ -562,7 +648,8 @@ impl<B: BlockBuilder> ShardedPipeline<B> {
             )
             .await
             .with_context(|| format!("opening {} shard {k}", B::SIGNAL))?
-            .with_upload_sem(upload_sem.clone());
+            .with_upload_sem(upload_sem.clone())
+            .with_adaptive_compression(adaptive_compression);
             if let Some(s) = upload_stats.as_ref() {
                 pipe = pipe.with_upload_stats(s.clone());
             }
@@ -703,6 +790,36 @@ mod tests {
     };
     use scry_block::{BlockBuilderConfig, DummyBlockBuilder};
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// The adaptive-compression policy, exhaustively. When the upload pool
+    /// is full we pick DENSE regardless of CPU (the bucket is the wall).
+    /// When the pool has slack the CPU decides: busy → FAST (encode is the
+    /// wall, save CPU), comfortable → DENSE (we can afford to compress
+    /// hard), and an unreadable load average → DENSE (safe default).
+    #[test]
+    fn adaptive_level_policy() {
+        // Saturated → dense, whatever the load reads (even busy / unknown).
+        assert_eq!(decide_adaptive_level(true, None), ADAPTIVE_DENSE_LEVEL);
+        assert_eq!(decide_adaptive_level(true, Some(5.0)), ADAPTIVE_DENSE_LEVEL);
+        assert_eq!(decide_adaptive_level(true, Some(0.1)), ADAPTIVE_DENSE_LEVEL);
+
+        // Slack + busy CPU → fast. Test right at and above the threshold.
+        assert_eq!(
+            decide_adaptive_level(false, Some(ADAPTIVE_LOAD_BUSY_PER_CORE)),
+            ADAPTIVE_FAST_LEVEL
+        );
+        assert_eq!(decide_adaptive_level(false, Some(2.0)), ADAPTIVE_FAST_LEVEL);
+
+        // Slack + comfortable CPU → dense.
+        assert_eq!(
+            decide_adaptive_level(false, Some(ADAPTIVE_LOAD_BUSY_PER_CORE - 0.01)),
+            ADAPTIVE_DENSE_LEVEL
+        );
+        assert_eq!(decide_adaptive_level(false, Some(0.0)), ADAPTIVE_DENSE_LEVEL);
+
+        // Slack + unreadable load → dense (safe default).
+        assert_eq!(decide_adaptive_level(false, None), ADAPTIVE_DENSE_LEVEL);
+    }
 
     /// An `ObjectStore` wrapping `InMemory` whose writes block on a
     /// caller-controlled gate. Starting the gate at zero permits makes
