@@ -1,0 +1,29 @@
+[package]
+name        = "scry-agent"
+version     = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "scry log-collection agent: discovers pods via the Kubernetes API, tails CRI container logs, and ships them over the native binschema wire to a scry ingest server."
+
+[[bin]]
+name = "scry-agent"
+path = "src/main.rs"
+
+[dependencies]
+anyhow            = { workspace = true }
+chrono            = { workspace = true }
+clap              = { workspace = true, features = ["env"] }
+futures           = { workspace = true }
+k8s-openapi       = { workspace = true }
+kube              = { workspace = true }
+mimalloc          = { workspace = true }
+scry-proto        = { workspace = true }
+tokio             = { workspace = true }
+tracing           = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid              = { workspace = true }
+zstd              = { workspace = true }
+
+[lints]
+workspace = true

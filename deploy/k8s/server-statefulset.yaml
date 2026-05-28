@@ -1,0 +1,65 @@
+# The scry ingest server (the noise-sink binary). Single replica for
+# dogfooding — the block layout supports multiple writers, but one is enough
+# to start. The WAL needs durable local disk for crash replay; the SQLite
+# catalog lives alongside it and is rebuildable from the bucket via scry-list.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: scry-server
+  namespace: scry
+  labels:
+    app: scry-server
+spec:
+  serviceName: scry-server
+  replicas: 1
+  selector:
+    matchLabels:
+      app: scry-server
+  template:
+    metadata:
+      labels:
+        app: scry-server
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: scry-server
+          image: ghcr.io/serialexp/scry:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - noise-sink
+            - --listen=0.0.0.0:4000
+            - --stats-listen=0.0.0.0:4098
+            - --storage
+            - --wal-dir=/wal
+            - --catalog=/wal/catalog.sqlite
+            - --writer-id=scry-server-0
+          envFrom:
+            - secretRef:
+                name: scry-objstore
+          ports:
+            - name: ingest
+              containerPort: 4000
+            - name: stats
+              containerPort: 4098
+          readinessProbe:
+            tcpSocket:
+              port: 4098
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              memory: "2Gi"
+          volumeMounts:
+            - name: wal
+              mountPath: /wal
+  volumeClaimTemplates:
+    - metadata:
+        name: wal
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 20Gi

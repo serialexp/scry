@@ -1,0 +1,11 @@
+# Build artifacts and local state — never needed in the image context.
+target/
+**/target/
+.git/
+docker/garage/data/
+docker/garage/.env
+*.sqlite
+*.sqlite-*
+/tmp/
+**/*.log
+deploy/

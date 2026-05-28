@@ -1,0 +1,65 @@
+# One scry-agent per node. Tails CRI container logs from the host and ships
+# them to the ingest server. Runs as root because /var/log/pods is root-owned.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: scry-agent
+  namespace: scry
+  labels:
+    app: scry-agent
+spec:
+  selector:
+    matchLabels:
+      app: scry-agent
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: scry-agent
+    spec:
+      serviceAccountName: scry-agent
+      terminationGracePeriodSeconds: 30
+      # Collect from every node, including control-plane.
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: scry-agent
+          image: ghcr.io/serialexp/scry:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - scry-agent
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: SCRY_SERVER_ADDR
+              value: "scry-server.scry.svc:4000"
+            # Tune verbosity via RUST_LOG if needed (default info).
+            - name: RUST_LOG
+              value: "info"
+          securityContext:
+            runAsUser: 0
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              memory: "256Mi"
+          volumeMounts:
+            - name: pod-logs
+              mountPath: /var/log/pods
+              readOnly: true
+            - name: container-logs
+              mountPath: /var/log/containers
+              readOnly: true
+      volumes:
+        - name: pod-logs
+          hostPath:
+            path: /var/log/pods
+            type: Directory
+        - name: container-logs
+          hostPath:
+            path: /var/log/containers
+            type: DirectoryOrCreate

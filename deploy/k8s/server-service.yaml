@@ -1,0 +1,19 @@
+# Headless-friendly ClusterIP fronting the ingest server. The agent connects
+# to scry-server.scry.svc:4000; 4098 exposes the stats endpoint.
+apiVersion: v1
+kind: Service
+metadata:
+  name: scry-server
+  namespace: scry
+  labels:
+    app: scry-server
+spec:
+  selector:
+    app: scry-server
+  ports:
+    - name: ingest
+      port: 4000
+      targetPort: 4000
+    - name: stats
+      port: 4098
+      targetPort: 4098

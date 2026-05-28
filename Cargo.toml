@@ -8,6 +8,7 @@ members = [
     "crates/block",
     "crates/catalog",
     "crates/server",
+    "crates/agent",
     "crates/noise-spewer",
     "crates/noise-sink",
     "crates/scry-list",
@@ -17,7 +18,10 @@ members = [
 
 [workspace.package]
 edition = "2021"
-rust-version = "1.75"
+# kube-rs 3.x sets the floor: its MSRV is 1.88. Everything else in the
+# workspace builds well below this; the agent's Kubernetes client is what
+# pins us here.
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/serialexp/scry"
 
@@ -40,6 +44,8 @@ chrono    = { version = "0.4", default-features = false, features = ["clock"] }
 clap      = { version = "4", features = ["derive"] }
 crc32fast = "1"
 futures   = "0.3"
+k8s-openapi = { version = "0.27", features = ["latest"] }
+kube      = { version = "3", default-features = false, features = ["client", "runtime", "rustls-tls", "ring"] }
 mimalloc  = { version = "0.1", default-features = false }
 num_cpus  = "1"
 object_store = "0.13"
