@@ -946,13 +946,59 @@ abstraction that was claimed to be signal-agnostic actually was.
 That's the exit criterion this step was set up to test, and it
 passed.
 
+## D-033: v0.4 logs vertical — complete
+
+**Date:** 2026-05-28
+**Status:** accepted
+
+The logs signal described in D-032 is in, end to end, and sealed by the
+same `scripts/smoke.sh` that sealed v0.1/v0.2 — extended with a **query
+round-trip leg**. The script now, for `SIGNAL=logs`, `metrics`, and
+`both`, reconciles a fresh catalog from the bucket and then drives it
+through `scry-query --signal <sig>` (implicit `SELECT * FROM <table>`,
+stream-drained), asserting the scanned row count equals exactly the
+sink-accepted count for that signal. v0.1 only proved *bytes landed in
+the bucket*; v0.4's headline is *querying logs back*, so the seal proves
+the full `ingest → WAL → block → bucket → catalog → DataFusion query`
+loop is loss-free for both signals through one shared plumbing.
+
+What that proves, in architecture terms, on top of D-030:
+
+- The per-signal postings sidecar (`build_postings` / `encode_postings`)
+  works identically for logs' stream labels and metrics' series labels —
+  `SIGNAL=both` lands ≥1 block of each with a non-empty postings file.
+- The shared `(matchers, ts_min, ts_max)` `Query` envelope (D-032) and
+  the `signal: uint8` wire byte route to the right table provider
+  (`LogsTable` vs `MetricsTable`) and read back the right rows.
+- The `all_fingerprints` empty-matcher fallback on `BlockMeta` (the one
+  non-trivial new field D-032 needed) drives correctly for a signal with
+  no per-series type metadata.
+
+Two things were *not* required by v0.4 but landed during it, triggered by
+running the live saturation harness against the new logs path: the live
+stats endpoint (`/stats.json` + bottleneck classifier) and a chain of
+ingest-throughput work — lock-free WAL segment release, an 8-way sharded
+ingest pipeline, a contiguous-sort metrics encode, decode-out-of-lock +
+column merge, and tunable/adaptive block compression (`--compression
+dense|fast|auto`). These are performance, not signal scope; they're
+captured in their own commits, not gated on this seal.
+
+Deferred from v0.4 to later, unchanged:
+
+- **Body-substring search** for logs — its own tantivy phase (v0.7), as
+  scoped in D-032. v0.4 logs query is label-predicate + time-range only.
+- **Profiles payload schema** (native pprof vs. denormalised
+  one-row-per-sample) — see Deferred / open; decide as v0.5/v0.6 design
+  starts.
+
 ## Deferred / open
 
 These are not decisions yet; they're flagged for "we'll decide when the
 constraint shows up":
 
 - **Profiles payload schema.** Native pprof vs. denormalised
-  one-row-per-sample. Decide during v0.4 design.
+  one-row-per-sample. Not decided during v0.4 (logs needed no payload-
+  schema choice); decide as v0.6 profiles design starts.
 - **High-cardinality metrics index.** Per-block label-fingerprint blooms
   may suffice; if not, we add a sketch (HLL? cuckoo filter?) — decide
   based on measurement during v0.5.

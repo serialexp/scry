@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# v0.1/v0.2 storage exit criterion — end-to-end smoke test.
+# v0.1/v0.2/v0.4 storage + query exit criterion — end-to-end smoke test.
 #
 # Sends a known number of batches through the wire path, runs the
 # storage pipeline (WAL → block → object store → online catalog),
@@ -7,8 +7,13 @@
 # asserts:
 #
 #   * the new catalog's total row count equals exactly the number of
-#     records the sink accepted, and
-#   * at least one block landed in the bucket.
+#     records the sink accepted,
+#   * at least one block landed in the bucket, and
+#   * (metrics/logs/both) the reconciled catalog *queries back* the same
+#     row count through scry-query — i.e. ingest → store → query is
+#     loss-free. This last leg is the v0.4 exit criterion: the headline
+#     of the logs milestone is querying logs back, so the seal proves the
+#     full round-trip live, not just that bytes landed in the bucket.
 #
 # Parameterised by `SIGNAL` (default `dummy`):
 #
@@ -132,7 +137,7 @@ fi
 
 # ── Build ───────────────────────────────────────────────────────────
 echo "[smoke] building release binaries..."
-cargo build --release -p noise-sink -p noise-spewer -p scry-list >&2
+cargo build --release -p noise-sink -p noise-spewer -p scry-list -p scry-query >&2
 
 # ── Clean slate ─────────────────────────────────────────────────────
 rm -rf "$SMOKE_DIR"
@@ -321,6 +326,40 @@ if [[ "$SIGNAL" == "metrics" || "$SIGNAL" == "logs" || "$SIGNAL" == "both" ]]; t
         fi
         if [[ "${sig_postings:-0}" -lt 1 ]]; then
             echo "[smoke] FAIL: no $sig blocks carry a postings sidecar"
+            failed=1
+        fi
+    done
+fi
+
+# ── Query round-trip (v0.4 exit criterion) ──────────────────────────
+# Ingest + storage is only half the milestone; the headline of v0.4 is
+# *querying logs back*. Drive the reconciled catalog through scry-query
+# (implicit `SELECT * FROM <table>`, stream-drained) and assert the
+# scanned row count equals what the bucket holds for that signal —
+# proving the ingest → store → query round-trip is loss-free. dummy has
+# no query table, so it's skipped.
+if [[ "$SIGNAL" != "dummy" ]]; then
+    case "$SIGNAL" in
+        metrics) query_pairs=("metrics:$sink_accepted") ;;
+        logs)    query_pairs=("logs:$sink_accepted") ;;
+        both)    query_pairs=("metrics:$sink_metrics" "logs:$sink_logs") ;;
+    esac
+    for pair in "${query_pairs[@]}"; do
+        sig="${pair%%:*}"
+        exp="${pair##*:}"
+        # scry-query prints its trailer ("# scan: <N> rows total | ...")
+        # on stderr; `|| true` keeps set -e from aborting before we get
+        # to assert on the parsed count.
+        ./target/release/scry-query \
+            --catalog "$SMOKE_DIR/recon.sqlite" \
+            --signal "$sig" \
+            > "$SMOKE_DIR/query.$sig.txt" 2>&1 || true
+        queried=$(awk '/^# scan:/ { print $3; exit }' "$SMOKE_DIR/query.$sig.txt")
+        echo "[smoke] $sig queried rows  : ${queried:-<none>} (expected $exp)"
+        if [[ "${queried:-}" != "$exp" ]]; then
+            echo "[smoke] FAIL: $sig query returned ${queried:-<none>} rows, expected $exp (ingest→store→query lost rows)"
+            echo "[smoke] scry-query output:"
+            cat "$SMOKE_DIR/query.$sig.txt"
             failed=1
         fi
     done

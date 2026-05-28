@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `scry` is an opinionated single-binary replacement for the Grafana observability stack (Loki + Tempo + Mimir + Pyroscope). It stores metrics, logs, traces, and profiles as immutable parquet blocks in S3-compatible object storage and serves queries from the same bucket. One deployment, one tenant, no hash ring, no service split.
 
-Status: **v0.1 storage layer complete.** A dummy record goes in via the wire protocol, lands in a per-writer WAL, gets uploaded as a parquet block to Garage, and shows up in a SQLite catalog (either the writer's online one or one reconciled from the bucket). Sealed by `scripts/smoke.sh`. See `docs/v0.1-storage.md` for scope and `docs/decisions.md § D-029, D-030` for the rationale. The query engine, signal-specific subsystems, multi-bucket sealing, and Valkey convergence from `docs/ARCHITECTURE.md` are not yet implemented — that's v0.2+ territory.
+Status: **v0.4 complete — metrics and logs flow end to end and query back.** A record goes in via the wire protocol, lands in a per-writer WAL, gets uploaded as a parquet block (with a per-signal postings sidecar for metrics/logs) to Garage, shows up in a SQLite catalog (online or reconciled from the bucket), and is queryable through DataFusion either locally (`scry-query`) or over the `scry-queryd` daemon's binschema-framed wire. v0.1 (storage), v0.2 (metrics ingest+query), v0.3 (query daemon), and v0.4 (logs as the second signal) are all sealed by `scripts/smoke.sh`, which now asserts the full ingest → store → **query** round-trip per signal. See `docs/decisions.md § D-029…D-033` for the rationale and the README milestone table for scope. Still not implemented: traces (v0.5), profiles (v0.6), PromQL + full-text logs (v0.7), compaction/retention (v0.8), and the multi-bucket / Valkey convergence from `docs/ARCHITECTURE.md`.
 
 ## Commands
 
@@ -27,14 +27,17 @@ Smoke-test the wire protocol end-to-end (two terminals):
 
 The sink prints per-session counters on disconnect (`batches=… samples=… log_entries=… spans=… profiles=… rejected=0`).
 
-Smoke-test the v0.1 storage path end-to-end (single terminal — wraps Garage bring-up, sink, spewer, scry-list, and a row-count assertion):
+Smoke-test the storage + query path end-to-end (single terminal — wraps the sink, spewer, scry-list reconcile, a row-count assertion, and a `scry-query` round-trip assertion):
 
 ```bash
 scripts/dev-garage-up.sh         # one-time per machine
-scripts/smoke.sh                  # the scripted v0.1 exit criterion
+scripts/smoke.sh                  # default SIGNAL=dummy (v0.1 path)
+SIGNAL=metrics scripts/smoke.sh   # v0.2: also asserts ≥1 block w/ postings + query round-trip
+SIGNAL=logs    scripts/smoke.sh   # v0.4: same, for logs
+SIGNAL=both    scripts/smoke.sh   # v0.4 exit criterion: metrics + logs through one sink
 ```
 
-Tweak via env vars: `BATCHES=20000 RATE=4000 scripts/smoke.sh` for stress runs. The script empties the dev Garage bucket on every run; don't point it at a bucket whose contents you want to keep.
+For `metrics`/`logs`/`both` the script additionally reconciles a fresh catalog and runs `scry-query --signal <sig>` against it, asserting the queried row count equals the sink-accepted count — i.e. ingest → store → query is loss-free. Tweak via env vars: `BATCHES=20000 RATE=4000 scripts/smoke.sh` for stress runs. The script empties the dev Garage bucket on every run; don't point it at a bucket whose contents you want to keep.
 
 The smoke script also wraps `noise-sink` in `/usr/bin/time -v` and prints a service-performance block at the end — peak RSS, user/sys CPU, records/sec, and **CPU-µs / record** (the headline regression sentinel; rate-independent, unlike `%CPU` which slides with the inter-batch idle gap). Full `time -v` output is kept in `$SMOKE_DIR/sink.time` for context (ctx switches, page faults, etc.). The script sends SIGINT directly to the noise-sink PID, not to `time`, because GNU time does not forward signals to its child.
 
