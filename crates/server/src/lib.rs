@@ -2,7 +2,7 @@
 //!
 //! Owns the wire-protocol lifecycle (listener, handshake, per-batch
 //! dispatch) and the per-signal generic [`Pipeline`] that turns
-//! accepted batches into durable parquet blocks. Callers (`noise-sink`
+//! accepted batches into durable parquet blocks. Callers (`scry-ingestd`
 //! today, the eventual single `scry` binary tomorrow) build one
 //! [`Pipeline<B>`] per signal they want stored and hand them to
 //! [`Server`] — that way the same pipelines can be shared with future
@@ -20,7 +20,7 @@
 //! let server = Server::new(
 //!     ServerConfig {
 //!         listen_addr: "127.0.0.1:4000".into(),
-//!         writer_id: "noise-sink-1".into(),
+//!         writer_id: "scry-ingestd-1".into(),
 //!         writer_uuid,
 //!     },
 //!     Some(dummy),

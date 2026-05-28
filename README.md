@@ -94,10 +94,10 @@ crates/
   scry-list/           catalog inspector / bucket reconciler
   agent/               Kubernetes log-collection agent: tails CRI logs, ships logs over the wire (scry-agent)
   noise-spewer/        TCP client; emits random metrics/logs/traces/profiles
-  noise-sink/          TCP ingest server binary (wraps scry-server)
+  scry-ingestd/        ingest server daemon binary (wraps scry-server)
 proto/                 binschema source-of-truth schemas
 deploy/k8s/            Kubernetes manifests: ingest server (StatefulSet+PVC) + agent (DaemonSet)
-Dockerfile             one image carrying noise-sink + scry-agent + scry-list
+Dockerfile             one image carrying scry-ingestd + scry-agent + scry-list
 scripts/gen-proto.sh   regenerate Rust bindings from proto/*.schema.json
 scripts/smoke.sh       end-to-end ingest→store→query exit criterion (v0.1/0.2/0.4)
 ```
@@ -108,7 +108,7 @@ Build and smoke-test:
 cargo build --release --workspace
 
 # In one terminal:
-./target/release/noise-sink   --listen 127.0.0.1:4000
+./target/release/scry-ingestd --listen 127.0.0.1:4000
 
 # In another:
 ./target/release/noise-spewer --addr 127.0.0.1:4000 --rate 50 --duration 3s

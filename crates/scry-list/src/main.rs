@@ -37,7 +37,7 @@ struct Args {
 
     /// Skip the bucket walk and just print what's already in the
     /// catalog. Useful for sanity-checking the online insert path
-    /// (noise-sink's [`scry_catalog::Catalog::insert_block`] calls)
+    /// (scry-ingestd's [`scry_catalog::Catalog::insert_block`] calls)
     /// without depending on the bucket.
     #[arg(long)]
     no_reconcile: bool,

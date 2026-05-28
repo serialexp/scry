@@ -5,8 +5,8 @@
 //! Run:
 //!   noise-spewer --addr 127.0.0.1:4000 --rate 100 --duration 30s
 //!
-//! Run it concurrently with `noise-sink` for a full loop:
-//!   noise-sink   --listen 127.0.0.1:4000 &
+//! Run it concurrently with `scry-ingestd` for a full loop:
+//!   scry-ingestd --listen 127.0.0.1:4000 &
 //!   noise-spewer --addr   127.0.0.1:4000 --duration 5s
 
 use anyhow::{Context, Result, bail};

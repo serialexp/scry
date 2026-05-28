@@ -10,7 +10,7 @@ members = [
     "crates/server",
     "crates/agent",
     "crates/noise-spewer",
-    "crates/noise-sink",
+    "crates/scry-ingestd",
     "crates/scry-list",
     "crates/query",
     "crates/scry-queryd",

@@ -21,7 +21,7 @@ cargo test -p scry-proto fingerprint::tests::order_independence   # single test
 Smoke-test the wire protocol end-to-end (two terminals):
 
 ```bash
-./target/release/noise-sink   --listen 127.0.0.1:4000
+./target/release/scry-ingestd --listen 127.0.0.1:4000
 ./target/release/noise-spewer --addr 127.0.0.1:4000 --rate 50 --duration 3s
 ```
 
@@ -39,7 +39,7 @@ SIGNAL=both    scripts/smoke.sh   # v0.4 exit criterion: metrics + logs through 
 
 For `metrics`/`logs`/`both` the script additionally reconciles a fresh catalog and runs `scry-query --signal <sig>` against it, asserting the queried row count equals the sink-accepted count — i.e. ingest → store → query is loss-free. Tweak via env vars: `BATCHES=20000 RATE=4000 scripts/smoke.sh` for stress runs. The script empties the dev Garage bucket on every run; don't point it at a bucket whose contents you want to keep.
 
-The smoke script also wraps `noise-sink` in `/usr/bin/time -v` and prints a service-performance block at the end — peak RSS, user/sys CPU, records/sec, and **CPU-µs / record** (the headline regression sentinel; rate-independent, unlike `%CPU` which slides with the inter-batch idle gap). Full `time -v` output is kept in `$SMOKE_DIR/sink.time` for context (ctx switches, page faults, etc.). The script sends SIGINT directly to the noise-sink PID, not to `time`, because GNU time does not forward signals to its child.
+The smoke script also wraps `scry-ingestd` in `/usr/bin/time -v` and prints a service-performance block at the end — peak RSS, user/sys CPU, records/sec, and **CPU-µs / record** (the headline regression sentinel; rate-independent, unlike `%CPU` which slides with the inter-batch idle gap). Full `time -v` output is kept in `$SMOKE_DIR/sink.time` for context (ctx switches, page faults, etc.). The script sends SIGINT directly to the scry-ingestd PID, not to `time`, because GNU time does not forward signals to its child.
 
 Regenerate Rust bindings from the wire schema (only path that should touch `crates/proto/src/generated.rs` or `crates/binschema-runtime/src/*.rs`):
 
@@ -70,7 +70,7 @@ Crates in `crates/`:
 
 **Binaries**
 - **`noise-spewer`** — TCP client. Does the Hello handshake, then emits random metrics/logs/traces/profiles/dummy batches at a target rate, respecting `max_inflight_batches` from the HelloAck. Payload generators live in `gen.rs`. `--max-batches N` for an exact count (rate × duration is off-by-one).
-- **`noise-sink`** — thin CLI around `scry-server`. Parses flags, optionally constructs a `DummyPipeline` from `SCRY_OBJSTORE_*` env + `--wal-dir [--catalog]`, then hands it to `Server::serve_with_shutdown(ctrl_c)`. All wire-protocol behaviour lives in `scry-server`.
+- **`scry-ingestd`** — the ingest server daemon; a thin CLI around `scry-server`. Parses flags, optionally constructs a `DummyPipeline` from `SCRY_OBJSTORE_*` env + `--wal-dir [--catalog]`, then hands it to `Server::serve_with_shutdown(ctrl_c)`. All wire-protocol behaviour lives in `scry-server`. (Formerly `noise-sink`.)
 - **`scry-list`** — catalog inspector. Opens a SQLite catalog (creates the schema if missing), runs `reconcile_from_bucket` unless `--no-reconcile`, prints one line per block + a `# total rows=N bytes=N` trailer.
 
 **Tooling**

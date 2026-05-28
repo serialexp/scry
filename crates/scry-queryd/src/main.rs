@@ -1,6 +1,6 @@
 //! scry-queryd — long-running query daemon (binschema-over-TCP).
 //!
-//! The architectural counterpart to `noise-sink`: where `noise-sink`
+//! The architectural counterpart to `scry-ingestd`: where `scry-ingestd`
 //! exposes `scry-server::Server` (ingest) as a process, this binary
 //! exposes `scry-server::QueryService` (query) over the same length-
 //! prefixed binschema framing pattern as ingest — `QueryFrame`s

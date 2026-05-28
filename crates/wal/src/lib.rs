@@ -151,7 +151,7 @@ impl Wal {
     }
 
     /// Append one opaque payload. The caller chooses the granularity —
-    /// scry's noise-sink writes one whole `DummyBatch` payload per
+    /// scry's scry-ingestd writes one whole `DummyBatch` payload per
     /// frame, which is also the natural durability unit for an ack.
     ///
     /// Triggers an internal rotation (with fsync) if the active

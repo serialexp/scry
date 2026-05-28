@@ -31,7 +31,7 @@
 #                                        #  the per-signal block count.
 #
 # Records-per-batch and the connection-summary counter parsed from
-# noise-sink's log are signal-specific. The per-signal record
+# scry-ingestd's log are signal-specific. The per-signal record
 # definitions match the server.rs counters:
 #
 #   dummy   → records   = DummyRecord count        (256/batch)
@@ -137,7 +137,7 @@ fi
 
 # ── Build ───────────────────────────────────────────────────────────
 echo "[smoke] building release binaries..."
-cargo build --release -p noise-sink -p noise-spewer -p scry-list -p scry-query >&2
+cargo build --release -p scry-ingestd -p noise-spewer -p scry-list -p scry-query >&2
 
 # ── Clean slate ─────────────────────────────────────────────────────
 rm -rf "$SMOKE_DIR"
@@ -151,20 +151,20 @@ AWS_REGION="$SCRY_OBJSTORE_REGION" \
         s3 rm "s3://$SCRY_OBJSTORE_BUCKET/" --recursive >/dev/null || true
 
 # ── Run the pipeline ────────────────────────────────────────────────
-# noise-sink runs under /usr/bin/time so we can capture peak RSS +
+# scry-ingestd runs under /usr/bin/time so we can capture peak RSS +
 # user/sys CPU across its whole lifetime, including the final flush.
 # Time does NOT forward SIGINT to its child, so we send the shutdown
-# signal directly to noise-sink via its PID (found with pgrep).
-echo "[smoke] starting noise-sink on $LISTEN (signal=$SIGNAL)..."
+# signal directly to scry-ingestd via its PID (found with pgrep).
+echo "[smoke] starting scry-ingestd on $LISTEN (signal=$SIGNAL)..."
 RUST_LOG="${RUST_LOG:-info}" "$TIME_BIN" -v -o "$SMOKE_DIR/sink.time" \
-    ./target/release/noise-sink \
+    ./target/release/scry-ingestd \
         --listen "$LISTEN" \
         --storage \
         --wal-dir "$SMOKE_DIR/wal" \
         --catalog "$SMOKE_DIR/online.sqlite" \
     > "$SMOKE_DIR/sink.log" 2>&1 &
 TIME_PID=$!
-# Find the actual noise-sink child of /usr/bin/time. Fork+exec is
+# Find the actual scry-ingestd child of /usr/bin/time. Fork+exec is
 # fast but not instantaneous; poll briefly.
 SINK_PID=""
 for _ in $(seq 1 50); do
@@ -173,7 +173,7 @@ for _ in $(seq 1 50); do
     sleep 0.05
 done
 if [[ -z "$SINK_PID" ]]; then
-    echo "[smoke] could not locate noise-sink under time(pid=$TIME_PID)" >&2
+    echo "[smoke] could not locate scry-ingestd under time(pid=$TIME_PID)" >&2
     kill -9 "$TIME_PID" 2>/dev/null || true
     exit 1
 fi
@@ -224,7 +224,7 @@ fi
     > "$SMOKE_DIR/spewer.log" 2>&1
 
 
-echo "[smoke] SIGINT noise-sink → graceful flush..."
+echo "[smoke] SIGINT scry-ingestd → graceful flush..."
 kill -INT "$SINK_PID"
 # Wait on the time wrapper, not on the sink directly — time exits
 # after the sink does, AND it's the process that writes sink.time.

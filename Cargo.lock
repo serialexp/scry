@@ -2663,23 +2663,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "noise-sink"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "clap",
- "mimalloc",
- "num_cpus",
- "scry-catalog",
- "scry-objstore",
- "scry-server",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
 name = "noise-spewer"
 version = "0.0.1"
 dependencies = [
@@ -3548,6 +3531,23 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "scry-ingestd"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "mimalloc",
+ "num_cpus",
+ "scry-catalog",
+ "scry-objstore",
+ "scry-server",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

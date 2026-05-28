@@ -1,12 +1,12 @@
 [package]
-name        = "noise-sink"
+name        = "scry-ingestd"
 version     = "0.0.1"
 edition.workspace = true
 license.workspace = true
-description = "Test harness: thin CLI around scry-server. Listens for agents, optionally enables the v0.1 storage path (WAL + parquet blocks → object storage + optional online catalog)."
+description = "scry ingest server daemon: thin CLI around scry-server. Listens for agents, optionally enables the storage path (WAL + parquet blocks → object storage + optional online catalog)."
 
 [[bin]]
-name = "noise-sink"
+name = "scry-ingestd"
 path = "src/main.rs"
 
 [dependencies]

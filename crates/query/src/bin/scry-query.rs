@@ -1,7 +1,7 @@
 //! scry-query — DataFusion-backed metrics querier CLI (v0.3).
 //!
 //! Opens a SQLite catalog + the configured object store (same
-//! `SCRY_OBJSTORE_*` env vars as noise-sink + scry-list), pre-resolves
+//! `SCRY_OBJSTORE_*` env vars as scry-ingestd + scry-list), pre-resolves
 //! AND'd label matchers via the postings sidecars, registers the
 //! result as a DataFusion `metrics` table, and either:
 //!
@@ -52,7 +52,7 @@ use std::path::PathBuf;
 /// mimalloc keeps large allocations inside its own segment heaps and
 /// reuses pages across allocations within the process, sidestepping
 /// the `mmap`/`munmap` churn entirely. Same allocator that
-/// `noise-sink` uses for the ingest hot path, applied here for the
+/// `scry-ingestd` uses for the ingest hot path, applied here for the
 /// same reason.
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;

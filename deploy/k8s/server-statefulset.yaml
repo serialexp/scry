@@ -1,4 +1,4 @@
-# The scry ingest server (the noise-sink binary). Single replica for
+# The scry ingest server (the scry-ingestd binary). Single replica for
 # dogfooding — the block layout supports multiple writers, but one is enough
 # to start. The WAL needs durable local disk for crash replay; the SQLite
 # catalog lives alongside it and is rebuildable from the bucket via scry-list.
@@ -26,7 +26,7 @@ spec:
           image: serialexp/scry:latest
           imagePullPolicy: IfNotPresent
           command:
-            - noise-sink
+            - scry-ingestd
             - --listen=0.0.0.0:4000
             - --stats-listen=0.0.0.0:4098
             - --storage

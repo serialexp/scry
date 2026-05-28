@@ -1,16 +1,17 @@
-//! noise-sink — thin CLI shell around `scry-server`.
+//! scry-ingestd — the scry ingest server daemon; a thin CLI shell around
+//! `scry-server`.
 //!
 //! Parses flags, optionally constructs a `DummyPipeline` (WAL + parquet
 //! builder + optional online catalog targeting object storage), then
 //! hands everything to `scry-server::Server::serve_with_shutdown`.
-//! Ctrl-C triggers a graceful flush of the in-progress block.
+//! Ctrl-C / SIGTERM triggers a graceful flush of the in-progress block.
 //!
 //! Run (no storage):
-//!   noise-sink --listen 127.0.0.1:4000
+//!   scry-ingestd --listen 127.0.0.1:4000
 //!
-//! Run (v0.1 storage path):
+//! Run (storage path):
 //!   source docker/garage/.env
-//!   noise-sink --listen 127.0.0.1:4000 --storage --wal-dir ./wal
+//!   scry-ingestd --listen 127.0.0.1:4000 --storage --wal-dir ./wal
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
@@ -138,7 +139,7 @@ async fn main() -> Result<()> {
 
     let writer_id = args
         .writer_id
-        .unwrap_or_else(|| format!("noise-sink-{}", rand_short()));
+        .unwrap_or_else(|| format!("scry-ingestd-{}", rand_short()));
     let writer_uuid = Uuid::now_v7();
 
     // Shared upload-concurrency cap = physical core count. The dominant

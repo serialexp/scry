@@ -98,7 +98,7 @@ use crate::stats::UploadStats;
 /// [`Pipeline::with_upload_sem`]. Two is a conservative fallback (one
 /// block uploading while the next finishes filling).
 ///
-/// In production (noise-sink) this default is overridden: all signals
+/// In production (scry-ingestd) this default is overridden: all signals
 /// share a single semaphore sized to the host's *physical* core count,
 /// because the dominant cost of an upload is the parquet encode (sort +
 /// Arrow build + zstd), which is CPU-bound and runs on the blocking
