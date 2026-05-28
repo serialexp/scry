@@ -106,6 +106,21 @@ use crate::stats::UploadStats;
 /// bounding concurrent in-flight blocks (and therefore RAM).
 pub const MAX_INFLIGHT_UPLOADS: usize = 2;
 
+/// Number of independent ingest shards per signal. Each connection is
+/// pinned to one shard (by session id), so the per-signal ingest mutex
+/// is no longer a single global contention point — connections spread
+/// across `INGEST_SHARDS` independent `(WAL + builder + mutex)` pipelines.
+///
+/// Sized at 8 against a 12-physical/24-logical-core host: with the
+/// lock-free decode landing ~50–79M rec/s and a single ingest mutex
+/// walling at ~8–10M rec/s, ~8× independent shards lifts the ingest
+/// ceiling at/above the decode ceiling, so the lock stops being the
+/// binding constraint (the parquet encode sort becomes the next lever).
+/// The shared upload semaphore still bounds total in-flight encode+PUT
+/// across *all* shards and signals, so more shards doesn't mean more
+/// concurrent encodes — just finer-grained, less-contended ingest.
+pub const INGEST_SHARDS: usize = 8;
+
 /// Decoder function type: takes a (decompressed) batch payload + the
 /// active block builder, walks the wire format streaming-style, calls
 /// the builder's signal-specific appender for each record, and returns
@@ -448,6 +463,127 @@ impl<B: BlockBuilder> Pipeline<B> {
             anyhow::bail!("{errors} upload task(s) failed during flush");
         }
         Ok(())
+    }
+}
+
+/// `INGEST_SHARDS` independent [`Pipeline`] instances for one signal.
+///
+/// Each connection is pinned to a single shard (chosen by its session
+/// id — see [`ShardedPipeline::shard_for`]), so all of a connection's
+/// batches for the signal funnel through one shard's `(WAL + builder +
+/// mutex)` — preserving per-connection WAL ordering and replay — while
+/// *different* connections land on different shards. That turns the
+/// single per-signal ingest mutex (the measured throughput wall) into N
+/// independent locks, each seeing only `connections / N`-way contention.
+///
+/// Shards are fully independent on the durability side: each owns a
+/// distinct WAL subtree (`<wal_dir>/shard-NN/<signal>/`) so segment
+/// files never collide and replay is per-shard. They *share* the object
+/// store, the catalog, the writer identity, and — crucially — the global
+/// upload semaphore, so the total number of concurrent encode+PUT tasks
+/// across every shard and every signal stays bounded by the host's core
+/// count (encode is CPU-bound; CPU is the shared resource).
+///
+/// Cheap to clone (one `Arc` bump): the accept loop clones it per
+/// connection.
+pub struct ShardedPipeline<B: BlockBuilder> {
+    shards: Arc<Vec<Arc<Mutex<Pipeline<B>>>>>,
+}
+
+impl<B: BlockBuilder> Clone for ShardedPipeline<B> {
+    fn clone(&self) -> Self {
+        Self {
+            shards: self.shards.clone(),
+        }
+    }
+}
+
+impl<B: BlockBuilder> ShardedPipeline<B> {
+    /// Open `n` independent pipeline shards for one signal with the
+    /// default [`BlockBuilderConfig`]. Mirrors [`Pipeline::open`]; see
+    /// [`ShardedPipeline::open_with_config`] for the details and to force
+    /// a non-default block size (tests).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open(
+        n: usize,
+        wal_dir: PathBuf,
+        store: Arc<dyn ObjectStore>,
+        catalog: Option<Arc<Mutex<Catalog>>>,
+        writer_uuid: Uuid,
+        decode: DecodeFn<B>,
+        upload_sem: Arc<Semaphore>,
+        upload_stats: Option<Arc<UploadStats>>,
+    ) -> Result<Self> {
+        Self::open_with_config(
+            n,
+            wal_dir,
+            store,
+            catalog,
+            writer_uuid,
+            decode,
+            BlockBuilderConfig::default(),
+            upload_sem,
+            upload_stats,
+        )
+        .await
+    }
+
+    /// Open `n` independent pipeline shards for one signal. Each shard
+    /// `k` opens its WAL under `<wal_dir>/shard-<k>/` (so the usual
+    /// `<…>/<signal>/` subdir lands at `<wal_dir>/shard-<k>/<signal>/`
+    /// and never collides with a sibling shard), replaying any leftover
+    /// records from its own subtree. All shards share `store`, `catalog`,
+    /// `writer_uuid`, the global `upload_sem`, and — when observed — the
+    /// per-signal `upload_stats` gauge (so the stats endpoint sees the
+    /// signal's totals aggregated across shards).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open_with_config(
+        n: usize,
+        wal_dir: PathBuf,
+        store: Arc<dyn ObjectStore>,
+        catalog: Option<Arc<Mutex<Catalog>>>,
+        writer_uuid: Uuid,
+        decode: DecodeFn<B>,
+        cfg: BlockBuilderConfig,
+        upload_sem: Arc<Semaphore>,
+        upload_stats: Option<Arc<UploadStats>>,
+    ) -> Result<Self> {
+        assert!(n >= 1, "ShardedPipeline needs at least one shard");
+        let mut shards = Vec::with_capacity(n);
+        for k in 0..n {
+            let shard_wal = wal_dir.join(format!("shard-{k:02}"));
+            let mut pipe = Pipeline::<B>::open_with_config(
+                shard_wal,
+                store.clone(),
+                catalog.clone(),
+                writer_uuid,
+                decode,
+                cfg,
+            )
+            .await
+            .with_context(|| format!("opening {} shard {k}", B::SIGNAL))?
+            .with_upload_sem(upload_sem.clone());
+            if let Some(s) = upload_stats.as_ref() {
+                pipe = pipe.with_upload_stats(s.clone());
+            }
+            shards.push(Arc::new(Mutex::new(pipe)));
+        }
+        Ok(Self {
+            shards: Arc::new(shards),
+        })
+    }
+
+    /// The shard a connection's batches for this signal go to. Pinned by
+    /// session id so a connection always hits the same shard (stable WAL
+    /// ordering); modulo `N` spreads connections evenly across shards.
+    pub fn shard_for(&self, session_id: u64) -> &Arc<Mutex<Pipeline<B>>> {
+        &self.shards[session_id as usize % self.shards.len()]
+    }
+
+    /// All shards, for lifecycle operations that must touch every one
+    /// (e.g. the final `flush` on shutdown).
+    pub fn shards(&self) -> &[Arc<Mutex<Pipeline<B>>>] {
+        &self.shards
     }
 }
 

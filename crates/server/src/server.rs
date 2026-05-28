@@ -32,12 +32,11 @@ use std::{
 use tokio::{
     io::{AsyncWriteExt, BufReader, BufWriter},
     net::{TcpListener, TcpStream},
-    sync::Mutex,
 };
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::pipeline::{DecodeFn, Pipeline};
+use crate::pipeline::{DecodeFn, Pipeline, ShardedPipeline};
 use crate::stats::ServerMetrics;
 
 /// Type alias for the Dummy storage pipeline. Same generic machinery
@@ -54,6 +53,12 @@ pub type MetricsPipeline = Pipeline<MetricsBlockBuilder>;
 /// as Dummy / Metrics; the LogsBlockBuilder owns the per-signal
 /// parquet schema and postings layout.
 pub type LogsPipeline = Pipeline<LogsBlockBuilder>;
+
+/// Sharded (per-connection-striped) variants of the three storage
+/// pipelines — what the server actually holds. See [`ShardedPipeline`].
+pub type DummyShards = ShardedPipeline<DummyBlockBuilder>;
+pub type MetricsShards = ShardedPipeline<MetricsBlockBuilder>;
+pub type LogsShards = ShardedPipeline<LogsBlockBuilder>;
 
 /// Static configuration for a [`Server`]. Cheap to construct, cloned
 /// into each spawned connection task.
@@ -73,14 +78,17 @@ pub struct ServerConfig {
 /// The ingest server. Constructed with [`Server::new`], driven to
 /// completion with [`Server::serve_with_shutdown`].
 ///
-/// One pipeline per signal — at N=3 the three `Option` fields are
-/// still clearer than a `HashMap<Signal, Box<dyn ErasedPipeline>>`.
-/// Revisit the erased trait approach once N ≥ ~5.
+/// One [`ShardedPipeline`] per signal — at N=3 signals the three
+/// `Option` fields are still clearer than a
+/// `HashMap<Signal, Box<dyn ErasedPipeline>>`. Each signal's pipeline is
+/// internally sharded (see [`ShardedPipeline`]) so the per-signal ingest
+/// mutex is no longer a single contention point; a connection is pinned
+/// to one shard by its session id.
 pub struct Server {
     config: ServerConfig,
-    dummy_pipeline: Option<Arc<Mutex<DummyPipeline>>>,
-    metrics_pipeline: Option<Arc<Mutex<MetricsPipeline>>>,
-    logs_pipeline: Option<Arc<Mutex<LogsPipeline>>>,
+    dummy_pipeline: Option<ShardedPipeline<DummyBlockBuilder>>,
+    metrics_pipeline: Option<ShardedPipeline<MetricsBlockBuilder>>,
+    logs_pipeline: Option<ShardedPipeline<LogsBlockBuilder>>,
     /// Optional process-global stats. When present, the ingest path
     /// bumps it at batch granularity and the connection count is
     /// tracked; the stats HTTP endpoint reads from the same `Arc`.
@@ -90,9 +98,9 @@ pub struct Server {
 impl Server {
     pub fn new(
         config: ServerConfig,
-        dummy_pipeline: Option<Arc<Mutex<DummyPipeline>>>,
-        metrics_pipeline: Option<Arc<Mutex<MetricsPipeline>>>,
-        logs_pipeline: Option<Arc<Mutex<LogsPipeline>>>,
+        dummy_pipeline: Option<ShardedPipeline<DummyBlockBuilder>>,
+        metrics_pipeline: Option<ShardedPipeline<MetricsBlockBuilder>>,
+        logs_pipeline: Option<ShardedPipeline<LogsBlockBuilder>>,
     ) -> Self {
         Self {
             config,
@@ -168,34 +176,32 @@ impl Server {
             _ = shutdown    => { info!("shutdown signalled; flushing"); }
         }
 
-        // Flush every active pipeline. Order doesn't matter; each one
-        // owns its own JoinSet of inflight uploads.
-        if let Some(pipe) = self.dummy_pipeline.as_ref() {
-            let mut guard = pipe.lock().await;
-            if let Err(e) = guard.flush().await {
-                warn!(error = %e, "final dummy flush failed");
-            } else {
-                info!("final dummy flush complete");
-            }
+        // Flush every active pipeline shard. Order doesn't matter; each
+        // shard owns its own WAL + JoinSet of inflight uploads.
+        if let Some(sharded) = self.dummy_pipeline.as_ref() {
+            flush_all_shards(sharded, "dummy").await;
         }
-        if let Some(pipe) = self.metrics_pipeline.as_ref() {
-            let mut guard = pipe.lock().await;
-            if let Err(e) = guard.flush().await {
-                warn!(error = %e, "final metrics flush failed");
-            } else {
-                info!("final metrics flush complete");
-            }
+        if let Some(sharded) = self.metrics_pipeline.as_ref() {
+            flush_all_shards(sharded, "metrics").await;
         }
-        if let Some(pipe) = self.logs_pipeline.as_ref() {
-            let mut guard = pipe.lock().await;
-            if let Err(e) = guard.flush().await {
-                warn!(error = %e, "final logs flush failed");
-            } else {
-                info!("final logs flush complete");
-            }
+        if let Some(sharded) = self.logs_pipeline.as_ref() {
+            flush_all_shards(sharded, "logs").await;
         }
 
         Ok(())
+    }
+}
+
+/// Flush every shard of one signal's [`ShardedPipeline`] on shutdown,
+/// logging per-shard outcomes. Each shard owns an independent WAL +
+/// inflight-upload set, so they're flushed one after another.
+async fn flush_all_shards<B: BlockBuilder>(sharded: &ShardedPipeline<B>, signal: &str) {
+    for (k, shard) in sharded.shards().iter().enumerate() {
+        let mut guard = shard.lock().await;
+        match guard.flush().await {
+            Ok(()) => info!(signal, shard = k, "final flush complete"),
+            Err(e) => warn!(signal, shard = k, error = %e, "final flush failed"),
+        }
     }
 }
 
@@ -241,11 +247,27 @@ async fn handle(
     peer: SocketAddr,
     config: Arc<ServerConfig>,
     session_id: u64,
-    dummy_pipeline: Option<Arc<Mutex<DummyPipeline>>>,
-    metrics_pipeline: Option<Arc<Mutex<MetricsPipeline>>>,
-    logs_pipeline: Option<Arc<Mutex<LogsPipeline>>>,
+    dummy_sharded: Option<ShardedPipeline<DummyBlockBuilder>>,
+    metrics_sharded: Option<ShardedPipeline<MetricsBlockBuilder>>,
+    logs_sharded: Option<ShardedPipeline<LogsBlockBuilder>>,
     metrics: Option<Arc<ServerMetrics>>,
 ) -> Result<()> {
+    // Pin this connection to one shard per signal (by session id). All of
+    // this connection's batches for a signal funnel through the same
+    // shard's (WAL + builder + mutex) — stable WAL ordering for replay —
+    // while different connections spread across shards, so the per-signal
+    // ingest lock is N independent locks rather than one. The resolved
+    // `Arc<Mutex<Pipeline>>` is what the rest of `handle` uses, exactly as
+    // the unsharded pipeline did.
+    let dummy_pipeline = dummy_sharded
+        .as_ref()
+        .map(|s| s.shard_for(session_id).clone());
+    let metrics_pipeline = metrics_sharded
+        .as_ref()
+        .map(|s| s.shard_for(session_id).clone());
+    let logs_pipeline = logs_sharded
+        .as_ref()
+        .map(|s| s.shard_for(session_id).clone());
     sock.set_nodelay(true)?;
     // Track this connection in the live gauge for as long as `handle`
     // runs, regardless of which path returns.

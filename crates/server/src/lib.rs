@@ -11,18 +11,19 @@
 //! Example (sketch):
 //!
 //! ```ignore
-//! use scry_block::DummyBlockBuilder;
-//! let dummy_pipeline = Pipeline::<DummyBlockBuilder>::open(
-//!     wal_dir, store, catalog, writer_uuid, decode::dummy,
+//! // Each signal is internally sharded across connections (see
+//! // `ShardedPipeline`); the shards share one global upload semaphore.
+//! let dummy = ShardedPipeline::open(
+//!     INGEST_SHARDS, wal_dir, store, catalog, writer_uuid,
+//!     decode::dummy, upload_sem, /* upload_stats */ None,
 //! ).await?;
-//! let dummy_pipeline = std::sync::Arc::new(tokio::sync::Mutex::new(dummy_pipeline));
 //! let server = Server::new(
 //!     ServerConfig {
 //!         listen_addr: "127.0.0.1:4000".into(),
 //!         writer_id: "noise-sink-1".into(),
 //!         writer_uuid,
 //!     },
-//!     Some(dummy_pipeline.clone()),
+//!     Some(dummy),
 //!     None,
 //!     None,
 //! );
@@ -35,7 +36,10 @@ pub mod query_service;
 mod server;
 pub mod stats;
 
-pub use pipeline::{DecodeFn, Pipeline};
+pub use pipeline::{DecodeFn, Pipeline, ShardedPipeline, INGEST_SHARDS};
 pub use query_service::QueryService;
-pub use server::{DummyPipeline, LogsPipeline, MetricsPipeline, Server, ServerConfig};
+pub use server::{
+    DummyPipeline, DummyShards, LogsPipeline, LogsShards, MetricsPipeline, MetricsShards, Server,
+    ServerConfig,
+};
 pub use stats::{serve_stats, ServerMetrics, StatsProvider, UploadStats};

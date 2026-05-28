@@ -17,8 +17,8 @@ use clap::Parser;
 use scry_catalog::Catalog;
 use scry_objstore::{open as open_objstore, ObjStoreConfig};
 use scry_server::{
-    decode, serve_stats, DummyPipeline, LogsPipeline, MetricsPipeline, Server, ServerConfig,
-    ServerMetrics,
+    decode, serve_stats, DummyShards, LogsShards, MetricsShards, Server, ServerConfig,
+    ServerMetrics, ShardedPipeline, INGEST_SHARDS,
 };
 use std::{path::PathBuf, sync::Arc};
 use tokio::sync::{Mutex, Semaphore};
@@ -126,11 +126,10 @@ async fn main() -> Result<()> {
     // share the same object store + catalog; each gets its own WAL
     // subdir (`<wal>/dummy/`, `<wal>/metrics/`, `<wal>/logs/`) via the
     // `BlockBuilder::SIGNAL` constant inside `Pipeline::open`.
-    type SharedPipeline<P> = Option<Arc<Mutex<P>>>;
     type Pipelines = (
-        SharedPipeline<DummyPipeline>,
-        SharedPipeline<MetricsPipeline>,
-        SharedPipeline<LogsPipeline>,
+        Option<DummyShards>,
+        Option<MetricsShards>,
+        Option<LogsShards>,
     );
     let (dummy_pipeline, metrics_pipeline, logs_pipeline): Pipelines = if args.storage {
         let wal_dir = args
@@ -155,51 +154,54 @@ async fn main() -> Result<()> {
             ))),
             None => None,
         };
-        // One semaphore, shared by every signal's pipeline — the global
-        // encode+upload concurrency cap (see `upload_concurrency` above).
+        // One semaphore, shared by every signal's pipeline (and every
+        // shard) — the global encode+upload concurrency cap (see
+        // `upload_concurrency` above). Sharing it across shards is what
+        // keeps total in-flight encodes bounded even with N×signals
+        // independent ingest pipelines.
         let upload_sem = Arc::new(Semaphore::new(upload_concurrency));
-        let dummy = DummyPipeline::open(
+        info!(
+            shards = INGEST_SHARDS,
+            "per-signal ingest sharding (connections striped across shards by session id)"
+        );
+        // Each signal becomes INGEST_SHARDS independent pipelines, one
+        // WAL subtree per shard, all sharing store/catalog/sem and the
+        // per-signal upload-stats gauge (so the endpoint aggregates
+        // across shards).
+        let dummy = ShardedPipeline::open(
+            INGEST_SHARDS,
             wal_dir.clone(),
             store.clone(),
             catalog.clone(),
             writer_uuid,
             decode::dummy,
+            upload_sem.clone(),
+            stats_metrics.as_ref().map(|m| m.dummy_upload()),
         )
-        .await?
-        .with_upload_sem(upload_sem.clone());
-        let metrics = MetricsPipeline::open(
+        .await?;
+        let metrics = ShardedPipeline::open(
+            INGEST_SHARDS,
             wal_dir.clone(),
             store.clone(),
             catalog.clone(),
             writer_uuid,
             decode::metrics,
+            upload_sem.clone(),
+            stats_metrics.as_ref().map(|m| m.metrics_upload()),
         )
-        .await?
-        .with_upload_sem(upload_sem.clone());
-        let logs = LogsPipeline::open(
+        .await?;
+        let logs = ShardedPipeline::open(
+            INGEST_SHARDS,
             wal_dir,
             store,
             catalog,
             writer_uuid,
             decode::logs,
+            upload_sem.clone(),
+            stats_metrics.as_ref().map(|m| m.logs_upload()),
         )
-        .await?
-        .with_upload_sem(upload_sem.clone());
-        // Wire each pipeline's upload gauges into the shared stats, if
-        // the endpoint is enabled.
-        let (dummy, metrics, logs) = match stats_metrics.as_ref() {
-            Some(m) => (
-                dummy.with_upload_stats(m.dummy_upload()),
-                metrics.with_upload_stats(m.metrics_upload()),
-                logs.with_upload_stats(m.logs_upload()),
-            ),
-            None => (dummy, metrics, logs),
-        };
-        (
-            Some(Arc::new(Mutex::new(dummy))),
-            Some(Arc::new(Mutex::new(metrics))),
-            Some(Arc::new(Mutex::new(logs))),
-        )
+        .await?;
+        (Some(dummy), Some(metrics), Some(logs))
     } else {
         if args.wal_dir.is_some() {
             warn!("--wal-dir set but --storage is not; ignoring WAL");
