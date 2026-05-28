@@ -283,30 +283,44 @@ impl MetricsBlockBuilder {
 
         // ── Main parquet ───────────────────────────────────────────
         //
-        // Sort permutation over (fingerprint, ts) ascending. The
-        // intra-block sort is what makes the postings index pay off
-        // at query time: with sorted rows, parquet's row-group
-        // min/max stats on the fingerprint column let queriers skip
-        // most groups once they've resolved the fingerprint set from
-        // postings.
-        let mut order: Vec<u32> = (0..n as u32).collect();
-        order.sort_by_key(|&i| (self.fingerprints[i as usize], self.ts[i as usize]));
-
-        let main_schema = Self::main_schema();
-        let fp_arr: ArrayRef = Arc::new(UInt64Array::from_iter_values(
-            order.iter().map(|&i| self.fingerprints[i as usize]),
-        ));
-        let ts_arr: ArrayRef = Arc::new(UInt64Array::from_iter_values(
-            order.iter().map(|&i| self.ts[i as usize]),
-        ));
-        let val_arr: ArrayRef = Arc::new(Float64Array::from_iter_values(
-            order.iter().map(|&i| self.values[i as usize]),
-        ));
-        drop(order);
-        // Release source buffers — Arrow now owns column copies.
+        // Sort the rows ascending by (fingerprint, ts). The intra-block
+        // sort is what makes the postings index pay off at query time:
+        // with sorted rows, parquet's row-group min/max stats on the
+        // fingerprint column let queriers skip most groups once they've
+        // resolved the fingerprint set from postings.
+        //
+        // We sort one *contiguous* `(fp, ts, value)` row array rather
+        // than a `Vec<u32>` permutation that indexes back into three
+        // separate 8 MB columns. The permutation form costs ~4 random
+        // loads per comparison (fp/ts of both sides, across two arrays)
+        // and three more gather passes to build the columns — all
+        // cache-missing at n≈1M. Packing the row keeps every comparison
+        // *and* the column build on sequential memory; sequential
+        // bandwidth dwarfs random access, so the 24 MB temp pays for
+        // itself many times over. (Per-block allocation, not per-record
+        // — see CLAUDE.md § Performance.)
+        //
+        // `sort_unstable_by`: rows sharing an identical (fp, ts) are
+        // interchangeable to every reader, so we skip the stable sort's
+        // O(n) scratch buffer and take the faster algorithm.
+        let mut rows: Vec<(u64, u64, f64)> = (0..n)
+            .map(|i| (self.fingerprints[i], self.ts[i], self.values[i]))
+            .collect();
+        // Release the source columns now — `rows` owns everything the
+        // column build needs.
         self.fingerprints = Vec::new();
         self.ts = Vec::new();
         self.values = Vec::new();
+        rows.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+
+        let main_schema = Self::main_schema();
+        let fp_arr: ArrayRef =
+            Arc::new(UInt64Array::from_iter_values(rows.iter().map(|r| r.0)));
+        let ts_arr: ArrayRef =
+            Arc::new(UInt64Array::from_iter_values(rows.iter().map(|r| r.1)));
+        let val_arr: ArrayRef =
+            Arc::new(Float64Array::from_iter_values(rows.iter().map(|r| r.2)));
+        drop(rows);
 
         let main_batch = RecordBatch::try_new(main_schema.clone(), vec![fp_arr, ts_arr, val_arr])
             .context("constructing metrics main RecordBatch")?;
