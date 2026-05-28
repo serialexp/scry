@@ -225,25 +225,68 @@ impl Wal {
     /// Delete every segment whose seq is ≤ `up_to`. Refuses to delete
     /// the active segment (which would lose all subsequent appends
     /// silently); rotate first.
+    ///
+    /// Convenience wrapper around [`Wal::prepare_release`] +
+    /// [`Wal::release_segments`] that does both steps while holding
+    /// `&mut self`. The hot ingest path instead calls those two
+    /// separately so the slow filesystem work (a `read_dir` plus N
+    /// `unlink`s) runs *without* the WAL lock held — see the pipeline's
+    /// `run_upload`.
     pub async fn mark_uploaded(&mut self, up_to: SegmentId) -> Result<()> {
+        let signal_dir = self.prepare_release(up_to)?;
+        Self::release_segments(&signal_dir, up_to).await
+    }
+
+    /// Validate that `up_to` is a *sealed* (non-active) segment and
+    /// return the signal directory, so the caller can release the
+    /// eligible segments with [`Wal::release_segments`] *without*
+    /// holding the WAL mutex. Cheap: a single comparison plus a
+    /// `PathBuf` clone, so the WAL lock is held only for microseconds
+    /// even on the block-close path.
+    ///
+    /// Refuses the active segment (deleting it would silently drop every
+    /// subsequent append); rotate first.
+    pub fn prepare_release(&self, up_to: SegmentId) -> Result<PathBuf> {
         if up_to.0 >= self.current_seq {
             anyhow::bail!(
-                "WAL: mark_uploaded({}) refers to active segment ({}); rotate first",
+                "WAL: release({}) refers to active segment ({}); rotate first",
                 up_to.0,
                 self.current_seq
             );
         }
+        Ok(self.signal_dir.clone())
+    }
+
+    /// Delete every sealed segment in `signal_dir` whose seq is ≤
+    /// `up_to`. **No WAL lock required**: sealed segments are immutable
+    /// and never reopened by `append`/`rotate` (which only ever touch
+    /// the active segment, whose seq is strictly greater than any
+    /// releasable one — guaranteed by [`Wal::prepare_release`]). Pair it
+    /// with `prepare_release` so a slow directory scan + unlinks never
+    /// blocks the foreground append path, which takes the WAL lock under
+    /// the pipeline mutex.
+    ///
+    /// Idempotent: an already-deleted segment is ignored, so two uploads
+    /// finishing out of order (each releasing through its own sealed id,
+    /// with overlapping ≤-ranges) don't race-fail on the overlap.
+    pub async fn release_segments(signal_dir: &Path, up_to: SegmentId) -> Result<()> {
         let mut deleted = 0u64;
-        let mut rd = fs::read_dir(&self.signal_dir).await?;
+        let mut rd = fs::read_dir(signal_dir).await?;
         while let Some(entry) = rd.next_entry().await? {
             let name = entry.file_name();
             if let Some(seq) = parse_segment_filename(&name.to_string_lossy()) {
                 if seq <= up_to.0 {
                     let path = entry.path();
-                    fs::remove_file(&path)
-                        .await
-                        .with_context(|| format!("WAL: removing {}", path.display()))?;
-                    deleted += 1;
+                    match fs::remove_file(&path).await {
+                        Ok(()) => deleted += 1,
+                        // A concurrent out-of-order release already
+                        // unlinked it — fine, the goal state is reached.
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => {
+                            return Err(anyhow::Error::from(e)
+                                .context(format!("WAL: removing {}", path.display())));
+                        }
+                    }
                 }
             }
         }

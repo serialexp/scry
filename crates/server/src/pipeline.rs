@@ -47,9 +47,12 @@
 //! itself runs on the blocking pool inside `BlockBuilder::finish_and_upload`
 //! (`tokio::task::spawn_blocking`), so compressing a block doesn't
 //! monopolise an async worker that should be servicing ingest decode.
-//! When the upload finishes the task briefly re-acquires the WAL and
-//! catalog locks to call `mark_uploaded` and `insert_block`, then drops
-//! the permit.
+//! When the upload finishes the task releases the now-uploaded WAL
+//! segments and inserts the catalog row. The WAL lock is held only to
+//! *validate + snapshot* the release (`prepare_release`, microseconds);
+//! the actual `unlink`s (`release_segments`) run lock-free, so a block
+//! release never stalls the foreground append path — which takes the WAL
+//! lock under the pipeline mutex on every batch.
 //!
 //! The semaphore is normally *shared across all signals* (one pool sized
 //! to the host's physical core count — see [`Pipeline::with_upload_sem`]
@@ -71,9 +74,9 @@
 //!
 //! The WAL and catalog therefore live behind `Arc<Mutex<…>>` so the
 //! background task can share them with the ingest path. Lock contention
-//! is negligible: append/rotate take microseconds, mark_uploaded is a
-//! handful of `unlink` syscalls, and `insert_block` is a single SQLite
-//! INSERT.
+//! is negligible: append/rotate take microseconds, segment release holds
+//! the WAL lock only for a validate+snapshot (the `unlink`s run
+//! lock-free), and `insert_block` is a single SQLite INSERT.
 
 use anyhow::{Context, Result};
 use object_store::ObjectStore;
@@ -470,16 +473,31 @@ async fn run_upload<B: BlockBuilder>(
                 s.record_success(meta.byte_size, upload_nanos);
             }
             // WAL release: the sealed segments through `sealed` have
-            // been uploaded; safe to delete. We re-acquire the lock
-            // briefly here; the ingest path's `append` will contend
-            // with us for a few microseconds.
-            if let Err(e) = wal.lock().await.mark_uploaded(sealed).await {
-                warn!(
+            // been uploaded; safe to delete. We hold the WAL lock only
+            // to validate + snapshot the signal dir (a comparison + a
+            // PathBuf clone, microseconds), then drop it and do the slow
+            // part — the directory scan and the unlinks — with *no* lock
+            // held. The foreground ingest path takes the WAL lock under
+            // the pipeline mutex on every batch, so unlinking under the
+            // lock would periodically stall all ingest for this signal.
+            let release = wal.lock().await.prepare_release(sealed);
+            match release {
+                Ok(dir) => {
+                    if let Err(e) = Wal::release_segments(&dir, sealed).await {
+                        warn!(
+                            signal = B::SIGNAL,
+                            sealed_seq = sealed.0,
+                            error = %e,
+                            "WAL release_segments after block upload"
+                        );
+                    }
+                }
+                Err(e) => warn!(
                     signal = B::SIGNAL,
                     sealed_seq = sealed.0,
                     error = %e,
-                    "WAL mark_uploaded after block upload"
-                );
+                    "WAL prepare_release after block upload"
+                ),
             }
             // Catalog update is best-effort by design: the bucket is
             // the source of truth, and reconcile_from_bucket can
