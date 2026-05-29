@@ -1,0 +1,101 @@
+<svg width="256" height="256" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="scry logo">
+  <title>scry</title>
+  <defs>
+    <!-- Orb body: dark obsidian glass with an inner glow -->
+    <radialGradient id="orb" cx="42%" cy="36%" r="72%">
+      <stop offset="0%" stop-color="#3a2a6b"/>
+      <stop offset="38%" stop-color="#1c1640"/>
+      <stop offset="78%" stop-color="#0c0a1f"/>
+      <stop offset="100%" stop-color="#050410"/>
+    </radialGradient>
+    <!-- The scrying glow at the heart of the stone -->
+    <radialGradient id="core" cx="50%" cy="55%" r="55%">
+      <stop offset="0%" stop-color="#7af5d0" stop-opacity="0.95"/>
+      <stop offset="40%" stop-color="#33c2a8" stop-opacity="0.45"/>
+      <stop offset="100%" stop-color="#33c2a8" stop-opacity="0"/>
+    </radialGradient>
+    <!-- Specular highlight -->
+    <radialGradient id="spec" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.85"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+    <!-- Cushion the stone rests on: muted slate fabric, not stone -->
+    <linearGradient id="cushion" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#566070"/>
+      <stop offset="55%" stop-color="#3b434f"/>
+      <stop offset="100%" stop-color="#272d36"/>
+    </linearGradient>
+    <!-- Waveform body: hue + opacity vary along its length so it reads as a live signal, not a flat line -->
+    <linearGradient id="waveGlow" gradientUnits="userSpaceOnUse" x1="56" y1="0" x2="200" y2="0">
+      <stop offset="0%"   stop-color="#33c2a8" stop-opacity="0"/>
+      <stop offset="18%"  stop-color="#33c2a8" stop-opacity="0.65"/>
+      <stop offset="50%"  stop-color="#7af5d0" stop-opacity="1"/>
+      <stop offset="82%"  stop-color="#5fe6cb" stop-opacity="0.85"/>
+      <stop offset="100%" stop-color="#33c2a8" stop-opacity="0.1"/>
+    </linearGradient>
+    <!-- Bright inner core: fades at the ends so the line dissolves into the glass -->
+    <linearGradient id="waveCore" gradientUnits="userSpaceOnUse" x1="56" y1="0" x2="200" y2="0">
+      <stop offset="0%"   stop-color="#d8fff2" stop-opacity="0"/>
+      <stop offset="45%"  stop-color="#eafff8" stop-opacity="0.95"/>
+      <stop offset="60%"  stop-color="#ffffff" stop-opacity="1"/>
+      <stop offset="100%" stop-color="#d8fff2" stop-opacity="0"/>
+    </linearGradient>
+    <!-- Waveform stroke: hue + alpha sweep along the trace so it isn't a flat line -->
+    <linearGradient id="wave" gradientUnits="userSpaceOnUse" x1="56" y1="0" x2="200" y2="0">
+      <stop offset="0%"   stop-color="#2fae98" stop-opacity="0.12"/>
+      <stop offset="18%"  stop-color="#4fd6ba" stop-opacity="0.85"/>
+      <stop offset="52%"  stop-color="#7af5d0" stop-opacity="1"/>
+      <stop offset="82%"  stop-color="#9dffe2" stop-opacity="0.8"/>
+      <stop offset="100%" stop-color="#d8fff2" stop-opacity="0.15"/>
+    </linearGradient>
+    <!-- Bright core highlight, faded at both ends -->
+    <linearGradient id="waveHi" gradientUnits="userSpaceOnUse" x1="56" y1="0" x2="200" y2="0">
+      <stop offset="0%"   stop-color="#ffffff" stop-opacity="0"/>
+      <stop offset="50%"  stop-color="#ffffff" stop-opacity="0.85"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <clipPath id="orbClip">
+      <circle cx="128" cy="108" r="84"/>
+    </clipPath>
+  </defs>
+
+  <!-- The stone rests on a soft cushion (it works in the hand too — this is just where you set it down) -->
+  <path d="M70 190 Q128 181 186 190 Q220 196 212 210 Q220 228 186 231 Q128 239 70 231 Q36 228 44 210 Q36 196 70 190 Z"
+        fill="url(#cushion)" stroke="#1d2229" stroke-width="1.5"/>
+  <!-- Stitched seam just inside the edge -->
+  <path d="M74 196 Q128 188 182 196 Q210 201 204 211 Q210 225 182 227 Q128 233 74 227 Q46 225 52 211 Q46 201 74 196 Z"
+        fill="none" stroke="#5d6775" stroke-width="1" stroke-dasharray="3 3" opacity="0.6"/>
+  <!-- Corner tufts -->
+  <circle cx="50" cy="210" r="3.5" fill="#2b323c"/>
+  <circle cx="206" cy="210" r="3.5" fill="#2b323c"/>
+  <circle cx="78" cy="229" r="3" fill="#2b323c"/>
+  <circle cx="178" cy="229" r="3" fill="#2b323c"/>
+  <!-- Contact shadow where the orb presses into the cushion -->
+  <ellipse cx="128" cy="192" rx="56" ry="11" fill="#1a1f26" opacity="0.7"/>
+
+  <!-- The orb -->
+  <circle cx="128" cy="108" r="84" fill="url(#orb)"/>
+
+  <!-- Inner contents, clipped to the glass -->
+  <g clip-path="url(#orbClip)">
+    <circle cx="128" cy="108" r="84" fill="url(#core)"/>
+
+    <!-- The unique mark: the observability waveform scry reads from the stone.
+         A glowing sparkline sweeping across the heart of the palantir. -->
+    <polyline
+      points="56,118 74,118 84,96 96,134 108,80 120,124 132,104 142,150 156,72 168,112 182,112 200,118"
+      fill="none" stroke="url(#wave)" stroke-width="4"
+      stroke-linejoin="round" stroke-linecap="round"/>
+    <polyline
+      points="56,118 74,118 84,96 96,134 108,80 120,124 132,104 142,150 156,72 168,112 182,112 200,118"
+      fill="none" stroke="url(#waveHi)" stroke-width="1.5"
+      stroke-linejoin="round" stroke-linecap="round"/>
+
+    <!-- Faint baseline grid to read as "data" -->
+    <line x1="56" y1="118" x2="200" y2="118" stroke="#7af5d0" stroke-width="1" opacity="0.25"/>
+  </g>
+
+  <!-- Glass rim + specular highlight on top -->
+  <circle cx="128" cy="108" r="84" fill="none" stroke="#5a4fa0" stroke-width="2" opacity="0.6"/>
+  <ellipse cx="104" cy="78" rx="30" ry="20" fill="url(#spec)" opacity="0.5" transform="rotate(-28 104 78)"/>
+</svg>

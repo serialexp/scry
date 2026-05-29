@@ -1,6 +1,10 @@
-# scry
+<p align="center">
+  <img src="logo.svg" alt="scry logo" width="160" height="160">
+</p>
 
-> One observability backend. Four signals. One screen of config.
+<h1 align="center">scry</h1>
+
+<p align="center"><em>One observability backend. Four signals. One screen of config.</em></p>
 
 `scry` is an opinionated, single-binary replacement for the Grafana
 observability stack (Loki + Tempo + Mimir + Pyroscope). It stores
