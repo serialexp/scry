@@ -13,7 +13,7 @@ use anyhow::Result;
 use clap::Parser;
 use scry_proto::{
     build,
-    constants::{COMPRESSION_ZSTD, Signal},
+    constants::{COMPRESSION_ZSTD, Signal, SIGNAL_BIT_LOGS},
     generated::{LogEntry, LogStream, LogsBatch},
     LabelPair,
 };
@@ -21,13 +21,12 @@ use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-mod client;
 mod cri;
 mod discovery;
 mod stream;
 
-use client::Client;
 use cri::RawLog;
+use scry_client::Client;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -129,6 +128,7 @@ async fn main() -> Result<()> {
         &args.server_addr,
         agent_id,
         &hostname,
+        SIGNAL_BIT_LOGS,
         vec![
             LabelPair { key: "service".into(), value: "scry-agent".into() },
             LabelPair { key: "node".into(), value: node.clone() },
@@ -178,7 +178,7 @@ async fn main() -> Result<()> {
         ingest(&mut pending, &registry, &node, rec).await;
     }
     flush(&mut conn, &mut pending, session_id, &mut batch_id).await?;
-    conn.shutdown().await?;
+    conn.shutdown("agent shutdown").await?;
 
     if let Some(h) = watcher_handle {
         let _ = h.await;

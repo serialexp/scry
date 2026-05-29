@@ -1,16 +1,18 @@
 //! Reusable wire-transport client for a scry ingest server.
 //!
-//! This is the signal-agnostic half of `noise-spewer`'s main loop lifted
-//! into a small struct: connect + handshake, a background reader task that
-//! turns each `BatchAck` into an inflight credit, and `send_batch` with the
-//! same inflight flow control the spewer used. The agent feeds it
-//! already-built `Frame`s (Batch variants); the client knows nothing about
-//! logs specifically.
+//! This is the signal-agnostic half of an ingest producer's main loop:
+//! connect and handshake, a background reader task that turns each `BatchAck`
+//! into an inflight credit, and `send_batch` with inflight flow control. Callers feed it
+//! already-built `Frame`s (Batch variants); the client knows nothing about any
+//! particular signal — the producer announces which signals it will send via the
+//! `signals` bitmask at [`Client::connect`].
+//!
+//! Used by both `scry-agent` (logs) and `scry-gateway` (traces + profiles).
 
 use anyhow::{bail, Context, Result};
 use scry_proto::{
     build,
-    constants::{ACK_ACCEPTED, GOODBYE_NORMAL, PROTOCOL_VERSION_V0, SIGNAL_BIT_LOGS},
+    constants::{ACK_ACCEPTED, GOODBYE_NORMAL, PROTOCOL_VERSION_V0},
     framing::{read_frame, write_frame},
     generated::FrameMsg,
     Frame, LabelPair,
@@ -39,11 +41,13 @@ pub struct Client {
 
 impl Client {
     /// Connect to `addr`, perform the Hello/HelloAck handshake announcing the
-    /// logs signal, and spawn the ack-draining reader task.
+    /// given `signals` bitmask (`SIGNAL_BIT_*` from `scry_proto::constants`,
+    /// OR-combined), and spawn the ack-draining reader task.
     pub async fn connect(
         addr: &str,
         agent_id: [u8; 16],
         hostname: &str,
+        signals: u8,
         resource_attrs: Vec<LabelPair>,
     ) -> Result<Self> {
         let stream = TcpStream::connect(addr)
@@ -63,7 +67,7 @@ impl Client {
                 agent_id,
                 agent_version: env!("CARGO_PKG_VERSION"),
                 hostname,
-                signals: SIGNAL_BIT_LOGS,
+                signals,
                 capabilities: 0,
                 resource_attrs,
             }),
@@ -128,9 +132,10 @@ impl Client {
         Ok(())
     }
 
-    /// Send a graceful Goodbye, flush, and wait for the reader to drain.
-    pub async fn shutdown(mut self) -> Result<()> {
-        write_frame(&mut self.wr, &build::goodbye(GOODBYE_NORMAL, "agent shutdown")).await?;
+    /// Send a graceful Goodbye with the given operator-log `reason` text, flush,
+    /// and wait for the reader to drain.
+    pub async fn shutdown(mut self, reason: &str) -> Result<()> {
+        write_frame(&mut self.wr, &build::goodbye(GOODBYE_NORMAL, reason)).await?;
         self.wr.flush().await?;
         drop(self.wr);
         let _ = self.reader.await;
@@ -140,7 +145,7 @@ impl Client {
 }
 
 /// Drain server-initiated frames. Each `BatchAck` releases one inflight
-/// credit; everything else is logged and ignored (the agent does not answer
+/// credit; everything else is logged and ignored (the client does not answer
 /// Ping/FlowControl yet).
 async fn reader_loop(mut rd: BufReader<OwnedReadHalf>, ack_tx: mpsc::Sender<()>) {
     loop {

@@ -62,6 +62,21 @@ impl Signal {
 /// Used in `FlowControl.signal` to mean "every signal".
 pub const SIGNAL_ALL: u8 = 0xFF;
 
+// ── SeriesDictEntry.metric_type ─────────────────────────────────────────
+// Free-form per-series type byte. It is not validated on the wire and lands
+// only in the block meta sidecar (`series_types`), so it is advisory metadata
+// for the query layer, not a correctness-bearing field. The values mirror the
+// Prometheus metric-type enum. `UNKNOWN` is the right choice when the producer
+// can't supply a type — notably Prometheus remote-write v1, whose sample stream
+// carries no per-series type. Histograms/summaries are exploded into component
+// series (`_bucket`/`_sum`/`_count`) upstream, so they appear here as the
+// constituent series' types, not as a single HISTOGRAM series.
+pub const METRIC_TYPE_UNKNOWN:   u8 = 0;
+pub const METRIC_TYPE_COUNTER:   u8 = 1;
+pub const METRIC_TYPE_GAUGE:     u8 = 2;
+pub const METRIC_TYPE_HISTOGRAM: u8 = 3;
+pub const METRIC_TYPE_SUMMARY:   u8 = 4;
+
 // ── Batch.compression ──────────────────────────────────────────────────
 pub const COMPRESSION_NONE: u8 = 0;
 pub const COMPRESSION_ZSTD: u8 = 1;

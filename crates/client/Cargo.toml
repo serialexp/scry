@@ -1,0 +1,17 @@
+[package]
+name        = "scry-client"
+version     = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Reusable binschema wire-transport client for a scry ingest server: connect + handshake, background ack-reader, and send_batch with inflight flow control. Shared by scry-agent and scry-gateway."
+
+[dependencies]
+anyhow     = { workspace = true }
+scry-proto = { workspace = true }
+tokio      = { workspace = true }
+tracing    = { workspace = true }
+
+[lints]
+workspace = true

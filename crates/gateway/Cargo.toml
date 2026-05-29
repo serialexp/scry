@@ -1,0 +1,37 @@
+[package]
+name        = "scry-gateway"
+version     = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "scry foreign-protocol push gateway: terminates OTLP/HTTP trace push and legacy Pyroscope profile ingest, translates each request into a binschema batch, and forwards it to a scry ingest server as just another wire client."
+
+[[bin]]
+name = "scry-gateway"
+path = "src/main.rs"
+
+[[bin]]
+name = "scry-gateway-probe"
+path = "src/bin/probe.rs"
+
+[dependencies]
+anyhow              = { workspace = true }
+axum                = { workspace = true }
+binschema-runtime   = { workspace = true }
+bytes               = { workspace = true }
+clap                = { workspace = true }
+mimalloc            = { workspace = true }
+opentelemetry-proto = { workspace = true }
+prost               = { workspace = true }
+scry-client         = { workspace = true }
+scry-proto          = { workspace = true }
+snap                = { workspace = true }
+tokio               = { workspace = true }
+tracing             = { workspace = true }
+tracing-subscriber  = { workspace = true }
+uuid                = { workspace = true }
+zstd                = { workspace = true }
+
+[lints]
+workspace = true
