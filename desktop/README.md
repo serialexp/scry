@@ -144,9 +144,12 @@ published. The Ubuntu desktop runner `apt install`s
 `libwebkit2gtk-4.1-dev` + `librsvg2-dev` so the AppImage actually bundles
 there.
 
-> The desktop bundle's embedded version comes from
-> `src-tauri/tauri.conf.json`, not the git tag — bump it there when you
-> want asset filenames to track the release tag.
+> On tag builds, `scripts/stamp-version.mjs` writes the tag's version into
+> `src-tauri/tauri.conf.json` before bundling, so asset filenames and the
+> installer version track the release tag automatically (the committed
+> `0.1.0` is just a dev placeholder). Release tags must be plain
+> `vMAJOR.MINOR.PATCH` — a pre-release/build suffix breaks the Windows MSI
+> (WiX ProductVersion is numeric only), so the stamp step rejects it.
 
 ## Regenerating the protocol bindings
 

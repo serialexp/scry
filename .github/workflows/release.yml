@@ -79,6 +79,14 @@ jobs:
       - name: Install bun
         uses: oven-sh/setup-bun@v2
 
+      - name: Stamp bundle version from tag
+        # Tag builds carry the real version in the bundles/installers; manual
+        # (branch) dispatch keeps the placeholder in tauri.conf.json.
+        if: github.ref_type == 'tag'
+        shell: bash
+        working-directory: desktop
+        run: bun scripts/stamp-version.mjs "${{ github.ref_name }}"
+
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
