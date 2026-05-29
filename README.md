@@ -33,12 +33,24 @@ of it. That's `scry`.
 
 ## What `scry` is
 
-- **One binary** for the server. Ingest, query, compaction, and
-  retention are subsystems of one process, not separate services.
-- **One binary** for the agent. It scrapes Prometheus endpoints, tails
-  log files / journald, pulls pprof endpoints, and ships everything to
-  the server in one batched, compressed stream over a single wire
-  protocol (defined in [binschema](../binschema)).
+- **One binary for the server** (`scry-ingestd`). Ingest, query,
+  compaction, and retention are subsystems of one process, not separate
+  services.
+- **One native wire protocol.** Producers ship batched, compressed
+  records to the server over a single binschema-defined wire
+  ([`proto/ingest.schema.json`](proto/ingest.schema.json)) — a flat
+  tagged union, big-endian, 32 MiB frame cap. Everything that puts data
+  in speaks this one protocol.
+- **Two ways to feed it:**
+  - the **agent** (`scry-agent`) — a per-node collector that tails CRI
+    container logs and ships them over the native wire (logs today;
+    Prometheus scrape and pprof pull are planned);
+  - the **gateway** (`scry-gateway`) — an HTTP front-end that terminates
+    *foreign push protocols* and forwards them over the same native wire,
+    so you don't have to adopt the agent to get data in. It speaks
+    **OTLP/HTTP traces**, **legacy Pyroscope `/ingest`**, and
+    **Prometheus remote-write**. See [Point existing telemetry at
+    scry](#point-existing-telemetry-at-scry).
 - **Parquet on S3-compatible object storage** as the single source of
   truth. No separate index store, no Cassandra, no Bigtable, no boltdb.
 - **WAL on local SSD** as the ingestion buffer and crash-safety
@@ -54,10 +66,13 @@ of it. That's `scry`.
   distributor/ingester/querier/store-gateway split. If you are running
   hundreds of TB/day, `scry` is not the answer; Mimir is.
 - **Not multi-tenant.** One deployment, one tenant. Run more deployments
-  if you need more tenants.
-- **Not backwards-compatible with Prom/Loki/Tempo/Pyroscope wire
-  protocols.** The agent is ours. The reason their protocols are messy
-  is precisely the kind of accidental complexity we're escaping.
+  if you need more tenants. (The gateway ignores `X-Scope-OrgID`.)
+- **Not a drop-in for their query APIs.** PromQL, LogQL, and TraceQL are
+  later milestones; the native query path is DataFusion SQL today. The
+  gateway translates a curated subset of foreign *push* protocols at the
+  edge, but scry's storage, query, and native wire are its own — the
+  reason the upstream protocols are messy is precisely the kind of
+  accidental complexity we're escaping.
 - **Not a UI.** Grafana adapters and/or our own UI come later, on top of
   a clean storage and query foundation. The first milestone has no UI
   at all.
@@ -70,17 +85,32 @@ of it. That's `scry`.
 
 Pre-zero, but the storage + query spine is real. Architecture is settled
 in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); decisions in
-[`docs/decisions.md`](docs/decisions.md); the agent→server wire protocol
-in [`proto/ingest.schema.json`](proto/ingest.schema.json).
+[`docs/decisions.md`](docs/decisions.md); the native wire protocol in
+[`proto/ingest.schema.json`](proto/ingest.schema.json).
 
-Two real signals — **metrics** and **logs** — flow the whole way through:
-agent → wire protocol → per-writer WAL → parquet blocks on
-S3-compatible storage → SQLite catalog → DataFusion-backed query (local
-CLI or the `scry-queryd` daemon over a binschema-framed wire). v0.1–v0.4
-are sealed; `scripts/smoke.sh` exercises the full ingest → store → query
-round-trip live for each signal (see the milestone table below). Traces
-(v0.5) and profiles (v0.6) are the next signals; PromQL, full-text logs,
-compaction, and retention follow.
+- **All four signals** — metrics, logs, traces, profiles — flow the whole
+  way and query back: producer → native wire → per-writer WAL → parquet
+  blocks on S3-compatible storage → SQLite catalog → DataFusion-backed
+  query (local `scry-query` CLI or the `scry-queryd` daemon over a
+  binschema-framed wire). v0.1–v0.6 are sealed; `scripts/smoke.sh`
+  exercises the full ingest → store → query round-trip live for each
+  signal, including a `--trace-id` by-id lookup for traces.
+- **Metrics** and **logs** preselect via a per-block postings sidecar on
+  AND'd label matchers. **Traces** and **profiles** carry no postings —
+  matcher / time / trace-id filters push down as parquet row predicates
+  and row-group statistics prune. Traces additionally support a
+  trace-by-id lookup (`--trace-id`, sorted-column pruning) and promoted
+  resource-column matchers (`service.name`, …); profiles are retrieval by
+  time + label with the raw pprof blob streamed back untouched.
+- **The gateway** terminates OTLP/HTTP traces, legacy Pyroscope `/ingest`,
+  and Prometheus remote-write, and forwards each over the native wire;
+  `scripts/smoke-gateway.sh` drives all three end to end against a
+  Garage-backed server.
+
+Profiles **flamegraph aggregation** (pprof parse + stack-merge; Grafana
+renders pre-aggregated data, so this is backend work for when a UI
+consumes it), PromQL + full-text logs (v0.7), compaction + retention
+(v0.8), and Grafana/UI (v1.0) follow. See the milestone table below.
 
 ## Workspace
 
@@ -96,38 +126,162 @@ crates/
   query/               DataFusion query engine + scry-query CLI (scry-query)
   scry-queryd/         remote query daemon (binschema-framed wire)
   scry-list/           catalog inspector / bucket reconciler
-  agent/               Kubernetes log-collection agent: tails CRI logs, ships logs over the wire (scry-agent)
+  client/              reusable native-wire client, shared by agent + gateway (scry-client)
+  agent/               per-node log-collection agent: tails CRI logs, ships over the wire (scry-agent)
+  gateway/             foreign-protocol push gateway (scry-gateway): OTLP traces, Pyroscope, Prometheus remote-write
   noise-spewer/        TCP client; emits random metrics/logs/traces/profiles
   scry-ingestd/        ingest server daemon binary (wraps scry-server)
 proto/                 binschema source-of-truth schemas
 deploy/k8s/            Kubernetes manifests: ingest server (StatefulSet+PVC) + agent (DaemonSet)
-Dockerfile             one image carrying scry-ingestd + scry-agent + scry-list
-scripts/gen-proto.sh   regenerate Rust bindings from proto/*.schema.json
-scripts/smoke.sh       end-to-end ingest→store→query exit criterion (v0.1/0.2/0.4)
+Dockerfile             one image, four roles: scry-ingestd + scry-agent + scry-gateway + scry-list
+scripts/gen-proto.sh        regenerate Rust bindings from proto/*.schema.json
+scripts/smoke.sh            end-to-end ingest→store→query exit criterion (metrics/logs)
+scripts/smoke-gateway.sh    end-to-end push-gateway smoke (OTLP + Pyroscope + remote-write)
 ```
 
-Build and smoke-test:
+## Build and run locally
 
 ```bash
 cargo build --release --workspace
 
-# In one terminal:
+# Ingest server (add --storage --wal-dir … --catalog … to persist; see below):
 ./target/release/scry-ingestd --listen 127.0.0.1:4000
 
-# In another:
+# Feed it synthetic load over the native wire:
 ./target/release/noise-spewer --addr 127.0.0.1:4000 --rate 50 --duration 3s
 ```
 
 You'll see the sink report something like
 `batches=150 samples=15200 log_entries=2280 spans=740 profiles=37 rejected=0`.
 
+To accept foreign push protocols, run the gateway alongside the server:
+
+```bash
+# Terminates OTLP/Pyroscope/remote-write on :4318, forwards to the server:
+./target/release/scry-gateway --listen 0.0.0.0:4318 --upstream 127.0.0.1:4000
+```
+
+End-to-end smoke tests (require a local Garage — `scripts/dev-garage-up.sh`):
+
+```bash
+SIGNAL=metrics scripts/smoke.sh   # ingest → store → query round-trip, native wire
+scripts/smoke-gateway.sh          # OTLP + Pyroscope + remote-write through the gateway
+```
+
+## Deploy (Kubernetes)
+
+One image, `serialexp/scry:latest` (multi-arch `linux/amd64` + `linux/arm64`),
+carries every role; the manifest's `command:` selects which binary runs.
+
+**Prerequisite:** an S3-compatible bucket (Cloudflare R2, Hetzner Object
+Storage, Garage, MinIO, …). The server reads credentials from
+`SCRY_OBJSTORE_*` env, supplied by a Secret.
+
+```bash
+kubectl apply -f deploy/k8s/namespace.yaml
+
+# Fill in real bucket credentials, then apply out of band (never commit it):
+cp deploy/k8s/objstore-secret.example.yaml deploy/k8s/objstore-secret.yaml
+$EDITOR deploy/k8s/objstore-secret.yaml
+kubectl apply -f deploy/k8s/objstore-secret.yaml
+
+# Ingest server (StatefulSet + PVC for the WAL/catalog) and its Service:
+kubectl apply -f deploy/k8s/server-statefulset.yaml
+kubectl apply -f deploy/k8s/server-service.yaml
+
+# Per-node log agent (DaemonSet + read-only pod-watch RBAC):
+kubectl apply -f deploy/k8s/agent-rbac.yaml
+kubectl apply -f deploy/k8s/agent-daemonset.yaml
+```
+
+The server runs with `--storage --wal-dir=/wal --catalog=/wal/catalog.sqlite`
+on a `ReadWriteOnce` PVC, exposes the ingest wire on `:4000` and a live stats
+dashboard on `:4098`, and is reachable in-cluster as `scry-server.scry.svc:4000`.
+The catalog is rebuildable from the bucket at any time with `scry-list`, so the
+PVC is a cache, not a system of record.
+
+### The gateway
+
+The gateway runs from the same image (`command: [scry-gateway]`,
+`--upstream=scry-server.scry.svc:4000`, listening on `:4318`). A packaged
+manifest isn't in `deploy/k8s/` yet — a minimal one looks like:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: scry-gateway, namespace: scry, labels: { app: scry-gateway } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: scry-gateway } }
+  template:
+    metadata: { labels: { app: scry-gateway } }
+    spec:
+      containers:
+        - name: scry-gateway
+          image: serialexp/scry:latest
+          command: [scry-gateway, --listen=0.0.0.0:4318, --upstream=scry-server.scry.svc:4000]
+          ports: [{ name: http, containerPort: 4318 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: scry-gateway, namespace: scry }
+spec:
+  selector: { app: scry-gateway }
+  ports: [{ name: http, port: 4318, targetPort: 4318 }]
+```
+
+## Point existing telemetry at scry
+
+Aim your existing exporters at the **gateway** (`:4318`). It forwards each
+request over the native wire as one batch; on upstream failure the caller
+sees a `502` and applies its own retry. v0 is best-effort (no local spool).
+
+- **OTLP traces (HTTP/protobuf).** Point any OTLP/HTTP exporter at the
+  gateway's `/v1/traces`:
+
+  ```bash
+  export OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/protobuf
+  export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://scry-gateway.scry.svc:4318/v1/traces
+  ```
+
+  Traces only for now — there's no `/v1/metrics` or `/v1/logs` receiver
+  (use remote-write for metrics; the agent for logs). gRPC OTLP and
+  OTLP/JSON are out of scope.
+
+- **Prometheus / VictoriaMetrics remote-write.** Add a `remote_write`
+  target (v1 protobuf + snappy; `/api/v1/push` is accepted as a
+  Mimir/Cortex alias):
+
+  ```yaml
+  remote_write:
+    - url: http://scry-gateway.scry.svc:4318/api/v1/write
+  ```
+
+  Classic histograms/summaries map natively (their `_bucket`/`_sum`/
+  `_count` series land as ordinary samples). Remote-write **v2**, native
+  histograms, and exemplars are not handled yet.
+
+- **Pyroscope profiles.** Point a legacy Pyroscope client (e.g.
+  [`serialexp/pyroscope-bun`](https://github.com/serialexp/pyroscope-bun))
+  at the gateway; it posts gzipped pprof to `/ingest`:
+
+  ```
+  server address: http://scry-gateway.scry.svc:4318
+  ```
+
+  Profiles are stored opaquely (pprof preserved verbatim); flamegraph
+  aggregation is a later milestone.
+
 ## Scope (v0 → v1)
 
 Reconciled against what actually shipped: the original plan put logs
 first (v0.2) and metrics later (v0.5), but in practice metrics drove
 the early work — postings + DataFusion are easier to validate against
-a numeric workload — and logs are landing as the second real signal in
-v0.4. Order updated accordingly.
+a numeric workload — and logs landed as the second real signal in v0.4.
+The push gateway then landed (unnumbered), carrying traces + profiles
+*storage* in ahead of their query paths. The roadmap is a storage-then-
+query split: v0.5/v0.6 below are the traces/profiles **query** verticals
+that closed that gap (see D-034). Order updated accordingly.
 
 | Milestone | Status | Deliverable |
 |-----------|--------|-------------|
@@ -135,10 +289,12 @@ v0.4. Order updated accordingly.
 | **v0.2**  | ✅     | Metrics ingest + query: per-block postings sidecar, ingest-side WAL+pipeline, DataFusion-backed CLI querier with row-group pruning, postings cache. |
 | **v0.3**  | ✅     | Query daemon (`scry-queryd`): binschema-framed remote query path (see D-031), shared between CLI and future tools. Streaming Arrow IPC batches with mid-stream resource errors. |
 | **v0.4**  | ✅     | Logs as the second real signal: stream-label postings (same shape as metrics), per-entry attributes as a `Map<Utf8,Utf8>` column, CLI `--signal logs`, signal byte on the query wire. Body-substring search deferred to its own tantivy phase. |
-| **v0.5**  | —      | Traces: trace-by-id lookup + simple span attribute filtering. |
-| **v0.6**  | —      | Profiles: pprof ingest, flamegraph aggregation over a time range. |
+| **gateway** | ✅   | Push-protocol front-end (`scry-gateway`): OTLP/HTTP traces, legacy Pyroscope `/ingest`, Prometheus remote-write → native wire. Traces + profiles storage paths land end to end. |
+| **v0.5**  | ✅     | Traces query: `--trace-id` by-id lookup (sorted-column pruning) + promoted resource-column matchers (`service.name`, …) + `SELECT *` round-trip. Predicate pushdown, no postings. |
+| **v0.6**  | ✅     | Profiles query: retrieval by time + label, raw pprof blob streamed back loss-free. Flamegraph aggregation deferred (Grafana renders pre-aggregated data — backend work for when a UI consumes it). |
 | **v0.7**  | —      | PromQL surface on top of the metrics path, plus the tantivy-backed full-text phase for logs. |
 | **v0.8**  | —      | Compaction, retention, and operational hardening across all signals. |
+| later     | —      | Profiles flamegraph aggregation (pprof parse + stack-merge → flame-tree for a UI). |
 | **v1.0**  | —      | Grafana datasource adapters (or our own minimal UI — TBD). |
 
 ## License

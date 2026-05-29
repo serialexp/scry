@@ -161,6 +161,8 @@ mod tests {
             sql: String::new(),
             limit: 0,
             request_id: String::new(),
+            // Empty = absent (traces-only by-id lookup).
+            trace_id: Vec::new(),
         };
         let frame = QueryFrame {
             msg: QueryFrameMsg::QueryRequest(req.clone().into()),

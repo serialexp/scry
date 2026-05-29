@@ -63,8 +63,14 @@ use scry_query::{
     logs::{
         list_logs_candidates, register_logs_table_from_candidates, LOGS_TABLE_NAME,
     },
-    register_metrics_table_from_candidates, PostingsCache, PostingsCacheStats, QueryRequest,
-    METRICS_TABLE_NAME,
+    profiles::{
+        list_profiles_candidates, register_profiles_table_from_candidates, PROFILES_TABLE_NAME,
+    },
+    register_metrics_table_from_candidates,
+    traces::{
+        list_traces_candidates, register_traces_table_from_candidates, TRACES_TABLE_NAME,
+    },
+    PostingsCache, PostingsCacheStats, QueryRequest, METRICS_TABLE_NAME,
 };
 use scry_catalog::CatalogEntry;
 use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
@@ -243,12 +249,17 @@ impl QueryService {
         // QUERY_ERR_BAD_REQUEST than rope it through the rest of
         // the pipeline.
         let signal = match Signal::from_u8(req.signal) {
-            Some(s @ (Signal::Metrics | Signal::Logs)) => s,
+            Some(
+                s @ (Signal::Metrics | Signal::Logs | Signal::Traces | Signal::Profiles),
+            ) => s,
             Some(other) => {
                 let _ = emit_stream_error(
                     &mut wr,
                     QUERY_ERR_BAD_REQUEST,
-                    format!("signal {other:?} has no query table at v0.4 (expected metrics or logs)"),
+                    format!(
+                        "signal {other:?} has no query table \
+                         (expected metrics, logs, traces, or profiles)"
+                    ),
                 )
                 .await;
                 let _ = wr.flush().await;
@@ -258,7 +269,11 @@ impl QueryService {
                 let _ = emit_stream_error(
                     &mut wr,
                     QUERY_ERR_BAD_REQUEST,
-                    format!("unknown signal byte {} (expected 1=metrics, 2=logs)", req.signal),
+                    format!(
+                        "unknown signal byte {} \
+                         (expected 1=metrics, 2=logs, 3=traces, 4=profiles)",
+                        req.signal
+                    ),
                 )
                 .await;
                 let _ = wr.flush().await;
@@ -338,6 +353,10 @@ impl QueryService {
                     .map_err(|e| format!("list_metrics_candidates: {e:#}")),
                 Signal::Logs => list_logs_candidates(&guard, &req.query)
                     .map_err(|e| format!("list_logs_candidates: {e:#}")),
+                Signal::Traces => list_traces_candidates(&guard, &req.query)
+                    .map_err(|e| format!("list_traces_candidates: {e:#}")),
+                Signal::Profiles => list_profiles_candidates(&guard, &req.query)
+                    .map_err(|e| format!("list_profiles_candidates: {e:#}")),
                 // Unreachable: handle_connection rejects other signals
                 // before reaching run_query.
                 other => Err(format!("BUG: unsupported signal {other:?} reached run_query")),
@@ -375,6 +394,26 @@ impl QueryService {
                 )
                 .await
             }
+            Signal::Traces => {
+                register_traces_table_from_candidates(
+                    &ctx,
+                    candidates,
+                    self.store.clone(),
+                    Some(self.postings_cache.as_ref()),
+                    &req.query,
+                )
+                .await
+            }
+            Signal::Profiles => {
+                register_profiles_table_from_candidates(
+                    &ctx,
+                    candidates,
+                    self.store.clone(),
+                    Some(self.postings_cache.as_ref()),
+                    &req.query,
+                )
+                .await
+            }
             other => {
                 Err(anyhow::anyhow!("BUG: unsupported signal {other:?} reached run_query"))
             }
@@ -402,6 +441,8 @@ impl QueryService {
         let default_table = match signal {
             Signal::Metrics => METRICS_TABLE_NAME,
             Signal::Logs => LOGS_TABLE_NAME,
+            Signal::Traces => TRACES_TABLE_NAME,
+            Signal::Profiles => PROFILES_TABLE_NAME,
             // Unreachable: see above guards.
             _ => METRICS_TABLE_NAME,
         };

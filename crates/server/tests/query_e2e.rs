@@ -36,19 +36,21 @@
 
 use std::sync::{Arc, Mutex};
 
-use arrow::array::{Int64Array, UInt64Array};
+use arrow::array::{Array, FixedSizeBinaryArray, Int64Array, UInt64Array};
 use arrow::buffer::Buffer;
 use arrow::record_batch::RecordBatch;
 use arrow_ipc::reader::StreamDecoder;
 use datafusion::execution::memory_pool::GreedyMemoryPool;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use object_store::{memory::InMemory, ObjectStore};
-use scry_block::{BlockBuilder, BlockBuilderConfig, LogsBlockBuilder, MetricsBlockBuilder};
+use scry_block::{
+    BlockBuilder, BlockBuilderConfig, LogsBlockBuilder, MetricsBlockBuilder, TracesBlockBuilder,
+};
 use scry_catalog::Catalog;
 use scry_objstore::BufPool;
 use scry_proto::framing::{read_frame, write_frame};
 use scry_proto::constants::Signal;
-use scry_proto::streaming::{LogsAppender, MetricsAppender};
+use scry_proto::streaming::{DecodedSpan, LogsAppender, MetricsAppender, TracesAppender};
 use scry_proto::{QueryFrame, QueryFrameMsg};
 use scry_query::{PostingsCache, Query, QueryRequest};
 use scry_server::QueryService;
@@ -273,6 +275,7 @@ async fn query_round_trip() {
             matchers: vec![("__name__".into(), "foo".into())],
             ts_min: None,
             ts_max: None,
+            trace_id: None,
         },
         sql: None,
         limit: None,
@@ -349,6 +352,7 @@ async fn query_round_trip() {
             matchers: vec![("__name__".into(), "foo".into())],
             ts_min: None,
             ts_max: None,
+            trace_id: None,
         },
         sql: None,
         limit: None,
@@ -498,6 +502,7 @@ async fn logs_round_trip() {
             matchers: vec![("service".into(), "api".into())],
             ts_min: None,
             ts_max: None,
+            trace_id: None,
         },
         sql: None,
         limit: None,
@@ -565,6 +570,177 @@ async fn logs_round_trip() {
         "default SELECT * over the logs block must include every entry"
     );
     assert_eq!(result_all.server_total_rows, 60);
+
+    // ── Clean shutdown ─────────────────────────────────────────────
+    let _ = shutdown_tx.send(());
+    serve_handle.await.expect("serve task join").unwrap();
+}
+
+// Traces end-to-end over the daemon. Proves the `Signal::Traces` arm of
+// the QueryService dispatch (candidate listing + table registration +
+// default-table resolution) and — crucially — that `query.trace_id`
+// survives the binschema wire round-trip and prunes to exactly one
+// trace's spans on the server. Traces carry no postings sidecar, so the
+// matcher / trace-id / time filters are pushed as parquet row predicates;
+// this is the remote counterpart to the local `scry-query` smoke leg.
+fn append_test_span(
+    b: &mut TracesBlockBuilder,
+    trace_id: &[u8; 16],
+    span_id: &[u8; 8],
+    service_name: &str,
+    start: u64,
+) {
+    let resource_labels: Vec<(Vec<u8>, Vec<u8>)> =
+        vec![(b"service.name".to_vec(), service_name.as_bytes().to_vec())];
+    let span = DecodedSpan {
+        trace_id: &trace_id[..],
+        span_id: &span_id[..],
+        parent_span_id: None,
+        resource_labels: &resource_labels,
+        scope_name: b"test-scope",
+        scope_version: b"1.0",
+        name: b"op",
+        kind: 1,
+        start_unix_nano: start,
+        end_unix_nano: start + 1_000,
+        status_code: 0,
+        status_message: b"",
+        attributes: &[],
+        events: &[],
+        links: &[],
+    };
+    b.append_span(&span);
+}
+
+#[tokio::test]
+async fn traces_round_trip() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let writer = Uuid::now_v7();
+
+    // ── Plant one traces block: trace A (3 spans, service=api) +
+    //    trace B (2 spans, service=db) = 5 spans total. ──────────────
+    let trace_a: [u8; 16] = [0xAA; 16];
+    let trace_b: [u8; 16] = [0xBB; 16];
+    let mut block = <TracesBlockBuilder as BlockBuilder>::new(writer, test_cfg());
+    append_test_span(&mut block, &trace_a, &[0x01; 8], "api", 5_000_000);
+    append_test_span(&mut block, &trace_a, &[0x02; 8], "api", 5_000_100);
+    append_test_span(&mut block, &trace_a, &[0x03; 8], "api", 5_000_200);
+    append_test_span(&mut block, &trace_b, &[0x04; 8], "db", 5_000_300);
+    append_test_span(&mut block, &trace_b, &[0x05; 8], "db", 5_000_400);
+    let meta = block
+        .finish_and_upload(store.as_ref())
+        .await
+        .unwrap()
+        .expect("traces block non-empty");
+    assert_eq!(meta.row_count, 5);
+    assert_eq!(meta.signal, "traces");
+    // Traces carry no postings sidecar.
+    assert!(!meta.has_postings, "traces blocks must not carry postings");
+
+    // ── Catalog + service ──────────────────────────────────────────
+    let tmp = TempDir::new().unwrap();
+    let catalog = Catalog::open(&tmp.path().join("cat.sqlite"), BUCKET).unwrap();
+    assert!(catalog.insert_block(&meta).unwrap());
+
+    let pool = BufPool::new();
+    let postings_cache = Arc::new(PostingsCache::with_budget_bytes(16 * 1024 * 1024));
+    let memory_pool = Arc::new(GreedyMemoryPool::new(256 * 1024 * 1024));
+    let runtime_env = Arc::new(
+        RuntimeEnvBuilder::new()
+            .with_memory_pool(memory_pool.clone())
+            .build()
+            .expect("build RuntimeEnv"),
+    );
+    let service = Arc::new(QueryService::new(
+        Arc::new(Mutex::new(catalog)),
+        store.clone(),
+        pool,
+        postings_cache.clone(),
+        runtime_env,
+        memory_pool,
+    ));
+
+    let bind = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let svc_for_task = service.clone();
+    let probe = tokio::net::TcpListener::bind(bind).await.unwrap();
+    let listen_addr = probe.local_addr().unwrap();
+    drop(probe);
+    let serve_handle = tokio::spawn(async move {
+        svc_for_task
+            .serve_with_shutdown(listen_addr, async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // ── Default SELECT * → all 5 spans ─────────────────────────────
+    let req_all = QueryRequest {
+        signal: Signal::Traces as u8,
+        query: Query::default(),
+        sql: None,
+        limit: None,
+        request_id: Some("traces-default".into()),
+    };
+    let result_all = run_query(listen_addr, req_all).await;
+    assert_eq!(
+        total_rows(&result_all.batches),
+        5,
+        "default SELECT * over the traces block must include every span"
+    );
+    assert_eq!(result_all.server_total_rows, 5);
+
+    // ── trace_id A (over the wire) → exactly trace A's 3 spans ─────
+    let req_by_id = QueryRequest {
+        signal: Signal::Traces as u8,
+        query: Query {
+            trace_id: Some(trace_a),
+            ..Default::default()
+        },
+        sql: None,
+        limit: None,
+        request_id: Some("traces-by-id".into()),
+    };
+    let result_by_id = run_query(listen_addr, req_by_id).await;
+    assert_eq!(
+        total_rows(&result_by_id.batches),
+        3,
+        "trace_id=A must prune to A's 3 spans only"
+    );
+    assert_eq!(result_by_id.server_total_rows, 3);
+    // Every returned trace_id must be A — proves the FixedSizeBinary
+    // predicate filtered, not just that the count happened to match.
+    for b in &result_by_id.batches {
+        let col = b.schema().index_of("trace_id").unwrap();
+        let arr = b
+            .column(col)
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .expect("trace_id column is FixedSizeBinary");
+        for i in 0..arr.len() {
+            assert_eq!(arr.value(i), &trace_a[..], "by-id row carries a non-A trace_id");
+        }
+    }
+
+    // ── Promoted matcher service.name=db → trace B's 2 spans ───────
+    let req_matcher = QueryRequest {
+        signal: Signal::Traces as u8,
+        query: Query {
+            matchers: vec![("service.name".into(), "db".into())],
+            ..Default::default()
+        },
+        sql: None,
+        limit: None,
+        request_id: Some("traces-matcher".into()),
+    };
+    let result_matcher = run_query(listen_addr, req_matcher).await;
+    assert_eq!(
+        total_rows(&result_matcher.batches),
+        2,
+        "service.name=db must select only trace B's 2 spans"
+    );
+    assert_eq!(result_matcher.server_total_rows, 2);
 
     // ── Clean shutdown ─────────────────────────────────────────────
     let _ = shutdown_tx.send(());

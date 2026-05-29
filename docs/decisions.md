@@ -991,14 +991,91 @@ Deferred from v0.4 to later, unchanged:
   one-row-per-sample) — see Deferred / open; decide as v0.5/v0.6 design
   starts.
 
+## D-034: traces + profiles query verticals (v0.5 / v0.6) — complete
+
+**Date:** 2026-05-29
+**Status:** accepted
+
+scry stored all four signals before it could query all four. Traces and
+profiles ingest + block storage landed ahead of their query paths (the
+traces/profiles `BlockBuilder`s + the `scry-gateway` foreign-protocol
+push front-end shipped as unnumbered milestones between D-033 and here),
+so for a window the catalog held traces/profiles blocks that no query
+table could read — `query_service.rs` accepted only `Signal::Metrics |
+Signal::Logs`, and `scry-query --signal` rejected the rest. This decision
+lights up the **query** side for both and renumbers the roadmap to a
+storage-then-query split: **v0.5 = traces query, v0.6 = profiles
+retrieval query.**
+
+**Scope, traces (v0.5):**
+
+- `SELECT *` round-trip + the shared `(matchers, ts_min, ts_max)` `Query`
+  preselect, plus a dedicated **`--trace-id <hex>`** by-id lookup (a new
+  `trace_id: Option<[u8;16]>` field on `Query` and a `trace_id` bytes
+  field on the wire `QueryRequest`; empty = absent, same sentinel as
+  `sql`). The block is sorted by `trace_id`, so the by-id equality on the
+  `FixedSizeBinary(16)` column prunes via row-group min/max stats.
+- Promoted resource columns (`service.name`, `service.namespace`,
+  `deployment.environment[.name]`) are first-class `--matcher` targets;
+  any other matcher key is **rejected up front** (pointing the user at
+  `--sql`) rather than silently ignored, which would over-return rows.
+
+**Scope, profiles (v0.6):** retrieval only — select profile rows by time
+(and, via `--sql`, by label against the `labels` Map) and stream them
+back including the raw pprof `data` blob, loss-free like logs. Label
+matchers are rejected up front for the same reason as traces' unknown
+keys.
+
+**No postings for either.** Unlike metrics/logs, traces/profiles blocks
+carry no postings sidecar (`has_postings = false`). Their query modules
+(`crates/query/src/{traces,profiles}.rs`, mirroring `logs.rs`) skip the
+postings resolve entirely; matcher / trace-id / time filters become
+DataFusion **row-filter predicates** pushed into `ParquetSource`
+(`with_predicate` + `with_pushdown_filters(true)`), and row-group
+statistics do the pruning. The query-side schemas reuse the block
+writers' `main_schema()` verbatim, so the registered table type can never
+drift from the on-disk parquet type.
+
+**Seal.** `scripts/smoke.sh` now runs its query round-trip leg for
+`SIGNAL=traces` and `SIGNAL=profiles` (and all four under `SIGNAL=all`):
+reconcile a fresh catalog, drive `scry-query --signal <sig>`, assert the
+scanned row count equals the sink-accepted count. For traces it
+additionally picks the densest `trace_id` from the landed block (hex via
+DataFusion's `encode()`) and asserts a `--trace-id` lookup returns
+exactly that trace's spans — proving the predicate prunes, not just that
+the count happens to match. The remote (`scry-queryd`) path is covered by
+`crates/server/tests/query_e2e.rs::traces_round_trip`, which proves the
+`Signal::Traces` daemon dispatch and that `trace_id` survives the
+binschema wire round-trip into a server-side prune.
+
+**Profiles payload schema — decided.** The "native pprof vs. denormalised
+one-row-per-sample" open question (below, from v0.4) is resolved in favour
+of **one row per profile blob with the pprof carried as an opaque
+`Binary` column** (`ts_unix_nano`, `duration_nano`, `labels` Map,
+`format` u8, `data` Binary). Rationale: nothing in scry parses pprof yet,
+and retrieval round-trips the blob untouched.
+
+**Flamegraph aggregation — deferred.** Parsing pprof and merging stacks
+over a time range into a flame-tree is explicitly *not* in v0.6. Grafana's
+flamegraph panel renders *pre-aggregated* data — the Pyroscope/Phlare
+backend parses pprof and merges stacks server-side; the UI never parses
+raw pprof. So aggregation is backend/query work, but with no UI and no
+query language consuming it yet, retrieval is the useful step. Aggregation
+becomes its own stage (needs a pprof-parser dep + the nested-set output a
+UI consumes) when something consumes it.
+
+Deferred elsewhere, unchanged: PromQL + full-text/body-substring logs
+search (v0.7), compaction/retention (v0.8).
+
 ## Deferred / open
 
 These are not decisions yet; they're flagged for "we'll decide when the
 constraint shows up":
 
-- **Profiles payload schema.** Native pprof vs. denormalised
-  one-row-per-sample. Not decided during v0.4 (logs needed no payload-
-  schema choice); decide as v0.6 profiles design starts.
+- **Profiles flamegraph aggregation.** pprof parse + stack-merge over a
+  time range → the flame-tree shape a UI consumes. Deferred from v0.6 by
+  D-034 (Grafana renders pre-aggregated data; nothing consumes it yet).
+  Becomes its own stage when a UI / query language lands.
 - **High-cardinality metrics index.** Per-block label-fingerprint blooms
   may suffice; if not, we add a sketch (HLL? cuckoo filter?) — decide
   based on measurement during v0.5.

@@ -50,18 +50,46 @@ node "$CLI" generate --language rust --schema "$QUERY_SCHEMA" --out "$TMP_QUERY"
 # diverge it's a bug in the generator (or a sign that the runtime has
 # acquired schema-specific knowledge); fail loudly rather than silently
 # overwriting one set with the other.
-for f in lib.rs bitstream.rs context.rs; do
-  if ! cmp -s "$TMP_INGEST/binschema_runtime/src/$f" "$TMP_QUERY/binschema_runtime/src/$f"; then
+#
+# We enumerate whatever `.rs` files the generator emits rather than
+# hardcoding the set — the runtime has grown modules over time (e.g.
+# `codecs.rs`), and a hardcoded list silently drops new files, leaving
+# `lib.rs` referencing a `mod` that was never vendored.
+INGEST_RT="$TMP_INGEST/binschema_runtime/src"
+QUERY_RT="$TMP_QUERY/binschema_runtime/src"
+runtime_files=()
+for path in "$INGEST_RT"/*.rs; do
+  runtime_files+=("$(basename "$path")")
+done
+
+for f in "${runtime_files[@]}"; do
+  if [[ ! -f "$QUERY_RT/$f" ]]; then
+    echo "error: binschema runtime ($f) present for ingest but not query — generator bug?" >&2
+    exit 1
+  fi
+  if ! cmp -s "$INGEST_RT/$f" "$QUERY_RT/$f"; then
     echo "error: binschema runtime ($f) differs between schemas — generator bug?" >&2
-    diff -u "$TMP_INGEST/binschema_runtime/src/$f" "$TMP_QUERY/binschema_runtime/src/$f" >&2 || true
+    diff -u "$INGEST_RT/$f" "$QUERY_RT/$f" >&2 || true
+    exit 1
+  fi
+done
+# Guard the other direction too: a file only the query run emits would
+# otherwise be silently skipped.
+for path in "$QUERY_RT"/*.rs; do
+  f="$(basename "$path")"
+  if [[ ! -f "$INGEST_RT/$f" ]]; then
+    echo "error: binschema runtime ($f) present for query but not ingest — generator bug?" >&2
     exit 1
   fi
 done
 
-echo "copying runtime  -> crates/binschema-runtime/src/"
-cp "$TMP_INGEST/binschema_runtime/src/lib.rs"       "$ROOT/crates/binschema-runtime/src/lib.rs"
-cp "$TMP_INGEST/binschema_runtime/src/bitstream.rs" "$ROOT/crates/binschema-runtime/src/bitstream.rs"
-cp "$TMP_INGEST/binschema_runtime/src/context.rs"   "$ROOT/crates/binschema-runtime/src/context.rs"
+echo "copying runtime  -> crates/binschema-runtime/src/ (${runtime_files[*]})"
+# Drop any stale vendored runtime files the generator no longer emits,
+# so a removed module can't linger and shadow the fresh set.
+rm -f "$ROOT/crates/binschema-runtime/src"/*.rs
+for f in "${runtime_files[@]}"; do
+  cp "$INGEST_RT/$f" "$ROOT/crates/binschema-runtime/src/$f"
+done
 
 echo "copying generated -> crates/proto/src/generated.rs"
 cp "$TMP_INGEST/src/generated.rs" "$ROOT/crates/proto/src/generated.rs"

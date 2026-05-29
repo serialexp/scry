@@ -77,7 +77,10 @@ use scry_proto::{
 };
 use scry_query::{
     logs::{register_logs_table, LOGS_TABLE_NAME},
-    register_metrics_table, Query, QueryRequest, METRICS_TABLE_NAME,
+    profiles::{register_profiles_table, PROFILES_TABLE_NAME},
+    register_metrics_table,
+    traces::{register_traces_table, TRACES_TABLE_NAME},
+    Query, QueryRequest, METRICS_TABLE_NAME,
 };
 use tokio::io::{BufReader as TokioBufReader, BufWriter as TokioBufWriter};
 use tokio::net::TcpStream;
@@ -106,10 +109,11 @@ struct Args {
     #[arg(long = "matcher", value_parser = parse_matcher)]
     matchers: Vec<(String, String)>,
 
-    /// Target signal: `metrics` (default) or `logs`. Drives the
-    /// table name (`metrics` vs `logs`) and the per-signal postings
-    /// layer. Required when querying logs; metrics is the default
-    /// because it's been the only signal until v0.4.
+    /// Target signal: `metrics` (default), `logs`, `traces`, or
+    /// `profiles`. Drives the table name and the per-signal postings
+    /// layer (metrics/logs have postings; traces/profiles push matcher
+    /// and time filters as row predicates instead). metrics is the
+    /// default because it was the only signal until v0.4.
     #[arg(long, value_parser = parse_signal, default_value = "metrics")]
     signal: CliSignal,
 
@@ -128,11 +132,22 @@ struct Args {
     limit: Option<usize>,
 
     /// Arbitrary SQL against the registered table for the chosen
-    /// signal (`metrics` or `logs`). The matcher / time flags
-    /// still apply as a *preselect* — the SQL runs against the
-    /// already-narrowed table.
+    /// signal (`metrics`, `logs`, `traces`, `profiles`). The matcher /
+    /// time flags still apply as a *preselect* — the SQL runs against
+    /// the already-narrowed table. For traces/profiles, arbitrary
+    /// attribute/label filtering (Map element access) lives here until
+    /// the query language lands; promoted trace columns
+    /// (`service_name` etc.) get first-class `--matcher` support.
     #[arg(long)]
     sql: Option<String>,
+
+    /// Look up a single trace by its 32-hex-character (16-byte) id.
+    /// Traces-only; implies `--signal traces`. Blocks are sorted by
+    /// `trace_id`, so this prunes to the row group(s) holding the
+    /// trace and returns only that trace's spans. Combine with `--sql`
+    /// for further shaping.
+    #[arg(long = "trace-id", value_parser = parse_trace_id)]
+    trace_id: Option<[u8; 16]>,
 
     /// Print the produced physical plan to stderr after execution.
     /// Useful for verifying pushdown / pruning behaviour.
@@ -208,9 +223,11 @@ impl CliSignal {
         match self.0 {
             Signal::Metrics => METRICS_TABLE_NAME,
             Signal::Logs => LOGS_TABLE_NAME,
-            // Traces/profiles/dummy don't have query tables yet —
-            // parse_signal rejects them before we ever hit this.
-            _ => "<unsupported>",
+            Signal::Traces => TRACES_TABLE_NAME,
+            Signal::Profiles => PROFILES_TABLE_NAME,
+            // Dummy has no query table — parse_signal rejects it
+            // before we ever hit this.
+            Signal::Dummy => "<unsupported>",
         }
     }
 }
@@ -219,10 +236,32 @@ fn parse_signal(raw: &str) -> Result<CliSignal, String> {
     match raw.to_ascii_lowercase().as_str() {
         "metrics" => Ok(CliSignal(Signal::Metrics)),
         "logs" => Ok(CliSignal(Signal::Logs)),
+        "traces" => Ok(CliSignal(Signal::Traces)),
+        "profiles" => Ok(CliSignal(Signal::Profiles)),
         other => Err(format!(
-            "unknown signal `{other}` (supported at v0.4: metrics, logs)"
+            "unknown signal `{other}` (supported: metrics, logs, traces, profiles)"
         )),
     }
+}
+
+/// Parse a 32-hex-character trace id into 16 raw bytes. Accepts an
+/// optional `0x` prefix; rejects any length other than 16 bytes so the
+/// FixedSizeBinary(16) predicate is always well-formed.
+fn parse_trace_id(raw: &str) -> Result<[u8; 16], String> {
+    let hex = raw.strip_prefix("0x").unwrap_or(raw);
+    if hex.len() != 32 {
+        return Err(format!(
+            "trace id `{raw}` must be 32 hex characters (16 bytes), got {}",
+            hex.len()
+        ));
+    }
+    let mut out = [0u8; 16];
+    for (i, byte) in out.iter_mut().enumerate() {
+        let pair = &hex[i * 2..i * 2 + 2];
+        *byte = u8::from_str_radix(pair, 16)
+            .map_err(|_| format!("trace id `{raw}` has non-hex characters"))?;
+    }
+    Ok(out)
 }
 
 #[tokio::main]
@@ -235,10 +274,26 @@ async fn main() -> Result<()> {
         .init();
     let args = Args::parse();
 
+    // `--trace-id` is a traces-only operation. If the user passed it
+    // without an explicit `--signal traces`, infer the signal; if they
+    // explicitly asked for a *different* signal, that's a usage error.
+    let signal = if args.trace_id.is_some() {
+        match args.signal.0 {
+            Signal::Traces => args.signal,
+            Signal::Metrics => CliSignal(Signal::Traces), // default → infer traces
+            other => {
+                anyhow::bail!("--trace-id is only valid with --signal traces (got {other:?})")
+            }
+        }
+    } else {
+        args.signal
+    };
+
     let q = Query {
         matchers: args.matchers.clone(),
         ts_min: args.from,
         ts_max: args.until,
+        trace_id: args.trace_id,
     };
 
     // ── Remote mode short-circuit ──────────────────────────────────
@@ -248,7 +303,7 @@ async fn main() -> Result<()> {
     // degenerate trailer. Per-block scan stats live in the daemon's
     // `scan_complete` log event.
     if let Some(addr) = args.remote.as_deref() {
-        return run_remote(addr, args.signal, q, args.sql.clone(), args.limit).await;
+        return run_remote(addr, signal, q, args.sql.clone(), args.limit).await;
     }
 
     let cfg = ObjStoreConfig::from_env()
@@ -291,10 +346,12 @@ async fn main() -> Result<()> {
     // signal so `scry-query --signal logs ...` registers `logs`
     // instead of `metrics`.
     let ctx = SessionContext::new();
-    let table_name = args.signal.table_name();
-    match args.signal.0 {
+    let table_name = signal.table_name();
+    match signal.0 {
         Signal::Metrics => register_metrics_table(&ctx, &catalog, store, &q).await?,
         Signal::Logs => register_logs_table(&ctx, &catalog, store, &q).await?,
+        Signal::Traces => register_traces_table(&ctx, &catalog, store, &q).await?,
+        Signal::Profiles => register_profiles_table(&ctx, &catalog, store, &q).await?,
         other => anyhow::bail!("CLI signal {other:?} has no query table yet"),
     }
 

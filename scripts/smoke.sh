@@ -24,12 +24,14 @@
 #                                        #  block with has_postings=1 —
 #                                        #  logs gets the same stream-
 #                                        #  level postings as metrics)
-#   SIGNAL=traces  ./scripts/smoke.sh    # v0.5 storage path (storage-
-#                                        #  only: blocks-landed +
-#                                        #  reconciled-rows == accepted;
-#                                        #  no query leg)
-#   SIGNAL=profiles ./scripts/smoke.sh   # v0.6 storage path (storage-
-#                                        #  only, opaque pprof blob)
+#   SIGNAL=traces  ./scripts/smoke.sh    # v0.5 path (asserts query
+#                                        #  round-trip: SELECT * rows ==
+#                                        #  accepted, plus a --trace-id
+#                                        #  by-id lookup returns exactly
+#                                        #  that trace's spans)
+#   SIGNAL=profiles ./scripts/smoke.sh   # v0.6 path (asserts retrieval
+#                                        #  round-trip: SELECT * rows ==
+#                                        #  accepted; raw pprof blob out)
 #   SIGNAL=both    ./scripts/smoke.sh    # v0.4 cross-signal: spew
 #                                        #  metrics + logs through the
 #                                        #  same sink, assert both
@@ -40,8 +42,8 @@
 #                                        #  logs, traces, profiles)
 #                                        #  through one sink; per-signal
 #                                        #  loss-free + block-shape
-#                                        #  assertions; query leg for
-#                                        #  metrics/logs only.
+#                                        #  assertions; query leg for all
+#                                        #  four + the --trace-id lookup.
 #
 # Records-per-batch and the connection-summary counter parsed from
 # scry-ingestd's log are signal-specific. The per-signal record
@@ -112,7 +114,7 @@ case "$SIGNAL" in
         # (metrics, logs, traces, profiles) through one connection, so
         # over a long run each gets ≈ BATCHES/4 batches. Like `both`,
         # per-signal assertions live under "── Verify ──"; the query leg
-        # runs for metrics/logs only (traces/profiles are storage-only).
+        # now runs for all four signals, plus the --trace-id by-id lookup.
         RECORDS_PER_BATCH=0          # not meaningful in cross-signal mode
         SUMMARY_TAG=""               # parsed per-signal below
         ;;
@@ -398,11 +400,12 @@ if [[ ${#expect_postings_for[@]} -gt 0 ]]; then
     done
 fi
 
-# Storage-only signals (traces/profiles) in `all` mode: assert ≥1 block
-# landed and that it carries NO postings sidecar (has_postings=0). Single
-# traces/profiles runs assert this implicitly via blocks-landed +
-# row-count == accepted, same as dummy; here we make the no-postings
-# invariant explicit since sqlite3 is already required.
+# No-postings signals (traces/profiles) in `all` mode: assert ≥1 block
+# landed and that it carries NO postings sidecar (has_postings=0) — these
+# signals push matcher/time/trace-id filters as row predicates instead of
+# resolving postings. Single traces/profiles runs assert blocks-landed
+# via the query round-trip above; here we make the no-postings invariant
+# explicit since sqlite3 is already required.
 if [[ "$SIGNAL" == "all" ]]; then
     for sig in traces profiles; do
         sig_blocks=$(sqlite3 "$SMOKE_DIR/recon.sqlite" \
@@ -428,17 +431,21 @@ fi
 # scanned row count equals what the bucket holds for that signal —
 # proving the ingest → store → query round-trip is loss-free.
 #
-# This leg only runs for signals that have a query table (metrics/logs/
-# both). dummy has no table; traces/profiles are storage-only in the
-# v0.5/v0.6 storage phase (trace-by-id lookup and flamegraph aggregation
-# are deferred to the query phases) — they assert blocks-landed +
-# reconciled-row-count == sink-accepted above, same as dummy.
-if [[ "$SIGNAL" == "metrics" || "$SIGNAL" == "logs" || "$SIGNAL" == "both" || "$SIGNAL" == "all" ]]; then
+# This leg runs for every signal that has a query table — all four real
+# signals now do (metrics, logs, traces, profiles). dummy has no table
+# and is excluded. traces/profiles came online as query verticals in
+# v0.5/v0.6: traces support `SELECT *` + matcher/time preselect +
+# `--trace-id` by-id lookup; profiles support retrieval by time (raw
+# pprof blob out). Flamegraph aggregation is still deferred (see
+# docs/decisions.md D-034).
+if [[ "$SIGNAL" != "dummy" ]]; then
     case "$SIGNAL" in
-        metrics) query_pairs=("metrics:$sink_accepted") ;;
-        logs)    query_pairs=("logs:$sink_accepted") ;;
-        both)    query_pairs=("metrics:$sink_metrics" "logs:$sink_logs") ;;
-        all)     query_pairs=("metrics:$sink_metrics" "logs:$sink_logs") ;;
+        metrics)  query_pairs=("metrics:$sink_accepted") ;;
+        logs)     query_pairs=("logs:$sink_accepted") ;;
+        traces)   query_pairs=("traces:$sink_accepted") ;;
+        profiles) query_pairs=("profiles:$sink_accepted") ;;
+        both)     query_pairs=("metrics:$sink_metrics" "logs:$sink_logs") ;;
+        all)      query_pairs=("metrics:$sink_metrics" "logs:$sink_logs" "traces:$sink_traces" "profiles:$sink_profiles") ;;
     esac
     for pair in "${query_pairs[@]}"; do
         sig="${pair%%:*}"
@@ -459,6 +466,55 @@ if [[ "$SIGNAL" == "metrics" || "$SIGNAL" == "logs" || "$SIGNAL" == "both" || "$
             failed=1
         fi
     done
+fi
+
+# ── Trace-by-id lookup (v0.5) ────────────────────────────────────────
+# The headline traces operation is "give me one trace." Prove the
+# `--trace-id` flag prunes to exactly that trace's spans and nothing
+# else. Pick the densest trace_id from the landed blocks (hex via
+# DataFusion's `encode()`), look it up by id, and assert the scanned
+# row count equals that trace's own span count — so the lookup returns
+# that trace and *only* that trace, not the whole table. `--trace-id`
+# implies `--signal traces`, so we deliberately omit `--signal` here to
+# exercise that inference too.
+if [[ "$SIGNAL" == "traces" || "$SIGNAL" == "all" ]]; then
+    ./target/release/scry-query \
+        --catalog "$SMOKE_DIR/recon.sqlite" \
+        --signal traces \
+        --show \
+        --sql "SELECT encode(trace_id, 'hex') AS tid, count(*) AS n FROM traces GROUP BY trace_id ORDER BY n DESC, tid LIMIT 1" \
+        > "$SMOKE_DIR/query.traceid-pick.txt" 2>&1 || true
+    # comfy_table output: border lines start with '+', header + data
+    # rows start with '|'. The 2nd '|'-row is the first data row.
+    read -r pick_tid pick_n < <(awk -F'|' '
+        /^\|/ {
+            cnt++
+            if (cnt == 2) {
+                gsub(/^[ \t]+|[ \t]+$/, "", $2)
+                gsub(/^[ \t]+|[ \t]+$/, "", $3)
+                print $2, $3
+                exit
+            }
+        }' "$SMOKE_DIR/query.traceid-pick.txt")
+    if [[ -z "${pick_tid:-}" || -z "${pick_n:-}" ]]; then
+        echo "[smoke] FAIL: could not extract a trace_id to look up"
+        echo "[smoke] pick query output:"
+        cat "$SMOKE_DIR/query.traceid-pick.txt"
+        failed=1
+    else
+        ./target/release/scry-query \
+            --catalog "$SMOKE_DIR/recon.sqlite" \
+            --trace-id "$pick_tid" \
+            > "$SMOKE_DIR/query.traceid.txt" 2>&1 || true
+        tid_rows=$(awk '/^# scan:/ { print $3; exit }' "$SMOKE_DIR/query.traceid.txt")
+        echo "[smoke] trace-id lookup    : ${pick_tid:0:16}… → ${tid_rows:-<none>} spans (expected $pick_n)"
+        if [[ "${tid_rows:-}" != "$pick_n" ]]; then
+            echo "[smoke] FAIL: --trace-id returned ${tid_rows:-<none>} spans, expected $pick_n (pruning/predicate bug)"
+            echo "[smoke] scry-query output:"
+            cat "$SMOKE_DIR/query.traceid.txt"
+            failed=1
+        fi
+    fi
 fi
 
 # Throughput observation: the sink's accepted count below

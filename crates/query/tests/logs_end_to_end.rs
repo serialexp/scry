@@ -174,6 +174,7 @@ async fn logs_querier_end_to_end() {
         matchers: vec![("service".into(), "api".into())],
         ts_min: None,
         ts_max: None,
+        trace_id: None,
     };
     let (batches, _plan) = run_query(&catalog, store.clone(), &q1).await;
     assert_eq!(total_rows(&batches), 200);
@@ -189,6 +190,7 @@ async fn logs_querier_end_to_end() {
         matchers: vec![("env".into(), "prod".into())],
         ts_min: None,
         ts_max: None,
+        trace_id: None,
     };
     let (batches, _plan) = run_query(&catalog, store.clone(), &q2).await;
     assert_eq!(total_rows(&batches), 400);
@@ -204,6 +206,7 @@ async fn logs_querier_end_to_end() {
         ],
         ts_min: None,
         ts_max: None,
+        trace_id: None,
     };
     let candidates = list_logs_candidates(&catalog, &q3).unwrap();
     let table = build_logs_table_from_candidates(candidates, store.clone(), None, &q3)
@@ -222,6 +225,7 @@ async fn logs_querier_end_to_end() {
         matchers: vec![("nonexistent".into(), "x".into())],
         ts_min: None,
         ts_max: None,
+        trace_id: None,
     };
     let (batches, _plan) = run_query(&catalog, store.clone(), &q4).await;
     assert_eq!(total_rows(&batches), 0);
@@ -244,6 +248,7 @@ async fn logs_querier_end_to_end() {
         matchers: vec![("env".into(), "prod".into())],
         ts_min: Some(2_000_050),
         ts_max: Some(2_000_150),
+        trace_id: None,
     };
     let candidates = list_logs_candidates(&catalog, &q6).unwrap();
     let table = build_logs_table_from_candidates(candidates, store.clone(), None, &q6)

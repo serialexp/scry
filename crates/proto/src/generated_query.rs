@@ -47,6 +47,10 @@ impl QueryFrameMsg {
                 for &b in string_bytes.iter() {
                     encoder.write_uint8(b);
                 }
+                encoder.write_uint16(v.trace_id.len() as u16, Endianness::BigEndian);
+                for item in &v.trace_id {
+                    encoder.write_uint8(*item);
+                }
             }
             QueryFrameMsg::SchemaMsg(v) => {
                 encoder.write_uint8(16);
@@ -161,6 +165,7 @@ pub struct QueryRequestInput {
     pub sql: std::string::String,
     pub limit: u64,
     pub request_id: std::string::String,
+    pub trace_id: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -175,6 +180,7 @@ pub struct QueryRequestOutput {
     pub sql: std::string::String,
     pub limit: u64,
     pub request_id: std::string::String,
+    pub trace_id: Vec<u8>,
 }
 
 pub type QueryRequest = QueryRequestOutput;
@@ -207,6 +213,10 @@ impl QueryRequestInput {
         let string_bytes: Vec<u8> = self.request_id.chars().map(|c| c as u8).collect();
         for &b in string_bytes.iter() {
             encoder.write_byte(b);
+        }
+        encoder.write_u16_be(self.trace_id.len() as u16);
+        for item in &self.trace_id {
+            encoder.write_byte(*item);
         }
         Ok(())
     }
@@ -242,6 +252,12 @@ impl QueryRequestOutput {
         let length = decoder.read_u16_be()? as usize;
         let bytes = decoder.read_bytes_vec(length)?;
         let request_id: std::string::String = bytes.iter().map(|&b| b as char).collect();
+        let length = decoder.read_u16_be()? as usize;
+        let mut trace_id = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = decoder.read_byte()?;
+            trace_id.push(item);
+        }
         Ok(Self {
             tag,
             signal,
@@ -253,6 +269,7 @@ impl QueryRequestOutput {
             sql,
             limit,
             request_id,
+            trace_id,
         })
     }
     pub fn encode(&self) -> Result<Vec<u8>> {
@@ -275,6 +292,7 @@ impl From<QueryRequestOutput> for QueryRequestInput {
             sql: o.sql,
             limit: o.limit,
             request_id: o.request_id,
+            trace_id: o.trace_id,
         }
     }
 }
@@ -292,6 +310,7 @@ impl From<QueryRequestInput> for QueryRequestOutput {
             sql: i.sql,
             limit: i.limit,
             request_id: i.request_id,
+            trace_id: i.trace_id,
         }
     }
 }

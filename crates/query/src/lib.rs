@@ -41,6 +41,8 @@
 pub mod logs;
 pub mod postings;
 pub mod postings_cache;
+pub mod profiles;
+pub mod traces;
 pub mod wire;
 mod table;
 
@@ -69,6 +71,20 @@ pub use logs::{
     register_logs_table, register_logs_table_from_candidates, LogsBlockEntry, LogsTable,
     LOGS_TABLE_NAME,
 };
+// Traces + profiles query verticals (v0.5 / v0.6). Same signal-prefixed
+// convenience re-exports as logs — these two have no postings sidecar,
+// so their `build_*` helpers skip the postings resolve entirely and the
+// catalog narrow + per-block scan is the whole story.
+pub use traces::{
+    build_traces_table_from_candidates, list_traces_candidates, register_traces_table,
+    register_traces_table_from_candidates, traces_query, TracesBlockEntry, TracesTable,
+    TRACES_TABLE_NAME,
+};
+pub use profiles::{
+    build_profiles_table_from_candidates, list_profiles_candidates, profiles_query,
+    register_profiles_table, register_profiles_table_from_candidates, ProfilesBlockEntry,
+    ProfilesTable, PROFILES_TABLE_NAME,
+};
 
 /// AND of equality matchers + optional time-range bounds. Shared
 /// across signals: at v0 both metrics and logs want exactly this
@@ -92,6 +108,15 @@ pub struct Query {
     pub matchers: Vec<(String, String)>,
     pub ts_min: Option<u64>,
     pub ts_max: Option<u64>,
+    /// Trace-by-id lookup, meaningful only for the traces signal. When
+    /// `Some`, [`crate::traces::TracesTable`] pushes an equality
+    /// predicate on the `trace_id` `FixedSizeBinary(16)` column (which
+    /// the block is sorted by, so row-group min/max stats prune to the
+    /// one block + row-group that holds the trace). Other signals ignore
+    /// it. This is the "new optional field everyone ignores" growth the
+    /// doc above predicted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<[u8; 16]>,
 }
 
 /// Default name the `MetricsTable` is registered under in a
