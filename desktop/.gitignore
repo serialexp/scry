@@ -1,0 +1,8 @@
+node_modules
+dist
+*.log
+
+# Rust / Tauri build artifacts
+src-tauri/target
+# Tauri codegen output (schemas, etc.) — regenerated on build
+src-tauri/gen

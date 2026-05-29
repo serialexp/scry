@@ -1,0 +1,31 @@
+[package]
+name = "scry-desktop"
+version = "0.1.0"
+description = "scry desktop query app"
+authors = ["serialexp"]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/serialexp/scry"
+
+# The library half is what Tauri's mobile/desktop entrypoints link against;
+# `main.rs` is a thin shim that calls `run()`.
+[lib]
+name = "scry_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Only the TCP + IO bits — the rest of the query protocol lives in
+# TypeScript. Tauri drives its own tokio runtime, so async commands run
+# on it without us building one.
+tokio = { version = "1", features = ["net", "io-util"] }
+
+[features]
+# This feature is used for production builds or when a dev server is not
+# specified, DO NOT REMOVE!!
+custom-protocol = ["tauri/custom-protocol"]

@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Capabilities for the main scry query window. Application commands (run_query) are always reachable; we only need the core defaults for window plumbing.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}
