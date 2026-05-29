@@ -21,6 +21,15 @@ spec:
         app: scry-server
     spec:
       terminationGracePeriodSeconds: 30
+      # The image runs as UID 65532 (distroless :nonroot). fsGroup makes the
+      # kubelet chown the /wal PVC to that group on mount, so the non-root
+      # process can write the WAL + SQLite catalog on a freshly provisioned
+      # volume.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
       containers:
         - name: scry-server
           image: serialexp/scry:latest

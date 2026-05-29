@@ -24,4 +24,13 @@ target "scry" {
   dockerfile = "Dockerfile"
   tags       = ["${IMAGE}:${TAG}"]
   platforms  = ["linux/amd64", "linux/arm64"]
+
+  # Supply-chain attestations: full provenance (build inputs/steps) + an SBOM.
+  # Satisfies Docker Scout's "supply chain attestation(s)" policy. These attach
+  # to the pushed OCI manifest index, so they require `--push` (the local docker
+  # image store can't hold them) — fine here, release builds always push.
+  attest = [
+    "type=provenance,mode=max",
+    "type=sbom",
+  ]
 }
