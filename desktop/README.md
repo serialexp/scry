@@ -72,6 +72,66 @@ Build a distributable bundle:
 bun run app:build    # cargo tauri build
 ```
 
+## Install
+
+`install.sh` is the user-facing installer (same shape as the `dbui`
+installer).
+
+**On this dev box, right now — build from source and install:**
+
+```bash
+desktop/install.sh --local
+```
+
+This compiles the release binary (`cargo tauri build --no-bundle`) and
+drops it at `~/.local/bin/scry-desktop` with an XDG desktop entry + icon,
+so "scry" shows up in your application menu. No root, and no AppImage
+bundle (which would need `librsvg2-dev` at bundle time) — the binary
+links against the system `webkit2gtk` already present. The server binary
+is `scry`; the app installs as `scry-desktop` so they don't collide.
+
+**From a published release (any machine):**
+
+```bash
+desktop/install.sh
+```
+
+Detects the platform and installs the latest published `desktop-v*`
+GitHub release — AppImage (preferred) or `.deb` on Linux, `.dmg` on
+macOS, `.msi` instructions on Windows.
+
+## Releases / CI
+
+`.github/workflows/release-desktop.yml` builds the per-platform bundles
+with [`tauri-apps/tauri-action`](https://github.com/tauri-apps/tauri-action)
+across a macOS (arm + intel) / Ubuntu / Windows matrix and attaches them
+to a **draft** GitHub Release. (The core server crates are not built here
+— they're a separate Docker pipeline, and the desktop crate is excluded
+from the cargo workspace.)
+
+The jobs run on **[Depot](https://depot.dev) GitHub Actions runners**
+(`depot-ubuntu-22.04`, `depot-macos-latest`, `depot-windows-latest`).
+This requires a **one-time, dashboard-only** step: connect the `serialexp`
+GitHub org to Depot (install the Depot GitHub App + enable runners). Until
+that's done, `depot-*` jobs queue with no runner. Runners are an
+org-level Depot feature, independent of the `depot.json` project id (which
+only governs container builds / `depot bake`). Depot's macOS runners are
+Apple Silicon only, so the Intel `.dmg` is cross-compiled from the ARM
+runner — both Mac architectures still ship. To fall back to GitHub-hosted
+runners, drop the `depot-` prefix from each `runs-on` label.
+
+To cut a release:
+
+```bash
+git tag desktop-v0.1.0
+git push origin desktop-v0.1.0   # → workflow runs, creates a draft release
+```
+
+Review the draft's assets, then publish it. `install.sh` (release mode)
+pulls the latest *published* `desktop-v*` release, so it only sees it
+once published. The Ubuntu runner `apt install`s `libwebkit2gtk-4.1-dev`
++ `librsvg2-dev` so the AppImage actually bundles there.
+
 ## Regenerating the protocol bindings
 
 After changing `proto/query.schema.json`:
