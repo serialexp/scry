@@ -18,11 +18,15 @@ mod dummy;
 pub mod logs;
 mod meta;
 pub mod metrics;
+pub mod profiles;
+pub mod traces;
 
 pub use dummy::DummyBlockBuilder;
 pub use logs::LogsBlockBuilder;
 pub use meta::BlockMeta;
 pub use metrics::MetricsBlockBuilder;
+pub use profiles::ProfilesBlockBuilder;
+pub use traces::TracesBlockBuilder;
 
 use anyhow::Result;
 use bytes::Bytes;

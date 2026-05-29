@@ -7,8 +7,10 @@
 //! flushes the pipeline once before returning.
 
 use anyhow::{Context, Result};
-use binschema_runtime::{BitOrder, BitStreamDecoder};
-use scry_block::{BlockBuilder, DummyBlockBuilder, LogsBlockBuilder, MetricsBlockBuilder};
+use scry_block::{
+    BlockBuilder, DummyBlockBuilder, LogsBlockBuilder, MetricsBlockBuilder, ProfilesBlockBuilder,
+    TracesBlockBuilder,
+};
 use scry_proto::{
     build,
     constants::{
@@ -20,7 +22,7 @@ use scry_proto::{
         SIGNAL_BIT_TRACES, Signal,
     },
     framing::{FrameError, read_frame, write_frame},
-    generated::{FrameMsg, HelloOutput, ProfilesBatch, TracesBatch},
+    generated::{FrameMsg, HelloOutput},
 };
 use std::{
     future::Future,
@@ -54,11 +56,24 @@ pub type MetricsPipeline = Pipeline<MetricsBlockBuilder>;
 /// parquet schema and postings layout.
 pub type LogsPipeline = Pipeline<LogsBlockBuilder>;
 
-/// Sharded (per-connection-striped) variants of the three storage
+/// Type alias for the Traces storage pipeline. The TracesBlockBuilder
+/// owns the per-signal nested parquet schema (one row per span, with
+/// native `List<Struct>` events/links); no postings (trace-by-id rides
+/// row-group `trace_id` stats).
+pub type TracesPipeline = Pipeline<TracesBlockBuilder>;
+
+/// Type alias for the Profiles storage pipeline. The
+/// ProfilesBlockBuilder stores one row per blob with the pprof bytes
+/// verbatim in an opaque Binary column; no postings.
+pub type ProfilesPipeline = Pipeline<ProfilesBlockBuilder>;
+
+/// Sharded (per-connection-striped) variants of the storage
 /// pipelines — what the server actually holds. See [`ShardedPipeline`].
 pub type DummyShards = ShardedPipeline<DummyBlockBuilder>;
 pub type MetricsShards = ShardedPipeline<MetricsBlockBuilder>;
 pub type LogsShards = ShardedPipeline<LogsBlockBuilder>;
+pub type TracesShards = ShardedPipeline<TracesBlockBuilder>;
+pub type ProfilesShards = ShardedPipeline<ProfilesBlockBuilder>;
 
 /// Static configuration for a [`Server`]. Cheap to construct, cloned
 /// into each spawned connection task.
@@ -89,6 +104,8 @@ pub struct Server {
     dummy_pipeline: Option<ShardedPipeline<DummyBlockBuilder>>,
     metrics_pipeline: Option<ShardedPipeline<MetricsBlockBuilder>>,
     logs_pipeline: Option<ShardedPipeline<LogsBlockBuilder>>,
+    traces_pipeline: Option<ShardedPipeline<TracesBlockBuilder>>,
+    profiles_pipeline: Option<ShardedPipeline<ProfilesBlockBuilder>>,
     /// Optional process-global stats. When present, the ingest path
     /// bumps it at batch granularity and the connection count is
     /// tracked; the stats HTTP endpoint reads from the same `Arc`.
@@ -96,17 +113,22 @@ pub struct Server {
 }
 
 impl Server {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: ServerConfig,
         dummy_pipeline: Option<ShardedPipeline<DummyBlockBuilder>>,
         metrics_pipeline: Option<ShardedPipeline<MetricsBlockBuilder>>,
         logs_pipeline: Option<ShardedPipeline<LogsBlockBuilder>>,
+        traces_pipeline: Option<ShardedPipeline<TracesBlockBuilder>>,
+        profiles_pipeline: Option<ShardedPipeline<ProfilesBlockBuilder>>,
     ) -> Self {
         Self {
             config,
             dummy_pipeline,
             metrics_pipeline,
             logs_pipeline,
+            traces_pipeline,
+            profiles_pipeline,
             metrics: None,
         }
     }
@@ -149,6 +171,8 @@ impl Server {
                 let dummy_pipeline = self.dummy_pipeline.clone();
                 let metrics_pipeline = self.metrics_pipeline.clone();
                 let logs_pipeline = self.logs_pipeline.clone();
+                let traces_pipeline = self.traces_pipeline.clone();
+                let profiles_pipeline = self.profiles_pipeline.clone();
                 let metrics = self.metrics.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle(
@@ -159,6 +183,8 @@ impl Server {
                         dummy_pipeline,
                         metrics_pipeline,
                         logs_pipeline,
+                        traces_pipeline,
+                        profiles_pipeline,
                         metrics,
                     )
                     .await
@@ -186,6 +212,12 @@ impl Server {
         }
         if let Some(sharded) = self.logs_pipeline.as_ref() {
             flush_all_shards(sharded, "logs").await;
+        }
+        if let Some(sharded) = self.traces_pipeline.as_ref() {
+            flush_all_shards(sharded, "traces").await;
+        }
+        if let Some(sharded) = self.profiles_pipeline.as_ref() {
+            flush_all_shards(sharded, "profiles").await;
         }
 
         Ok(())
@@ -250,6 +282,8 @@ async fn handle(
     dummy_sharded: Option<ShardedPipeline<DummyBlockBuilder>>,
     metrics_sharded: Option<ShardedPipeline<MetricsBlockBuilder>>,
     logs_sharded: Option<ShardedPipeline<LogsBlockBuilder>>,
+    traces_sharded: Option<ShardedPipeline<TracesBlockBuilder>>,
+    profiles_sharded: Option<ShardedPipeline<ProfilesBlockBuilder>>,
     metrics: Option<Arc<ServerMetrics>>,
 ) -> Result<()> {
     // Pin this connection to one shard per signal (by session id). All of
@@ -266,6 +300,12 @@ async fn handle(
         .as_ref()
         .map(|s| s.shard_for(session_id).clone());
     let logs_pipeline = logs_sharded
+        .as_ref()
+        .map(|s| s.shard_for(session_id).clone());
+    let traces_pipeline = traces_sharded
+        .as_ref()
+        .map(|s| s.shard_for(session_id).clone());
+    let profiles_pipeline = profiles_sharded
         .as_ref()
         .map(|s| s.shard_for(session_id).clone());
     sock.set_nodelay(true)?;
@@ -352,6 +392,8 @@ async fn handle(
     let mut dummy_scratch: Option<(DecodeFn<DummyBlockBuilder>, DummyBlockBuilder)> = None;
     let mut metrics_scratch: Option<(DecodeFn<MetricsBlockBuilder>, MetricsBlockBuilder)> = None;
     let mut logs_scratch: Option<(DecodeFn<LogsBlockBuilder>, LogsBlockBuilder)> = None;
+    let mut traces_scratch: Option<(DecodeFn<TracesBlockBuilder>, TracesBlockBuilder)> = None;
+    let mut profiles_scratch: Option<(DecodeFn<ProfilesBlockBuilder>, ProfilesBlockBuilder)> = None;
 
     loop {
         let frame = match read_frame::<scry_proto::Frame, _>(&mut rd).await {
@@ -618,7 +660,81 @@ async fn handle(
                             .map_err(|e| anyhow::anyhow!("LogsBatch: {e}"))
                         }
                     }
-                    _ => decode_payload(signal, &decompressed),
+                    Signal::Traces => {
+                        if let Some(pipe) = traces_pipeline.as_ref() {
+                            if traces_scratch.is_none() {
+                                let g = pipe.lock().await;
+                                traces_scratch = Some((g.decode_fn(), g.new_scratch()));
+                            }
+                            let (decode_fn, scratch) = traces_scratch.as_mut().unwrap();
+                            // Phase 1: decode into private scratch, no lock held.
+                            match decode_fn(&decompressed, scratch) {
+                                Ok(n) => {
+                                    // Phase 2: commit (WAL append + merge) under lock.
+                                    let mut guard = pipe.lock().await;
+                                    match guard.ingest_decoded(&decompressed, scratch).await {
+                                        Ok(()) => Ok(n as u64),
+                                        Err(e) => {
+                                            scratch.reset();
+                                            Err(e)
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    scratch.reset();
+                                    Err(e)
+                                }
+                            }
+                        } else {
+                            // No traces pipeline: validate + count spans
+                            // (resources/scopes are dictionary entries,
+                            // not records — same accounting as the
+                            // pipeline path).
+                            let mut counter = CountTracesAppender::default();
+                            scry_proto::streaming::decode_traces_batch_into(
+                                &decompressed,
+                                &mut counter,
+                            )
+                            .map(|spans| spans as u64)
+                            .map_err(|e| anyhow::anyhow!("TracesBatch: {e}"))
+                        }
+                    }
+                    Signal::Profiles => {
+                        if let Some(pipe) = profiles_pipeline.as_ref() {
+                            if profiles_scratch.is_none() {
+                                let g = pipe.lock().await;
+                                profiles_scratch = Some((g.decode_fn(), g.new_scratch()));
+                            }
+                            let (decode_fn, scratch) = profiles_scratch.as_mut().unwrap();
+                            // Phase 1: decode into private scratch, no lock held.
+                            match decode_fn(&decompressed, scratch) {
+                                Ok(n) => {
+                                    // Phase 2: commit (WAL append + merge) under lock.
+                                    let mut guard = pipe.lock().await;
+                                    match guard.ingest_decoded(&decompressed, scratch).await {
+                                        Ok(()) => Ok(n as u64),
+                                        Err(e) => {
+                                            scratch.reset();
+                                            Err(e)
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    scratch.reset();
+                                    Err(e)
+                                }
+                            }
+                        } else {
+                            // No profiles pipeline: validate + count blobs.
+                            let mut counter = CountProfilesAppender::default();
+                            scry_proto::streaming::decode_profiles_batch_into(
+                                &decompressed,
+                                &mut counter,
+                            )
+                            .map(|blobs| blobs as u64)
+                            .map_err(|e| anyhow::anyhow!("ProfilesBatch: {e}"))
+                        }
+                    }
                 };
 
                 match decode_result {
@@ -771,30 +887,40 @@ impl scry_proto::streaming::LogsAppender for CountLogsAppender {
     }
 }
 
-/// Validate-and-count fallback for signals the server has no
-/// streaming decoder for yet (Traces/Profiles). Dummy, Metrics, and
-/// Logs route through their streaming appenders upstream and never
-/// reach here.
-fn decode_payload(signal: Signal, bytes: &[u8]) -> Result<u64> {
-    let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
-    let n: u64 = match signal {
-        Signal::Traces => {
-            let t = TracesBatch::decode_with_decoder(&mut decoder)
-                .map_err(|e| anyhow::anyhow!("TracesBatch: {e}"))?;
-            t.spans.len() as u64
-        }
-        Signal::Profiles => {
-            let p = ProfilesBatch::decode_with_decoder(&mut decoder)
-                .map_err(|e| anyhow::anyhow!("ProfilesBatch: {e}"))?;
-            p.samples.len() as u64
-        }
-        Signal::Dummy | Signal::Metrics | Signal::Logs => {
-            // Routed through streaming appenders upstream; should
-            // never reach `decode_payload`.
-            anyhow::bail!("BUG: decode_payload called for {signal:?}")
-        }
-    };
-    Ok(n)
+/// Counter-only `TracesAppender` for the no-traces-pipeline case.
+/// Spans are counted; resources/scopes are dictionary entries and the
+/// per-span data is discarded — matching the configured-pipeline path's
+/// accounting (`spans = records`).
+#[derive(Default)]
+struct CountTracesAppender {
+    spans: u64,
+}
+
+impl scry_proto::streaming::TracesAppender for CountTracesAppender {
+    #[inline]
+    fn append_span(&mut self, _span: &scry_proto::streaming::DecodedSpan<'_>) {
+        self.spans += 1;
+    }
+}
+
+/// Counter-only `ProfilesAppender` for the no-profiles-pipeline case.
+#[derive(Default)]
+struct CountProfilesAppender {
+    blobs: u64,
+}
+
+impl scry_proto::streaming::ProfilesAppender for CountProfilesAppender {
+    #[inline]
+    fn append_blob(
+        &mut self,
+        _ts_unix_nano: u64,
+        _duration_nano: u64,
+        _labels: Vec<(Vec<u8>, Vec<u8>)>,
+        _format: u8,
+        _data: Vec<u8>,
+    ) {
+        self.blobs += 1;
+    }
 }
 
 fn short_msg_name(m: &FrameMsg) -> &'static str {

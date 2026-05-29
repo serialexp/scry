@@ -341,6 +341,313 @@ fn read_label_pair(
     Ok((key, value))
 }
 
+/// Read `len` fixed bytes as a slice borrowed straight out of `payload`
+/// (no copy), advancing the decoder. Used for the fixed-width id fields
+/// in spans (`trace_id`/`span_id`/`parent_span_id`).
+fn read_fixed<'p>(
+    dec: &mut BitStreamDecoder<'_>,
+    payload: &'p [u8],
+    len: usize,
+) -> Result<&'p [u8], BinSchemaError> {
+    let start = dec.position();
+    let end = start.checked_add(len).ok_or(BinSchemaError::UnexpectedEof)?;
+    if end > payload.len() {
+        return Err(BinSchemaError::UnexpectedEof);
+    }
+    dec.seek(end)?;
+    Ok(&payload[start..end])
+}
+
+/// Read a `u16 BE`-length-prefixed byte run as a borrowed slice.
+fn read_str_u16<'p>(
+    dec: &mut BitStreamDecoder<'_>,
+    payload: &'p [u8],
+) -> Result<&'p [u8], BinSchemaError> {
+    let len = dec.read_u16_be()? as usize;
+    read_fixed(dec, payload, len)
+}
+
+/// Read a `u8`-length-prefixed byte run as a borrowed slice.
+fn read_str_u8<'p>(
+    dec: &mut BitStreamDecoder<'_>,
+    payload: &'p [u8],
+) -> Result<&'p [u8], BinSchemaError> {
+    let len = dec.read_byte()? as usize;
+    read_fixed(dec, payload, len)
+}
+
+/// Read a `u8`-count run of `LabelPair`s as owned `(Vec<u8>, Vec<u8>)`s.
+/// Span events/links use a `u8` attribute count (vs the `u16` on the span
+/// itself); this is the cold path either way.
+// The `Vec<(Vec<u8>, Vec<u8>)>` label-pair shape is the crate-wide
+// convention (see the appender traits + `DecodedEvent`/`DecodedLink`); it
+// reads clearly here, so opt this helper out of `type_complexity` rather
+// than introduce a one-off alias that diverges from those signatures.
+#[allow(clippy::type_complexity)]
+fn read_attrs_u8(
+    dec: &mut BitStreamDecoder<'_>,
+    payload: &[u8],
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>, BinSchemaError> {
+    let count = dec.read_byte()? as usize;
+    let mut attrs = Vec::with_capacity(count);
+    for _ in 0..count {
+        attrs.push(read_label_pair(dec, payload)?);
+    }
+    Ok(attrs)
+}
+
+// ── Traces ───────────────────────────────────────────────────────────────
+
+/// A span's nested event, materialised during streaming decode and handed
+/// to the appender by reference inside a [`DecodedSpan`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecodedEvent {
+    pub ts_unix_nano: u64,
+    pub name: Vec<u8>,
+    pub attributes: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+/// A span's nested link.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecodedLink {
+    pub trace_id: Vec<u8>,
+    pub span_id: Vec<u8>,
+    pub attributes: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+/// One fully-resolved span handed to a [`TracesAppender`]. Scalar fields
+/// and the fixed-width ids are borrowed straight out of the wire payload
+/// (no copy); the per-batch `resources`/`scopes` dictionaries are resolved
+/// by the decoder so the appender sees denormalised resource labels +
+/// scope name/version and never has to carry the dictionary itself. Nested
+/// `events`/`links` are owned (cold path — typically ≤1 of each per span).
+pub struct DecodedSpan<'a> {
+    pub trace_id: &'a [u8],
+    pub span_id: &'a [u8],
+    pub parent_span_id: Option<&'a [u8]>,
+    pub resource_labels: &'a [(Vec<u8>, Vec<u8>)],
+    pub scope_name: &'a [u8],
+    pub scope_version: &'a [u8],
+    pub name: &'a [u8],
+    pub kind: u8,
+    pub start_unix_nano: u64,
+    pub end_unix_nano: u64,
+    pub status_code: u8,
+    pub status_message: &'a [u8],
+    pub attributes: &'a [(Vec<u8>, Vec<u8>)],
+    pub events: &'a [DecodedEvent],
+    pub links: &'a [DecodedLink],
+}
+
+/// Consumer for streaming `TracesBatch` decode.
+///
+/// Wire shape (mirrored from `generated::{TracesBatch, ResourceEntry,
+/// ScopeEntry, Span, SpanEvent, SpanLink}::encode_into`):
+///
+/// ```text
+/// resource_count: u16 BE
+/// for each resource:
+///     label_count: u16 BE  → LabelPair…       (u8 key-len, u16 BE value-len)
+/// scope_count: u16 BE
+/// for each scope:
+///     name:    u8-len bytes (utf8)
+///     version: u8-len bytes (ascii)
+/// span_count: u32 BE
+/// for each span:
+///     resource_idx: u16 BE
+///     scope_idx:    u16 BE
+///     trace_id:     16 bytes
+///     span_id:      8 bytes
+///     parent_span_id: u8 present-flag (+ 8 bytes if 1)
+///     name:           u16-len bytes (utf8)
+///     kind:           u8
+///     start_unix_nano: u64 BE
+///     end_unix_nano:   u64 BE
+///     status_code:     u8
+///     status_message:  u16-len bytes (utf8)
+///     attr_count:  u16 BE → LabelPair…
+///     event_count: u16 BE → SpanEvent…  (ts u64, name u16-len, attr u8-count LabelPair…)
+///     link_count:  u8     → SpanLink…   (trace_id[16], span_id[8], attr u8-count LabelPair…)
+/// ```
+///
+/// Unlike metrics/logs there's no `observe_*` dictionary call: the
+/// decoder resolves `resource_idx`/`scope_idx` against the per-batch
+/// dictionaries and hands the appender self-contained spans. A span whose
+/// `resource_idx`/`scope_idx` is out of range is treated as a malformed
+/// batch (`UnexpectedEof`-class error), same severity as a truncated read.
+pub trait TracesAppender {
+    fn append_span(&mut self, span: &DecodedSpan<'_>);
+}
+
+/// Decode a `TracesBatch` payload into `appender`. Returns the span count.
+pub fn decode_traces_batch_into<A: TracesAppender>(
+    payload: &[u8],
+    appender: &mut A,
+) -> Result<usize, BinSchemaError> {
+    let mut dec = BitStreamDecoder::new(payload, BitOrder::MsbFirst);
+
+    // Resource dictionary.
+    let resource_count = dec.read_u16_be()? as usize;
+    let mut resources: Vec<Vec<(Vec<u8>, Vec<u8>)>> = Vec::with_capacity(resource_count);
+    for _ in 0..resource_count {
+        let label_count = dec.read_u16_be()? as usize;
+        let mut labels = Vec::with_capacity(label_count);
+        for _ in 0..label_count {
+            labels.push(read_label_pair(&mut dec, payload)?);
+        }
+        resources.push(labels);
+    }
+
+    // Scope dictionary (owned name/version bytes — referenced for the
+    // whole batch, so a copy out of the payload is the right call).
+    let scope_count = dec.read_u16_be()? as usize;
+    let mut scopes: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(scope_count);
+    for _ in 0..scope_count {
+        let name = read_str_u8(&mut dec, payload)?.to_vec();
+        let version = read_str_u8(&mut dec, payload)?.to_vec();
+        scopes.push((name, version));
+    }
+
+    let span_count = dec.read_u32_be()? as usize;
+    for _ in 0..span_count {
+        let resource_idx = dec.read_u16_be()? as usize;
+        let scope_idx = dec.read_u16_be()? as usize;
+        let trace_id = read_fixed(&mut dec, payload, 16)?;
+        let span_id = read_fixed(&mut dec, payload, 8)?;
+        let has_parent = dec.read_byte()? != 0;
+        let parent_span_id = if has_parent {
+            Some(read_fixed(&mut dec, payload, 8)?)
+        } else {
+            None
+        };
+        let name = read_str_u16(&mut dec, payload)?;
+        let kind = dec.read_byte()?;
+        let start_unix_nano = dec.read_u64_be()?;
+        let end_unix_nano = dec.read_u64_be()?;
+        let status_code = dec.read_byte()?;
+        let status_message = read_str_u16(&mut dec, payload)?;
+
+        let attr_count = dec.read_u16_be()? as usize;
+        let mut attributes = Vec::with_capacity(attr_count);
+        for _ in 0..attr_count {
+            attributes.push(read_label_pair(&mut dec, payload)?);
+        }
+
+        let event_count = dec.read_u16_be()? as usize;
+        let mut events = Vec::with_capacity(event_count);
+        for _ in 0..event_count {
+            let ts_unix_nano = dec.read_u64_be()?;
+            let ename = read_str_u16(&mut dec, payload)?.to_vec();
+            let eattrs = read_attrs_u8(&mut dec, payload)?;
+            events.push(DecodedEvent {
+                ts_unix_nano,
+                name: ename,
+                attributes: eattrs,
+            });
+        }
+
+        let link_count = dec.read_byte()? as usize;
+        let mut links = Vec::with_capacity(link_count);
+        for _ in 0..link_count {
+            let ltrace = read_fixed(&mut dec, payload, 16)?.to_vec();
+            let lspan = read_fixed(&mut dec, payload, 8)?.to_vec();
+            let lattrs = read_attrs_u8(&mut dec, payload)?;
+            links.push(DecodedLink {
+                trace_id: ltrace,
+                span_id: lspan,
+                attributes: lattrs,
+            });
+        }
+
+        // Resolve the per-batch dictionaries. An out-of-range index is a
+        // malformed batch — reject it rather than silently dropping
+        // resource/scope context.
+        let resource_labels = resources
+            .get(resource_idx)
+            .map(|v| v.as_slice())
+            .ok_or(BinSchemaError::UnexpectedEof)?;
+        let (scope_name, scope_version) = scopes
+            .get(scope_idx)
+            .map(|(n, v)| (n.as_slice(), v.as_slice()))
+            .ok_or(BinSchemaError::UnexpectedEof)?;
+
+        appender.append_span(&DecodedSpan {
+            trace_id,
+            span_id,
+            parent_span_id,
+            resource_labels,
+            scope_name,
+            scope_version,
+            name,
+            kind,
+            start_unix_nano,
+            end_unix_nano,
+            status_code,
+            status_message,
+            attributes: &attributes,
+            events: &events,
+            links: &links,
+        });
+    }
+
+    Ok(span_count)
+}
+
+// ── Profiles ───────────────────────────────────────────────────────────
+
+/// Consumer for streaming `ProfilesBatch` decode.
+///
+/// Wire shape (mirrored from `generated::{ProfilesBatch, ProfileBlob}::
+/// encode_into`):
+///
+/// ```text
+/// blob_count: u32 BE
+/// for each blob:
+///     ts_unix_nano:  u64 BE
+///     duration_nano: u64 BE
+///     label_count:   u16 BE → LabelPair…
+///     format:        u8
+///     data_len:      u32 BE  bytes…   (opaque pprof; stored verbatim)
+/// ```
+///
+/// The pprof `data` blob is handed over owned — one allocation per blob,
+/// and the builder needs the bytes in one contiguous place for the parquet
+/// `Binary` column anyway. Profiles are low-volume (≈1 blob/batch), so
+/// there's no hot path here to optimise.
+pub trait ProfilesAppender {
+    fn append_blob(
+        &mut self,
+        ts_unix_nano: u64,
+        duration_nano: u64,
+        labels: Vec<(Vec<u8>, Vec<u8>)>,
+        format: u8,
+        data: Vec<u8>,
+    );
+}
+
+/// Decode a `ProfilesBatch` payload into `appender`. Returns the blob count.
+pub fn decode_profiles_batch_into<A: ProfilesAppender>(
+    payload: &[u8],
+    appender: &mut A,
+) -> Result<usize, BinSchemaError> {
+    let mut dec = BitStreamDecoder::new(payload, BitOrder::MsbFirst);
+    let blob_count = dec.read_u32_be()? as usize;
+    for _ in 0..blob_count {
+        let ts_unix_nano = dec.read_u64_be()?;
+        let duration_nano = dec.read_u64_be()?;
+        let label_count = dec.read_u16_be()? as usize;
+        let mut labels = Vec::with_capacity(label_count);
+        for _ in 0..label_count {
+            labels.push(read_label_pair(&mut dec, payload)?);
+        }
+        let format = dec.read_byte()?;
+        let data_len = dec.read_u32_be()? as usize;
+        let data = read_fixed(&mut dec, payload, data_len)?.to_vec();
+        appender.append_blob(ts_unix_nano, duration_nano, labels, format, data);
+    }
+    Ok(blob_count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,8 +782,8 @@ mod tests {
                 },
             ],
             samples: vec![
-                MetricSample { fingerprint: 0xCAFE_BABE, ts_unix_nano: 1_000, value:  3.14 },
-                MetricSample { fingerprint: 0xCAFE_BABE, ts_unix_nano: 2_000, value:  6.28 },
+                MetricSample { fingerprint: 0xCAFE_BABE, ts_unix_nano: 1_000, value:  3.25 },
+                MetricSample { fingerprint: 0xCAFE_BABE, ts_unix_nano: 2_000, value:  6.5  },
                 MetricSample { fingerprint: 0xDEAD_BEEF, ts_unix_nano: 1_500, value: 42.0  },
                 MetricSample { fingerprint: 0xDEAD_BEEF, ts_unix_nano: 2_500, value: 43.0  },
             ],
@@ -695,6 +1002,307 @@ mod tests {
 
         let mut collected = MetricsCollected::default();
         let result = decode_metrics_batch_into(&payload, &mut collected);
+        assert!(result.is_err(), "expected error, got {:?}", result);
+    }
+
+    // ── Traces ──────────────────────────────────────────────────────
+
+    use crate::generated::{
+        ProfileBlob, ProfilesBatch, ResourceEntry, ScopeEntry, Span, SpanEvent, SpanLink,
+        TracesBatch,
+    };
+
+    /// Owned mirror of a `DecodedSpan` — `append_span` borrows, so the
+    /// collector copies everything out for later structural comparison.
+    #[derive(Debug, PartialEq)]
+    struct OwnedSpan {
+        trace_id: Vec<u8>,
+        span_id: Vec<u8>,
+        parent_span_id: Option<Vec<u8>>,
+        resource_labels: Vec<(Vec<u8>, Vec<u8>)>,
+        scope_name: Vec<u8>,
+        scope_version: Vec<u8>,
+        name: Vec<u8>,
+        kind: u8,
+        start_unix_nano: u64,
+        end_unix_nano: u64,
+        status_code: u8,
+        status_message: Vec<u8>,
+        attributes: Vec<(Vec<u8>, Vec<u8>)>,
+        events: Vec<DecodedEvent>,
+        links: Vec<DecodedLink>,
+    }
+
+    #[derive(Default)]
+    struct TracesCollected {
+        spans: Vec<OwnedSpan>,
+    }
+
+    impl TracesAppender for TracesCollected {
+        fn append_span(&mut self, s: &DecodedSpan<'_>) {
+            self.spans.push(OwnedSpan {
+                trace_id: s.trace_id.to_vec(),
+                span_id: s.span_id.to_vec(),
+                parent_span_id: s.parent_span_id.map(|p| p.to_vec()),
+                resource_labels: s.resource_labels.to_vec(),
+                scope_name: s.scope_name.to_vec(),
+                scope_version: s.scope_version.to_vec(),
+                name: s.name.to_vec(),
+                kind: s.kind,
+                start_unix_nano: s.start_unix_nano,
+                end_unix_nano: s.end_unix_nano,
+                status_code: s.status_code,
+                status_message: s.status_message.to_vec(),
+                attributes: s.attributes.to_vec(),
+                events: s.events.to_vec(),
+                links: s.links.to_vec(),
+            });
+        }
+    }
+
+    fn sample_traces_batch() -> TracesBatch {
+        TracesBatch {
+            resources: vec![
+                ResourceEntry {
+                    labels: vec![
+                        LabelPair { key: "service.name".into(), value: "api".into() },
+                        LabelPair { key: "host".into(), value: "host-1".into() },
+                    ],
+                },
+                ResourceEntry {
+                    labels: vec![LabelPair { key: "service.name".into(), value: "worker".into() }],
+                },
+            ],
+            scopes: vec![
+                ScopeEntry { name: "scry.spewer".into(), version: "0.1.0".into() },
+                ScopeEntry { name: "tokio".into(), version: "1.0".into() },
+            ],
+            spans: vec![
+                Span {
+                    resource_idx: 0,
+                    scope_idx: 1,
+                    trace_id: (0..16u8).collect(),
+                    span_id: (0..8u8).collect(),
+                    parent_span_id: None,
+                    name: "root".into(),
+                    kind: 2,
+                    start_unix_nano: 1_000,
+                    end_unix_nano: 2_000,
+                    status_code: 1,
+                    status_message: "ok".into(),
+                    attributes: vec![
+                        LabelPair { key: "http.method".into(), value: "GET".into() },
+                        LabelPair { key: "http.status".into(), value: "200".into() },
+                    ],
+                    events: vec![SpanEvent {
+                        ts_unix_nano: 1_500,
+                        name: "checkpoint".into(),
+                        attributes: vec![LabelPair { key: "k".into(), value: "v".into() }],
+                    }],
+                    links: vec![SpanLink {
+                        trace_id: (16..32u8).collect(),
+                        span_id: (8..16u8).collect(),
+                        attributes: vec![],
+                    }],
+                },
+                Span {
+                    // Child span: parent set, no events, two links, empty
+                    // attrs — exercises the optional + zero-count paths.
+                    resource_idx: 1,
+                    scope_idx: 0,
+                    trace_id: (0..16u8).collect(),
+                    span_id: (8..16u8).collect(),
+                    parent_span_id: Some((0..8u8).collect()),
+                    name: "child".into(),
+                    kind: 3,
+                    start_unix_nano: 1_200,
+                    end_unix_nano: 1_800,
+                    status_code: 2,
+                    status_message: String::new(),
+                    attributes: vec![],
+                    events: vec![],
+                    links: vec![
+                        SpanLink { trace_id: (32..48u8).collect(), span_id: (0..8u8).collect(), attributes: vec![] },
+                        SpanLink { trace_id: (48..64u8).collect(), span_id: (8..16u8).collect(), attributes: vec![LabelPair { key: "rel".into(), value: "follows".into() }] },
+                    ],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn traces_streaming_matches_generated() {
+        let batch = sample_traces_batch();
+        let payload = batch.encode().expect("encode");
+
+        let mut collected = TracesCollected::default();
+        let n = decode_traces_batch_into(&payload, &mut collected).expect("decode");
+        assert_eq!(n, batch.spans.len());
+        assert_eq!(collected.spans.len(), batch.spans.len());
+
+        for (got, want) in collected.spans.iter().zip(batch.spans.iter()) {
+            assert_eq!(&got.trace_id, &want.trace_id);
+            assert_eq!(&got.span_id, &want.span_id);
+            assert_eq!(got.parent_span_id.as_deref(), want.parent_span_id.as_deref());
+            assert_eq!(&got.name, want.name.as_bytes());
+            assert_eq!(got.kind, want.kind);
+            assert_eq!(got.start_unix_nano, want.start_unix_nano);
+            assert_eq!(got.end_unix_nano, want.end_unix_nano);
+            assert_eq!(got.status_code, want.status_code);
+            assert_eq!(&got.status_message, want.status_message.as_bytes());
+
+            // Resolved dictionaries.
+            let want_res = &batch.resources[want.resource_idx as usize].labels;
+            assert_eq!(got.resource_labels.len(), want_res.len());
+            for (gl, wl) in got.resource_labels.iter().zip(want_res.iter()) {
+                assert_eq!(&gl.0, wl.key.as_bytes());
+                assert_eq!(&gl.1, wl.value.as_bytes());
+            }
+            let want_scope = &batch.scopes[want.scope_idx as usize];
+            assert_eq!(&got.scope_name, want_scope.name.as_bytes());
+            assert_eq!(&got.scope_version, want_scope.version.as_bytes());
+
+            // Span attributes.
+            assert_eq!(got.attributes.len(), want.attributes.len());
+            for (ga, wa) in got.attributes.iter().zip(want.attributes.iter()) {
+                assert_eq!(&ga.0, wa.key.as_bytes());
+                assert_eq!(&ga.1, wa.value.as_bytes());
+            }
+
+            // Nested events.
+            assert_eq!(got.events.len(), want.events.len());
+            for (ge, we) in got.events.iter().zip(want.events.iter()) {
+                assert_eq!(ge.ts_unix_nano, we.ts_unix_nano);
+                assert_eq!(&ge.name, we.name.as_bytes());
+                assert_eq!(ge.attributes.len(), we.attributes.len());
+                for (ga, wa) in ge.attributes.iter().zip(we.attributes.iter()) {
+                    assert_eq!(&ga.0, wa.key.as_bytes());
+                    assert_eq!(&ga.1, wa.value.as_bytes());
+                }
+            }
+
+            // Nested links.
+            assert_eq!(got.links.len(), want.links.len());
+            for (gl, wl) in got.links.iter().zip(want.links.iter()) {
+                assert_eq!(&gl.trace_id, &wl.trace_id);
+                assert_eq!(&gl.span_id, &wl.span_id);
+                assert_eq!(gl.attributes.len(), wl.attributes.len());
+            }
+        }
+    }
+
+    #[test]
+    fn traces_streaming_handles_empty_batch() {
+        let batch = TracesBatch { resources: vec![], scopes: vec![], spans: vec![] };
+        let payload = batch.encode().expect("encode");
+        let mut collected = TracesCollected::default();
+        let n = decode_traces_batch_into(&payload, &mut collected).expect("decode");
+        assert_eq!(n, 0);
+        assert!(collected.spans.is_empty());
+    }
+
+    #[test]
+    fn traces_streaming_rejects_truncated_payload() {
+        let batch = sample_traces_batch();
+        let mut payload = batch.encode().expect("encode");
+        let truncated_len = payload.len() - 5;
+        payload.truncate(truncated_len);
+        let mut collected = TracesCollected::default();
+        let result = decode_traces_batch_into(&payload, &mut collected);
+        assert!(result.is_err(), "expected error, got {:?}", result);
+    }
+
+    // ── Profiles ────────────────────────────────────────────────────
+
+    // Tuple shape lines up 1:1 with `ProfilesAppender::append_blob`'s
+    // argument order (ts, duration, labels, format, data) — same legibility
+    // tradeoff (and `type_complexity` dodge) as `CollectedEntry` above.
+    type CollectedBlob = (u64, u64, Vec<(Vec<u8>, Vec<u8>)>, u8, Vec<u8>);
+
+    #[derive(Default)]
+    struct ProfilesCollected {
+        blobs: Vec<CollectedBlob>,
+    }
+
+    impl ProfilesAppender for ProfilesCollected {
+        fn append_blob(
+            &mut self,
+            ts_unix_nano: u64,
+            duration_nano: u64,
+            labels: Vec<(Vec<u8>, Vec<u8>)>,
+            format: u8,
+            data: Vec<u8>,
+        ) {
+            self.blobs.push((ts_unix_nano, duration_nano, labels, format, data));
+        }
+    }
+
+    fn sample_profiles_batch() -> ProfilesBatch {
+        ProfilesBatch {
+            samples: vec![
+                ProfileBlob {
+                    ts_unix_nano: 42,
+                    duration_nano: 10_000_000_000,
+                    labels: vec![
+                        LabelPair { key: "service".into(), value: "api".into() },
+                        LabelPair { key: "profile.type".into(), value: "cpu".into() },
+                    ],
+                    format: 1,
+                    data: (0..255u16).map(|b| b as u8).collect(),
+                },
+                ProfileBlob {
+                    // Empty labels + empty data — zero-count edge case.
+                    ts_unix_nano: 99,
+                    duration_nano: 0,
+                    labels: vec![],
+                    format: 2,
+                    data: vec![],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn profiles_streaming_matches_generated() {
+        let batch = sample_profiles_batch();
+        let payload = batch.encode().expect("encode");
+
+        let mut collected = ProfilesCollected::default();
+        let n = decode_profiles_batch_into(&payload, &mut collected).expect("decode");
+        assert_eq!(n, batch.samples.len());
+        assert_eq!(collected.blobs.len(), batch.samples.len());
+
+        for (got, want) in collected.blobs.iter().zip(batch.samples.iter()) {
+            assert_eq!(got.0, want.ts_unix_nano);
+            assert_eq!(got.1, want.duration_nano);
+            assert_eq!(got.2.len(), want.labels.len());
+            for (gl, wl) in got.2.iter().zip(want.labels.iter()) {
+                assert_eq!(&gl.0, wl.key.as_bytes());
+                assert_eq!(&gl.1, wl.value.as_bytes());
+            }
+            assert_eq!(got.3, want.format);
+            assert_eq!(&got.4, &want.data);
+        }
+    }
+
+    #[test]
+    fn profiles_streaming_handles_empty_batch() {
+        let batch = ProfilesBatch { samples: vec![] };
+        let payload = batch.encode().expect("encode");
+        let mut collected = ProfilesCollected::default();
+        let n = decode_profiles_batch_into(&payload, &mut collected).expect("decode");
+        assert_eq!(n, 0);
+        assert!(collected.blobs.is_empty());
+    }
+
+    #[test]
+    fn profiles_streaming_rejects_truncated_payload() {
+        let batch = sample_profiles_batch();
+        let mut payload = batch.encode().expect("encode");
+        let truncated_len = payload.len() - 10;
+        payload.truncate(truncated_len);
+        let mut collected = ProfilesCollected::default();
+        let result = decode_profiles_batch_into(&payload, &mut collected);
         assert!(result.is_err(), "expected error, got {:?}", result);
     }
 }

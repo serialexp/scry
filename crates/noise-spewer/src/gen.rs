@@ -185,12 +185,16 @@ fn render_traces<R: Rng>(rng: &mut R, now_ns: u64) -> (u32, Vec<u8>, u64, u64) {
     // 5 traces, 4 spans each = 20 spans.
     let resources = vec![
         ResourceEntry { labels: vec![
-            LabelPair { key: "service.name".into(), value: "api".into() },
-            LabelPair { key: "host".into(),         value: "host-1".into() },
+            LabelPair { key: "service.name".into(),           value: "api".into() },
+            LabelPair { key: "service.namespace".into(),      value: "shop".into() },
+            LabelPair { key: "deployment.environment".into(), value: "prod".into() },
+            LabelPair { key: "host".into(),                   value: "host-1".into() },
         ]},
         ResourceEntry { labels: vec![
-            LabelPair { key: "service.name".into(), value: "worker".into() },
-            LabelPair { key: "host".into(),         value: "host-2".into() },
+            LabelPair { key: "service.name".into(),           value: "worker".into() },
+            LabelPair { key: "service.namespace".into(),      value: "shop".into() },
+            LabelPair { key: "deployment.environment".into(), value: "staging".into() },
+            LabelPair { key: "host".into(),                   value: "host-2".into() },
         ]},
     ];
     let scopes = vec![

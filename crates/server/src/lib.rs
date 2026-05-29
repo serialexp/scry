@@ -26,6 +26,8 @@
 //!     Some(dummy),
 //!     None,
 //!     None,
+//!     None,
+//!     None,
 //! );
 //! server.serve_with_shutdown(tokio::signal::ctrl_c()).await?;
 //! ```
@@ -40,7 +42,7 @@ pub use pipeline::{DecodeFn, Pipeline, ShardedPipeline, INGEST_SHARDS};
 pub use query_service::QueryService;
 pub use scry_block::BlockBuilderConfig;
 pub use server::{
-    DummyPipeline, DummyShards, LogsPipeline, LogsShards, MetricsPipeline, MetricsShards, Server,
-    ServerConfig,
+    DummyPipeline, DummyShards, LogsPipeline, LogsShards, MetricsPipeline, MetricsShards,
+    ProfilesPipeline, ProfilesShards, Server, ServerConfig, TracesPipeline, TracesShards,
 };
 pub use stats::{serve_stats, ServerMetrics, StatsProvider, UploadStats};

@@ -340,6 +340,8 @@ pub struct ServerMetrics {
     upload_concurrency: u64,
     metrics_upload: Arc<UploadStats>,
     logs_upload: Arc<UploadStats>,
+    traces_upload: Arc<UploadStats>,
+    profiles_upload: Arc<UploadStats>,
     dummy_upload: Arc<UploadStats>,
 }
 
@@ -365,6 +367,8 @@ impl ServerMetrics {
             upload_concurrency: upload_concurrency as u64,
             metrics_upload: Arc::new(UploadStats::default()),
             logs_upload: Arc::new(UploadStats::default()),
+            traces_upload: Arc::new(UploadStats::default()),
+            profiles_upload: Arc::new(UploadStats::default()),
             dummy_upload: Arc::new(UploadStats::default()),
         }
     }
@@ -376,6 +380,12 @@ impl ServerMetrics {
     }
     pub fn logs_upload(&self) -> Arc<UploadStats> {
         self.logs_upload.clone()
+    }
+    pub fn traces_upload(&self) -> Arc<UploadStats> {
+        self.traces_upload.clone()
+    }
+    pub fn profiles_upload(&self) -> Arc<UploadStats> {
+        self.profiles_upload.clone()
     }
     pub fn dummy_upload(&self) -> Arc<UploadStats> {
         self.dummy_upload.clone()
@@ -426,6 +436,8 @@ impl ServerMetrics {
         let uploads = [
             &self.metrics_upload,
             &self.logs_upload,
+            &self.traces_upload,
+            &self.profiles_upload,
             &self.dummy_upload,
         ];
         let total_waiters: u64 = uploads
@@ -495,6 +507,8 @@ impl ServerMetrics {
             "uploads": {
                 "metrics": self.metrics_upload.snapshot(),
                 "logs": self.logs_upload.snapshot(),
+                "traces": self.traces_upload.snapshot(),
+                "profiles": self.profiles_upload.snapshot(),
                 "dummy": self.dummy_upload.snapshot(),
             },
             "bottleneck": {

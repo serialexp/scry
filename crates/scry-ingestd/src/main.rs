@@ -18,8 +18,9 @@ use clap::{Parser, ValueEnum};
 use scry_catalog::Catalog;
 use scry_objstore::{open as open_objstore, ObjStoreConfig};
 use scry_server::{
-    decode, serve_stats, BlockBuilderConfig, DummyShards, LogsShards, MetricsShards, Server,
-    ServerConfig, ServerMetrics, ShardedPipeline, INGEST_SHARDS,
+    decode, serve_stats, BlockBuilderConfig, DummyShards, LogsShards, MetricsShards,
+    ProfilesShards, Server, ServerConfig, ServerMetrics, ShardedPipeline, TracesShards,
+    INGEST_SHARDS,
 };
 use std::{path::PathBuf, sync::Arc};
 use tokio::sync::{Mutex, Semaphore};
@@ -175,8 +176,11 @@ async fn main() -> Result<()> {
         Option<DummyShards>,
         Option<MetricsShards>,
         Option<LogsShards>,
+        Option<TracesShards>,
+        Option<ProfilesShards>,
     );
-    let (dummy_pipeline, metrics_pipeline, logs_pipeline): Pipelines = if args.storage {
+    let (dummy_pipeline, metrics_pipeline, logs_pipeline, traces_pipeline, profiles_pipeline): Pipelines =
+        if args.storage {
         let wal_dir = args
             .wal_dir
             .clone()
@@ -189,7 +193,7 @@ async fn main() -> Result<()> {
             bucket   = %bucket,
             wal_dir  = %wal_dir.display(),
             catalog  = ?args.catalog,
-            "storage mode: WAL + parquet blocks → object storage (dummy + metrics + logs)"
+            "storage mode: WAL + parquet blocks → object storage (dummy + metrics + logs + traces + profiles)"
         );
         let store = open_objstore(&cfg)?;
         let catalog = match args.catalog.as_ref() {
@@ -254,9 +258,9 @@ async fn main() -> Result<()> {
         .await?;
         let logs = ShardedPipeline::open_with_config(
             INGEST_SHARDS,
-            wal_dir,
-            store,
-            catalog,
+            wal_dir.clone(),
+            store.clone(),
+            catalog.clone(),
             writer_uuid,
             decode::logs,
             block_cfg,
@@ -265,7 +269,39 @@ async fn main() -> Result<()> {
             adaptive_compression,
         )
         .await?;
-        (Some(dummy), Some(metrics), Some(logs))
+        let traces = ShardedPipeline::open_with_config(
+            INGEST_SHARDS,
+            wal_dir.clone(),
+            store.clone(),
+            catalog.clone(),
+            writer_uuid,
+            decode::traces,
+            block_cfg,
+            upload_sem.clone(),
+            stats_metrics.as_ref().map(|m| m.traces_upload()),
+            adaptive_compression,
+        )
+        .await?;
+        let profiles = ShardedPipeline::open_with_config(
+            INGEST_SHARDS,
+            wal_dir,
+            store,
+            catalog,
+            writer_uuid,
+            decode::profiles,
+            block_cfg,
+            upload_sem.clone(),
+            stats_metrics.as_ref().map(|m| m.profiles_upload()),
+            adaptive_compression,
+        )
+        .await?;
+        (
+            Some(dummy),
+            Some(metrics),
+            Some(logs),
+            Some(traces),
+            Some(profiles),
+        )
     } else {
         if args.wal_dir.is_some() {
             warn!("--wal-dir set but --storage is not; ignoring WAL");
@@ -273,7 +309,7 @@ async fn main() -> Result<()> {
         if args.catalog.is_some() {
             warn!("--catalog set but --storage is not; ignoring catalog");
         }
-        (None, None, None)
+        (None, None, None, None, None)
     };
 
     let mut server = Server::new(
@@ -285,6 +321,8 @@ async fn main() -> Result<()> {
         dummy_pipeline,
         metrics_pipeline,
         logs_pipeline,
+        traces_pipeline,
+        profiles_pipeline,
     );
     if let Some(m) = stats_metrics.as_ref() {
         server = server.with_metrics(m.clone());

@@ -11,7 +11,10 @@
 //! to the pipeline's `DecodeFn<B>` function-pointer type.
 
 use anyhow::Result;
-use scry_block::{DummyBlockBuilder, LogsBlockBuilder, MetricsBlockBuilder};
+use scry_block::{
+    DummyBlockBuilder, LogsBlockBuilder, MetricsBlockBuilder, ProfilesBlockBuilder,
+    TracesBlockBuilder,
+};
 use scry_proto::streaming;
 
 /// Adapter for `decode_dummy_batch_into`, wired to [`DummyBlockBuilder`].
@@ -39,4 +42,20 @@ pub fn metrics(payload: &[u8], builder: &mut MetricsBlockBuilder) -> Result<usiz
 pub fn logs(payload: &[u8], builder: &mut LogsBlockBuilder) -> Result<usize> {
     streaming::decode_logs_batch_into(payload, builder)
         .map_err(|e| anyhow::anyhow!("LogsBatch: {e}"))
+}
+
+/// Adapter for `decode_traces_batch_into`, wired to
+/// [`TracesBlockBuilder`]. The streaming decoder resolves each span's
+/// resource/scope dictionary entries and returns the span count (spans
+/// are the records; resources/scopes are dictionaries).
+pub fn traces(payload: &[u8], builder: &mut TracesBlockBuilder) -> Result<usize> {
+    streaming::decode_traces_batch_into(payload, builder)
+        .map_err(|e| anyhow::anyhow!("TracesBatch: {e}"))
+}
+
+/// Adapter for `decode_profiles_batch_into`, wired to
+/// [`ProfilesBlockBuilder`]. Returns the blob count.
+pub fn profiles(payload: &[u8], builder: &mut ProfilesBlockBuilder) -> Result<usize> {
+    streaming::decode_profiles_batch_into(payload, builder)
+        .map_err(|e| anyhow::anyhow!("ProfilesBatch: {e}"))
 }
