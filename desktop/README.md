@@ -96,41 +96,57 @@ is `scry`; the app installs as `scry-desktop` so they don't collide.
 desktop/install.sh
 ```
 
-Detects the platform and installs the latest published `desktop-v*`
-GitHub release — AppImage (preferred) or `.deb` on Linux, `.dmg` on
-macOS, `.msi` instructions on Windows.
+Detects the platform and installs the latest published `v*` GitHub
+release — AppImage (preferred) or `.deb` on Linux, `.dmg` on macOS, `.msi`
+instructions on Windows.
 
 ## Releases / CI
 
-`.github/workflows/release-desktop.yml` builds the per-platform bundles
-with [`tauri-apps/tauri-action`](https://github.com/tauri-apps/tauri-action)
-across a macOS (arm + intel) / Ubuntu / Windows matrix and attaches them
-to a **draft** GitHub Release. (The core server crates are not built here
-— they're a separate Docker pipeline, and the desktop crate is excluded
-from the cargo workspace.)
+One tag builds everything. `.github/workflows/release.yml` fires on a
+`vX.Y.Z` tag (or manual dispatch) and runs two independent jobs, both on
+Depot:
 
-The jobs run on **[Depot](https://depot.dev) GitHub Actions runners**
-(`depot-ubuntu-22.04`, `depot-macos-latest`, `depot-windows-latest`).
-This requires a **one-time, dashboard-only** step: connect the `serialexp`
-GitHub org to Depot (install the Depot GitHub App + enable runners). Until
-that's done, `depot-*` jobs queue with no runner. Runners are an
-org-level Depot feature, independent of the `depot.json` project id (which
-only governs container builds / `depot bake`). Depot's macOS runners are
-Apple Silicon only, so the Intel `.dmg` is cross-compiled from the ARM
-runner — both Mac architectures still ship. To fall back to GitHub-hosted
-runners, drop the `depot-` prefix from each `runs-on` label.
+- **`image`** — `depot bake --push` builds the server container image on
+  Depot's remote BuildKit and pushes `docker.io/serialexp/scry:<tag>`
+  (project id + targets come from `depot.json` / `docker-bake.hcl`).
+- **`desktop`** — [`tauri-apps/tauri-action`](https://github.com/tauri-apps/tauri-action)
+  builds the app bundles across a macOS (arm + intel) / Ubuntu / Windows
+  matrix and attaches them to a **draft** GitHub Release.
+
+The desktop matrix runs on **[Depot](https://depot.dev) GitHub Actions
+runners** (`depot-ubuntu-22.04`, `depot-macos-latest`,
+`depot-windows-latest`). Depot's macOS runners are Apple Silicon only, so
+the Intel `.dmg` is cross-compiled from the ARM runner — both Mac
+architectures still ship. To fall back to GitHub-hosted runners, drop the
+`depot-` prefix from each `runs-on` label.
+
+**One-time prerequisites** (dashboard/secrets — not in code):
+
+1. **Depot runners** — the `serialexp` org connected to Depot (Depot
+   GitHub App installed + runners enabled). Done.
+2. **Image build auth (OIDC)** — in the Depot dashboard for the `scry`
+   project, add a trust relationship: GitHub → org `serialexp` → repo
+   `scry`. Then `depot bake` authenticates with no stored token. Fallback:
+   a `DEPOT_TOKEN` secret (and drop `id-token: write`).
+3. **Docker Hub push** — repo/org secrets `DOCKERHUB_USERNAME` +
+   `DOCKERHUB_TOKEN` (a token with write on `docker.io/serialexp/scry`).
 
 To cut a release:
 
 ```bash
-git tag desktop-v0.1.0
-git push origin desktop-v0.1.0   # → workflow runs, creates a draft release
+git tag v0.6.0
+git push origin v0.6.0   # → image pushed; desktop draft release created
 ```
 
 Review the draft's assets, then publish it. `install.sh` (release mode)
-pulls the latest *published* `desktop-v*` release, so it only sees it
-once published. The Ubuntu runner `apt install`s `libwebkit2gtk-4.1-dev`
-+ `librsvg2-dev` so the AppImage actually bundles there.
+pulls the latest *published* `v*` release, so it only sees it once
+published. The Ubuntu desktop runner `apt install`s
+`libwebkit2gtk-4.1-dev` + `librsvg2-dev` so the AppImage actually bundles
+there.
+
+> The desktop bundle's embedded version comes from
+> `src-tauri/tauri.conf.json`, not the git tag — bump it there when you
+> want asset filenames to track the release tag.
 
 ## Regenerating the protocol bindings
 

@@ -1,0 +1,116 @@
+name: Release
+
+# One tag, everything built. Push a `vX.Y.Z` tag (or run manually) and this:
+#   • builds + pushes the server container image via Depot (`depot bake`), and
+#   • builds the Tauri desktop app bundles for macOS / Linux / Windows and
+#     attaches them to a draft GitHub Release.
+#
+# Both run on Depot infrastructure. The `serialexp` org is connected to Depot
+# GitHub Actions runners (used by the desktop matrix); the image build uses
+# Depot's remote BuildKit builders via the depot CLI.
+#
+# PREREQUISITES (one-time, dashboard/secrets — not doable from code):
+#   1. Image build auth — OIDC. In the Depot dashboard for the `scry` project
+#      (id in depot.json), add a trust relationship: GitHub → org `serialexp`
+#      → repo `scry`. That lets `depot bake` authenticate with no stored token.
+#      (Fallback: set a `DEPOT_TOKEN` repo/org secret and drop the id-token
+#      permission.)
+#   2. Docker Hub push — set repo/org secrets `DOCKERHUB_USERNAME` and
+#      `DOCKERHUB_TOKEN` (a Docker Hub access token with write on
+#      docker.io/serialexp/scry).
+#
+# Note: the desktop bundle's embedded version comes from
+# desktop/src-tauri/tauri.conf.json, not the git tag — bump it there when you
+# want the asset filenames to match the release tag.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  # ── Server container image (Depot remote build → Docker Hub) ───────────
+  image:
+    runs-on: depot-ubuntu-22.04
+    permissions:
+      contents: read
+      id-token: write          # OIDC token for depot auth (see prereq #1)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Depot CLI
+        uses: depot/setup-action@v1
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push image
+        # Reads the project id from depot.json and the targets from
+        # docker-bake.hcl; TAG flows into the image tag (${IMAGE}:${TAG}).
+        run: depot bake --push
+        env:
+          TAG: ${{ github.ref_name }}
+
+  # ── Desktop app bundles (Tauri, per-platform) ──────────────────────────
+  desktop:
+    permissions:
+      contents: write          # create the GitHub Release + upload assets
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: 'depot-macos-latest'     # Apple Silicon (native)
+            args: '--target aarch64-apple-darwin'
+          - platform: 'depot-macos-latest'     # Intel (cross-compiled from ARM)
+            args: '--target x86_64-apple-darwin'
+          - platform: 'depot-ubuntu-22.04'
+            args: ''
+          - platform: 'depot-windows-latest'
+            args: ''
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ startsWith(matrix.platform, 'depot-macos') && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './desktop/src-tauri -> target'
+
+      - name: Install Linux dependencies (Ubuntu only)
+        if: matrix.platform == 'depot-ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Install frontend dependencies
+        working-directory: desktop
+        run: bun install --frozen-lockfile
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: desktop
+          tagName: ${{ github.ref_name }}
+          releaseName: 'scry ${{ github.ref_name }}'
+          releaseBody: 'scry desktop query app. Download the asset for your platform, or run the installer (see desktop/README.md).'
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}

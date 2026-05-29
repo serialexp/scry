@@ -8,7 +8,7 @@ set -euo pipefail
 REPO="serialexp/scry"
 APP_NAME="scry-desktop"          # installed binary name (server binary is `scry`)
 DISPLAY_NAME="scry"              # menu / window name
-TAG_PREFIX="desktop-v"           # release tags for this app
+TAG_PREFIX="v"                   # release tags (shared: `vX.Y.Z` builds image + app)
 ICON_URL="https://raw.githubusercontent.com/${REPO}/main/desktop/src-tauri/icons/icon.png"
 
 # Colors for output
