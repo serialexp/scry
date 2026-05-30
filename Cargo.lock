@@ -3705,6 +3705,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "scry-compact"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "bytes",
+ "clap",
+ "datafusion",
+ "futures",
+ "object_store",
+ "parquet",
+ "scry-block",
+ "scry-catalog",
+ "scry-objstore",
+ "scry-proto",
+ "scry-query",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "scry-gateway"
 version = "0.0.1"
 dependencies = [
@@ -3825,6 +3851,27 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "scry-retention"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "clap",
+ "datafusion",
+ "object_store",
+ "scry-block",
+ "scry-catalog",
+ "scry-objstore",
+ "scry-proto",
+ "scry-query",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

@@ -1,0 +1,36 @@
+[package]
+name        = "scry-retention"
+version     = "0.0.1"
+edition.workspace = true
+license.workspace = true
+description = "v0.8 per-signal TTL retention: reap blocks whose data is entirely past an age limit (single-instance)."
+
+[lib]
+name = "scry_retention"
+path = "src/lib.rs"
+
+[[bin]]
+name = "scry-retention"
+path = "src/main.rs"
+
+[dependencies]
+anyhow             = { workspace = true }
+clap               = { workspace = true }
+object_store       = { workspace = true }
+scry-block         = { workspace = true }
+scry-catalog       = { workspace = true }
+scry-objstore      = { workspace = true }
+tokio              = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid               = { workspace = true }
+
+[dev-dependencies]
+arrow              = { workspace = true }
+datafusion         = { workspace = true }
+scry-query         = { workspace = true }
+scry-proto         = { workspace = true }
+tempfile           = "3"
+
+[lints]
+workspace = true
