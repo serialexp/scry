@@ -15,17 +15,21 @@
 //!   record (`ts_max_unix_nano`) is past the TTL, so a block still holding
 //!   in-window data is never dropped.
 //!
-//! This crate is the engine plus a thin CLI (`src/main.rs`). Like
-//! `scry-compact` it is single-instance (one reaper, no distributed lease
-//! — the multi-instance coordination is the documented follow-up).
+//! This crate is the engine plus a thin CLI (`src/main.rs`). The standalone
+//! [`retain_once`](engine::retain_once) entry point is single-instance (one
+//! reaper, no lease). The v0.9 multi-instance daemon drives
+//! [`retain_planned`](engine::retain_planned) under the global retention lease
+//! (a [`Fence`](scry_block::Fence)) and emits `Deleted` events through a
+//! [`BlockEventSink`](scry_block::BlockEventSink) so peers evict reaped blocks.
 //!
 //! - [`policy`] — which blocks are expired ([`RetentionConfig`],
 //!   [`plan_reaping`]).
 //! - [`engine`] — the dry-run / apply lifecycle
-//!   ([`retain_once`](engine::retain_once)).
+//!   ([`retain_once`](engine::retain_once) /
+//!   [`retain_planned`](engine::retain_planned)).
 
 pub mod engine;
 pub mod policy;
 
-pub use engine::{retain_once, RetentionReport};
+pub use engine::{retain_once, retain_planned, RetentionReport};
 pub use policy::{plan_reaping, RetentionConfig};

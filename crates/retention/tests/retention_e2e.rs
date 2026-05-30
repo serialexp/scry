@@ -22,11 +22,14 @@ use std::time::Duration;
 use arrow::array::{Array, StringArray, UInt64Array};
 use datafusion::execution::context::SessionContext;
 use object_store::{memory::InMemory, ObjectStore, ObjectStoreExt};
-use scry_block::{block_path, BlockBuilder, BlockBuilderConfig, LogsBlockBuilder, MetricsBlockBuilder};
+use scry_block::{
+    block_path, BlockBuilder, BlockBuilderConfig, Fence, LogsBlockBuilder, MetricsBlockBuilder,
+    NoopSink,
+};
 use scry_catalog::Catalog;
 use scry_proto::streaming::{LogsAppender, MetricsAppender};
 use scry_query::{register_logs_table, Query, LOGS_TABLE_NAME};
-use scry_retention::{retain_once, RetentionConfig};
+use scry_retention::{plan_reaping, retain_once, retain_planned, RetentionConfig};
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -241,4 +244,56 @@ async fn logs_retention_dry_run_then_apply() {
         .await
         .unwrap();
     assert_eq!(again.reaped, 0);
+}
+
+/// A [`Fence`] that is always lost — the retention lease was never (or no
+/// longer) held.
+struct LostFence;
+impl Fence for LostFence {
+    fn check(&self) -> anyhow::Result<()> {
+        anyhow::bail!("retention lease lost")
+    }
+}
+
+#[tokio::test]
+async fn retention_aborts_under_a_lost_lease_leaving_blocks_intact() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let writer = Uuid::now_v7();
+
+    // One aged logs block — a genuine reaping candidate under a 7-day TTL.
+    let fp_old: u64 = 0xA001;
+    let mut old = LogsBlockBuilder::new(writer, test_cfg());
+    old.observe_stream(fp_old, labels(&[("service", "api")]));
+    logs_entries(&mut old, fp_old, NOW - 90 * DAY, 50);
+    let m_old = old
+        .finish_and_upload(store.as_ref())
+        .await
+        .unwrap()
+        .expect("old block");
+
+    let tmp = TempDir::new().unwrap();
+    let catalog = Catalog::open(&tmp.path().join("cat.sqlite"), BUCKET).unwrap();
+    assert!(catalog.insert_block(&m_old).unwrap());
+
+    // The block is genuinely expired (plan would reap it).
+    let cfg = ttl_logs(7, true);
+    let live = catalog.list_blocks().unwrap();
+    let expired = plan_reaping(&live, &cfg, NOW);
+    assert_eq!(expired.len(), 1, "block is a reaping candidate");
+
+    // But the lease is lost → retain_planned must abort and touch nothing.
+    let aborted = retain_planned(&expired, store.clone(), &catalog, &cfg, NOW, &LostFence, &NoopSink)
+        .await
+        .unwrap();
+    assert!(aborted, "a lost lease aborts the pass");
+
+    // Block survives: row present, objects present.
+    assert!(
+        catalog.get_block(m_old.uuid).unwrap().is_some(),
+        "catalog row must survive a fenced abort"
+    );
+    assert!(
+        parquet_present(&store, &m_old).await,
+        "objects must survive a fenced abort"
+    );
 }

@@ -32,7 +32,7 @@ use futures::StreamExt;
 use object_store::{path::Path as ObjPath, ObjectStore, ObjectStoreExt};
 use parquet::arrow::ArrowWriter;
 use scry_block::postings::{decode_postings, encode_postings, merge_postings};
-use scry_block::{block_path, BlockBuilderConfig, BlockMeta, BodyBloomBuilder};
+use scry_block::{block_path, BlockBuilderConfig, BlockMeta, BodyBloomBuilder, Fence};
 use scry_catalog::CatalogEntry;
 use uuid::Uuid;
 
@@ -84,8 +84,28 @@ fn spec_for(signal: &str) -> Result<SignalSpec> {
 
 /// Merge `inputs` (all same signal + level) into one block at
 /// `out_level`, written under `writer_id`. Returns the merged
-/// [`BlockMeta`] (already uploaded, meta sidecar last). Does **not**
-/// touch the catalog — the engine does that.
+/// [`BlockMeta`] (already uploaded, meta sidecar last) on success, or
+/// `Ok(None)` if the `fence` reported the lease lost during the merge —
+/// see the commit-point fence below. Does **not** touch the catalog — the
+/// engine does that.
+///
+/// ## Commit-point fence
+///
+/// A merge can run for minutes (DataFusion sort over the K inputs). In a
+/// multi-instance deployment the lease guarding this partition can be lost
+/// mid-merge (a renewal failed; a peer took over). Blocks are addressed by
+/// random UUID, **not** content hash, so two instances merging the same
+/// partition produce two *distinct* blocks with identical rows — a
+/// double-count a later merge would union, not dedupe. The fence makes a
+/// double-merge benign: `reconcile_from_bucket` keys on `meta.json`, so a
+/// block with no `meta.json` is invisible. We therefore upload the data
+/// objects (`main → [postings] → [bloom]`) first, then **check the fence
+/// immediately before the `meta.json` PUT**. If the lease was lost we skip
+/// `meta.json` and return `Ok(None)`: the uploaded data objects are harmless
+/// leaked bytes (reclaimable by a future orphan-GC / full walk), there is no
+/// catalog row, no events, and the inputs are untouched for the rightful
+/// lease holder to re-merge.
+#[allow(clippy::too_many_arguments)]
 pub async fn merge_blocks(
     store: Arc<dyn ObjectStore>,
     bucket: &str,
@@ -94,7 +114,8 @@ pub async fn merge_blocks(
     out_level: u32,
     writer_id: Uuid,
     block_cfg: &BlockBuilderConfig,
-) -> Result<BlockMeta> {
+    fence: &dyn Fence,
+) -> Result<Option<BlockMeta>> {
     anyhow::ensure!(!inputs.is_empty(), "merge_blocks called with no inputs");
     let spec = spec_for(signal)?;
 
@@ -318,18 +339,38 @@ pub async fn merge_blocks(
         body_bloom_size_bytes,
     };
     let meta_bytes = Bytes::from(serde_json::to_vec_pretty(&meta).context("serialise merged meta")?);
-    puts.push((
-        ObjPath::from(block_path(signal, ts_min, writer_id, block_uuid, "meta.json")),
-        meta_bytes,
-    ));
 
-    // Upload in order; meta.json is last (durability invariant).
+    // Upload the data objects first (main → [postings] → [bloom]). These
+    // carry no "block exists" signal on their own — reconcile keys on
+    // meta.json — so they are safe to write before the commit point.
     for (path, bytes) in puts {
         store
             .put(&path, bytes.into())
             .await
             .with_context(|| format!("upload merged object {path}"))?;
     }
+
+    // Commit-point fence: the merge may have taken minutes. If the lease was
+    // lost in the meantime, abort *before* writing meta.json. Without the
+    // meta sidecar the block is invisible to reconcile, the inputs stay
+    // intact, and the only residue is the leaked data objects above.
+    if let Err(e) = fence.check() {
+        tracing::warn!(
+            block_uuid = %block_uuid,
+            signal,
+            out_level,
+            error = %e,
+            "lease lost during merge; skipping meta.json commit (block aborted)"
+        );
+        return Ok(None);
+    }
+
+    // Commit: meta.json last (durability invariant — the "block exists" signal).
+    let meta_path = ObjPath::from(block_path(signal, ts_min, writer_id, block_uuid, "meta.json"));
+    store
+        .put(&meta_path, meta_bytes.into())
+        .await
+        .with_context(|| format!("upload merged meta {meta_path}"))?;
 
     tracing::info!(
         block_uuid = %meta.uuid,
@@ -340,7 +381,7 @@ pub async fn merge_blocks(
         byte_size = meta.byte_size,
         "merged block uploaded"
     );
-    Ok(meta)
+    Ok(Some(meta))
 }
 
 /// Fetch and parse a block's `meta.json` sidecar from the bucket.
