@@ -64,7 +64,7 @@ use parquet::file::properties::WriterProperties;
 use scry_proto::streaming::LogsAppender;
 use uuid::Uuid;
 
-use crate::{block_path, BlockBuilder, BlockBuilderConfig, BlockMeta, EncodedBlock};
+use crate::{block_path, BlockBuilder, BlockBuilderConfig, BlockMeta, BodyBloom, EncodedBlock};
 
 const SIGNAL: &str = "logs";
 const SCHEMA_VERSION: u32 = 1;
@@ -401,6 +401,20 @@ impl LogsBlockBuilder {
         }
         let attr_arr: ArrayRef = Arc::new(attr_builder.finish());
 
+        // ── Body bloom (full-text skip sidecar) ────────────────────
+        //
+        // Byte-trigram bloom over every body, built from the complete
+        // set so it's sized optimally for this block's distinct-gram
+        // count. Order is irrelevant (a bloom is a set), so we build
+        // straight from `self.bodies` before the buffers are released.
+        let body_bloom = BodyBloom::build_from_bodies(
+            self.bodies.iter().map(|s| s.as_str()),
+            self.cfg.bloom_ngram,
+            self.cfg.bloom_target_fpr,
+        );
+        let bloom_bytes = Bytes::from(body_bloom.to_bytes());
+        let bloom_size = bloom_bytes.len() as u64;
+
         drop(order);
         // Release source buffers — Arrow now owns column copies.
         self.fingerprints = Vec::new();
@@ -461,6 +475,8 @@ impl LogsBlockBuilder {
             // that drives `scry_query::postings::resolve_fingerprints`.
             series_types: None,
             all_fingerprints: Some(all_fingerprints),
+            has_body_bloom: true,
+            body_bloom_size_bytes: Some(bloom_size),
         };
         let meta_bytes = Bytes::from(
             serde_json::to_vec_pretty(&meta).context("serialising logs BlockMeta")?,
@@ -486,6 +502,13 @@ impl LogsBlockBuilder {
             block_uuid,
             "postings.parquet",
         ));
+        let bloom_path = Path::from(block_path(
+            SIGNAL,
+            self.ts_min,
+            self.writer_id,
+            block_uuid,
+            "body.bloom",
+        ));
         let meta_path = Path::from(block_path(
             SIGNAL,
             self.ts_min,
@@ -499,6 +522,7 @@ impl LogsBlockBuilder {
             puts: vec![
                 (main_path, main_bytes),
                 (postings_path, postings_bytes),
+                (bloom_path, bloom_bytes),
                 (meta_path, meta_bytes),
             ],
         })

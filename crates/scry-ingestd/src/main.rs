@@ -96,6 +96,15 @@ struct Args {
     ///             fast; when there's CPU headroom, dense.
     #[arg(long, value_enum, default_value_t = Compression::Dense)]
     compression: Compression,
+
+    /// Override the per-block row-count seal trigger
+    /// (`BlockBuilderConfig::max_rows`, default 1,000,000). Lower it to
+    /// force a block to close after fewer rows — handy for tests that
+    /// need several blocks from a modest ingest volume (e.g. exercising
+    /// the per-block body-bloom skip across multiple blocks). Unset or 0
+    /// keeps the default. Only meaningful with `--storage`.
+    #[arg(long)]
+    block_max_rows: Option<u64>,
 }
 
 /// Block compression mode. Maps to a zstd level; see `--compression`.
@@ -211,10 +220,18 @@ async fn main() -> Result<()> {
         let upload_sem = Arc::new(Semaphore::new(upload_concurrency));
         // Block config: default close triggers, plus the chosen zstd
         // level (see `--compression`). Shared by every signal/shard.
-        let block_cfg = BlockBuilderConfig {
+        let mut block_cfg = BlockBuilderConfig {
             compression_level: args.compression.zstd_level(),
             ..Default::default()
         };
+        // Optional small-block override for tests (see `--block-max-rows`).
+        // 0 is treated as "unset" so `--block-max-rows 0` can't wedge the
+        // builder into sealing every row.
+        if let Some(n) = args.block_max_rows {
+            if n > 0 {
+                block_cfg.max_rows = n;
+            }
+        }
         // Adaptive mode (`--compression auto`): every shard picks its
         // closing block's ZSTD level from live load instead of the static
         // baseline above.

@@ -47,6 +47,7 @@ use object_store::ObjectStore;
 use scry_block::block_path;
 use scry_catalog::{Catalog, CatalogEntry};
 
+use crate::bloom_cache::BloomCache;
 use crate::postings;
 use crate::postings_cache::PostingsCache;
 use crate::table::{object_store_url_for, time_overlaps};
@@ -112,6 +113,11 @@ pub struct LogsTable {
     blocks: Vec<LogsBlockEntry>,
     ts_min: Option<u64>,
     ts_max: Option<u64>,
+    /// Literal substring the query requires in `body` (the `--grep` /
+    /// `Query::body_contains` surface). Pushed as an exact substring
+    /// predicate per block in `scan`; block-level skipping via the bloom
+    /// sidecar happens earlier, in `build_logs_table_from_candidates`.
+    body_contains: Option<String>,
 }
 
 impl std::fmt::Debug for LogsTable {
@@ -128,6 +134,7 @@ impl std::fmt::Debug for LogsTable {
             )
             .field("ts_min", &self.ts_min)
             .field("ts_max", &self.ts_max)
+            .field("body_contains", &self.body_contains)
             .finish()
     }
 }
@@ -138,6 +145,7 @@ impl LogsTable {
         blocks: Vec<LogsBlockEntry>,
         ts_min: Option<u64>,
         ts_max: Option<u64>,
+        body_contains: Option<String>,
     ) -> DfResult<Self> {
         Ok(Self {
             schema: logs_schema(),
@@ -145,6 +153,7 @@ impl LogsTable {
             blocks,
             ts_min,
             ts_max,
+            body_contains,
         })
     }
 
@@ -212,6 +221,18 @@ impl TableProvider for LogsTable {
                     datafusion::logical_expr::col("ts_unix_nano")
                         .lt_eq(Expr::Literal(ScalarValue::UInt64(Some(max)), None)),
                 );
+            }
+            // Body full-text: an exact, case-sensitive substring predicate.
+            // `contains(body, pat)` (not `LIKE '%pat%'`) so the search text is
+            // matched literally — no `%`/`_` wildcard interpretation — which
+            // is exactly the semantics the trigram bloom skip relies on. This
+            // is the correctness backstop: even if a block's bloom let it
+            // through as a false positive, this filter drops non-matching rows.
+            if let Some(pat) = &self.body_contains {
+                block_filters.push(datafusion::functions::expr_fn::contains(
+                    datafusion::logical_expr::col("body"),
+                    Expr::Literal(ScalarValue::Utf8(Some(pat.clone())), None),
+                ));
             }
 
             let predicate = conjunction(block_filters)
@@ -292,6 +313,7 @@ pub async fn build_logs_table_from_candidates(
     candidates: Vec<CatalogEntry>,
     store: Arc<dyn ObjectStore>,
     cache: Option<&PostingsCache>,
+    bloom_cache: Option<&BloomCache>,
     q: &Query,
 ) -> Result<LogsTable> {
     let bucket = match candidates.first() {
@@ -306,13 +328,40 @@ pub async fn build_logs_table_from_candidates(
         None => {
             // No overlapping blocks. Return an empty table so
             // `SELECT count(*) FROM logs` still works.
-            return Ok(LogsTable::new("", Vec::new(), q.ts_min, q.ts_max)?);
+            return Ok(LogsTable::new(
+                "",
+                Vec::new(),
+                q.ts_min,
+                q.ts_max,
+                q.body_contains.clone(),
+            )?);
         }
     };
 
     let mut blocks: Vec<LogsBlockEntry> = Vec::with_capacity(candidates.len());
     let matchers_empty = q.matchers.is_empty();
     for entry in candidates {
+        // ── Body-bloom skip (full-text accelerator) ────────────────
+        //
+        // If the query carries a `body_contains` substring and this
+        // block's bloom sidecar authoritatively rules it out, drop the
+        // block before any postings or parquet I/O. The exact
+        // `contains(body, pat)` predicate added in `LogsTable::scan`
+        // remains the correctness backstop for survivors, so a bloom
+        // false positive only costs a scan and a missing/bad bloom just
+        // means "don't skip" (see `body_bloom::block_excluded_by_bloom`).
+        if let Some(pat) = q.body_contains.as_deref() {
+            let excluded = match bloom_cache {
+                Some(bc) => bc.block_excluded(store.clone(), &entry.meta, pat).await,
+                None => {
+                    crate::body_bloom::block_excluded_by_bloom(store.clone(), &entry.meta, pat).await
+                }
+            };
+            if excluded {
+                continue;
+            }
+        }
+
         // PostingsCache is signal-agnostic (keyed by block UUID +
         // matcher set), so the metrics infrastructure carries over
         // unchanged. The empty-matcher fallback inside the cache /
@@ -340,7 +389,7 @@ pub async fn build_logs_table_from_candidates(
         }
     }
 
-    LogsTable::new(&bucket, blocks, q.ts_min, q.ts_max)
+    LogsTable::new(&bucket, blocks, q.ts_min, q.ts_max, q.body_contains.clone())
         .map_err(|e| anyhow::anyhow!("constructing LogsTable: {e}"))
 }
 
@@ -354,7 +403,7 @@ pub async fn register_logs_table(
     q: &Query,
 ) -> Result<()> {
     let candidates = list_logs_candidates(catalog, q)?;
-    register_logs_table_from_candidates(ctx, candidates, store, None, q).await
+    register_logs_table_from_candidates(ctx, candidates, store, None, None, q).await
 }
 
 /// Same as [`register_logs_table`] but accepts pre-listed catalog
@@ -366,9 +415,11 @@ pub async fn register_logs_table_from_candidates(
     candidates: Vec<CatalogEntry>,
     store: Arc<dyn ObjectStore>,
     cache: Option<&PostingsCache>,
+    bloom_cache: Option<&BloomCache>,
     q: &Query,
 ) -> Result<()> {
-    let table = build_logs_table_from_candidates(candidates, store.clone(), cache, q).await?;
+    let table =
+        build_logs_table_from_candidates(candidates, store.clone(), cache, bloom_cache, q).await?;
     let url: &url::Url = table.object_store_url().as_ref();
     ctx.runtime_env().register_object_store(url, store);
     ctx.register_table(LOGS_TABLE_NAME, Arc::new(table))

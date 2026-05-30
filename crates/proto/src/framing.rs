@@ -163,6 +163,8 @@ mod tests {
             request_id: String::new(),
             // Empty = absent (traces-only by-id lookup).
             trace_id: Vec::new(),
+            // Empty = absent (logs-only full-text substring).
+            body_contains: String::new(),
         };
         let frame = QueryFrame {
             msg: QueryFrameMsg::QueryRequest(req.clone().into()),

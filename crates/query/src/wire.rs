@@ -105,6 +105,8 @@ impl QueryRequest {
             // Present is always exactly 16 bytes (the CLI parser enforces
             // it); the receiver treats any other length as absent.
             trace_id: self.query.trace_id.map(|id| id.to_vec()).unwrap_or_default(),
+            // Empty string = absent (same sentinel convention as `sql`).
+            body_contains: self.query.body_contains.clone().unwrap_or_default(),
         }
     }
 
@@ -140,6 +142,11 @@ impl QueryRequest {
         // malformed client and we defensively drop it (the server simply
         // won't apply a trace_id filter rather than erroring the query).
         let trace_id = <[u8; 16]>::try_from(w.trace_id.as_slice()).ok();
+        let body_contains = if w.body_contains.is_empty() {
+            None
+        } else {
+            Some(w.body_contains)
+        };
         Self {
             signal: w.signal,
             query: Query {
@@ -147,6 +154,7 @@ impl QueryRequest {
                 ts_min,
                 ts_max,
                 trace_id,
+                body_contains,
             },
             sql,
             limit,
@@ -173,6 +181,7 @@ mod tests {
             limit: wire.limit,
             request_id: wire.request_id,
             trace_id: wire.trace_id,
+            body_contains: wire.body_contains,
         };
         let back = QueryRequest::from_wire(out);
         assert_eq!(back.signal, req.signal);
@@ -180,6 +189,7 @@ mod tests {
         assert_eq!(back.query.ts_min, req.query.ts_min);
         assert_eq!(back.query.ts_max, req.query.ts_max);
         assert_eq!(back.query.trace_id, req.query.trace_id);
+        assert_eq!(back.query.body_contains, req.query.body_contains);
         assert_eq!(back.sql, req.sql);
         assert_eq!(back.limit, req.limit);
         assert_eq!(back.request_id, req.request_id);
@@ -202,6 +212,7 @@ mod tests {
                 ts_min: Some(1_700_000_000_000_000_000),
                 ts_max: Some(1_700_000_001_000_000_000),
                 trace_id: None,
+                body_contains: None,
             },
             sql: Some("SELECT count(*) FROM metrics".into()),
             limit: Some(10),
@@ -218,6 +229,7 @@ mod tests {
                 ts_min: Some(1_700_000_000_000_000_000),
                 ts_max: None,
                 trace_id: None,
+                body_contains: Some("connection refused".into()),
             },
             sql: Some("SELECT count(*) FROM logs".into()),
             limit: Some(100),
@@ -235,6 +247,7 @@ mod tests {
                 ts_min: Some(0),
                 ts_max: None,
                 trace_id: None,
+                body_contains: None,
             },
             ..Default::default()
         });
@@ -253,6 +266,24 @@ mod tests {
                 ts_min: None,
                 ts_max: None,
                 trace_id: Some(id),
+                body_contains: None,
+            },
+            sql: None,
+            limit: None,
+            request_id: None,
+        });
+    }
+
+    #[test]
+    fn body_contains_roundtrips_when_present() {
+        roundtrip(QueryRequest {
+            signal: Signal::Logs as u8,
+            query: Query {
+                matchers: vec![("service".into(), "api".into())],
+                ts_min: None,
+                ts_max: None,
+                trace_id: None,
+                body_contains: Some("req_id=8f3a91c2".into()),
             },
             sql: None,
             limit: None,

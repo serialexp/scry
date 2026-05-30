@@ -38,6 +38,8 @@
 //! results stream as `RecordBatch`es and pruning stats come from
 //! DataFusion's `MetricsSet` on the produced `ExecutionPlan`.
 
+pub mod bloom_cache;
+pub mod body_bloom;
 pub mod logs;
 pub mod postings;
 pub mod postings_cache;
@@ -60,6 +62,10 @@ pub use wire::QueryRequest;
 pub use postings_cache::{
     PostingsCache, PostingsCacheConfig, PostingsCacheStats, PostingsIndex,
     DEFAULT_BUDGET_BYTES as DEFAULT_POSTINGS_CACHE_BYTES,
+};
+pub use bloom_cache::{
+    BloomCache, BloomCacheConfig, BloomCacheStats,
+    DEFAULT_BUDGET_BYTES as DEFAULT_BLOOM_CACHE_BYTES,
 };
 pub use table::{time_overlaps, BlockEntry, MetricsTable};
 // Logs symmetry: same convenience re-exports the metrics path has, so
@@ -117,6 +123,15 @@ pub struct Query {
     /// doc above predicted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<[u8; 16]>,
+    /// Body substring search, meaningful only for the logs signal. When
+    /// `Some(pat)`, [`crate::logs::LogsTable`] pushes a literal-substring
+    /// predicate on the `body` column (so DataFusion still scans surviving
+    /// rows exactly), and the planner skips any block whose body bloom
+    /// sidecar rules `pat` out (the v0.7 full-text accelerator). Case-
+    /// sensitive, matching the `body LIKE` backstop. Other signals ignore
+    /// it — another "new optional field everyone ignores" growth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_contains: Option<String>,
 }
 
 /// Default name the `MetricsTable` is registered under in a

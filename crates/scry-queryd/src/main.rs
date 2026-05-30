@@ -48,7 +48,7 @@ use datafusion::execution::memory_pool::GreedyMemoryPool;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use scry_catalog::Catalog;
 use scry_objstore::{open_with_pool_config, BufPoolConfig, ObjStoreConfig};
-use scry_query::{PostingsCache, PostingsCacheConfig};
+use scry_query::{BloomCache, BloomCacheConfig, PostingsCache, PostingsCacheConfig};
 use scry_server::QueryService;
 use tracing::info;
 
@@ -111,6 +111,15 @@ struct Args {
     /// pre-v0.3.x behaviour).
     #[arg(long)]
     postings_cache_bytes: Option<usize>,
+
+    /// Body-bloom sidecar cache byte budget for the logs full-text
+    /// path. Overrides `SCRY_BLOOM_CACHE_BYTES` if both are set. Blooms
+    /// run ~2% of body size (tens to hundreds of KB per block), so the
+    /// default budget holds many more blocks than postings needs. Set
+    /// to 0 to disable (every `--grep` query refetches each block's
+    /// bloom; correctness is unaffected, it's a pure accelerator).
+    #[arg(long)]
+    bloom_cache_bytes: Option<usize>,
 
     /// Process-wide DataFusion memory budget, in MiB. Every per-
     /// request `SessionContext` shares the same `GreedyMemoryPool`
@@ -182,6 +191,14 @@ async fn main() -> Result<()> {
     }
     let postings_cache = Arc::new(PostingsCache::new(cache_cfg));
 
+    // Bloom cache: env defaults, overridden by --bloom-cache-bytes.
+    let mut bloom_cache_cfg =
+        BloomCacheConfig::from_env().context("parsing SCRY_BLOOM_CACHE_BYTES env var")?;
+    if let Some(v) = args.bloom_cache_bytes {
+        bloom_cache_cfg.budget_bytes = v;
+    }
+    let bloom_cache = Arc::new(BloomCache::new(bloom_cache_cfg));
+
     // ── Memory pool + shared RuntimeEnv ───────────────────────────
     //
     // The pool is constructed once and lives for the lifetime of the
@@ -210,6 +227,7 @@ async fn main() -> Result<()> {
         store,
         pool.clone(),
         postings_cache.clone(),
+        bloom_cache.clone(),
         runtime_env.clone(),
         memory_pool.clone(),
     ));
@@ -221,6 +239,7 @@ async fn main() -> Result<()> {
         pool_warmup_parked          = pool.free_count(),
         pool_capacity               = pool.capacity(),
         postings_cache_budget_bytes = cache_cfg.budget_bytes,
+        bloom_cache_budget_bytes    = bloom_cache_cfg.budget_bytes,
         query_memory_budget_bytes   = memory_budget_bytes,
         "query daemon ready"
     );

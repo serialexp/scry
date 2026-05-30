@@ -92,9 +92,10 @@ in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); decisions in
   way and query back: producer → native wire → per-writer WAL → parquet
   blocks on S3-compatible storage → SQLite catalog → DataFusion-backed
   query (local `scry-query` CLI or the `scry-queryd` daemon over a
-  binschema-framed wire). v0.1–v0.6 are sealed; `scripts/smoke.sh`
+  binschema-framed wire). v0.1–v0.7 are sealed; `scripts/smoke.sh`
   exercises the full ingest → store → query round-trip live for each
-  signal, including a `--trace-id` by-id lookup for traces.
+  signal, including a `--trace-id` by-id lookup for traces and a
+  `--grep` ≡ `body LIKE` equivalence check for logs.
 - **Metrics** and **logs** preselect via a per-block postings sidecar on
   AND'd label matchers. **Traces** and **profiles** carry no postings —
   matcher / time / trace-id filters push down as parquet row predicates
@@ -102,6 +103,11 @@ in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); decisions in
   trace-by-id lookup (`--trace-id`, sorted-column pruning) and promoted
   resource-column matchers (`service.name`, …); profiles are retrieval by
   time + label with the raw pprof blob streamed back untouched.
+- **Full-text log search** (`--grep` / `body_contains`): a per-block
+  byte-trigram **bloom skip sidecar**, built inline at block seal, lets a
+  substring query skip whole blocks that can't contain the term (one-sided
+  error — false positives cost a scan, never a missed match; the exact
+  `contains` predicate is the backstop). ~1–3% storage overhead. See D-035.
 - **The gateway** terminates OTLP/HTTP traces, legacy Pyroscope `/ingest`,
   and Prometheus remote-write, and forwards each over the native wire;
   `scripts/smoke-gateway.sh` drives all three end to end against a
@@ -109,8 +115,9 @@ in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); decisions in
 
 Profiles **flamegraph aggregation** (pprof parse + stack-merge; Grafana
 renders pre-aggregated data, so this is backend work for when a UI
-consumes it), PromQL + full-text logs (v0.7), compaction + retention
-(v0.8), and Grafana/UI (v1.0) follow. See the milestone table below.
+consumes it), compaction + retention (v0.8), and Grafana/UI (v1.0)
+follow; PromQL is demoted now that scry has its own query UI. See the
+milestone table below.
 
 ## Workspace
 
@@ -292,7 +299,7 @@ that closed that gap (see D-034). Order updated accordingly.
 | **gateway** | ✅   | Push-protocol front-end (`scry-gateway`): OTLP/HTTP traces, legacy Pyroscope `/ingest`, Prometheus remote-write → native wire. Traces + profiles storage paths land end to end. |
 | **v0.5**  | ✅     | Traces query: `--trace-id` by-id lookup (sorted-column pruning) + promoted resource-column matchers (`service.name`, …) + `SELECT *` round-trip. Predicate pushdown, no postings. |
 | **v0.6**  | ✅     | Profiles query: retrieval by time + label, raw pprof blob streamed back loss-free. Flamegraph aggregation deferred (Grafana renders pre-aggregated data — backend work for when a UI consumes it). |
-| **v0.7**  | —      | PromQL surface on top of the metrics path, plus the tantivy-backed full-text phase for logs. |
+| **v0.7**  | ✅     | Full-text log search: first-class `--grep` / `body_contains` substring search accelerated by a per-block byte-trigram **bloom skip sidecar** (built inline at seal; one-sided error, exact `contains` backstop). ~1–3% storage overhead, skips whole blocks that can't match. See D-035. (PromQL demoted — own UI removes the Grafana-compat driver.) |
 | **v0.8**  | —      | Compaction, retention, and operational hardening across all signals. |
 | later     | —      | Profiles flamegraph aggregation (pprof parse + stack-merge → flame-tree for a UI). |
 | **v1.0**  | —      | Grafana datasource adapters (or our own minimal UI — TBD). |

@@ -14,6 +14,7 @@
 //! the only signal is `dummy/`. Signal-specific builders come back
 //! when real signals do.
 
+pub mod bloom;
 mod dummy;
 pub mod logs;
 mod meta;
@@ -21,6 +22,7 @@ pub mod metrics;
 pub mod profiles;
 pub mod traces;
 
+pub use bloom::BodyBloom;
 pub use dummy::DummyBlockBuilder;
 pub use logs::LogsBlockBuilder;
 pub use meta::BlockMeta;
@@ -148,6 +150,23 @@ pub struct BlockBuilderConfig {
     /// down. Measured 2026-05. Other zstd levels are accepted by
     /// parquet but untested here.
     pub compression_level: i32,
+
+    /// N-gram width for the logs body bloom sidecar (the v0.7 full-text
+    /// skip index). Trigrams (`3`) are the default: small enough that
+    /// short search terms still produce at least one gram, wide enough
+    /// that the false-positive rate on real searches stays low. Patterns
+    /// shorter than this can't be grammed, so the bloom can't prune them
+    /// (the query scans every candidate block instead — still correct).
+    /// Only the logs builder consumes this today.
+    pub bloom_ngram: usize,
+
+    /// Target false-positive rate for the logs body bloom. The builder
+    /// sizes each block's filter (`m` bits, `k` probes) optimally for its
+    /// exact distinct-gram count to hit this rate — possible because the
+    /// block is sealed from the complete set of bodies. `0.01` (1%) keeps
+    /// the sidecar near ~2% of body bytes. False positives only cost a
+    /// wasted scan; there are never false negatives.
+    pub bloom_target_fpr: f64,
 }
 
 impl Default for BlockBuilderConfig {
@@ -157,6 +176,8 @@ impl Default for BlockBuilderConfig {
             target_bytes: 128 * 1024 * 1024, // 128 MiB before compression
             row_group_size: 1024 * 1024,     // ~1M rows
             compression_level: 3,            // dense by default
+            bloom_ngram: 3,                  // trigrams
+            bloom_target_fpr: 0.01,          // 1%
         }
     }
 }
@@ -202,7 +223,8 @@ impl BlockBuilderConfig {
 /// Build the canonical object-storage path for a block, given its
 /// signal prefix, the `ts_min` of its records, the writer UUID, and
 /// the block UUID. `kind` is the file suffix (`"parquet"`,
-/// `"meta.json"`, or `"postings.parquet"` once metrics land).
+/// `"meta.json"`, `"postings.parquet"` for metrics/logs, or
+/// `"body.bloom"` for the logs full-text skip sidecar).
 pub fn block_path(
     signal: &str,
     ts_min_unix_nano: u64,

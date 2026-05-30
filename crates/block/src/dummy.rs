@@ -321,6 +321,8 @@ impl DummyBlockBuilder {
             postings_size_bytes: None,
             series_types: None,
             all_fingerprints: None,
+            has_body_bloom: false,
+            body_bloom_size_bytes: None,
         };
         let meta_bytes = Bytes::from(
             serde_json::to_vec_pretty(&meta).context("serialising BlockMeta")?,

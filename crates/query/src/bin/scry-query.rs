@@ -149,6 +149,15 @@ struct Args {
     #[arg(long = "trace-id", value_parser = parse_trace_id)]
     trace_id: Option<[u8; 16]>,
 
+    /// Full-text search: keep only log entries whose `body` contains this
+    /// literal substring (case-sensitive). Logs-only; implies
+    /// `--signal logs`. Blocks whose body-bloom sidecar rules the substring
+    /// out are skipped entirely; survivors are scanned with an exact
+    /// substring filter. Combine with `--matcher` / `--from` / `--until` to
+    /// narrow the candidate set first.
+    #[arg(long = "grep")]
+    grep: Option<String>,
+
     /// Print the produced physical plan to stderr after execution.
     /// Useful for verifying pushdown / pruning behaviour.
     #[arg(long)]
@@ -285,6 +294,17 @@ async fn main() -> Result<()> {
                 anyhow::bail!("--trace-id is only valid with --signal traces (got {other:?})")
             }
         }
+    } else if args.grep.is_some() {
+        // `--grep` is a logs-only operation. Same inference shape as
+        // `--trace-id`: infer logs from the default, error on a conflicting
+        // explicit signal.
+        match args.signal.0 {
+            Signal::Logs => args.signal,
+            Signal::Metrics => CliSignal(Signal::Logs), // default → infer logs
+            other => {
+                anyhow::bail!("--grep is only valid with --signal logs (got {other:?})")
+            }
+        }
     } else {
         args.signal
     };
@@ -294,6 +314,7 @@ async fn main() -> Result<()> {
         ts_min: args.from,
         ts_max: args.until,
         trace_id: args.trace_id,
+        body_contains: args.grep.clone(),
     };
 
     // ── Remote mode short-circuit ──────────────────────────────────

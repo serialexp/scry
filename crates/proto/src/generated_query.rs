@@ -51,6 +51,11 @@ impl QueryFrameMsg {
                 for item in &v.trace_id {
                     encoder.write_uint8(*item);
                 }
+                encoder.write_uint32(v.body_contains.len() as u32, Endianness::BigEndian);
+                let string_bytes: &[u8] = v.body_contains.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
             }
             QueryFrameMsg::SchemaMsg(v) => {
                 encoder.write_uint8(16);
@@ -166,6 +171,7 @@ pub struct QueryRequestInput {
     pub limit: u64,
     pub request_id: std::string::String,
     pub trace_id: Vec<u8>,
+    pub body_contains: std::string::String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -181,6 +187,7 @@ pub struct QueryRequestOutput {
     pub limit: u64,
     pub request_id: std::string::String,
     pub trace_id: Vec<u8>,
+    pub body_contains: std::string::String,
 }
 
 pub type QueryRequest = QueryRequestOutput;
@@ -217,6 +224,11 @@ impl QueryRequestInput {
         encoder.write_u16_be(self.trace_id.len() as u16);
         for item in &self.trace_id {
             encoder.write_byte(*item);
+        }
+        encoder.write_u32_be(self.body_contains.len() as u32);
+        let string_bytes: &[u8] = self.body_contains.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
         }
         Ok(())
     }
@@ -258,6 +270,9 @@ impl QueryRequestOutput {
             let item = decoder.read_byte()?;
             trace_id.push(item);
         }
+        let length = decoder.read_u32_be()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let body_contains = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
         Ok(Self {
             tag,
             signal,
@@ -270,6 +285,7 @@ impl QueryRequestOutput {
             limit,
             request_id,
             trace_id,
+            body_contains,
         })
     }
     pub fn encode(&self) -> Result<Vec<u8>> {
@@ -293,6 +309,7 @@ impl From<QueryRequestOutput> for QueryRequestInput {
             limit: o.limit,
             request_id: o.request_id,
             trace_id: o.trace_id,
+            body_contains: o.body_contains,
         }
     }
 }
@@ -311,6 +328,7 @@ impl From<QueryRequestInput> for QueryRequestOutput {
             limit: i.limit,
             request_id: i.request_id,
             trace_id: i.trace_id,
+            body_contains: i.body_contains,
         }
     }
 }

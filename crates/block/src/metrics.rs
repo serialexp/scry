@@ -385,6 +385,8 @@ impl MetricsBlockBuilder {
             postings_size_bytes: Some(postings_size),
             series_types: Some(series_types),
             all_fingerprints: Some(all_fingerprints),
+            has_body_bloom: false,
+            body_bloom_size_bytes: None,
         };
         let meta_bytes = Bytes::from(
             serde_json::to_vec_pretty(&meta).context("serialising metrics BlockMeta")?,

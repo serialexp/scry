@@ -20,7 +20,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::UInt64Array;
+use arrow::array::{Array, StringArray, UInt64Array};
 use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::ExecutionPlan;
 use object_store::{memory::InMemory, ObjectStore};
@@ -110,6 +110,22 @@ fn total_rows(batches: &[arrow::record_batch::RecordBatch]) -> usize {
     batches.iter().map(|b| b.num_rows()).sum()
 }
 
+fn collect_strings(batches: &[arrow::record_batch::RecordBatch], col: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for b in batches {
+        let idx = b.schema().index_of(col).unwrap();
+        let arr = b
+            .column(idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..arr.len() {
+            out.push(arr.value(i).to_string());
+        }
+    }
+    out
+}
+
 #[tokio::test]
 async fn logs_querier_end_to_end() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -175,6 +191,7 @@ async fn logs_querier_end_to_end() {
         ts_min: None,
         ts_max: None,
         trace_id: None,
+        body_contains: None,
     };
     let (batches, _plan) = run_query(&catalog, store.clone(), &q1).await;
     assert_eq!(total_rows(&batches), 200);
@@ -191,6 +208,7 @@ async fn logs_querier_end_to_end() {
         ts_min: None,
         ts_max: None,
         trace_id: None,
+        body_contains: None,
     };
     let (batches, _plan) = run_query(&catalog, store.clone(), &q2).await;
     assert_eq!(total_rows(&batches), 400);
@@ -207,9 +225,10 @@ async fn logs_querier_end_to_end() {
         ts_min: None,
         ts_max: None,
         trace_id: None,
+        body_contains: None,
     };
     let candidates = list_logs_candidates(&catalog, &q3).unwrap();
-    let table = build_logs_table_from_candidates(candidates, store.clone(), None, &q3)
+    let table = build_logs_table_from_candidates(candidates, store.clone(), None, None, &q3)
         .await
         .unwrap();
     assert_eq!(
@@ -226,6 +245,7 @@ async fn logs_querier_end_to_end() {
         ts_min: None,
         ts_max: None,
         trace_id: None,
+        body_contains: None,
     };
     let (batches, _plan) = run_query(&catalog, store.clone(), &q4).await;
     assert_eq!(total_rows(&batches), 0);
@@ -249,9 +269,10 @@ async fn logs_querier_end_to_end() {
         ts_min: Some(2_000_050),
         ts_max: Some(2_000_150),
         trace_id: None,
+        body_contains: None,
     };
     let candidates = list_logs_candidates(&catalog, &q6).unwrap();
-    let table = build_logs_table_from_candidates(candidates, store.clone(), None, &q6)
+    let table = build_logs_table_from_candidates(candidates, store.clone(), None, None, &q6)
         .await
         .unwrap();
     assert_eq!(
@@ -268,4 +289,116 @@ async fn logs_querier_end_to_end() {
     for ts in collect_u64(&batches, "ts_unix_nano") {
         assert!((2_000_050..=2_000_150).contains(&ts));
     }
+}
+
+/// v0.7 full-text: a `body_contains` query must (a) prune blocks whose
+/// body-bloom rules the needle out, and (b) return *exactly* the rows a
+/// brute-force `body LIKE '%needle%'` scan would — the load-bearing
+/// "skip never loses a match" equivalence. Bodies are `row {i} fp={fp:#x}`
+/// (see `entries_for`), so a per-stream hex fp is a needle that occurs in
+/// exactly one block.
+#[tokio::test]
+async fn logs_body_contains_bloom_skip_equals_scan() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let writer = Uuid::now_v7();
+
+    // Block A: fps 0xA001/0xA002/0xA003. Block B: 0xB001/0xB002.
+    let l_api: u64 = 0xA001;
+    let l_db: u64 = 0xA002;
+    let mut block_a = LogsBlockBuilder::new(writer, test_cfg());
+    block_a.observe_stream(l_api, labels(&[("service", "api"), ("env", "prod")]));
+    block_a.observe_stream(l_db, labels(&[("service", "db"), ("env", "prod")]));
+    entries_for(&mut block_a, l_api, 1_000_000, 100, 9);
+    entries_for(&mut block_a, l_db, 1_000_100, 100, 6);
+    let meta_a = block_a
+        .finish_and_upload(store.as_ref())
+        .await
+        .unwrap()
+        .expect("block A non-empty");
+    assert!(meta_a.has_body_bloom, "logs block must carry a body bloom");
+
+    let l_worker: u64 = 0xB002;
+    let mut block_b = LogsBlockBuilder::new(writer, test_cfg());
+    block_b.observe_stream(l_worker, labels(&[("service", "worker"), ("env", "prod")]));
+    entries_for(&mut block_b, l_worker, 2_000_000, 100, 6);
+    let meta_b = block_b
+        .finish_and_upload(store.as_ref())
+        .await
+        .unwrap()
+        .expect("block B non-empty");
+    assert!(meta_b.has_body_bloom);
+
+    let tmp = TempDir::new().unwrap();
+    let catalog = Catalog::open(&tmp.path().join("cat.sqlite"), BUCKET).unwrap();
+    assert!(catalog.insert_block(&meta_a).unwrap());
+    assert!(catalog.insert_block(&meta_b).unwrap());
+
+    // Needle "0xa001" occurs only in block A's L_api bodies. Empty
+    // matchers so postings never prune — the *only* pruning lever is the
+    // body bloom, which must drop block B.
+    let needle = "0xa001";
+    let q = Query {
+        matchers: vec![],
+        ts_min: None,
+        ts_max: None,
+        trace_id: None,
+        body_contains: Some(needle.to_string()),
+    };
+
+    // (a) The bloom skip must drop block B before scan. `None` bloom
+    // cache → the direct `body_bloom::block_excluded_by_bloom` path.
+    let candidates = list_logs_candidates(&catalog, &q).unwrap();
+    assert_eq!(candidates.len(), 2, "both blocks overlap the open window");
+    let table = build_logs_table_from_candidates(candidates, store.clone(), None, None, &q)
+        .await
+        .unwrap();
+    let surviving: Vec<Uuid> = table.blocks().iter().map(|b| b.entry.meta.uuid).collect();
+    assert_eq!(
+        surviving,
+        vec![meta_a.uuid],
+        "bloom must skip block B (needle absent) and keep block A"
+    );
+
+    // (b) Run the query through the full table path and compare against a
+    // brute-force reference: scan every row (empty query, no body filter)
+    // and count those whose body contains the needle.
+    let (bloom_batches, _plan) = run_query(&catalog, store.clone(), &q).await;
+    let bloom_bodies = collect_strings(&bloom_batches, "body");
+
+    let all_rows = Query::default();
+    let (all_batches, _plan) = run_query(&catalog, store.clone(), &all_rows).await;
+    let reference: Vec<String> = collect_strings(&all_batches, "body")
+        .into_iter()
+        .filter(|b| b.contains(needle))
+        .collect();
+
+    assert_eq!(reference.len(), 100, "exactly L_api's 100 rows match");
+    assert_eq!(
+        bloom_bodies.len(),
+        reference.len(),
+        "bloom-skip result count must equal brute-force scan count"
+    );
+    for body in &bloom_bodies {
+        assert!(
+            body.contains(needle),
+            "row {body:?} survived the body filter without containing the needle"
+        );
+    }
+
+    // A needle that exists in NO block must prune both → 0 rows, 0 blocks.
+    let q_miss = Query {
+        body_contains: Some("zzz-nonexistent-token".to_string()),
+        ..Default::default()
+    };
+    let candidates = list_logs_candidates(&catalog, &q_miss).unwrap();
+    let table = build_logs_table_from_candidates(candidates, store.clone(), None, None, &q_miss)
+        .await
+        .unwrap();
+    assert_eq!(
+        table.blocks().len(),
+        0,
+        "both blocks bloom-pruned for an absent needle"
+    );
+    let (miss_batches, _plan) = run_query(&catalog, store.clone(), &q_miss).await;
+    assert_eq!(total_rows(&miss_batches), 0);
 }

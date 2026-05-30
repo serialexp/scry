@@ -899,7 +899,9 @@ re-litigate them:
    later (tantivy is already used elsewhere in the codebase and is
    strong at this). Deliberately staged: v0.4 step 1 proves the
    two-signal shape; the indexing answer can be its own decision when
-   we have a real query mix to size against.
+   we have a real query mix to size against. **(Superseded by D-035: v0.7
+   shipped full-text as a scan path + inline bloom skip sidecar, not a
+   tantivy inverted index.)**
 
 3. **Duplicate-first for signal-divergent code; share only the
    genuinely-shared envelope.** `LogsBlockBuilder`, `LogsTable`, the
@@ -985,8 +987,9 @@ captured in their own commits, not gated on this seal.
 
 Deferred from v0.4 to later, unchanged:
 
-- **Body-substring search** for logs — its own tantivy phase (v0.7), as
-  scoped in D-032. v0.4 logs query is label-predicate + time-range only.
+- **Body-substring search** for logs — deferred to v0.7. v0.4 logs query is
+  label-predicate + time-range only. *(Shipped in v0.7 as a bloom skip path,
+  not a tantivy index — see D-035.)*
 - **Profiles payload schema** (native pprof vs. denormalised
   one-row-per-sample) — see Deferred / open; decide as v0.5/v0.6 design
   starts.
@@ -1064,8 +1067,103 @@ query language consuming it yet, retrieval is the useful step. Aggregation
 becomes its own stage (needs a pprof-parser dep + the nested-set output a
 UI consumes) when something consumes it.
 
-Deferred elsewhere, unchanged: PromQL + full-text/body-substring logs
-search (v0.7), compaction/retention (v0.8).
+Deferred elsewhere: full-text/body-substring logs search (v0.7 — shipped, see
+D-035), PromQL (demoted; own-UI removes the Grafana-compat driver),
+compaction/retention (v0.8).
+
+## D-035: full-text log search — scan path + inline bloom skip sidecar (v0.7)
+
+**Date:** 2026-05-29
+**Status:** accepted
+
+**Supersedes the "tantivy-backed phase" framing in D-032 point 2 and
+D-033's deferred-items list.** Those decisions deferred body-substring
+search to "a tantivy-backed phase later." When v0.7 came up for design we
+revisited that and chose a different shape — driven by a roadmap change:
+PromQL was the original v0.7, justified by Grafana compatibility, but scry
+now has its own query UI (the `desktop/` Tauri app), which removes the
+Grafana-compat driver. Full-text log search ("grep the bodies") is the more
+valuable logs operation, so it takes v0.7 and PromQL is demoted.
+
+The mechanism is **not** a stored inverted index (tantivy / Elasticsearch
+style). It is a **scan path accelerated by a per-block bloom skip
+sidecar**:
+
+- **Storage.** Bodies stay where they already are — the `body` Utf8 column
+  in the logs main parquet (zstd, Loki-class ~0.1× raw). Each block gains
+  one extra sidecar object, `<uuid>.body.bloom`, alongside the existing
+  postings sidecar. The bloom runs ~1–3% of body size at the default 1%
+  FPR, so total storage is roughly an order of magnitude below a full
+  inverted index.
+- **Query.** `body LIKE '%pat%'` was reachable in v0.4 only via hand-written
+  `--sql`, as a full column scan. v0.7 adds a first-class surface
+  (`Query::body_contains`, the `--grep` CLI flag, a `body_contains` field on
+  the wire `QueryRequest` — empty = absent, the same sentinel convention as
+  `sql`/`trace_id`). The bloom lets a query *skip whole blocks* that cannot
+  contain the term before any parquet (or even postings) I/O, so selective
+  searches beat a Loki-classic full-window scan.
+
+**Why a hand-rolled bloom, not a crate or tantivy.**
+
+1. **One-sided error is exactly the correctness property we need.** A bloom
+   yields false positives (a wasted scan) but **never** false negatives
+   (never drops a block that matches). The exact `contains(body, pat)`
+   predicate stays in the scan as the backstop on survivors, so the bloom
+   is a pure accelerator — a stale, missing, or unparseable bloom can only
+   cost a scan, never a result. Every failure path (`body_bloom`,
+   `bloom_cache`) resolves to "keep the block."
+2. **Built offline from the complete body set at seal time.** Because the
+   block builder sees every body, it sizes each filter optimally for its
+   exact distinct-gram count (`m = -n·ln p / (ln2)²`, `k = (m/n)·ln2`,
+   `p = 1%`) and the bloom exists the instant the block does — no
+   recent-data gap like Loki's out-of-band bloom-compactor, and no extra
+   service (fits the single-binary thesis).
+3. **`unsafe_code = "forbid"` workspace-wide** rules out most bloom crates;
+   we already depend on `twox-hash` for fingerprinting. The filter is ~60
+   lines (`crates/block/src/bloom.rs`): byte-trigram tokenization,
+   Kirsch–Mitzenmacher double-hashing (`g_i = h1 + i·h2` from two seeded
+   xxh3 hashes), a `magic|version|ngram|k|m_bits|bitset` serialised form.
+
+**Tokenization: byte-level trigrams (n=3), case-sensitive** — chosen to
+match the `contains` predicate's semantics exactly, which is what makes the
+superset guarantee hold: if a pattern P (len ≥ 3) occurs in a body, every
+trigram window of P was inserted, so all of P's grams test present and the
+block is kept. Patterns shorter than 3 bytes can't be trigrammed →
+`contains_pattern` returns `true` (the bloom can't rule them out) → those
+blocks are scanned. Regex / case-insensitive / phrase search are future
+work.
+
+**Granularity: per-block**, mirroring the postings sidecar and slotting into
+the same `build_logs_table_from_candidates` prune loop. Per-row-group
+granularity is a documented future refinement.
+
+**Catalog.** `BlockMeta` gained `has_body_bloom: bool` and
+`body_bloom_size_bytes: Option<u64>` (mirroring `has_postings` /
+`postings_size_bytes`); the catalog table gained the matching columns. Fresh
+schema, no migration (Rule #8 — smoke wipes the catalog).
+
+**Caching.** A `BloomCache` (`crates/query/src/bloom_cache.rs`) mirrors the
+postings cache — byte-budgeted, LRU, single-flight, keyed by block UUID —
+but with its own budget (`SCRY_BLOOM_CACHE_BYTES`, default 64 MiB) so cheap
+blooms aren't evicted by larger postings. The daemon constructs one at
+startup beside the postings cache and logs per-query hit/miss deltas in
+`scan_complete`; the one-shot CLI passes `None` and takes the direct fetch
+path. A cached `None` records "this block has no usable bloom" so a
+known-bad block isn't re-fetched every query.
+
+**Seal.** `scripts/smoke.sh` (logs / both / all) now asserts (a) every logs
+block carries a `body.bloom` sidecar (`has_body_bloom = 1`,
+`body_bloom_size_bytes > 0`); (b) a `--grep <token>` query returns *exactly*
+the same row count as an un-accelerated `body LIKE '%token%'` scan — the
+"skip never loses a match" equivalence on a real bucket; (c) a `--grep` of
+an absent token prunes to zero rows. The no-false-negative property is
+additionally proven exhaustively over random bodies in
+`crates/block/src/bloom.rs` unit tests and the skip≡scan equivalence in
+`crates/query/tests/logs_end_to_end.rs::logs_body_contains_bloom_skip_equals_scan`.
+
+**Future storage optimization, noted:** binary-fuse filters would be ~30%
+smaller for immutable data; deferred, the classic bloom is simpler and the
+sidecar bytes are already a small fraction of the block.
 
 ## Deferred / open
 

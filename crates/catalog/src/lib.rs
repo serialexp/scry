@@ -119,6 +119,8 @@ impl Catalog {
               byte_size           INTEGER NOT NULL,
               postings_size_bytes INTEGER,
               has_postings        INTEGER NOT NULL DEFAULT 0,
+              body_bloom_size_bytes INTEGER,
+              has_body_bloom      INTEGER NOT NULL DEFAULT 0,
               schema_version      INTEGER NOT NULL,
               fingerprint         BLOB,
               superseded_by       TEXT REFERENCES blocks(uuid),
@@ -153,12 +155,14 @@ impl Catalog {
               uuid, bucket, signal, date, writer_id, level,
               ts_min, ts_max, row_count, byte_size,
               postings_size_bytes, has_postings,
+              body_bloom_size_bytes, has_body_bloom,
               schema_version, fingerprint, superseded_by, deleted_at
             ) VALUES (
               ?1, ?2, ?3, ?4, ?5, 0,
               ?6, ?7, ?8, ?9,
               ?10, ?11,
-              ?12, ?13, NULL, NULL
+              ?12, ?13,
+              ?14, ?15, NULL, NULL
             )
             "#,
             params![
@@ -176,6 +180,8 @@ impl Catalog {
                 meta.byte_size as i64,
                 meta.postings_size_bytes.map(|v| v as i64),
                 if meta.has_postings { 1i64 } else { 0i64 },
+                meta.body_bloom_size_bytes.map(|v| v as i64),
+                if meta.has_body_bloom { 1i64 } else { 0i64 },
                 meta.schema_version as i64,
                 meta.label_fingerprint_bloom.as_deref(),
             ],
@@ -191,7 +197,8 @@ impl Catalog {
             SELECT uuid, bucket, signal, date, writer_id, level,
                    ts_min, ts_max, row_count, byte_size,
                    schema_version, fingerprint,
-                   has_postings, postings_size_bytes
+                   has_postings, postings_size_bytes,
+                   has_body_bloom, body_bloom_size_bytes
             FROM blocks
             WHERE deleted_at IS NULL
             ORDER BY date, ts_min, uuid
@@ -212,7 +219,8 @@ impl Catalog {
             SELECT uuid, bucket, signal, date, writer_id, level,
                    ts_min, ts_max, row_count, byte_size,
                    schema_version, fingerprint,
-                   has_postings, postings_size_bytes
+                   has_postings, postings_size_bytes,
+                   has_body_bloom, body_bloom_size_bytes
             FROM blocks
             WHERE uuid = ?1
             "#,
@@ -326,6 +334,8 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<CatalogEntry> {
     let fingerprint: Option<Vec<u8>> = row.get(11)?;
     let has_postings_raw: i64 = row.get(12)?;
     let postings_size_bytes: Option<i64> = row.get(13)?;
+    let has_body_bloom_raw: i64 = row.get(14)?;
+    let body_bloom_size_bytes: Option<i64> = row.get(15)?;
 
     let uuid = Uuid::parse_str(&uuid_str)
         .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
@@ -358,6 +368,8 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<CatalogEntry> {
             // sidecar. Callers that hit the empty-matcher fallback
             // read the sidecar (see `scry_query::postings`).
             all_fingerprints: None,
+            has_body_bloom: has_body_bloom_raw != 0,
+            body_bloom_size_bytes: body_bloom_size_bytes.map(|v| v as u64),
         },
         bucket,
         date,

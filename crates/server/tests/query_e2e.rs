@@ -52,7 +52,7 @@ use scry_proto::framing::{read_frame, write_frame};
 use scry_proto::constants::Signal;
 use scry_proto::streaming::{DecodedSpan, LogsAppender, MetricsAppender, TracesAppender};
 use scry_proto::{QueryFrame, QueryFrameMsg};
-use scry_query::{PostingsCache, Query, QueryRequest};
+use scry_query::{BloomCache, PostingsCache, Query, QueryRequest};
 use scry_server::QueryService;
 use tempfile::TempDir;
 use tokio::io::{AsyncWriteExt, BufReader as TokioBufReader, BufWriter as TokioBufWriter};
@@ -225,6 +225,7 @@ async fn query_round_trip() {
     // transport changed.
     let pool = BufPool::new();
     let postings_cache = Arc::new(PostingsCache::with_budget_bytes(16 * 1024 * 1024));
+    let bloom_cache = Arc::new(BloomCache::with_budget_bytes(16 * 1024 * 1024));
     let memory_pool = Arc::new(GreedyMemoryPool::new(256 * 1024 * 1024));
     let runtime_env = Arc::new(
         RuntimeEnvBuilder::new()
@@ -237,6 +238,7 @@ async fn query_round_trip() {
         store.clone(),
         pool,
         postings_cache.clone(),
+        bloom_cache.clone(),
         runtime_env,
         memory_pool,
     ));
@@ -276,6 +278,7 @@ async fn query_round_trip() {
             ts_min: None,
             ts_max: None,
             trace_id: None,
+            body_contains: None,
         },
         sql: None,
         limit: None,
@@ -353,6 +356,7 @@ async fn query_round_trip() {
             ts_min: None,
             ts_max: None,
             trace_id: None,
+            body_contains: None,
         },
         sql: None,
         limit: None,
@@ -461,6 +465,7 @@ async fn logs_round_trip() {
     // ── Service ────────────────────────────────────────────────────
     let pool = BufPool::new();
     let postings_cache = Arc::new(PostingsCache::with_budget_bytes(16 * 1024 * 1024));
+    let bloom_cache = Arc::new(BloomCache::with_budget_bytes(16 * 1024 * 1024));
     let memory_pool = Arc::new(GreedyMemoryPool::new(256 * 1024 * 1024));
     let runtime_env = Arc::new(
         RuntimeEnvBuilder::new()
@@ -473,6 +478,7 @@ async fn logs_round_trip() {
         store.clone(),
         pool,
         postings_cache.clone(),
+        bloom_cache.clone(),
         runtime_env,
         memory_pool,
     ));
@@ -503,6 +509,7 @@ async fn logs_round_trip() {
             ts_min: None,
             ts_max: None,
             trace_id: None,
+            body_contains: None,
         },
         sql: None,
         limit: None,
@@ -644,6 +651,7 @@ async fn traces_round_trip() {
 
     let pool = BufPool::new();
     let postings_cache = Arc::new(PostingsCache::with_budget_bytes(16 * 1024 * 1024));
+    let bloom_cache = Arc::new(BloomCache::with_budget_bytes(16 * 1024 * 1024));
     let memory_pool = Arc::new(GreedyMemoryPool::new(256 * 1024 * 1024));
     let runtime_env = Arc::new(
         RuntimeEnvBuilder::new()
@@ -656,6 +664,7 @@ async fn traces_round_trip() {
         store.clone(),
         pool,
         postings_cache.clone(),
+        bloom_cache.clone(),
         runtime_env,
         memory_pool,
     ));

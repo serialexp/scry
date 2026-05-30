@@ -70,4 +70,19 @@ pub struct BlockMeta {
     /// `all_fingerprints`.
     #[serde(default)]
     pub all_fingerprints: Option<Vec<u64>>,
+
+    /// Whether this block has a sibling `.body.bloom` sidecar — the v0.7
+    /// full-text skip index over log bodies (byte-trigram bloom). True for
+    /// logs blocks, false for every other signal (only logs carry a body
+    /// column). Mirrors `has_postings`: the query layer checks this before
+    /// fetching the sidecar, so blocks without one fall straight through to
+    /// the scan path.
+    #[serde(default)]
+    pub has_body_bloom: bool,
+
+    /// On-disk size of the body bloom sidecar, if present. `None` when
+    /// `has_body_bloom` is false. Carried here so the catalog can surface
+    /// the full-text index overhead without opening the sidecar.
+    #[serde(default)]
+    pub body_bloom_size_bytes: Option<u64>,
 }

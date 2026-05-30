@@ -152,6 +152,19 @@ elif [[ "$SIGNAL" == "all" ]]; then
 else
     EXPECTED_RECORDS=$(( BATCHES * RECORDS_PER_BATCH ))
 fi
+
+# For logs-bearing runs, force a small per-block row cap so the ingest
+# volume seals *several* logs blocks instead of one. This is what makes
+# the v0.7 full-text leg meaningful: the per-block body-bloom skip loop
+# has to run across multiple candidate blocks (prune the misses, keep the
+# hits) rather than trivially over a single block. A single spewer is one
+# session → one shard, so `max_rows` governs block count directly. At the
+# default BATCHES the smallest logs volume is `all` mode (~30k rows), so
+# 20k caps to ≥2 logs blocks there and more in logs/both modes.
+INGEST_EXTRA_ARGS=()
+case "$SIGNAL" in
+    logs|both|all) INGEST_EXTRA_ARGS+=(--block-max-rows "${BLOCK_MAX_ROWS:-20000}") ;;
+esac
 LISTEN="${LISTEN:-127.0.0.1:4099}"
 SMOKE_DIR="${SMOKE_DIR:-/tmp/scry-smoke}"
 
@@ -209,6 +222,7 @@ RUST_LOG="${RUST_LOG:-info}" "$TIME_BIN" -v -o "$SMOKE_DIR/sink.time" \
         --storage \
         --wal-dir "$SMOKE_DIR/wal" \
         --catalog "$SMOKE_DIR/online.sqlite" \
+        "${INGEST_EXTRA_ARGS[@]+"${INGEST_EXTRA_ARGS[@]}"}" \
     > "$SMOKE_DIR/sink.log" 2>&1 &
 TIME_PID=$!
 # Find the actual scry-ingestd child of /usr/bin/time. Fork+exec is
@@ -400,6 +414,31 @@ if [[ ${#expect_postings_for[@]} -gt 0 ]]; then
     done
 fi
 
+# Body-bloom sidecar (v0.7 full-text): every logs block must carry a
+# `body.bloom` sidecar — built inline at seal from the complete body set.
+# Metrics/traces/profiles never do. Asserting `has_body_bloom=1` here is the
+# storage-side half of the full-text milestone; the query-side half is the
+# `--grep` ≡ `LIKE` leg below.
+if [[ "$SIGNAL" == "logs" || "$SIGNAL" == "both" || "$SIGNAL" == "all" ]]; then
+    logs_with_bloom=$(sqlite3 "$SMOKE_DIR/recon.sqlite" \
+        "SELECT COUNT(*) FROM blocks WHERE signal = 'logs' AND has_body_bloom = 1 AND body_bloom_size_bytes IS NOT NULL AND body_bloom_size_bytes > 0;")
+    logs_total_blocks=$(sqlite3 "$SMOKE_DIR/recon.sqlite" \
+        "SELECT COUNT(*) FROM blocks WHERE signal = 'logs';")
+    echo "[smoke] logs blocks w/ bloom: $logs_with_bloom / $logs_total_blocks"
+    if [[ "${logs_with_bloom:-0}" -lt 1 || "${logs_with_bloom:-0}" -ne "${logs_total_blocks:-0}" ]]; then
+        echo "[smoke] FAIL: not every logs block carries a body.bloom sidecar ($logs_with_bloom/$logs_total_blocks)"
+        failed=1
+    fi
+    # The full-text leg below is only a real test of the per-block skip
+    # loop if there's more than one logs block to prune over. `--block-max-rows`
+    # is set above to force this; assert it actually happened.
+    if [[ "${logs_total_blocks:-0}" -lt 2 ]]; then
+        echo "[smoke] FAIL: expected ≥2 logs blocks (so the body-bloom skip runs across blocks); got ${logs_total_blocks:-0}"
+        echo "[smoke]       (tune BLOCK_MAX_ROWS / BATCHES if ingest volume changed)"
+        failed=1
+    fi
+fi
+
 # No-postings signals (traces/profiles) in `all` mode: assert ≥1 block
 # landed and that it carries NO postings sidecar (has_postings=0) — these
 # signals push matcher/time/trace-id filters as row predicates instead of
@@ -512,6 +551,117 @@ if [[ "$SIGNAL" == "traces" || "$SIGNAL" == "all" ]]; then
             echo "[smoke] FAIL: --trace-id returned ${tid_rows:-<none>} spans, expected $pick_n (pruning/predicate bug)"
             echo "[smoke] scry-query output:"
             cat "$SMOKE_DIR/query.traceid.txt"
+            failed=1
+        fi
+    fi
+fi
+
+# ── Full-text search (v0.7) ──────────────────────────────────────────
+# The headline logs operation is "grep the bodies." Prove two things:
+#   1. The bloom-accelerated `--grep` path returns *exactly* the same rows
+#      as an un-accelerated `body LIKE '%token%'` scan — the load-bearing
+#      "skip never loses a match" equivalence, on a real bucket.
+#   2. An absent token prunes to zero rows.
+# The spewer renders every log body as "request <rand> processed in <n>ms"
+# (see crates/noise-spewer/src/gen.rs::render_logs), so "processed" occurs
+# in every body — a deterministic needle present in all logs blocks. We
+# omit `--signal` on the grep call to exercise the grep→logs inference.
+if [[ "$SIGNAL" == "logs" || "$SIGNAL" == "both" || "$SIGNAL" == "all" ]]; then
+    case "$SIGNAL" in
+        logs) logs_exp="$sink_accepted" ;;
+        *)    logs_exp="$sink_logs" ;;
+    esac
+
+    # (1a) bloom-accelerated grep path.
+    ./target/release/scry-query \
+        --catalog "$SMOKE_DIR/recon.sqlite" \
+        --grep processed \
+        > "$SMOKE_DIR/query.grep.txt" 2>&1 || true
+    grep_rows=$(awk '/^# scan:/ { print $3; exit }' "$SMOKE_DIR/query.grep.txt")
+
+    # (1b) un-accelerated LIKE scan over the same column (no --grep → no
+    # body_contains → no bloom skip; pure DataFusion substring scan).
+    ./target/release/scry-query \
+        --catalog "$SMOKE_DIR/recon.sqlite" \
+        --signal logs \
+        --sql "SELECT * FROM logs WHERE body LIKE '%processed%'" \
+        > "$SMOKE_DIR/query.like.txt" 2>&1 || true
+    like_rows=$(awk '/^# scan:/ { print $3; exit }' "$SMOKE_DIR/query.like.txt")
+
+    echo "[smoke] grep 'processed'   : ${grep_rows:-<none>} rows (LIKE scan: ${like_rows:-<none>}, expected $logs_exp)"
+    if [[ "${grep_rows:-}" != "${like_rows:-X}" ]]; then
+        echo "[smoke] FAIL: --grep count (${grep_rows:-<none>}) != body LIKE count (${like_rows:-<none>}) — bloom skip lost rows"
+        echo "[smoke] grep output:"; cat "$SMOKE_DIR/query.grep.txt"
+        echo "[smoke] LIKE output:"; cat "$SMOKE_DIR/query.like.txt"
+        failed=1
+    fi
+    # "processed" is in every body, so the match set is the full logs table.
+    if [[ "${grep_rows:-}" != "$logs_exp" ]]; then
+        echo "[smoke] FAIL: --grep 'processed' returned ${grep_rows:-<none>} rows, expected all $logs_exp logs rows"
+        failed=1
+    fi
+
+    # (2) absent token → bloom prunes every block → zero rows.
+    ./target/release/scry-query \
+        --catalog "$SMOKE_DIR/recon.sqlite" \
+        --grep "zzqq-no-such-token-xyz" \
+        > "$SMOKE_DIR/query.grep-miss.txt" 2>&1 || true
+    miss_rows=$(awk '/^# scan:/ { print $3; exit }' "$SMOKE_DIR/query.grep-miss.txt")
+    echo "[smoke] grep absent token  : ${miss_rows:-<none>} rows (expected 0)"
+    if [[ "${miss_rows:-}" != "0" ]]; then
+        echo "[smoke] FAIL: --grep of an absent token returned ${miss_rows:-<none>} rows, expected 0"
+        echo "[smoke] grep-miss output:"; cat "$SMOKE_DIR/query.grep-miss.txt"
+        failed=1
+    fi
+
+    # (3) Selective needle. Pull a real per-line token from one body
+    # (bodies are "request <rand8> processed in <n>ms"; the rand8 is
+    # unique per entry) and grep for it. Because the token lives in only
+    # one block (or few), the body-bloom *skips the other blocks* before
+    # scan — and the result must still exactly equal an un-accelerated
+    # LIKE scan. This is the equivalence that proves selective skipping is
+    # loss-free, not just the all-match / no-match extremes. (rand8 is
+    # alphanumeric, so it's safe to interpolate into LIKE and --grep.)
+    ./target/release/scry-query \
+        --catalog "$SMOKE_DIR/recon.sqlite" \
+        --signal logs --show \
+        --sql "SELECT body FROM logs LIMIT 1" \
+        > "$SMOKE_DIR/query.body-pick.txt" 2>&1 || true
+    needle_tok=$(awk -F'|' '
+        /^\|/ {
+            cnt++
+            if (cnt == 2) {
+                gsub(/^[ \t]+|[ \t]+$/, "", $2)
+                split($2, a, " ")
+                print a[2]   # "request <TOKEN> processed in …"
+                exit
+            }
+        }' "$SMOKE_DIR/query.body-pick.txt")
+    if [[ -z "${needle_tok:-}" || ! "$needle_tok" =~ ^[A-Za-z0-9]+$ ]]; then
+        echo "[smoke] FAIL: could not extract a body token to grep (got '${needle_tok:-}')"
+        echo "[smoke] body-pick output:"; cat "$SMOKE_DIR/query.body-pick.txt"
+        failed=1
+    else
+        ./target/release/scry-query \
+            --catalog "$SMOKE_DIR/recon.sqlite" \
+            --grep "$needle_tok" \
+            > "$SMOKE_DIR/query.grep-sel.txt" 2>&1 || true
+        sel_grep=$(awk '/^# scan:/ { print $3; exit }' "$SMOKE_DIR/query.grep-sel.txt")
+        ./target/release/scry-query \
+            --catalog "$SMOKE_DIR/recon.sqlite" \
+            --signal logs \
+            --sql "SELECT * FROM logs WHERE body LIKE '%${needle_tok}%'" \
+            > "$SMOKE_DIR/query.like-sel.txt" 2>&1 || true
+        sel_like=$(awk '/^# scan:/ { print $3; exit }' "$SMOKE_DIR/query.like-sel.txt")
+        echo "[smoke] grep selective tok : ${sel_grep:-<none>} rows (LIKE scan: ${sel_like:-<none>}, token=$needle_tok)"
+        if [[ "${sel_grep:-}" != "${sel_like:-X}" ]]; then
+            echo "[smoke] FAIL: selective --grep count (${sel_grep:-<none>}) != LIKE count (${sel_like:-<none>}) — bloom skip lost a match"
+            echo "[smoke] grep output:"; cat "$SMOKE_DIR/query.grep-sel.txt"
+            echo "[smoke] LIKE output:"; cat "$SMOKE_DIR/query.like-sel.txt"
+            failed=1
+        fi
+        if [[ "${sel_grep:-0}" -lt 1 ]]; then
+            echo "[smoke] FAIL: selective --grep '$needle_tok' returned ${sel_grep:-<none>} rows, expected ≥1 (the token came from a real body)"
             failed=1
         fi
     fi

@@ -70,12 +70,22 @@ use scry_query::{
     traces::{
         list_traces_candidates, register_traces_table_from_candidates, TRACES_TABLE_NAME,
     },
-    PostingsCache, PostingsCacheStats, QueryRequest, METRICS_TABLE_NAME,
+    BloomCache, BloomCacheStats, PostingsCache, PostingsCacheStats, QueryRequest,
+    METRICS_TABLE_NAME,
 };
 use scry_catalog::CatalogEntry;
 use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, info_span, warn, Instrument, Span};
+
+/// Per-query start snapshots of the two sidecar caches, bundled so the
+/// many `emit_scan_complete` call sites can pass one `cache_start` value
+/// by name. Both inner stats types are `Copy`.
+#[derive(Debug, Clone, Copy)]
+struct CacheStarts {
+    postings: PostingsCacheStats,
+    bloom: BloomCacheStats,
+}
 
 /// Long-lived query service. One instance per daemon process. All
 /// fields are `Arc`'d / `Clone` so per-connection captures are cheap.
@@ -95,6 +105,11 @@ pub struct QueryService {
     /// Single-flight built in: concurrent misses on the same block
     /// only do one parquet fetch.
     postings_cache: Arc<PostingsCache>,
+    /// Per-block body-bloom cache for the logs full-text path. Same
+    /// immutable-block rationale as `postings_cache`, but a separate
+    /// budget (blooms are ~2% of body size) so cheap blooms aren't
+    /// evicted by larger postings. Only the logs signal consults it.
+    bloom_cache: Arc<BloomCache>,
     /// Shared DataFusion runtime env. Every per-request
     /// `SessionContext` is constructed with `new_with_config_rt(...,
     /// runtime_env.clone())`, which is the only way DataFusion
@@ -113,11 +128,13 @@ pub struct QueryService {
 }
 
 impl QueryService {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         catalog: Arc<Mutex<Catalog>>,
         store: Arc<dyn ObjectStore>,
         pool: BufPool,
         postings_cache: Arc<PostingsCache>,
+        bloom_cache: Arc<BloomCache>,
         runtime_env: Arc<RuntimeEnv>,
         memory_pool: Arc<GreedyMemoryPool>,
     ) -> Self {
@@ -126,6 +143,7 @@ impl QueryService {
             store,
             pool,
             postings_cache,
+            bloom_cache,
             runtime_env,
             memory_pool,
             next_request_id: AtomicU64::new(0),
@@ -136,6 +154,12 @@ impl QueryService {
     /// budget state at startup and so callers can inspect stats.
     pub fn postings_cache(&self) -> &Arc<PostingsCache> {
         &self.postings_cache
+    }
+
+    /// Borrow the bloom cache — exposed so the binary can log its budget
+    /// at startup and so callers can inspect stats.
+    pub fn bloom_cache(&self) -> &Arc<BloomCache> {
+        &self.bloom_cache
     }
 
     /// Borrow the pool — exposed so the binary can log warmup state.
@@ -318,7 +342,13 @@ impl QueryService {
         W: tokio::io::AsyncWrite + Unpin,
     {
         let pool_start = self.pool.stats();
-        let cache_start = self.postings_cache.stats();
+        // Bundle both cache start-snapshots under one name so every
+        // `emit_scan_complete` call site stays unchanged (they pass
+        // `cache_start` by name); only the type and the two reads here move.
+        let cache_start = CacheStarts {
+            postings: self.postings_cache.stats(),
+            bloom: self.bloom_cache.stats(),
+        };
         let t0 = Instant::now();
         // Pre-allocate row counter so we can pass it to emit_scan_complete
         // on every exit path (success + each error path).
@@ -390,6 +420,7 @@ impl QueryService {
                     candidates,
                     self.store.clone(),
                     Some(self.postings_cache.as_ref()),
+                    Some(self.bloom_cache.as_ref()),
                     &req.query,
                 )
                 .await
@@ -708,13 +739,15 @@ impl QueryService {
         plan: Option<&dyn ExecutionPlan>,
         rows_total: u64,
         pool_start: PoolStats,
-        cache_start: PostingsCacheStats,
+        cache_start: CacheStarts,
         wall: Duration,
     ) {
         let pool_end = self.pool.stats();
         let pool_delta = pool_end.delta(pool_start);
         let cache_end = self.postings_cache.stats();
-        let cache_delta = cache_end.delta(cache_start);
+        let cache_delta = cache_end.delta(cache_start.postings);
+        let bloom_end = self.bloom_cache.stats();
+        let bloom_delta = bloom_end.delta(cache_start.bloom);
         let metrics = plan.and_then(collect_leaf_metrics);
 
         let (row_groups_pruned, row_groups_matched, files_pruned, bytes_scanned) = match metrics {
@@ -746,6 +779,12 @@ impl QueryService {
             postings_cache_fetch_errors_delta = cache_delta.fetch_errors,
             postings_cache_entries            = cache_end.entries,
             postings_cache_bytes_in           = cache_end.bytes_in,
+            bloom_cache_hits_delta            = bloom_delta.hits,
+            bloom_cache_misses_delta          = bloom_delta.misses,
+            bloom_cache_evictions_delta       = bloom_delta.evictions,
+            bloom_cache_fetch_errors_delta    = bloom_delta.fetch_errors,
+            bloom_cache_entries               = bloom_end.entries,
+            bloom_cache_bytes_in              = bloom_end.bytes_in,
             query_memory_reserved_bytes_end   = memory_reserved_bytes_end,
             pool_in_flight    = pool_end.in_flight,
             wall_ms = wall.as_millis() as u64,
