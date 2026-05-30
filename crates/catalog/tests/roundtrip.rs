@@ -247,3 +247,64 @@ async fn reconcile_walks_bucket_and_upserts_sidecars() {
     assert_eq!(again.already_present, 3);
     assert_eq!(again.failed, 1);
 }
+
+#[test]
+fn poll_cursor_absent_then_advances_monotonically() {
+    let tmp = TempDir::new().unwrap();
+    let cat = Catalog::open(&tmp.path().join("cat.sqlite"), "scry-dev").unwrap();
+    let writer = Uuid::now_v7();
+
+    // No cursor yet for an unseen partition.
+    assert_eq!(cat.get_cursor("metrics", writer, "2026-05-30").unwrap(), None);
+
+    // First observation sets it.
+    let u1 = Uuid::now_v7();
+    cat.advance_cursor("metrics", writer, "2026-05-30", u1).unwrap();
+    assert_eq!(
+        cat.get_cursor("metrics", writer, "2026-05-30").unwrap(),
+        Some(u1)
+    );
+
+    // A newer (lexically-greater, since v7) UUID advances the cursor.
+    let u2 = Uuid::now_v7();
+    assert!(u2 > u1, "v7 UUIDs minted later sort greater");
+    cat.advance_cursor("metrics", writer, "2026-05-30", u2).unwrap();
+    assert_eq!(
+        cat.get_cursor("metrics", writer, "2026-05-30").unwrap(),
+        Some(u2)
+    );
+
+    // Re-applying an older observation is a no-op (monotonic high-water mark).
+    cat.advance_cursor("metrics", writer, "2026-05-30", u1).unwrap();
+    assert_eq!(
+        cat.get_cursor("metrics", writer, "2026-05-30").unwrap(),
+        Some(u2),
+        "an out-of-order older UUID must not roll the cursor backward"
+    );
+}
+
+#[test]
+fn poll_cursors_are_keyed_per_signal_writer_date_and_listed() {
+    let tmp = TempDir::new().unwrap();
+    let cat = Catalog::open(&tmp.path().join("cat.sqlite"), "scry-dev").unwrap();
+    let w1 = Uuid::now_v7();
+    let w2 = Uuid::now_v7();
+
+    cat.advance_cursor("metrics", w1, "2026-05-30", Uuid::now_v7()).unwrap();
+    cat.advance_cursor("logs", w1, "2026-05-30", Uuid::now_v7()).unwrap();
+    cat.advance_cursor("metrics", w2, "2026-05-30", Uuid::now_v7()).unwrap();
+    cat.advance_cursor("metrics", w1, "2026-05-29", Uuid::now_v7()).unwrap();
+
+    // Distinct keys → four independent cursors.
+    let mut cursors = cat.list_cursors().unwrap();
+    assert_eq!(cursors.len(), 4);
+
+    // Each is individually retrievable; a different key is absent.
+    assert!(cat.get_cursor("metrics", w1, "2026-05-30").unwrap().is_some());
+    assert!(cat.get_cursor("traces", w1, "2026-05-30").unwrap().is_none());
+
+    // list_cursors round-trips the (signal, writer, date) tuples.
+    cursors.sort();
+    assert!(cursors.contains(&("logs".to_string(), w1, "2026-05-30".to_string())));
+    assert!(cursors.contains(&("metrics".to_string(), w2, "2026-05-30".to_string())));
+}

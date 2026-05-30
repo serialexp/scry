@@ -134,6 +134,19 @@ impl Catalog {
             CREATE INDEX IF NOT EXISTS idx_blocks_compact
               ON blocks(bucket, signal, date, level)
               WHERE deleted_at IS NULL;
+
+            -- Per-(signal, writer, date) high-water mark for incremental
+            -- ListObjects polling (ARCHITECTURE.md § Cursor-driven polling).
+            -- `highest_uuid` is the lexically-greatest (== newest, since
+            -- block UUIDs are v7 time-sortable) block UUID this instance has
+            -- ingested for the partition; the next poll lists start-after it.
+            CREATE TABLE IF NOT EXISTS poll_cursors (
+              signal       TEXT NOT NULL,
+              writer_id    TEXT NOT NULL,
+              date         TEXT NOT NULL,
+              highest_uuid TEXT NOT NULL,
+              PRIMARY KEY (signal, writer_id, date)
+            );
             "#,
         )
         .context("initialising catalog schema")?;
@@ -317,6 +330,88 @@ impl Catalog {
         Ok(())
     }
 
+    /// The highest block UUID this instance has ingested for
+    /// `(signal, writer_id, date)`, or `None` if the partition has never
+    /// been polled. The incremental poller lists `start-after` this value
+    /// (see [`advance_cursor`](Self::advance_cursor)).
+    pub fn get_cursor(
+        &self,
+        signal: &str,
+        writer_id: Uuid,
+        date: &str,
+    ) -> Result<Option<Uuid>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT highest_uuid FROM poll_cursors \
+             WHERE signal = ?1 AND writer_id = ?2 AND date = ?3",
+        )?;
+        let res: Option<String> = stmt
+            .query_row(
+                params![signal, writer_id.to_string(), date],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match res {
+            None => Ok(None),
+            Some(s) => {
+                let u = Uuid::parse_str(&s)
+                    .with_context(|| format!("parsing cursor uuid {s}"))?;
+                Ok(Some(u))
+            }
+        }
+    }
+
+    /// Advance the cursor for `(signal, writer_id, date)` to `uuid`, but
+    /// **only if `uuid` is lexically greater** than the stored value — a
+    /// monotonic high-water mark. UUID v7 strings sort by creation time, so
+    /// "lexically greater" means "newer". This is what lets pub/sub and
+    /// polling converge on the same state: whichever path observes a block
+    /// first advances the cursor; the slower path's advance is a no-op.
+    ///
+    /// Implemented as an UPSERT whose `DO UPDATE` is gated on
+    /// `excluded.highest_uuid > poll_cursors.highest_uuid`, so an
+    /// out-of-order (older) observation can never roll the cursor backward.
+    pub fn advance_cursor(
+        &self,
+        signal: &str,
+        writer_id: Uuid,
+        date: &str,
+        uuid: Uuid,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO poll_cursors (signal, writer_id, date, highest_uuid) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(signal, writer_id, date) DO UPDATE SET \
+                   highest_uuid = excluded.highest_uuid \
+                 WHERE excluded.highest_uuid > poll_cursors.highest_uuid",
+                params![signal, writer_id.to_string(), date, uuid.to_string()],
+            )
+            .context("UPSERT poll_cursor")?;
+        Ok(())
+    }
+
+    /// Every known cursor as `(signal, writer_id, date)`. Used by the
+    /// reconnect full sweep to re-poll every partition's tail.
+    pub fn list_cursors(&self) -> Result<Vec<(String, Uuid, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT signal, writer_id, date FROM poll_cursors")?;
+        let rows = stmt.query_map([], |r| {
+            let signal: String = r.get(0)?;
+            let writer_id_str: String = r.get(1)?;
+            let date: String = r.get(2)?;
+            Ok((signal, writer_id_str, date))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (signal, writer_id_str, date) = r?;
+            let writer_id = Uuid::parse_str(&writer_id_str)
+                .with_context(|| format!("parsing cursor writer_id {writer_id_str}"))?;
+            out.push((signal, writer_id, date));
+        }
+        Ok(out)
+    }
+
     /// Walk the bucket, fetch every `*.meta.json`, parse it as a
     /// [`BlockMeta`], and `INSERT OR IGNORE` into the catalog. Used to
     /// bootstrap an empty catalog and to re-derive after corruption.
@@ -385,6 +480,52 @@ impl Catalog {
         );
         Ok(report)
     }
+}
+
+/// Short-lived, synchronous access to a [`Catalog`] for one operation.
+///
+/// The compaction/retention engines run a long lifecycle that interleaves
+/// quick catalog mutations (`insert_block`, `mark_superseded`,
+/// `delete_blocks`, …) with minutes-long async work (the DataFusion merge,
+/// object-store DELETEs). In a multi-instance daemon the catalog is shared
+/// behind a `Mutex` with the convergence consumer and the query path, so the
+/// lock **must not** be held across an `.await`.
+///
+/// This trait expresses exactly that discipline: [`with`](CatalogHandle::with)
+/// hands a `&Catalog` to a closure that does one synchronous call and returns
+/// before any await. The single-instance path passes a `&Catalog` (the impl is
+/// a no-op pass-through); the daemon passes a `&Mutex<Catalog>` (the impl locks
+/// for the duration of the closure only). The engines are generic over the
+/// handle, so one routine serves both without duplicating the lifecycle and
+/// without ever leaking a lock across an await point.
+pub trait CatalogHandle {
+    /// Run `f` against the catalog and return its result. For a locked handle
+    /// the lock is acquired before `f` and released as `f` returns — `f` is
+    /// synchronous, so this can never straddle an `.await`.
+    fn with<R>(&self, f: impl FnOnce(&Catalog) -> R) -> R;
+}
+
+impl CatalogHandle for Catalog {
+    #[inline]
+    fn with<R>(&self, f: impl FnOnce(&Catalog) -> R) -> R {
+        f(self)
+    }
+}
+
+impl CatalogHandle for std::sync::Mutex<Catalog> {
+    #[inline]
+    fn with<R>(&self, f: impl FnOnce(&Catalog) -> R) -> R {
+        f(&self.lock().expect("catalog mutex poisoned"))
+    }
+}
+
+/// The `yyyy-mm-dd` UTC partition date a block with this `ts_min_unix_nano`
+/// belongs to — the `date` column value and the date component of both the
+/// object-storage path and a poll cursor's key. Exposed so the cluster's
+/// convergence/poll code can derive a block's cursor key from its meta
+/// without re-deriving the calendar math.
+pub fn date_dir(ts_unix_nano: u64) -> String {
+    format_date(ts_unix_nano)
 }
 
 fn format_date(ts_unix_nano: u64) -> String {
