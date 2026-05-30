@@ -21,6 +21,17 @@ pub struct BlockMeta {
     /// On-disk size of the parquet payload after compression.
     pub byte_size: u64,
     pub schema_version: u32,
+
+    /// Compaction tier. `0` for freshly-written blocks from the block
+    /// builder; bumped by the compactor when it merges `K` blocks at
+    /// level `L` into one at level `L+1` (`ARCHITECTURE.md §
+    /// Compaction § Tiered levels`). Promoted into the sidecar — not
+    /// just the catalog — so a bucket reconcile recovers the level
+    /// instead of resetting every compacted block back to `0`.
+    /// `#[serde(default)]` keeps pre-v0.8 sidecars (which lack the
+    /// field) deserialising to level 0.
+    #[serde(default)]
+    pub level: u32,
     /// Producer software version string (cargo pkg version of the
     /// writer crate). Lets operators correlate a block to a release.
     pub producer_version: String,

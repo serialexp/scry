@@ -54,6 +54,71 @@ pub struct BodyBloom {
     bits: Vec<u8>,
 }
 
+/// Streaming accumulator for a [`BodyBloom`].
+///
+/// Bodies are fed in one at a time via [`add_body`](Self::add_body) and
+/// the filter is materialised by [`finish`](Self::finish). This is the
+/// shape the compactor needs: it merges blocks by streaming sorted
+/// record batches through DataFusion and can feed each batch's bodies
+/// here without ever holding the full merged body set in memory. The
+/// only state that grows is the distinct-gram set (the `(h1, h2)` pairs)
+/// — exactly the same bound as the one-shot [`BodyBloom::build_from_bodies`],
+/// which is now a thin wrapper over this builder.
+#[derive(Debug, Clone)]
+pub struct BodyBloomBuilder {
+    ngram: usize,
+    /// Dedup on `h1` (a 64-bit collision is negligible and would only
+    /// nudge sizing). Mirrors the one-shot path exactly so the two
+    /// produce bit-identical filters for the same body set.
+    seen: std::collections::HashSet<u64>,
+    grams: Vec<(u64, u64)>,
+}
+
+impl BodyBloomBuilder {
+    /// Start a builder n-gramming over bytes at width `cfg_ngram` (`0`
+    /// is treated as `1`, matching `build_from_bodies`).
+    pub fn new(cfg_ngram: usize) -> Self {
+        Self {
+            ngram: cfg_ngram.max(1).min(u8::MAX as usize),
+            seen: std::collections::HashSet::new(),
+            grams: Vec::new(),
+        }
+    }
+
+    /// Feed one body into the accumulator. Bodies shorter than the
+    /// n-gram width contribute no grams (the bloom can't index them; the
+    /// query scans for short patterns regardless).
+    pub fn add_body(&mut self, body: &str) {
+        let bytes = body.as_bytes();
+        if bytes.len() < self.ngram {
+            return;
+        }
+        for window in bytes.windows(self.ngram) {
+            let (h1, h2) = hash_pair(window);
+            if self.seen.insert(h1) {
+                self.grams.push((h1, h2));
+            }
+        }
+    }
+
+    /// Size `(m, k)` for the exact distinct-gram count at `target_fpr`
+    /// and fill the bit array. Consumes the builder.
+    pub fn finish(self, target_fpr: f64) -> BodyBloom {
+        let n = self.grams.len() as u64;
+        let (m_bits, k) = optimal_params(n, target_fpr);
+        let mut bloom = BodyBloom {
+            ngram: self.ngram as u8,
+            k,
+            m_bits,
+            bits: vec![0u8; m_bits.div_ceil(8) as usize],
+        };
+        for (h1, h2) in self.grams {
+            bloom.set_gram(h1, h2);
+        }
+        bloom
+    }
+}
+
 /// `(h1, h2)` for a gram. Two seeded xxhashes → two independent 64-bit
 /// values for double hashing.
 fn hash_pair(gram: &[u8]) -> (u64, u64) {
@@ -76,37 +141,11 @@ impl BodyBloom {
     where
         I: IntoIterator<Item = &'a str>,
     {
-        let ngram = cfg_ngram.max(1).min(u8::MAX as usize);
-        // First pass: collect distinct grams as `(h1, h2)` pairs so we
-        // can size `m`/`k` for the exact distinct count. Dedup on `h1`
-        // (a 64-bit collision is negligible and would only nudge sizing).
-        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
-        let mut grams: Vec<(u64, u64)> = Vec::new();
+        let mut builder = BodyBloomBuilder::new(cfg_ngram);
         for body in bodies {
-            let bytes = body.as_bytes();
-            if bytes.len() < ngram {
-                continue;
-            }
-            for window in bytes.windows(ngram) {
-                let (h1, h2) = hash_pair(window);
-                if seen.insert(h1) {
-                    grams.push((h1, h2));
-                }
-            }
+            builder.add_body(body);
         }
-
-        let n = grams.len() as u64;
-        let (m_bits, k) = optimal_params(n, target_fpr);
-        let mut bloom = BodyBloom {
-            ngram: ngram as u8,
-            k,
-            m_bits,
-            bits: vec![0u8; m_bits.div_ceil(8) as usize],
-        };
-        for (h1, h2) in grams {
-            bloom.set_gram(h1, h2);
-        }
-        bloom
+        builder.finish(target_fpr)
     }
 
     /// Does this block possibly contain `pattern` as a literal byte
@@ -283,6 +322,33 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn streaming_builder_matches_one_shot() {
+        // The compactor feeds bodies through BodyBloomBuilder batch by
+        // batch; that path must produce a bit-identical filter to the
+        // one-shot build_from_bodies over the same set (same dedup, same
+        // sizing, same fill order).
+        let bodies = [
+            "connection refused from 10.0.0.1",
+            "req_id=8f3a91c2 status=200 ok",
+            "timeout after 30s",
+            "connection refused from 10.0.0.2",
+        ];
+        let one_shot = BodyBloom::build_from_bodies(bodies.iter().copied(), 3, 0.01);
+
+        let mut builder = BodyBloomBuilder::new(3);
+        for b in &bodies {
+            builder.add_body(b);
+        }
+        let streamed = builder.finish(0.01);
+
+        assert_eq!(
+            one_shot.to_bytes(),
+            streamed.to_bytes(),
+            "streaming builder must produce a bit-identical filter"
+        );
     }
 
     #[test]

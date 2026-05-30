@@ -293,6 +293,7 @@ impl ProfilesBlockBuilder {
             row_count: n as u64,
             byte_size,
             schema_version: SCHEMA_VERSION,
+            level: 0,
             producer_version: env!("CARGO_PKG_VERSION").to_string(),
             label_fingerprint_bloom: None,
             // Profiles query by (type, time), served by block stats — no

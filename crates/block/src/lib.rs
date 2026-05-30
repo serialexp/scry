@@ -19,10 +19,11 @@ mod dummy;
 pub mod logs;
 mod meta;
 pub mod metrics;
+pub mod postings;
 pub mod profiles;
 pub mod traces;
 
-pub use bloom::BodyBloom;
+pub use bloom::{BodyBloom, BodyBloomBuilder};
 pub use dummy::DummyBlockBuilder;
 pub use logs::LogsBlockBuilder;
 pub use meta::BlockMeta;
@@ -244,6 +245,41 @@ pub fn block_path(
         block_uuid,
         kind,
     )
+}
+
+/// Delete every object that makes up a block — main parquet, meta.json,
+/// and whichever sidecars its flags say it carries. Used by both
+/// compaction (reaping merged-away inputs) and retention (reaping
+/// expired blocks). Tolerant of already-absent objects (a retried pass,
+/// or a partially-deleted block) so deletion is idempotent.
+pub async fn delete_block_objects(store: &dyn ObjectStore, meta: &BlockMeta) -> Result<()> {
+    use anyhow::Context as _;
+    use object_store::ObjectStoreExt as _;
+
+    let mut kinds: Vec<&str> = vec!["parquet", "meta.json"];
+    if meta.has_postings {
+        kinds.push("postings.parquet");
+    }
+    if meta.has_body_bloom {
+        kinds.push("body.bloom");
+    }
+    for kind in kinds {
+        let path = Path::from(block_path(
+            &meta.signal,
+            meta.ts_min_unix_nano,
+            meta.writer_id,
+            meta.uuid,
+            kind,
+        ));
+        match store.delete(&path).await {
+            Ok(()) => {}
+            Err(object_store::Error::NotFound { .. }) => {
+                tracing::debug!(%path, "object already absent during delete");
+            }
+            Err(e) => return Err(e).with_context(|| format!("delete {path}")),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

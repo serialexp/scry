@@ -38,16 +38,12 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use arrow::array::{
-    ArrayRef, Float64Array, ListArray, StringArray, UInt64Array, UInt64Builder,
-};
-use arrow::buffer::OffsetBuffer;
+use arrow::array::{ArrayRef, Float64Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use object_store::{path::Path, ObjectStore, ObjectStoreExt};
 use parquet::arrow::ArrowWriter;
-use parquet::file::properties::WriterProperties;
 use scry_proto::streaming::MetricsAppender;
 use uuid::Uuid;
 
@@ -96,17 +92,7 @@ impl MetricsBlockBuilder {
     }
 
     pub fn postings_schema() -> SchemaRef {
-        // List items are non-nullable u64 fingerprints.
-        let inner = Field::new("item", DataType::UInt64, false);
-        Arc::new(Schema::new(vec![
-            Field::new("label_name", DataType::Utf8, false),
-            Field::new("label_value", DataType::Utf8, false),
-            Field::new(
-                "series_fingerprints",
-                DataType::List(Arc::new(inner)),
-                false,
-            ),
-        ]))
+        crate::postings::postings_schema()
     }
 
     pub fn row_count(&self) -> u64 {
@@ -355,7 +341,7 @@ impl MetricsBlockBuilder {
         // postings map by integer IDs instead.
         let postings = self.build_postings();
         let postings_props = self.cfg.postings_writer_props()?;
-        let postings_bytes = self.encode_postings(postings, &postings_props)?;
+        let postings_bytes = crate::postings::encode_postings(&postings, &postings_props)?;
         let postings_size = postings_bytes.len() as u64;
 
         // ── Sidecar JSON ───────────────────────────────────────────
@@ -379,6 +365,7 @@ impl MetricsBlockBuilder {
             row_count: n as u64,
             byte_size,
             schema_version: SCHEMA_VERSION,
+            level: 0,
             producer_version: env!("CARGO_PKG_VERSION").to_string(),
             label_fingerprint_bloom: None,
             has_postings: true,
@@ -453,77 +440,5 @@ impl MetricsBlockBuilder {
             fps.dedup();
         }
         entries
-    }
-
-    fn encode_postings(
-        &self,
-        entries: Vec<((String, String), Vec<u64>)>,
-        props: &WriterProperties,
-    ) -> Result<Bytes> {
-        let schema = Self::postings_schema();
-        if entries.is_empty() {
-            // Write an empty parquet so the file is always present
-            // when has_postings=true. Cheap; query path can detect
-            // empty by row count.
-            let empty_main = RecordBatch::new_empty(schema.clone());
-            let mut buf: Vec<u8> = Vec::new();
-            let mut w = ArrowWriter::try_new(&mut buf, schema, Some(props.clone()))
-                .context("ArrowWriter::try_new (empty postings)")?;
-            w.write(&empty_main).context("ArrowWriter::write (empty postings)")?;
-            w.close().context("ArrowWriter::close (empty postings)")?;
-            return Ok(Bytes::from(buf));
-        }
-
-        // Build the three columns. The ListArray uses i32 offsets;
-        // at our 60M-series architecture ceiling each fingerprint
-        // list maxes at ~thousands of u64s and the cumulative offset
-        // stays well under i32::MAX. Still, debug_assert the running
-        // offset just in case real workloads ever stretch that.
-        //
-        // TODO(v0.3): If we ever ship a deployment where postings
-        // cardinality could push past 2.1B entries per block, switch
-        // to LargeListArray (i64 offsets). At v0.2 scale we're nowhere
-        // close.
-        let names: StringArray =
-            entries.iter().map(|((k, _), _)| Some(k.as_str())).collect();
-        let values: StringArray =
-            entries.iter().map(|((_, v), _)| Some(v.as_str())).collect();
-
-        let total_fps: usize = entries.iter().map(|(_, fps)| fps.len()).sum();
-        let mut values_builder = UInt64Builder::with_capacity(total_fps);
-        let mut offsets: Vec<i32> = Vec::with_capacity(entries.len() + 1);
-        let mut running: i32 = 0;
-        offsets.push(running);
-        for (_, fps) in entries.iter() {
-            for &fp in fps {
-                values_builder.append_value(fp);
-            }
-            running = running
-                .checked_add(fps.len() as i32)
-                .expect("postings offset overflow (i32); see LargeListArray TODO");
-            offsets.push(running);
-        }
-        debug_assert!(running >= 0);
-        let values_array = Arc::new(values_builder.finish());
-        let offset_buf = OffsetBuffer::new(offsets.into());
-        let field = match Self::postings_schema().field(2).data_type() {
-            DataType::List(f) => f.clone(),
-            other => {
-                anyhow::bail!("postings schema column 2 should be List, found {other:?}")
-            }
-        };
-        let list = ListArray::new(field, offset_buf, values_array, None);
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(names), Arc::new(values), Arc::new(list)],
-        )
-        .context("constructing postings RecordBatch")?;
-
-        let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
-        let mut w = ArrowWriter::try_new(&mut buf, schema, Some(props.clone()))
-            .context("ArrowWriter::try_new (postings)")?;
-        w.write(&batch).context("ArrowWriter::write (postings)")?;
-        w.close().context("ArrowWriter::close (postings)")?;
-        Ok(Bytes::from(buf))
     }
 }
