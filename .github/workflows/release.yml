@@ -50,10 +50,12 @@ jobs:
 
       - name: Build and push image
         # Reads the project id from depot.json and the targets from
-        # docker-bake.hcl; TAG flows into the image tag (${IMAGE}:${TAG}).
+        # docker-bake.hcl. TAG flows into the image tag; PUSH_LATEST also
+        # moves :latest, so a vX.Y.Z tag publishes both :<tag> and :latest.
         run: depot bake --push
         env:
           TAG: ${{ github.ref_name }}
+          PUSH_LATEST: "true"
 
   # ── Desktop app bundles (Tauri, per-platform) ──────────────────────────
   desktop:
