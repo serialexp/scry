@@ -16,6 +16,8 @@
 
 pub mod bloom;
 mod dummy;
+pub mod events;
+pub mod fence;
 pub mod logs;
 mod meta;
 pub mod metrics;
@@ -25,6 +27,8 @@ pub mod traces;
 
 pub use bloom::{BodyBloom, BodyBloomBuilder};
 pub use dummy::DummyBlockBuilder;
+pub use events::{BlockEvent, BlockEventSink, Envelope, NoopSink};
+pub use fence::{AlwaysValid, Fence};
 pub use logs::LogsBlockBuilder;
 pub use meta::BlockMeta;
 pub use metrics::MetricsBlockBuilder;
