@@ -158,7 +158,7 @@ impl Catalog {
               body_bloom_size_bytes, has_body_bloom,
               schema_version, fingerprint, superseded_by, deleted_at
             ) VALUES (
-              ?1, ?2, ?3, ?4, ?5, 0,
+              ?1, ?2, ?3, ?4, ?5, ?16,
               ?6, ?7, ?8, ?9,
               ?10, ?11,
               ?12, ?13,
@@ -184,13 +184,20 @@ impl Catalog {
                 if meta.has_body_bloom { 1i64 } else { 0i64 },
                 meta.schema_version as i64,
                 meta.label_fingerprint_bloom.as_deref(),
+                meta.level as i64,
             ],
         )
         .context("INSERT OR IGNORE block")?;
         Ok(rows > 0)
     }
 
-    /// List every non-deleted block, ordered by `(date, ts_min)`.
+    /// List every **live** block — not deleted and not superseded by a
+    /// compaction merge — ordered by `(date, ts_min)`. This is the set
+    /// queries read from: the moment the compactor sets `superseded_by`
+    /// on an input (pointing at its merged replacement), that input
+    /// drops out here, so a query never double-counts a merged block
+    /// against its still-present-but-superseded inputs during the
+    /// grace window before the input objects are deleted.
     pub fn list_blocks(&self) -> Result<Vec<CatalogEntry>> {
         let mut stmt = self.conn.prepare(
             r#"
@@ -200,7 +207,7 @@ impl Catalog {
                    has_postings, postings_size_bytes,
                    has_body_bloom, body_bloom_size_bytes
             FROM blocks
-            WHERE deleted_at IS NULL
+            WHERE deleted_at IS NULL AND superseded_by IS NULL
             ORDER BY date, ts_min, uuid
             "#,
         )?;
@@ -239,6 +246,75 @@ impl Catalog {
             |r| r.get(0),
         )?;
         Ok(n as usize)
+    }
+
+    /// Mark a set of input blocks as superseded by a freshly-written
+    /// compaction output (`merged`). Sets `superseded_by = merged` on
+    /// every input UUID. After this returns the inputs no longer appear
+    /// in [`list_blocks`], so queries read the merged block instead.
+    ///
+    /// `merged` must already be inserted (the `superseded_by` foreign
+    /// key references `blocks(uuid)`); the compactor inserts the merged
+    /// block before calling this. Runs in a single transaction so the
+    /// supersede flips atomically — a query either sees all inputs or
+    /// none of them, never a half-merged partition.
+    pub fn mark_superseded(&self, inputs: &[Uuid], merged: Uuid) -> Result<()> {
+        let merged_str = merged.to_string();
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare_cached(
+                "UPDATE blocks SET superseded_by = ?1 WHERE uuid = ?2",
+            )?;
+            for input in inputs {
+                stmt.execute(params![merged_str, input.to_string()])
+                    .context("UPDATE superseded_by")?;
+            }
+        }
+        tx.commit().context("commit mark_superseded")?;
+        Ok(())
+    }
+
+    /// Drop a set of block rows from the catalog. Called by the
+    /// compactor *after* the input objects have been deleted from the
+    /// bucket (the catalog is derived state — the row only goes once
+    /// the bucket truth is gone). Runs in one transaction.
+    ///
+    /// Safe to call on superseded inputs: nothing references an input's
+    /// UUID (the `superseded_by` FK points *from* the input *to* the
+    /// still-present merged block, not the other way round).
+    pub fn delete_blocks(&self, uuids: &[Uuid]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare_cached("DELETE FROM blocks WHERE uuid = ?1")?;
+            for uuid in uuids {
+                stmt.execute(params![uuid.to_string()])
+                    .context("DELETE block row")?;
+            }
+        }
+        tx.commit().context("commit delete_blocks")?;
+        Ok(())
+    }
+
+    /// Soft-delete a set of blocks: stamp `deleted_at` with
+    /// `deleted_at_unix_nano`. Because [`list_blocks`](Self::list_blocks)
+    /// filters `deleted_at IS NULL`, a marked block drops out of the live
+    /// set immediately — so the retention reaper can mark expired blocks,
+    /// let queries stop listing them, wait an optional grace window, and
+    /// only then delete their objects + rows. At grace 0 this step is
+    /// skipped and [`delete_blocks`](Self::delete_blocks) is called
+    /// directly. Runs in one transaction.
+    pub fn mark_deleted(&self, uuids: &[Uuid], deleted_at_unix_nano: u64) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt =
+                tx.prepare_cached("UPDATE blocks SET deleted_at = ?1 WHERE uuid = ?2")?;
+            for uuid in uuids {
+                stmt.execute(params![deleted_at_unix_nano as i64, uuid.to_string()])
+                    .context("UPDATE deleted_at")?;
+            }
+        }
+        tx.commit().context("commit mark_deleted")?;
+        Ok(())
     }
 
     /// Walk the bucket, fetch every `*.meta.json`, parse it as a
@@ -352,6 +428,7 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<CatalogEntry> {
             row_count: row_count as u64,
             byte_size: byte_size as u64,
             schema_version: schema_version as u32,
+            level: level as u32,
             // The producer_version isn't worth round-tripping through
             // the catalog — sidecar JSON has it. Empty string here is
             // the conventional "unknown" sentinel.
