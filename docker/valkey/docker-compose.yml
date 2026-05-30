@@ -1,0 +1,11 @@
+services:
+  valkey:
+    image: valkey/valkey:8.0-alpine
+    container_name: scry-valkey
+    restart: unless-stopped
+    network_mode: host
+    command: ["valkey-server", "--save", "", "--appendonly", "no"]
+    # Listens on the default 6379 via host networking so the dev machine can
+    # reach it at redis://127.0.0.1:6379 without DNS games. Persistence is off
+    # — the lease/pub-sub state is ephemeral coordination, never the source of
+    # truth (the bucket is), so there is nothing worth saving across restarts.

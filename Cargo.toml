@@ -19,6 +19,7 @@ members = [
     "crates/compact",
     "crates/retention",
     "crates/cluster",
+    "crates/valkey",
 ]
 # The desktop query app (Tauri + SolidJS) is its own crate with a heavy,
 # unrelated dependency tree (tauri, webkit bindings). It is intentionally
@@ -51,6 +52,7 @@ scry-query        = { path = "crates/query" }
 scry-compact      = { path = "crates/compact" }
 scry-retention    = { path = "crates/retention" }
 scry-cluster      = { path = "crates/cluster" }
+scry-valkey       = { path = "crates/valkey" }
 
 anyhow    = "1"
 arrow     = "58"
@@ -58,6 +60,7 @@ async-trait = "0.1"
 axum      = { version = "0.8", features = ["multipart"] }
 datafusion = "53"
 bytes     = "1"
+fred      = "10"
 chrono    = { version = "0.4", default-features = false, features = ["clock"] }
 clap      = { version = "4", features = ["derive"] }
 crc32fast = "1"
