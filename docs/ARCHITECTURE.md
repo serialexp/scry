@@ -1233,6 +1233,29 @@ number of small blocks (and thus the number of objects to open and
 metadata to load on every query) while bounding the write
 amplification cost.
 
+> **Implementation status (v0.8, D-036).** The shipped subset is
+> **single-instance** and runs as a **standalone tool** (`scry-compact`,
+> `--once` / `--watch`), not yet as an in-`scry-ingestd` background task.
+> It implements the tiered levels, the size-tiered policy, and the
+> per-merge sequence below — with three deliberate simplifications:
+> (1) **no compaction lease.** There is one compactor, so the
+> per-`(signal, day)` object-store lease in [Multi-writer
+> coordination](#multi-writer-coordination) is **deferred**. The
+> immutable + content-addressed block design already makes a stale-lease
+> double-merge harmless (worst case: an orphaned merged block the next
+> pass treats as another input), so the single-instance engine is
+> forward-compatible with adding the lease later. (2) **grace defaults to
+> 0.** Because `superseded_by IS NULL` is in the query filter, queries
+> skip inputs the instant step 5 commits — there's no live-overlap window
+> for one compactor, so the grace period (still configurable via
+> `--grace`) defaults to 0; it only matters once a concurrent reader can
+> be mid-scan, i.e. the multi-instance case. (3) the merge re-sorts the
+> inputs via a **DataFusion `ORDER BY`** (streaming, spills) rather than a
+> hand-rolled k-way merge over the already-sorted inputs — correct and
+> memory-bounded; the k-way merge is a later optimisation. Retention
+> (the other half of v0.8) ships as its own standalone tool — see the
+> [Retention](#retention) status note below.
+
 ### Tiered levels
 
 Blocks live at one of several **levels**, recorded in
@@ -1534,6 +1557,29 @@ Background task. Per signal, on a schedule:
 Because blocks never straddle a day boundary, this is a pure
 prefix-delete. No partial-block resurrection logic. No
 "open the block and find old records" scan.
+
+> **Implementation status (v0.8, D-037).** Shipped as a **standalone
+> tool** (`scry-retention`, `--watch` / one-shot), not yet an
+> in-`scry-ingestd` background task, and **single-instance** (no
+> distributed lease — shared deferral with compaction). Two deliberate
+> choices on top of the sketch above: (1) **opt-in per signal, no
+> implicit deletion.** A signal is reaped only when a TTL is configured
+> for it — a per-signal override (`--ttl-logs 30d`) or a global
+> `--ttl 30d` default. A signal with no TTL is never touched; nothing is
+> deleted by accident. (2) **dry-run by default.** A normal run only
+> *previews* (logs the candidate blocks + bytes, touches nothing);
+> `--apply` is required to delete. Selection is the **whole-block
+> `ts_max` criterion** — a block is reaped only when its *newest* record
+> is strictly past the TTL, so in-window data is never dropped. The
+> reaper walks the catalog (`list_blocks`, already filtering
+> `deleted_at IS NULL`) rather than blind prefix-deleting, so it reuses
+> compaction's delete plumbing (`delete_block_objects` →
+> `delete_blocks`, objects before rows) and the `deleted_at` soft-delete
+> gives a correct grace window (queries stop listing a block the instant
+> it's marked, before its objects go); grace defaults to 0, safe
+> single-instance. Still deferred: the multi-instance lease, time-based
+> *partial*-block rewriting (we only drop whole blocks), and
+> size/quota-based eviction (retention is purely age-based).
 
 ## Scaling
 

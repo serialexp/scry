@@ -197,7 +197,7 @@ fi
 
 # ── Build ───────────────────────────────────────────────────────────
 echo "[smoke] building release binaries..."
-cargo build --release -p scry-ingestd -p noise-spewer -p scry-list -p scry-query >&2
+cargo build --release -p scry-ingestd -p noise-spewer -p scry-list -p scry-query -p scry-compact -p scry-retention >&2
 
 # ── Clean slate ─────────────────────────────────────────────────────
 rm -rf "$SMOKE_DIR"
@@ -664,6 +664,172 @@ if [[ "$SIGNAL" == "logs" || "$SIGNAL" == "both" || "$SIGNAL" == "all" ]]; then
             echo "[smoke] FAIL: selective --grep '$needle_tok' returned ${sel_grep:-<none>} rows, expected ≥1 (the token came from a real body)"
             failed=1
         fi
+    fi
+fi
+
+# ── Compaction (v0.8) ────────────────────────────────────────────────
+# The forced `--block-max-rows` cap above sealed *several* small L0 logs
+# blocks. v0.8 compaction merges them into fewer, larger ones. Prove the
+# merge is lossless and the inputs are reaped, end-to-end against the real
+# bucket:
+#
+#   (a) the live logs block count drops (inputs superseded out of the
+#       catalog's live set);
+#   (b) ≥1 logs block now sits at level ≥1 (the merged output);
+#   (c) a *fresh reconcile from the bucket* still queries back exactly the
+#       pre-compaction logs row count — this is the load-bearing check.
+#       Reconcile rebuilds the catalog purely from the meta.json sidecars
+#       in the bucket, so if any superseded input's objects had lingered,
+#       they'd reappear as live blocks and inflate the count. An unchanged
+#       count therefore proves *both* losslessness and that the input
+#       objects were deleted; and
+#   (d) `--grep` still finds every body in the merged block (the body
+#       bloom was rebuilt during the merge).
+#
+# Runs only for logs-bearing signals — they're the ones guaranteed ≥2
+# logs blocks here (asserted above). Set COMPACT=0 to skip. Compaction
+# mutates the bucket, so this leg is deliberately last.
+if [[ "${COMPACT:-1}" == "1" ]] \
+   && { [[ "$SIGNAL" == "logs" || "$SIGNAL" == "both" || "$SIGNAL" == "all" ]]; }; then
+    case "$SIGNAL" in
+        logs) compact_exp="$sink_accepted" ;;
+        *)    compact_exp="$sink_logs" ;;
+    esac
+    COMPACT_FANOUT="${COMPACT_FANOUT:-2}"
+
+    pre_logs_live=$(sqlite3 "$SMOKE_DIR/recon.sqlite" \
+        "SELECT COUNT(*) FROM blocks WHERE signal='logs' AND superseded_by IS NULL AND deleted_at IS NULL;")
+    echo "[smoke] ──── compaction (v0.8) ────"
+    echo "[smoke] pre-compaction logs blocks : $pre_logs_live (fanout=$COMPACT_FANOUT)"
+
+    # One pass over a dedicated catalog reconciled fresh from the bucket
+    # by the tool itself. Merges the COMPACT_FANOUT smallest L0 logs
+    # blocks into one L1 block, supersedes + deletes the inputs (grace 0).
+    ./target/release/scry-compact \
+        --catalog "$SMOKE_DIR/compact.sqlite" \
+        --signal logs \
+        --fanout "$COMPACT_FANOUT" \
+        --grace 0 \
+        > "$SMOKE_DIR/compact.txt" 2>&1 || true
+    cat "$SMOKE_DIR/compact.txt"
+
+    # Reconcile a *fresh* catalog from the post-compaction bucket so every
+    # assertion below reads bucket truth, not the compactor's own catalog.
+    ./target/release/scry-list \
+        --catalog "$SMOKE_DIR/recon-post.sqlite" \
+        > "$SMOKE_DIR/scry-list-post.txt" 2>&1
+
+    post_logs_live=$(sqlite3 "$SMOKE_DIR/recon-post.sqlite" \
+        "SELECT COUNT(*) FROM blocks WHERE signal='logs' AND superseded_by IS NULL AND deleted_at IS NULL;")
+    post_logs_l1=$(sqlite3 "$SMOKE_DIR/recon-post.sqlite" \
+        "SELECT COUNT(*) FROM blocks WHERE signal='logs' AND level >= 1 AND superseded_by IS NULL AND deleted_at IS NULL;")
+    echo "[smoke] post-compaction logs blocks: $post_logs_live (level≥1: $post_logs_l1)"
+
+    # (a) live logs block count dropped.
+    if [[ "${post_logs_live:-0}" -ge "${pre_logs_live:-0}" ]]; then
+        echo "[smoke] FAIL: live logs block count did not drop after compaction ($pre_logs_live → $post_logs_live)"
+        failed=1
+    fi
+    # (b) at least one merged block at level ≥ 1.
+    if [[ "${post_logs_l1:-0}" -lt 1 ]]; then
+        echo "[smoke] FAIL: no logs block at level ≥1 after compaction (merge produced nothing)"
+        failed=1
+    fi
+
+    # (c) lossless + inputs reaped: a fresh reconcile still queries back the
+    #     same logs row count.
+    ./target/release/scry-query \
+        --catalog "$SMOKE_DIR/recon-post.sqlite" \
+        --signal logs \
+        > "$SMOKE_DIR/query.logs-post.txt" 2>&1 || true
+    post_rows=$(awk '/^# scan:/ { print $3; exit }' "$SMOKE_DIR/query.logs-post.txt")
+    echo "[smoke] post-compaction logs rows  : ${post_rows:-<none>} (expected $compact_exp)"
+    if [[ "${post_rows:-}" != "$compact_exp" ]]; then
+        echo "[smoke] FAIL: post-compaction logs query returned ${post_rows:-<none>} rows, expected $compact_exp (merge lossy or inputs not reaped)"
+        echo "[smoke] scry-query output:"; cat "$SMOKE_DIR/query.logs-post.txt"
+        failed=1
+    fi
+
+    # (d) the rebuilt body bloom still serves --grep over the merged block.
+    ./target/release/scry-query \
+        --catalog "$SMOKE_DIR/recon-post.sqlite" \
+        --grep processed \
+        > "$SMOKE_DIR/query.grep-post.txt" 2>&1 || true
+    post_grep=$(awk '/^# scan:/ { print $3; exit }' "$SMOKE_DIR/query.grep-post.txt")
+    echo "[smoke] post-compaction grep rows  : ${post_grep:-<none>} (expected $compact_exp)"
+    if [[ "${post_grep:-}" != "$compact_exp" ]]; then
+        echo "[smoke] FAIL: post-compaction --grep 'processed' returned ${post_grep:-<none>} rows, expected $compact_exp (rebuilt body bloom lost rows)"
+        echo "[smoke] grep output:"; cat "$SMOKE_DIR/query.grep-post.txt"
+        failed=1
+    fi
+fi
+
+# ── Retention (v0.8) ─────────────────────────────────────────────────
+# The other half of v0.8: per-signal TTL reaping. Prove the two safety
+# properties on a real bucket — dry-run is inert, and --apply deletes only
+# the signals that have a TTL. Runs after compaction (also deletes), for
+# logs-bearing signals. Set RETAIN=0 to skip. The bucket is wiped each
+# smoke run, so reaping all logs here is harmless.
+if [[ "${RETAIN:-1}" == "1" ]] \
+   && { [[ "$SIGNAL" == "logs" || "$SIGNAL" == "both" || "$SIGNAL" == "all" ]]; }; then
+    echo "[smoke] ──── retention (v0.8) ────"
+
+    # Baseline live counts from a fresh reconcile (post-compaction truth).
+    ./target/release/scry-list --catalog "$SMOKE_DIR/retain-base.sqlite" \
+        > "$SMOKE_DIR/scry-list-retain-base.txt" 2>&1
+    base_logs=$(sqlite3 "$SMOKE_DIR/retain-base.sqlite" \
+        "SELECT COUNT(*) FROM blocks WHERE signal='logs' AND superseded_by IS NULL AND deleted_at IS NULL;")
+    base_metrics=$(sqlite3 "$SMOKE_DIR/retain-base.sqlite" \
+        "SELECT COUNT(*) FROM blocks WHERE signal='metrics' AND superseded_by IS NULL AND deleted_at IS NULL;")
+    echo "[smoke] pre-retention  : logs=$base_logs metrics=$base_metrics"
+
+    # (a) Dry-run, --ttl-logs 0s: every logs block is a candidate (ts_max is
+    #     in the past), but WITHOUT --apply nothing is deleted. The reaper
+    #     must report candidates yet leave the bucket untouched.
+    ./target/release/scry-retention \
+        --catalog "$SMOKE_DIR/retain-dry.sqlite" \
+        --ttl-logs 0s \
+        > "$SMOKE_DIR/retain-dry.txt" 2>&1 || true
+    if ! grep -q "would reap" "$SMOKE_DIR/retain-dry.txt"; then
+        echo "[smoke] FAIL: dry-run reported no reapable logs blocks (expected ≥1)"
+        cat "$SMOKE_DIR/retain-dry.txt"
+        failed=1
+    fi
+    if grep -q "reaped expired block" "$SMOKE_DIR/retain-dry.txt"; then
+        echo "[smoke] FAIL: dry-run deleted a block — must be inert without --apply"
+        failed=1
+    fi
+    ./target/release/scry-list --catalog "$SMOKE_DIR/retain-after-dry.sqlite" \
+        > /dev/null 2>&1
+    after_dry_logs=$(sqlite3 "$SMOKE_DIR/retain-after-dry.sqlite" \
+        "SELECT COUNT(*) FROM blocks WHERE signal='logs' AND superseded_by IS NULL AND deleted_at IS NULL;")
+    echo "[smoke] after dry-run  : logs=$after_dry_logs (expected $base_logs)"
+    if [[ "${after_dry_logs:-0}" != "${base_logs:-X}" ]]; then
+        echo "[smoke] FAIL: dry-run changed the live logs count ($base_logs → $after_dry_logs)"
+        failed=1
+    fi
+
+    # (b) Apply, --ttl-logs 0s: all logs blocks reaped; metrics (no TTL)
+    #     untouched (signal-scoping, proven end-to-end via fresh reconcile).
+    ./target/release/scry-retention \
+        --catalog "$SMOKE_DIR/retain-apply.sqlite" \
+        --ttl-logs 0s --apply \
+        > "$SMOKE_DIR/retain-apply.txt" 2>&1 || true
+    ./target/release/scry-list --catalog "$SMOKE_DIR/retain-after.sqlite" \
+        > "$SMOKE_DIR/scry-list-retain-after.txt" 2>&1
+    after_logs=$(sqlite3 "$SMOKE_DIR/retain-after.sqlite" \
+        "SELECT COUNT(*) FROM blocks WHERE signal='logs' AND superseded_by IS NULL AND deleted_at IS NULL;")
+    after_metrics=$(sqlite3 "$SMOKE_DIR/retain-after.sqlite" \
+        "SELECT COUNT(*) FROM blocks WHERE signal='metrics' AND superseded_by IS NULL AND deleted_at IS NULL;")
+    echo "[smoke] after apply    : logs=$after_logs (expected 0) metrics=$after_metrics (expected $base_metrics)"
+    if [[ "${after_logs:-X}" != "0" ]]; then
+        echo "[smoke] FAIL: retention --apply left $after_logs logs blocks, expected 0"
+        cat "$SMOKE_DIR/retain-apply.txt"
+        failed=1
+    fi
+    if [[ "${after_metrics:-X}" != "${base_metrics:-Y}" ]]; then
+        echo "[smoke] FAIL: retention reaped metrics ($base_metrics → $after_metrics); only logs had a TTL"
+        failed=1
     fi
 fi
 

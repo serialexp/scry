@@ -1165,6 +1165,204 @@ additionally proven exhaustively over random bodies in
 smaller for immutable data; deferred, the classic bloom is simpler and the
 sidecar bytes are already a small fraction of the block.
 
+## D-036: size-tiered compaction — single-instance, DataFusion sort-merge (v0.8)
+
+**Date:** 2026-05-30
+**Status:** accepted
+
+Every milestone through v0.7 only ever *writes* immutable blocks; nothing
+reorganises them. A busy writer fans out into many small L0 blocks (one per
+WAL rotation per shard), and every query opens all of them — object count
+and per-block metadata load grow without bound. v0.8 closes that loop with
+**compaction**: merge many small same-level blocks into fewer larger ones.
+The full design (tiered levels L0→L3, size-tiered policy, per-merge
+sequence, per-partition object-store leases) already lives in
+`ARCHITECTURE.md § Compaction`; this decision records the **single-instance
+subset** that shipped, and what was deliberately deferred.
+
+**Scope shipped.** Size-tiered merge + the supersede→grace→delete lifecycle,
+as a standalone `scry-compact` tool (engine = `scry-compact` lib, CLI =
+`--once` one pass / `--watch` loop). **Not** shipped: the distributed
+object-store lease (v0.8 is one compactor), retention/TTL reaping, and the
+in-`scry-ingestd` background loop — all deferred, listed below.
+
+**Decisions, with rationale:**
+
+- **Standalone tool first.** The engine is a library so the eventual
+  in-daemon background loop reuses it verbatim; the CLI mirrors `scry-list`
+  (construct store + catalog from `SCRY_OBJSTORE_*`, run to completion).
+  Shipping the tool first keeps compaction operable and testable in
+  isolation before it's wired into the long-running daemon.
+
+- **Size-tiered, fanout 8, L3 ceiling.** A `(signal, date, level)`
+  partition with ≥ `fanout` blocks merges its `fanout` *smallest* into one
+  block at `level + 1`. Size-tiered (vs levelled) bounds write
+  amplification to ~`log_fanout(total)` rewrites per byte, which suits
+  append-mostly observability data. `max_level` (default 3) stops merging
+  past L3, where individual parquet files get large enough that
+  random-access reads suffer. One merge per partition per pass keeps a pass
+  bounded and predictable; repeated passes (or `--watch`) converge a
+  backlog.
+
+- **DataFusion sort-merge, not hand-rolled k-way.** The merged main parquet
+  is the K inputs read back via `read_parquet` and re-sorted by the
+  signal's sort key with `ORDER BY`, streamed (and spilled to disk under
+  memory pressure) into a new parquet. This reuses the query crate's
+  object-store registration pattern and never holds the whole partition in
+  RAM. A hand-rolled streaming k-way merge over the already-sorted inputs
+  would cut the re-sort cost, but DataFusion's spilling sort is correct and
+  bounded today; the k-way merge is a noted later optimisation. **One
+  subtlety:** the merge `SessionContext` sets
+  `parquet.schema_force_view_types = false`, because DataFusion otherwise
+  reads string columns back as `Utf8View` — which both breaks the
+  body-column downcast (for the bloom rebuild) and would make the merged
+  block's schema differ from a freshly-written L0 block. The merged block
+  must be schema-identical to an L0 block so every reader treats it the
+  same.
+
+- **`superseded_by IS NULL` is the safety mechanism.** The single change
+  that makes compaction safe for *all four* query signals is `list_blocks`
+  filtering `WHERE deleted_at IS NULL AND superseded_by IS NULL`. The
+  per-merge lifecycle is: merge → `insert_block(merged)` →
+  `mark_superseded(inputs, merged)` → (grace) → delete input objects →
+  `delete_blocks(inputs)`. The instant step 3 commits, queries read the
+  merged block and skip the inputs — *atomically, before any object is
+  deleted*. That's what lets the grace period default to **0** for the
+  single-instance tool: there's no window where both the merged block and
+  its inputs are live. A non-zero `--grace` only matters once a *concurrent
+  reader* might be mid-scan against an input it listed before the
+  supersede; that's the multi-instance follow-up's concern.
+
+- **`level` promoted into the `meta.json` sidecar.** The catalog is derived
+  state (reconcilable from the bucket), so the block's level must live in
+  the sidecar or a reconcile would demote every compacted block back to
+  L0. `BlockMeta` gains `#[serde(default)] level: u32` (old sidecars
+  deserialise to 0); `insert_block` writes it; `row_to_entry` reads it
+  back. `series_types` and `all_fingerprints` remain sidecar-only (not
+  promoted to catalog columns) — the merge rebuilds them and the reconcile
+  path already ignores them.
+
+- **Sidecars rebuilt, not copied.** postings (metrics/logs) are the union
+  of the inputs' postings, re-sorted/deduped via the shared
+  `scry_block::postings` encode/decode (lifted out of the logs/metrics
+  builders so all three call one implementation); the logs body bloom is
+  re-accumulated from the merged body column during the same streaming pass
+  via a new streaming `BodyBloomBuilder` (memory stays bounded to the
+  distinct-gram set); metrics `series_types` is unioned from the inputs'
+  `meta.json`. `all_fingerprints` is the distinct fingerprint set
+  accumulated during the stream. traces/profiles carry no sidecars.
+
+**Why a stale-lease double-merge is harmless (forward-compatibility).**
+Blocks are immutable and content-addressed under a compactor `writer_id`,
+and meta.json is uploaded *last* (the "block exists" signal for reconcile).
+If a merge dies partway, the worst case is an orphaned merged block the next
+pass treats as just another input at its level — correctness is never at
+risk. This is exactly the property the multi-instance lease relies on, so
+v0.8's single-instance engine is already forward-compatible with it.
+
+**Seal.** `scripts/smoke.sh` (logs / both / all) gained a compaction leg:
+after ingest seals several small L0 logs blocks (forced via
+`--block-max-rows`), `scry-compact --once --fanout 2 --grace 0` runs, then a
+*fresh reconcile from the bucket* asserts (a) the live logs block count
+dropped, (b) ≥1 logs block now sits at level ≥1, (c) the reconciled catalog
+still queries back exactly the pre-compaction logs row count — which, because
+reconcile rebuilds purely from bucket sidecars, proves *both* losslessness
+and that the superseded inputs' objects were deleted, and (d) `--grep` still
+matches every body through the rebuilt bloom. The merge correctness is
+additionally proven in `crates/compact/tests/compaction_e2e.rs` (lossless +
+sorted + postings union + `series_types` union + catalog transitions +
+input-object reaping, for both logs and metrics), with `postings`
+encode↔decode roundtrip and streaming-bloom≡one-shot equivalence in
+`crates/block` unit tests.
+
+**Deferred (tracked below):** the per-partition object-store compaction
+lease (multi-instance), retention/TTL, the in-`scry-ingestd` background
+loop, the hand-rolled k-way streaming merge, and per-row-group sidecar
+granularity.
+
+## D-037: per-signal TTL retention — single-instance, dry-run by default (v0.8)
+
+**Date:** 2026-05-30
+**Status:** accepted
+
+The second half of v0.8. Compaction (D-036) reorganises blocks; retention
+reclaims storage by *deleting* them. Without it a scry deployment grows
+without bound — every block ever written stays in the bucket and the catalog
+forever. Retention drops blocks whose data is entirely past a per-signal age
+limit, removing their objects and catalog rows.
+
+Retention is the **delete tail of compaction's lifecycle with no merge**, so
+it reuses compaction's machinery rather than reinventing it: the
+`delete_block_objects` helper (lifted into `scry-block` so both tools share
+it — see below), `Catalog::delete_blocks`, the standalone-tool skeleton
+(`scry-retention`, lib + bin, `--once` / `--watch`), and the same
+object-before-row deletion ordering (the catalog is derived state). Like
+compaction it is **single-instance** — no distributed lease; that's the
+shared multi-instance follow-up.
+
+**Decisions, with rationale:**
+
+- **Opt-in, no implicit deletion.** A signal is reaped only if a TTL is
+  configured for it — per-signal (`--ttl-logs 30d`) or via a blanket
+  `--ttl 30d` default applying to all signals. A signal with no TTL is
+  **never** touched (`RetentionConfig::ttl_for` returns `None` → skipped).
+  The CLI refuses a run with *no* TTL configured at all. Retention deletes
+  data irreversibly; the default posture is "touch nothing unless explicitly
+  told which signal and how old."
+
+- **Dry-run by default; `--apply` to delete.** A normal run only *previews*:
+  it lists the candidate blocks and bytes and touches nothing. Deletion
+  requires `--apply`. This makes the dangerous path opt-in and the safe path
+  the default — the opposite of compaction (which has no destructive-preview
+  concern because its deletes are always of just-superseded inputs).
+
+- **Whole-block `ts_max` criterion.** A block is reaped only when its
+  *newest* record (`ts_max_unix_nano`) is strictly older than `now - ttl`.
+  Using `ts_max` (not `ts_min` or the block date) guarantees a block still
+  holding any in-window data is never dropped — retention only ever removes
+  blocks that are entirely expired. We do **not** rewrite a block that
+  straddles the TTL to drop its old prefix (partial-block rewriting is
+  deferred); whole-block granularity is simpler and, with compaction keeping
+  blocks time-bounded, wastes little.
+
+- **`now` is injected, not read internally.** `plan_reaping` and
+  `retain_once` take `now_unix_nano` as a parameter; only `main.rs` reads
+  `SystemTime::now()`. This makes the age policy a pure, deterministic
+  function — the e2e test plants a 90-day-old and a 1-hour-old block against
+  a fixed `now` and asserts the exact cutoff, no clock games.
+
+- **`deleted_at` gives a correct grace window.** Because `list_blocks` already
+  filters `deleted_at IS NULL` (added for compaction in D-036), a new
+  `Catalog::mark_deleted` lets the reaper soft-delete expired blocks — queries
+  stop listing them *immediately* — then wait the configured `--grace` before
+  removing objects, so a concurrent reader that already listed a block keeps
+  its objects for the grace window. At the single-instance default
+  (`--grace 0`) this step is skipped and objects+rows go straight away.
+
+**Shared helper move.** `delete_block_objects` (delete a block's parquet +
+meta.json + flagged sidecars, NotFound-tolerant) was lifted from
+`scry-compact`'s `merge.rs` into `scry-block` (next to `block_path`, the
+block-layout knowledge it depends on). Both compaction and retention now call
+`scry_block::delete_block_objects`; retention does not depend on the
+compaction crate.
+
+**Seal.** `scripts/smoke.sh` (logs / both / all) gained a retention leg after
+the compaction leg: against the real bucket, (a) a **dry-run** with
+`--ttl-logs 0s` reports every logs block as a candidate yet a fresh reconcile
+shows the live count unchanged (dry-run is inert), and (b) `--apply` with
+`--ttl-logs 0s` reaps every logs block while the **metrics blocks are
+untouched** (signal-scoping, end-to-end). The precise age cutoff, dry-run
+inertness, signal-scoping, lossless survival of the in-window block, and
+idempotent re-runs are all proven in `crates/retention/tests/retention_e2e.rs`
+with controlled timestamps; the policy edges (boundary `<`, opt-in,
+override-beats-default, saturating huge TTL) in `policy.rs` unit tests, and
+`mark_deleted` query-skip in `crates/catalog`.
+
+**Deferred (shared with compaction / tracked below):** the multi-instance
+coordination lease, the in-`scry-ingestd` background reaper loop, partial
+(row-prefix) block rewriting at the TTL boundary, and size/quota-based
+eviction (retention here is purely age-based).
+
 ## Deferred / open
 
 These are not decisions yet; they're flagged for "we'll decide when the
@@ -1174,6 +1372,26 @@ constraint shows up":
   time range → the flame-tree shape a UI consumes. Deferred from v0.6 by
   D-034 (Grafana renders pre-aggregated data; nothing consumes it yet).
   Becomes its own stage when a UI / query language lands.
+- **Multi-instance compaction lease.** v0.8 (D-036) ships a single
+  compactor with no distributed lock. The per-`(signal, date)`
+  object-store lease that lets N compactors cooperate is designed in
+  `ARCHITECTURE.md § Compaction`; the immutable + content-addressed block
+  design already makes a stale-lease double-merge harmless, so the engine
+  is forward-compatible. Build it when more than one compactor is real.
+- **Retention multi-instance + partial-block rewriting.** Per-signal TTL
+  retention landed in v0.8 (D-037, single-instance, dry-run by default).
+  Still deferred: the multi-instance coordination lease (shared with
+  compaction), and rewriting a block that *straddles* the TTL to drop only
+  its expired row prefix (today retention only drops wholly-expired blocks).
+- **In-`scry-ingestd` background compaction/retention loop.** v0.8 runs both
+  compaction and retention as standalone tools (`--once` / `--watch`).
+  Wiring the same engines into the ingest daemon as background tasks
+  (sharing the pipeline's store + catalog) is deferred until the operational
+  shape is proven.
+- **Hand-rolled k-way streaming merge.** D-036 merges via a DataFusion
+  `ORDER BY` re-sort, which is correct and memory-bounded but re-sorts
+  already-sorted inputs. A streaming k-way merge over the sorted inputs
+  would cut that cost; do it if merge CPU shows up in profiles.
 - **High-cardinality metrics index.** Per-block label-fingerprint blooms
   may suffice; if not, we add a sketch (HLL? cuckoo filter?) — decide
   based on measurement during v0.5.
