@@ -3705,6 +3705,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "scry-cluster"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "futures",
+ "object_store",
+ "rand 0.8.6",
+ "scry-block",
+ "scry-catalog",
+ "scry-compact",
+ "scry-objstore",
+ "scry-proto",
+ "scry-query",
+ "scry-retention",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "scry-compact"
 version = "0.0.1"
 dependencies = [

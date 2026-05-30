@@ -1,0 +1,33 @@
+[package]
+name        = "scry-cluster"
+version     = "0.0.1"
+edition.workspace = true
+license.workspace = true
+description = "v0.9 multi-instance orchestration: catalog convergence (pub/sub apply + cursor poll + full walk) and the lease-guarded maintenance loop. Valkey-agnostic and unit-testable in-process."
+
+[lib]
+name = "scry_cluster"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow         = { workspace = true }
+futures        = { workspace = true }
+object_store   = { workspace = true }
+rand           = { workspace = true }
+scry-block     = { workspace = true }
+scry-catalog   = { workspace = true }
+scry-compact   = { workspace = true }
+scry-objstore  = { workspace = true }
+scry-retention = { workspace = true }
+serde_json     = { workspace = true }
+tokio          = { workspace = true }
+tracing        = { workspace = true }
+uuid           = { workspace = true }
+
+[dev-dependencies]
+scry-proto = { workspace = true }
+scry-query = { workspace = true }
+tempfile   = "3"
+
+[lints]
+workspace = true

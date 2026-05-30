@@ -18,6 +18,7 @@ members = [
     "crates/scry-queryd",
     "crates/compact",
     "crates/retention",
+    "crates/cluster",
 ]
 # The desktop query app (Tauri + SolidJS) is its own crate with a heavy,
 # unrelated dependency tree (tauri, webkit bindings). It is intentionally
@@ -47,6 +48,9 @@ scry-catalog      = { path = "crates/catalog" }
 scry-server       = { path = "crates/server" }
 scry-client       = { path = "crates/client" }
 scry-query        = { path = "crates/query" }
+scry-compact      = { path = "crates/compact" }
+scry-retention    = { path = "crates/retention" }
+scry-cluster      = { path = "crates/cluster" }
 
 anyhow    = "1"
 arrow     = "58"
