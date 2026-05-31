@@ -189,7 +189,18 @@ polling alone.
 ## D-013: Per-partition compaction leases via object-storage conditional writes
 
 **Date:** 2026-05-26
-**Status:** accepted
+**Status:** SUPERSEDED by D-038 (v0.9). The `If-None-Match`/`If-Match`
+object-store lease below is **not buildable on Garage** — Garage has no
+consensus and its own docs state conditional writes cannot implement mutual
+exclusion between concurrent writers (it silently ignores `If-None-Match: *`,
+which is also why D-029 dropped `put_if_absent`). v0.9 replaces it with a
+**Valkey lease** (`SET NX PX` + Lua compare-and-set renew/release); see D-038.
+The "double-compaction is harmless" claim below is also weaker than stated:
+blocks are addressed by **random UUID**, not content hash, so two merged blocks
+of the same inputs are *distinct* and both live — a later merge unions rather
+than dedupes them. Single-winner coordination is therefore a **correctness**
+requirement, which D-038's lease + commit-point fence + grace=0 delete provide.
+The original (now-historical) design follows.
 
 Multiple instances run the compactor loop. For each `(signal, day)`
 partition, an instance acquires a short-lived lease by `PUT`ing a
@@ -1363,6 +1374,133 @@ coordination lease, the in-`scry-ingestd` background reaper loop, partial
 (row-prefix) block rewriting at the TTL boundary, and size/quota-based
 eviction (retention here is purely age-based).
 
+## D-038: Valkey lease for multi-instance maintenance (supersedes D-013) (v0.9)
+
+**Date:** 2026-05-31
+**Status:** accepted
+
+v0.9 makes scry multi-instance: 1–N identical `full`-mode instances share one
+bucket; every instance ingests, queries, converges its catalog, and contends
+for the leases that gate destructive maintenance. This decision is the
+**exclusion** half (coordination); D-039 is the **convergence** half.
+
+**Why a lease at all (correctness, not efficiency).** Blocks are addressed by
+random **UUID v7, not by content hash** (D-029). So if two instances compact
+the same `(signal, date, level)` partition, they each produce a *distinct*
+merged block containing the same rows — both live, both queried, rows
+double-counted; a later merge of the two **unions** them (no dedupe). D-013's
+"benign double-merge" only holds if exactly one committer wins. So single-winner
+maintenance is a hard correctness requirement.
+
+**Why Valkey, not the D-013 object-store lease.** D-013's `If-None-Match: *`
+lease is **not implementable on Garage**: Garage has no consensus and silently
+ignores conditional-write preconditions between concurrent writers (the same
+reason D-029 dropped `put_if_absent`). Rather than restrict scry to S3-class
+backends, v0.9 coordinates through **Valkey**, which the architecture already
+assumes for the (future) service registry.
+
+**Mechanism (`scry-valkey`):**
+- **Acquire** = `SET key holder NX PX ttl` (server-side expiry → client clock
+  skew is irrelevant). Key granularity: one lease per `(signal, date,
+  input_level)` for compaction (independent partitions proceed in parallel
+  across instances) and **one global lease** `scry/lease/retention` for
+  retention (a pass spans all signals and is cheap).
+- **Renew** every `ttl/3` via a Lua compare-and-`PEXPIRE` (extends only if the
+  value is still our holder id). The guard **latches its fence invalid on the
+  first renewal failure**, strictly before server-side expiry, so the old
+  holder stops acting before any peer can acquire.
+- **Release** = Lua compare-and-`DEL` (delete only if still ours), on drop.
+
+**Engines stay Valkey-agnostic.** `scry-compact`/`scry-retention` take only a
+`&dyn Fence` (`scry-block`) and a `&dyn BlockEventSink`; `scry-cluster`'s
+maintenance loop is generic over a `LeaseProvider` trait (static dispatch →
+native `async fn` in trait, no `async-trait`). Production injects
+`ValkeyLeaseProvider`; tests inject an in-process `LocalLeaseProvider`.
+
+**The load-bearing invariants (why single-winner actually holds):**
+- **Commit-point fence.** `merge_blocks` uploads `main → [postings] → [bloom]`
+  then **`meta.json` last**; reconcile keys on `meta.json`, so a block with no
+  `meta.json` is invisible. The fence is checked immediately before the
+  `meta.json` PUT — a lease lost during the minutes-long merge ⇒ no `meta.json`,
+  no catalog row, inputs untouched; only uncommitted data objects leak
+  (reclaimable by a future full-walk/orphan-GC). This is what makes a
+  *concurrent* double-merge benign.
+- **grace=0 closes the *sequential* re-merge window.** The lease serialises
+  concurrent merges, but `compact_partition` plans from a catalog snapshot and
+  does **not** re-validate inputs after acquiring the lease. With the
+  lease-default grace (600 s) a stale peer that planned the same inputs could,
+  in the window after the winner committed but before it deleted the inputs,
+  re-merge them into a second live block. The smoke runs **`--compact-grace 0`**:
+  the winner deletes inputs immediately, so a stale peer's re-merge **404s on
+  the GET and aborts** before its own `meta.json` commit — no duplicate. (With
+  grace > 0 the brief duplicate is the documented D-039 soft edge, bounded by
+  convergence latency.)
+- **No-lease ⇒ pause, never race.** `try_acquire` returning `Err` (backend
+  unreachable) or `Ok(None)` (peer holds it) skips that unit; with Valkey
+  absent maintenance pauses entirely (unless `--allow-unfenced-maintenance`,
+  which asserts sole ownership via `LocalLeaseProvider`). The standalone
+  `scry-compact`/`scry-retention` CLIs are unchanged (sole-instance, unfenced).
+
+**Seal.** `MULTI=1 scripts/smoke.sh` (→ `scripts/smoke-multi.sh`) runs two
+`scry-ingestd` on one bucket + one Valkey: it asserts each instance's catalog
+converges to the union of both instances' rows, that the live row total is
+**exactly** the ingested total after both run compaction (a duplicate merge
+would inflate it) with a block reaching level ≥ 1 (compaction actually ran), and
+that coordinated retention reaps every block to zero with no panic / pass
+failure — only the lease winner logs actual deletes. Lease mutual exclusion,
+renew-past-TTL, and fence-on-release are also covered by gated
+`#[ignore]` integration tests against a real Valkey (`crates/valkey/tests`).
+
+## D-039: Three-tier catalog convergence (pub/sub + cursor poll + full walk) (v0.9)
+
+**Date:** 2026-05-31
+**Status:** accepted
+
+The convergence half of multi-instance (D-038 is exclusion). Each instance has
+its own SQLite catalog (derived state); a block one instance writes, compacts,
+or reaps must become visible to peers, and a peer-deleted block must not be a
+404 landmine. **The bucket is the single source of truth; Valkey is only ever a
+hint.** Three tiers, all converging on the bucket:
+
+1. **pub/sub apply (low-latency hint).** On every successful upload / supersede
+   / delete, the instance publishes a `BlockEvent` (`Created{meta}` |
+   `Superseded{inputs,by,by_meta}` | `Deleted{signal,uuids}`) on
+   `scry/blocks/<signal>`. Peers apply each idempotently: `Created`→`insert_block`
+   (`INSERT OR IGNORE`); `Superseded`→insert `by_meta` (satisfy the FK) then
+   `mark_superseded`; `Deleted`→`delete_blocks`. `Created` is byte-identical to
+   a `meta.json`, so the event reuses `BlockMeta`'s serde.
+2. **incremental cursor poll (dropped-event backstop).** Per `(signal, writer,
+   date)` the catalog keeps a high-water `poll_cursors` row; the poller lists
+   only objects after that UUID (`list_with_offset`) and upserts them. Cursors
+   are a high-water mark (monotonic UPSERT) — they never regress on delete.
+3. **full walk (ultimate backstop).** Periodic `reconcile_from_bucket`
+   discovers brand-new prefixes no event or cursor has seen.
+
+**Idempotency is the whole game.** Events may duplicate, reorder, or
+self-deliver; every apply is a no-op when already applied. The one **soft
+edge**: a `Superseded` arriving before its inputs' `Created` causes a brief
+double-count (both inputs and the merged block momentarily live) — bounded by
+the poll interval / full walk, and harmless given queries union live blocks.
+(D-038's grace=0 turns the analogous *compaction* re-merge hazard from a
+permanent duplicate into a clean 404-abort.)
+
+**404-tolerant reads close the loop.** A peer can delete a block this instance
+still lists. The `EvictOnNotFound` object-store decorator (`scry-query`) catches
+a `NotFound` during a scan read, parses the block UUID from the path, and
+records it; the driver (`scry-query` CLI and `scry-queryd`'s `QueryService`)
+`delete_blocks` the stale row and does **one** transparent re-plan. For
+metrics/logs the 404 surfaces at postings-sidecar fetch (before any wire
+output) → fully transparent re-plan; for traces/profiles it can surface
+mid-scan (schema already sent) → the row is evicted to heal the next query and a
+clean `StreamError` is returned.
+
+**Topology.** `scry-ingestd` runs all three tiers + the D-038 maintenance loop
+(`--mode full`), or convergence only (`ingest-only` / `query-only` / when no
+lease is available). `scry-queryd` is query-only: it runs the three convergence
+tiers but never leases (no destructive work). The `writer_uuid` is persisted to
+`<wal_dir>/writer_id` so a restart reuses its prefix rather than bloating the
+per-`(signal, writer, date)` poll fan-out with a fresh UUID each restart.
+
 ## Deferred / open
 
 These are not decisions yet; they're flagged for "we'll decide when the
@@ -1372,22 +1510,25 @@ constraint shows up":
   time range → the flame-tree shape a UI consumes. Deferred from v0.6 by
   D-034 (Grafana renders pre-aggregated data; nothing consumes it yet).
   Becomes its own stage when a UI / query language lands.
-- **Multi-instance compaction lease.** v0.8 (D-036) ships a single
-  compactor with no distributed lock. The per-`(signal, date)`
-  object-store lease that lets N compactors cooperate is designed in
-  `ARCHITECTURE.md § Compaction`; the immutable + content-addressed block
-  design already makes a stale-lease double-merge harmless, so the engine
-  is forward-compatible. Build it when more than one compactor is real.
-- **Retention multi-instance + partial-block rewriting.** Per-signal TTL
-  retention landed in v0.8 (D-037, single-instance, dry-run by default).
-  Still deferred: the multi-instance coordination lease (shared with
-  compaction), and rewriting a block that *straddles* the TTL to drop only
-  its expired row prefix (today retention only drops wholly-expired blocks).
-- **In-`scry-ingestd` background compaction/retention loop.** v0.8 runs both
-  compaction and retention as standalone tools (`--once` / `--watch`).
-  Wiring the same engines into the ingest daemon as background tasks
-  (sharing the pipeline's store + catalog) is deferred until the operational
-  shape is proven.
+- **Multi-instance compaction lease.** ✅ **Done in v0.9 (D-038).** A Valkey
+  per-`(signal, date, level)` lease (not the unbuildable-on-Garage D-013
+  object-store lease) gives single-winner compaction; the commit-point fence +
+  grace=0 delete keep it correct under UUID (not content) addressing.
+- **Retention multi-instance.** ✅ **Done in v0.9 (D-038):** a single global
+  Valkey retention lease coordinates reaping across instances. Still deferred:
+  rewriting a block that *straddles* the TTL to drop only its expired row prefix
+  (today retention only drops wholly-expired blocks).
+- **In-`scry-ingestd` background compaction/retention loop.** ✅ **Done in v0.9
+  (D-038/D-039):** `scry-ingestd --mode full` runs the lease-guarded
+  compaction + retention loops as background tasks sharing the pipeline's store
+  + catalog. The standalone `scry-compact`/`scry-retention` CLIs remain for
+  single-instance / ad-hoc use.
+- **Orphan-object GC.** A lost lease mid-merge (or a crash after data-object
+  upload but before the `meta.json` commit) leaks uncommitted parquet/sidecar
+  objects with no `meta.json` and no catalog row. They are invisible to queries
+  and reconcile; a full-walk-based reaper that deletes data objects with no
+  sibling `meta.json` past some age would reclaim them. Deferred (the leak is
+  bounded and harmless).
 - **Hand-rolled k-way streaming merge.** D-036 merges via a DataFusion
   `ORDER BY` re-sort, which is correct and memory-bounded but re-sorts
   already-sorted inputs. A streaming k-way merge over the sorted inputs

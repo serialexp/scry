@@ -68,6 +68,14 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+# v0.9 multi-instance leg: `MULTI=1 scripts/smoke.sh` runs the two-instance
+# convergence + single-winner-compaction + coordinated-retention harness. It is
+# a fundamentally different topology (two daemons + Valkey), so it lives in its
+# own script; this is just the documented entrypoint.
+if [[ "${MULTI:-0}" == "1" ]]; then
+    exec "$ROOT/scripts/smoke-multi.sh" "$@"
+fi
+
 # ── Parameters ──────────────────────────────────────────────────────
 SIGNAL="${SIGNAL:-dummy}"
 case "$SIGNAL" in

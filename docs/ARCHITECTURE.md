@@ -1256,6 +1256,28 @@ amplification cost.
 > (the other half of v0.8) ships as its own standalone tool — see the
 > [Retention](#retention) status note below.
 
+> **Implementation status (v0.9, D-038/D-039).** Compaction (and
+> retention) are now **multi-instance**, running as in-`scry-ingestd`
+> background loops under `--mode full`. Two corrections to the v0.8 note
+> above: (1) the lease is **no longer deferred** — it is a **Valkey**
+> lease (`SET NX PX` + Lua compare-and-set), not the object-store
+> `If-None-Match` lease, which **cannot** implement mutual exclusion on
+> Garage (no consensus). (2) The v0.8 claim that a stale-lease
+> double-merge is "harmless" is **wrong** and was the load-bearing reason
+> coordination is needed: blocks are addressed by random **UUID v7, not
+> by content hash**, so two winners produce two *distinct* live blocks
+> with identical rows → queries double-count, and a later merge unions
+> (not dedupes) them. Single-winner is therefore a **correctness**
+> requirement. It is upheld by the **commit-point fence** (the `meta.json`
+> PUT — which `reconcile_from_bucket` keys on — happens **last**, gated on
+> `fence.check()`, so a lost lease leaves only uncommitted bytes) plus
+> **grace=0** immediate input deletion (a stale peer's sequential re-merge
+> 404s at the input GET and aborts before committing). Convergence across
+> instances is three-tier (pub/sub → cursor poll → full walk); see
+> [Synchronisation](#synchronisation). The standalone `scry-compact` /
+> `scry-retention` CLIs still run **unfenced** as the single-instance
+> path. See `docs/decisions.md § D-038` and `§ D-039`.
+
 ### Tiered levels
 
 Blocks live at one of several **levels**, recorded in
@@ -1580,6 +1602,15 @@ prefix-delete. No partial-block resurrection logic. No
 > single-instance. Still deferred: the multi-instance lease, time-based
 > *partial*-block rewriting (we only drop whole blocks), and
 > size/quota-based eviction (retention is purely age-based).
+
+> **Implementation status (v0.9, D-038/D-039).** Retention now runs as an
+> in-`scry-ingestd` background loop under `--mode full`, guarded by **one
+> global Valkey retention lease** (`scry/lease/retention`) — so exactly
+> one instance reaps at a time. The reap fences before `mark_deleted` and
+> again before the object delete; a lost lease aborts with inputs intact.
+> The standalone `scry-retention` CLI still runs **unfenced** as the
+> single-instance path. The multi-instance lease is no longer deferred;
+> see `docs/decisions.md § D-038`.
 
 ## Scaling
 

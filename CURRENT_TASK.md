@@ -1,129 +1,103 @@
 # CURRENT_TASK — handoff
 
-## v0.8 — compaction + retention, both landed (single-instance), uncommitted
+## v0.9 — scry is now multi-instance (Valkey lease + pub/sub convergence)
 
-Both halves of the v0.8 line are implemented and green. Everything below is in
-the working tree, **not yet committed**. Rationale: `docs/decisions.md § D-036`
-(compaction) + `§ D-037` (retention); status notes in
-`docs/ARCHITECTURE.md § Compaction` and `§ Retention`.
+All 7 phases of the v0.9 plan are implemented and green. Phases 1–6 are
+committed (Phase 6 = `32aaece`); **Phase 7 (this session) is in the working
+tree, not yet committed**. Rationale: `docs/decisions.md § D-038` (Valkey lease,
+supersedes D-013) + `§ D-039` (three-tier convergence).
 
----
-
-## Part A — compaction (landed earlier)
-
-### What shipped
-
-- **`BlockMeta.level`** (`crates/block/src/meta.rs`, `#[serde(default)]`) +
-  catalog plumbing: `insert_block` writes `meta.level`, `row_to_entry` reads
-  it back. Every encoder sets `level: 0`. Old sidecars deserialise to 0.
-- **Catalog** (`crates/catalog/src/lib.rs`): `list_blocks` filters
-  `WHERE deleted_at IS NULL AND superseded_by IS NULL`. New
-  `mark_superseded(inputs, merged)` and `delete_blocks(uuids)` transactions.
-- **Shared sidecar helpers** (`crates/block`): `postings.rs`
-  (`encode_postings` / `decode_postings` / `merge_postings`); `bloom.rs`
-  streaming `BodyBloomBuilder` (`new`/`add_body`/`finish`).
-- **`crates/compact`** (`scry-compact`, lib + bin): `policy.rs`, `merge.rs`
-  (DataFusion sort-merge + sidecar rebuild), `engine.rs` (`compact_once`),
-  `main.rs` (`--once` / `--watch`).
-
-### Key gotcha (don't regress)
-
-The merge `SessionContext` **must** set
-`parquet.schema_force_view_types = false`. DataFusion otherwise reads parquet
-string columns back as `Utf8View`, which (a) breaks the body-column downcast
-in the bloom rebuild and (b) would make the merged block's schema differ from
-a freshly-written L0 block. Merged blocks must be schema-identical to L0.
+The single-instance path is preserved byte-for-byte: with no `SCRY_VALKEY_URL`,
+the convergence loops spawn but idle, maintenance pauses (no lease ⇒ no
+destructive work), and the standalone `scry-compact`/`scry-retention` CLIs run
+unfenced exactly as in v0.8. `SIGNAL=both scripts/smoke.sh` + `cargo test
+--workspace` stay green.
 
 ---
 
-## Part B — retention (this session)
+## What shipped (the shape of it)
 
-### What shipped
+**Two new crates:**
+- **`scry-valkey`** — the only crate that talks to Valkey (`fred` 10.1). The
+  `ValkeyClient` handle, the `SET NX PX` + Lua compare-and-set lease
+  (`LeaseProvider`/`ValkeyLeaseProvider`, auto-renew every `ttl/3`, latches
+  invalid before server-side expiry), pub/sub (`subscribe_blocks`,
+  `parse_envelope`), and `ValkeySink: BlockEventSink`.
+- **`scry-cluster`** — Valkey-agnostic orchestration: `apply_event` (idempotent
+  catalog mutations), `poll_once` + `full_walk` (cursor-poll + full-reconcile
+  tiers), `run_maintenance_loop<L: LeaseProvider>` (drives
+  `run_compaction_pass`/`run_retention_pass`), `LocalLeaseProvider`.
 
-- **`delete_block_objects` lifted into `scry-block`**
-  (`crates/block/src/lib.rs`, after `block_path`): deletes parquet +
-  meta.json + flagged sidecars, NotFound-tolerant, takes `&dyn ObjectStore`.
-  `scry-compact` dropped its local copy and imports it
-  (`engine.rs`: `delete_block_objects(store.as_ref(), &input.meta)`).
-- **Catalog `mark_deleted(uuids, deleted_at_unix_nano)`**
-  (`crates/catalog/src/lib.rs`): soft-delete via `deleted_at`, mirroring
-  `mark_superseded`. Since `list_blocks` filters `deleted_at IS NULL`, a
-  marked block drops out of queries instantly — that's what makes a non-zero
-  `--grace` a correct window. Catalog test
-  `marked_deleted_blocks_drop_out_of_list_blocks` (9 catalog tests pass).
-- **`crates/retention`** (`scry-retention`, lib + bin), added to workspace
-  `Cargo.toml` members:
-  - `policy.rs` — `RetentionConfig { default_ttl, overrides, grace, apply }`
-    with `ttl_for(signal) = overrides.or(default_ttl)` (opt-in: `None` →
-    never reaped) and `any_ttl_configured()`. `plan_reaping(blocks, cfg,
-    now_unix_nano)` selects blocks where the signal has a TTL **and**
-    `ts_max_unix_nano < now - ttl` (whole-block, strict `<`); sorts
-    deterministically `(signal, date, uuid)`. 6 unit tests.
-  - `engine.rs` — `RetentionReport { scanned, reaped, bytes_reaped, dry_run,
-    by_signal }`. `retain_once(store, catalog, cfg, now_unix_nano)`:
-    `list_blocks` → `plan_reaping` → dry-run returns the report untouched;
-    apply optionally `mark_deleted` + sleep when `grace > 0`, then
-    `delete_block_objects` per block (objects first), then `delete_blocks`
-    (rows last) — same ordering as compaction.
-  - `main.rs` — clap: `--catalog`, `--ttl` (global), `--ttl-{metrics,logs,
-    traces,profiles}` overrides, `--grace` (default 0), `--apply` (default
-    false → dry-run), `--no-reconcile`, `--watch`, `--interval` (default
-    3600). Errors if no TTL configured at all. `parse_duration` extends the
-    spewer's with `d` (days). `now` from `SystemTime::now()`.
+**Edited crates:** `scry-block` seams (`Fence`/`AlwaysValid`, `BlockEvent`/
+`Envelope`, `BlockEventSink`/`NoopSink`); `scry-catalog` `poll_cursors` table;
+`scry-compact` `compact_partition` + commit-point fence in `merge_blocks`;
+`scry-retention` `retain_planned`; `scry-query` `EvictOnNotFound` + one-shot
+re-plan; `scry-server::pipeline` catalog → `std::sync::Mutex<Catalog>` + an
+`event_sink` emitted in `run_upload`; `scry-ingestd`/`scry-queryd` wiring.
 
-### Tests / smoke
-
-- `crates/retention/tests/retention_e2e.rs`
-  (`logs_retention_dry_run_then_apply`): old logs (NOW−90d) + recent logs
-  (NOW−1h) + ancient metrics (NOW−200d, no TTL); `ttl_logs=7d`. Dry-run inert
-  (3 blocks, parquet present); apply reaps only the old logs block (NotFound +
-  `get_block` None), recent logs + metrics survive, surviving query returns
-  exactly the 50 recent rows; second apply reaps 0 (idempotent).
-- `scripts/smoke.sh`: `-p scry-retention` in the build; a retention leg
-  (gated `RETAIN=1`, logs/both/all) after compaction — baseline reconcile;
-  dry-run `--ttl-logs 0s` asserts "would reap" present + "reaped" absent +
-  count unchanged; apply `--ttl-logs 0s --apply` asserts logs=0 and
-  metrics==baseline (signal-scoping end to end).
-
-### Decisions (D-037)
-
-Single-instance; **opt-in per signal** (no implicit deletion); **dry-run by
-default**, `--apply` to delete; **whole-block `ts_max`** criterion (in-window
-data never dropped); reuses compaction's delete plumbing + the `deleted_at`
-query-skip for a correct grace.
+**Correctness invariants (load-bearing):**
+- Blocks are addressed by random **UUID v7, not content hash** → single-winner
+  compaction is a *correctness* requirement, not just efficiency.
+- **Commit-point fence:** `merge_blocks` uploads `main → [postings] → [bloom]`
+  then `meta.json` LAST; reconcile keys on `meta.json`. The fence is checked
+  immediately before the `meta.json` PUT, so a lost lease leaves only harmless
+  uncommitted bytes (no row, no events, inputs untouched).
+- **grace=0 closes the sequential re-merge window:** the winner deletes inputs
+  immediately, so a stale peer's re-merge 404s at the input GET and aborts
+  before its own `meta.json` commit. This is what makes the multi smoke
+  deterministic.
 
 ---
 
-## Verified (run before final commit)
+## Phase 7 (this session) — what's in the tree
 
-- `cargo test --workspace` green (compaction e2e + retention e2e + catalog +
-  block units).
-- `cargo clippy -p scry-retention -p scry-compact -p scry-block --tests`
-  clean (workspace warnings are all pre-existing in dependency crates).
-- `SIGNAL=logs scripts/smoke.sh` + `SIGNAL=both scripts/smoke.sh` PASS with
-  compaction **and** retention legs (both: pre-retention logs=2 metrics=20 →
-  dry-run logs=2 → apply logs=0 metrics=20).
+- **`scripts/smoke-multi.sh`** (NEW) — two `scry-ingestd --mode full` instances
+  sharing one bucket + Valkey. Phase 1: spew logs to both, wait for both
+  catalogs to converge to the same total live row count (pub/sub + cursor
+  poll, no double-count), assert `level ≥ 1` after a compaction round with rows
+  unchanged. Phase 2: restart with `--ttl-logs 1s --retention-apply
+  --retention-grace 0`, assert both catalogs reap to zero, bucket reconcile = 0,
+  no panic / no "pass failed" in either daemon log.
+- **`scripts/smoke.sh`** — `if [[ "${MULTI:-0}" == "1" ]]; then exec
+  scripts/smoke-multi.sh "$@"; fi` after `cd "$ROOT"`.
+- **Docs:** `docs/decisions.md` (D-013 → SUPERSEDED, full D-038 + D-039, three
+  deferred entries flipped to ✅, orphan-GC deferred entry added); `README.md`
+  (v0.9 row → ✅); `CLAUDE.md` (status paragraph + Workspace layout + Commands +
+  decisions range); this file.
 
-## Not done / deferred (shared follow-ups)
+### Smoke gotchas (don't re-trip)
 
-- **Multi-instance lease** (compaction + retention share the deferred
-  per-`(signal, day)` object-store lease). Single-instance engines are
-  forward-compatible.
-- **In-`scry-ingestd` background loop** for both compaction and retention.
-- **Hand-rolled k-way streaming merge** (compaction optimisation).
-- **Partial-block rewriting** (retention drops whole blocks only) and
-  **size/quota eviction** (retention is purely age-based).
+- The pass/fail grep must be `grep -iEq "panicked|pass failed"`. A looser
+  `ERROR`/`error` grep false-positives on the benign lowercase `error=io:
+  unexpected end of file` field inside a WARN — that WARN is caused by the
+  smoke's own `wait_bind` TCP probe disconnecting without a handshake.
+- Assert via the daemons' **own** catalogs (which track `superseded_by`
+  correctly), not a fresh bucket reconcile mid-merge. Total live rows is the
+  stable convergence / no-duplication signal.
+- A native host redis on `127.0.0.1:6379` collides with the dev
+  `scry-valkey` container (host networking). Run a throwaway
+  `docker run -d -p 6380:6379 valkey/valkey:8.0-alpine` and pass
+  `SCRY_VALKEY_URL=redis://127.0.0.1:6380`. The committed script defaults to
+  6379 but honors `SCRY_VALKEY_URL`.
 
-## Next step
+The multi smoke passed deterministically 3× against Valkey on 6380.
 
-Commit the v0.8 work (conventional commits; whole-file commits only per
-Rule #13). Suggested split if desired:
-1. `feat(block): level + shared postings/streaming-bloom helpers + lift delete_block_objects`
-2. `feat(catalog): supersede/delete/mark_deleted + superseded/deleted query filter`
-3. `feat(compact): scry-compact size-tiered compaction crate`
-4. `feat(retention): scry-retention per-signal TTL reaper`
-5. `test(smoke): compaction + retention legs` + docs
+---
 
-Check each commit stages whole files cleanly first (e.g. `scry-block`'s
-`lib.rs` changes span both compaction helpers and the lifted
-`delete_block_objects` — bundle them in commit 1).
+## Remaining
+
+- **Commit Phase 7** as a single whole-file feature commit — ONLY my Phase 7
+  files (`scripts/smoke-multi.sh`, `scripts/smoke.sh`, `docs/decisions.md`,
+  `README.md`, `CLAUDE.md`, `CURRENT_TASK.md`). **Exclude** parallel/unrelated
+  working-tree changes: `Dockerfile`, `crates/scry-list/src/main.rs`,
+  `deploy/k8s/queryd-*.yaml`. (Per Rule #13: whole files only — verify the
+  split is clean before staging.)
+- **Cleanup:** remove the throwaway `scry-valkey-smoke` container (port 6380)
+  once Bart's clean dev Valkey is the target.
+
+## Deferred to future rounds (out of v0.9 scope)
+Catalog snapshot bootstrap (the O(GB) cold-start optimisation); multi-bucket
+pool + sealing/auto-provisioning; orphan-object GC for uncommitted merge
+leftovers; partial-block rewriting at the TTL boundary; agent↔server discovery
+via a Valkey service registry. Next milestone is v1.0 (Grafana adapters / own
+UI).
