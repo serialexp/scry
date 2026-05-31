@@ -80,8 +80,10 @@ use scry_query::{
     profiles::{register_profiles_table, PROFILES_TABLE_NAME},
     register_metrics_table,
     traces::{register_traces_table, TRACES_TABLE_NAME},
-    Query, QueryRequest, METRICS_TABLE_NAME,
+    EvictOnNotFound, Query, QueryRequest, METRICS_TABLE_NAME,
 };
+use std::sync::Arc;
+use object_store::ObjectStore;
 use tokio::io::{BufReader as TokioBufReader, BufWriter as TokioBufWriter};
 use tokio::net::TcpStream;
 
@@ -366,15 +368,51 @@ async fn main() -> Result<()> {
     // narrowed and `scan()` is pure CPU. We branch on the requested
     // signal so `scry-query --signal logs ...` registers `logs`
     // instead of `metrics`.
-    let ctx = SessionContext::new();
+    // Wrap the store so a peer's deletion (another instance compacting or
+    // reaping the same bucket) surfaces as an evict-and-re-plan rather than a
+    // hard failure: a `NotFound` during the postings/sidecar GETs in
+    // `register_*_table` records the dead block's UUID; if registration fails
+    // with anything recorded we drop those stale catalog rows and re-plan once.
+    // (Traces/profiles resolve no sidecar at plan time, so their 404 only
+    // appears mid-scan — there the query errors and a re-run heals it.)
+    let evict = Arc::new(EvictOnNotFound::new(store));
+    let store: Arc<dyn ObjectStore> = evict.clone();
     let table_name = signal.table_name();
-    match signal.0 {
-        Signal::Metrics => register_metrics_table(&ctx, &catalog, store, &q).await?,
-        Signal::Logs => register_logs_table(&ctx, &catalog, store, &q).await?,
-        Signal::Traces => register_traces_table(&ctx, &catalog, store, &q).await?,
-        Signal::Profiles => register_profiles_table(&ctx, &catalog, store, &q).await?,
-        other => anyhow::bail!("CLI signal {other:?} has no query table yet"),
-    }
+    let ctx = {
+        let mut replanned = false;
+        loop {
+            let ctx = SessionContext::new();
+            let reg = match signal.0 {
+                Signal::Metrics => {
+                    register_metrics_table(&ctx, &catalog, store.clone(), &q).await
+                }
+                Signal::Logs => register_logs_table(&ctx, &catalog, store.clone(), &q).await,
+                Signal::Traces => register_traces_table(&ctx, &catalog, store.clone(), &q).await,
+                Signal::Profiles => {
+                    register_profiles_table(&ctx, &catalog, store.clone(), &q).await
+                }
+                other => anyhow::bail!("CLI signal {other:?} has no query table yet"),
+            };
+            match reg {
+                Ok(()) => break ctx,
+                Err(e) => {
+                    let evicted = evict.take_evicted();
+                    if !replanned && !evicted.is_empty() {
+                        replanned = true;
+                        catalog
+                            .delete_blocks(&evicted)
+                            .context("evicting stale catalog rows after 404")?;
+                        eprintln!(
+                            "note: evicted {} stale block row(s) after 404; re-planning",
+                            evicted.len()
+                        );
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    };
 
     // ── Produce a DataFrame ──────────────────────────────────────
     let df = if let Some(sql) = args.sql.as_deref() {

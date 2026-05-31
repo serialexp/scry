@@ -40,6 +40,7 @@
 
 pub mod bloom_cache;
 pub mod body_bloom;
+pub mod evict;
 pub mod logs;
 pub mod postings;
 pub mod postings_cache;
@@ -57,6 +58,7 @@ use object_store::ObjectStore;
 use scry_catalog::{Catalog, CatalogEntry};
 use serde::{Deserialize, Serialize};
 
+pub use evict::EvictOnNotFound;
 pub use postings::resolve_fingerprints;
 pub use wire::QueryRequest;
 pub use postings_cache::{

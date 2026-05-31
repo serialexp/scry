@@ -42,15 +42,23 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use datafusion::execution::memory_pool::GreedyMemoryPool;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use scry_catalog::Catalog;
+use scry_cluster::{apply_event, full_walk, poll_once};
 use scry_objstore::{open_with_pool_config, BufPoolConfig, ObjStoreConfig};
 use scry_query::{BloomCache, BloomCacheConfig, PostingsCache, PostingsCacheConfig};
 use scry_server::QueryService;
-use tracing::info;
+use scry_valkey::{parse_envelope, subscribe_blocks, ValkeyClient, VALKEY_URL_ENV};
+use tracing::{info, warn};
+use uuid::Uuid;
+
+/// Block-event channels the convergence loops follow (every signal).
+const ALL_SIGNALS: [&str; 5] = ["dummy", "metrics", "logs", "traces", "profiles"];
 
 /// Swap glibc's malloc for mimalloc — same reasoning as `scry-query`
 /// (large response Vecs go via `mmap` under glibc which forces a fresh
@@ -138,6 +146,24 @@ struct Args {
     /// headroom (e.g. cap this at ~70% of available RAM).
     #[arg(long, default_value_t = 1024)]
     query_memory_budget_mib: usize,
+
+    // ── Multi-instance convergence (v0.9) ─────────────────────────
+    /// Valkey URL for pub/sub catalog convergence. Falls back to
+    /// `$SCRY_VALKEY_URL`. The query daemon is **query-only**: it never
+    /// runs maintenance (no lease), it only *follows* the bucket so peers'
+    /// blocks become queryable promptly. With Valkey absent, convergence
+    /// still runs via polling + full-walk (just higher latency).
+    #[arg(long)]
+    valkey_url: Option<String>,
+
+    /// Seconds between incremental cursor convergence polls.
+    #[arg(long, default_value_t = 5)]
+    poll_interval: u64,
+
+    /// Seconds between exhaustive full-walk reconciles (backstop that also
+    /// discovers brand-new prefixes).
+    #[arg(long, default_value_t = 1800)]
+    full_walk_interval: u64,
 }
 
 #[tokio::main]
@@ -222,6 +248,13 @@ async fn main() -> Result<()> {
             .context("building shared DataFusion RuntimeEnv")?,
     );
 
+    // Clones for the convergence loops, captured before `catalog`/`store` are
+    // moved into the service. The daemon and the loops share one catalog
+    // connection (`std::sync::Mutex<Catalog>` is a `CatalogHandle`).
+    let conv_catalog = catalog.clone();
+    let conv_store = store.clone();
+    let conv_bucket = cfg.bucket.clone();
+
     let service = Arc::new(QueryService::new(
         catalog,
         store,
@@ -244,9 +277,131 @@ async fn main() -> Result<()> {
         "query daemon ready"
     );
 
-    service
+    // ── Catalog convergence (v0.9) ────────────────────────────────
+    // Query-only: pub/sub apply (low-latency), incremental cursor poll, and
+    // periodic full-walk all converge this daemon's catalog onto the shared
+    // bucket so peers' freshly-written/compacted/reaped blocks become
+    // queryable. No maintenance loop (no lease) — the daemon never does
+    // destructive work. Stale rows a peer deleted are healed at query time by
+    // the `EvictOnNotFound` re-plan in `QueryService`.
+    let valkey_url = args
+        .valkey_url
+        .clone()
+        .or_else(|| std::env::var(VALKEY_URL_ENV).ok());
+    let valkey = match valkey_url.as_deref() {
+        Some(url) => Some(
+            ValkeyClient::connect(url, Uuid::now_v7())
+                .await
+                .with_context(|| format!("connecting to Valkey at {url}"))?,
+        ),
+        None => {
+            info!("{VALKEY_URL_ENV} unset and no --valkey-url; convergence via polling + full-walk only");
+            None
+        }
+    };
+
+    let mut bg_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+    // pub/sub convergence consumer (only with Valkey).
+    if let Some(url) = valkey_url.clone() {
+        let cat = conv_catalog.clone();
+        bg_tasks.push(tokio::spawn(run_consumer(url, cat)));
+    }
+
+    // Incremental cursor poller.
+    {
+        let store = conv_store.clone();
+        let bucket = conv_bucket.clone();
+        let cat = conv_catalog.clone();
+        let interval = Duration::from_secs(args.poll_interval.max(1));
+        bg_tasks.push(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                match poll_once(store.as_ref(), cat.as_ref(), &bucket).await {
+                    Ok(r) if r.inserted > 0 => info!(
+                        inserted = r.inserted,
+                        cursors = r.cursors,
+                        "convergence poll applied new blocks"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => warn!(error = %e, "convergence poll failed"),
+                }
+            }
+        }));
+    }
+
+    // Periodic full walk.
+    {
+        let store = conv_store.clone();
+        let bucket = conv_bucket.clone();
+        let cat = conv_catalog.clone();
+        let interval = Duration::from_secs(args.full_walk_interval.max(1));
+        bg_tasks.push(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                match full_walk(store.as_ref(), cat.as_ref(), &bucket).await {
+                    Ok(r) if r.inserted > 0 => info!(
+                        inserted = r.inserted,
+                        seen = r.seen,
+                        "convergence full-walk applied new blocks"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => warn!(error = %e, "convergence full-walk failed"),
+                }
+            }
+        }));
+    }
+
+    let serve_result = service
         .serve_with_shutdown(args.listen, async {
             let _ = tokio::signal::ctrl_c().await;
         })
-        .await
+        .await;
+
+    // Process is exiting — stop the convergence loops and close Valkey.
+    for t in &bg_tasks {
+        t.abort();
+    }
+    if let Some(c) = valkey {
+        c.quit().await;
+    }
+    serve_result
+}
+
+/// Background pub/sub convergence consumer: subscribe to every block-event
+/// channel and apply each event to the catalog idempotently. Reconnects on a
+/// closed subscription; lag drops events (the cursor poller backstops).
+async fn run_consumer(url: String, catalog: Arc<Mutex<Catalog>>) {
+    use tokio::sync::broadcast::error::RecvError;
+    loop {
+        match subscribe_blocks(&url, &ALL_SIGNALS).await {
+            Ok((_sub, mut rx)) => {
+                info!("subscribed to block-event channels for catalog convergence");
+                loop {
+                    match rx.recv().await {
+                        Ok(msg) => {
+                            if let Some(env) = parse_envelope(&msg) {
+                                if let Err(e) = apply_event(catalog.as_ref(), &env.event) {
+                                    warn!(error = %e, "applying block event to catalog failed");
+                                }
+                            }
+                        }
+                        Err(RecvError::Lagged(n)) => {
+                            warn!(skipped = n, "convergence consumer lagged; polling will backstop")
+                        }
+                        Err(RecvError::Closed) => {
+                            warn!("convergence subscription closed; reconnecting");
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) => warn!(error = %e, "subscribing to Valkey block channels failed; retrying"),
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
 }

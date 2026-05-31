@@ -44,7 +44,7 @@ use datafusion::execution::context::SessionContext;
 use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::physical_plan::metrics::{MetricValue, MetricsSet};
-use datafusion::physical_plan::{execute_stream, ExecutionPlan};
+use datafusion::physical_plan::{execute_stream, ExecutionPlan, SendableRecordBatchStream};
 use datafusion::prelude::SessionConfig;
 use futures::StreamExt;
 use object_store::ObjectStore;
@@ -70,10 +70,11 @@ use scry_query::{
     traces::{
         list_traces_candidates, register_traces_table_from_candidates, TRACES_TABLE_NAME,
     },
-    BloomCache, BloomCacheStats, PostingsCache, PostingsCacheStats, QueryRequest,
+    BloomCache, BloomCacheStats, EvictOnNotFound, PostingsCache, PostingsCacheStats, QueryRequest,
     METRICS_TABLE_NAME,
 };
 use scry_catalog::CatalogEntry;
+use uuid::Uuid;
 use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, info_span, warn, Instrument, Span};
@@ -328,6 +329,157 @@ impl QueryService {
             .await
     }
 
+    /// Plan and begin executing one query against `store`: list candidate
+    /// blocks from the catalog, register the signal's table (resolving
+    /// postings/bloom sidecars for metrics/logs), build the `DataFrame`,
+    /// create the physical plan, and kick off the execution stream.
+    ///
+    /// Returns the live stream + the physical plan (for `scan_complete`
+    /// metrics), or a `(wire error code, message)` on any failure. No bytes
+    /// are written to the client here, so the caller can retry this whole
+    /// method transparently — which it does once if a `NotFound` was recorded
+    /// against `store` (a peer deleted a block we still list). For metrics/logs
+    /// the 404 surfaces here (postings GET); traces/profiles resolve no sidecar
+    /// at plan time so theirs only appears mid-scan (handled in `run_query`).
+    async fn plan_and_execute(
+        &self,
+        signal: Signal,
+        req: &QueryRequest,
+        store: Arc<dyn ObjectStore>,
+    ) -> std::result::Result<(SendableRecordBatchStream, Arc<dyn ExecutionPlan>), (u16, String)>
+    {
+        let ctx =
+            SessionContext::new_with_config_rt(SessionConfig::new(), self.runtime_env.clone());
+
+        // ── Catalog lookup (sync) ────────────────────────────────────
+        // Lock only to list candidates into an owned Vec; the guard drops
+        // before any .await (MutexGuard isn't Send across await anyway).
+        let candidates: Vec<CatalogEntry> = {
+            let guard = self
+                .catalog
+                .lock()
+                .map_err(|e| (QUERY_ERR_INTERNAL, format!("catalog mutex poisoned: {e}")))?;
+            match signal {
+                Signal::Metrics => list_metrics_candidates(&guard, &req.query)
+                    .map_err(|e| (QUERY_ERR_INTERNAL, format!("list_metrics_candidates: {e:#}")))?,
+                Signal::Logs => list_logs_candidates(&guard, &req.query)
+                    .map_err(|e| (QUERY_ERR_INTERNAL, format!("list_logs_candidates: {e:#}")))?,
+                Signal::Traces => list_traces_candidates(&guard, &req.query)
+                    .map_err(|e| (QUERY_ERR_INTERNAL, format!("list_traces_candidates: {e:#}")))?,
+                Signal::Profiles => list_profiles_candidates(&guard, &req.query)
+                    .map_err(|e| (QUERY_ERR_INTERNAL, format!("list_profiles_candidates: {e:#}")))?,
+                other => {
+                    return Err((
+                        QUERY_ERR_INTERNAL,
+                        format!("BUG: unsupported signal {other:?} reached run_query"),
+                    ))
+                }
+            }
+        };
+
+        // ── Register the signal's table (sidecar GETs happen here) ────
+        let register_result = match signal {
+            Signal::Metrics => {
+                register_metrics_table_from_candidates(
+                    &ctx,
+                    candidates,
+                    store.clone(),
+                    Some(self.postings_cache.as_ref()),
+                    &req.query,
+                )
+                .await
+            }
+            Signal::Logs => {
+                register_logs_table_from_candidates(
+                    &ctx,
+                    candidates,
+                    store.clone(),
+                    Some(self.postings_cache.as_ref()),
+                    Some(self.bloom_cache.as_ref()),
+                    &req.query,
+                )
+                .await
+            }
+            Signal::Traces => {
+                register_traces_table_from_candidates(
+                    &ctx,
+                    candidates,
+                    store.clone(),
+                    Some(self.postings_cache.as_ref()),
+                    &req.query,
+                )
+                .await
+            }
+            Signal::Profiles => {
+                register_profiles_table_from_candidates(
+                    &ctx,
+                    candidates,
+                    store.clone(),
+                    Some(self.postings_cache.as_ref()),
+                    &req.query,
+                )
+                .await
+            }
+            other => Err(anyhow::anyhow!(
+                "BUG: unsupported signal {other:?} reached run_query"
+            )),
+        };
+        register_result.map_err(|e| {
+            (
+                QUERY_ERR_INTERNAL,
+                format!("register_{}_table: {e:#}", signal_name(signal)),
+            )
+        })?;
+
+        // ── Build the DataFrame (SQL or default SELECT *) ────────────
+        let default_table = match signal {
+            Signal::Metrics => METRICS_TABLE_NAME,
+            Signal::Logs => LOGS_TABLE_NAME,
+            Signal::Traces => TRACES_TABLE_NAME,
+            Signal::Profiles => PROFILES_TABLE_NAME,
+            _ => METRICS_TABLE_NAME,
+        };
+        let df = if let Some(sql) = req.sql.as_deref() {
+            ctx.sql(sql)
+                .await
+                .map_err(|e| (QUERY_ERR_SQL_PARSE, format!("SQL parse: {e:#}")))?
+        } else {
+            let mut df = ctx
+                .table(default_table)
+                .await
+                .map_err(|e| (QUERY_ERR_INTERNAL, format!("table lookup: {e:#}")))?;
+            if let Some(limit) = req.limit {
+                df = df
+                    .limit(0, Some(limit))
+                    .map_err(|e| (QUERY_ERR_PLAN, format!("applying limit: {e:#}")))?;
+            }
+            df
+        };
+
+        let physical = df
+            .create_physical_plan()
+            .await
+            .map_err(|e| (QUERY_ERR_PLAN, format!("create_physical_plan: {e:#}")))?;
+        let task_ctx = ctx.task_ctx();
+        let stream = execute_stream(physical.clone(), task_ctx)
+            .map_err(|e| (QUERY_ERR_INTERNAL, format!("execute_stream: {e:#}")))?;
+        Ok((stream, physical))
+    }
+
+    /// Best-effort delete of stale catalog rows after their objects 404'd.
+    /// The bucket is the source of truth, so dropping a row we just proved is
+    /// gone is always safe; convergence would remove it anyway.
+    fn evict_rows(&self, uuids: &[Uuid]) {
+        match self.catalog.lock() {
+            Ok(guard) => {
+                if let Err(e) = guard.delete_blocks(uuids) {
+                    warn!(error = %e, "evicting stale catalog rows after 404 failed (bucket is truth; convergence will retry)");
+                }
+            }
+            Err(e) => warn!(error = %e, "catalog mutex poisoned while evicting stale rows"),
+        }
+    }
+
     /// The actual query execution. Split out from `handle_connection`
     /// so the request decode + span setup is one orderly block, and
     /// this fn can return early via `?` on framing errors without
@@ -354,220 +506,45 @@ impl QueryService {
         // on every exit path (success + each error path).
         let mut rows_total: u64 = 0;
 
-        // ── Build the per-request SessionContext ─────────────────────
+        // ── Plan + execute, with one transparent re-plan on a peer's
+        //    deletion ─────────────────────────────────────────────────
         //
-        // Fresh ctx per request keeps the table list per-query. The
-        // `metrics` registration is post-postings, post-time-overlap-
-        // narrow, so we don't want one request's narrowed table to
-        // bleed into the next. The construction is cheap (~µs);
-        // DataFusion's heavy initialisation is one-time. Sharing the
-        // RuntimeEnv across contexts is the only way DataFusion
-        // enforces the memory budget across queries.
-        let ctx = SessionContext::new_with_config_rt(
-            SessionConfig::new(),
-            self.runtime_env.clone(),
-        );
-
-        // ── Catalog lookup (sync) ────────────────────────────────────
-        //
-        // Lock the catalog only to list candidate blocks. The
-        // candidates Vec is owned, so the guard drops before any
-        // async work — multiple concurrent queries serialise on a
-        // single SELECT each, no more.
-        // Compute candidates synchronously and drop the guard before
-        // any .await — MutexGuard isn't Send, so we can't hold it
-        // across an await point in a tokio::spawn-ed future.
-        let candidates_result: Result<Vec<CatalogEntry>, String> = match self.catalog.lock() {
-            Ok(guard) => match signal {
-                Signal::Metrics => list_metrics_candidates(&guard, &req.query)
-                    .map_err(|e| format!("list_metrics_candidates: {e:#}")),
-                Signal::Logs => list_logs_candidates(&guard, &req.query)
-                    .map_err(|e| format!("list_logs_candidates: {e:#}")),
-                Signal::Traces => list_traces_candidates(&guard, &req.query)
-                    .map_err(|e| format!("list_traces_candidates: {e:#}")),
-                Signal::Profiles => list_profiles_candidates(&guard, &req.query)
-                    .map_err(|e| format!("list_profiles_candidates: {e:#}")),
-                // Unreachable: handle_connection rejects other signals
-                // before reaching run_query.
-                other => Err(format!("BUG: unsupported signal {other:?} reached run_query")),
-            },
-            Err(e) => Err(format!("catalog mutex poisoned: {e}")),
-        };
-        let candidates = match candidates_result {
-            Ok(v) => v,
-            Err(msg) => {
-                let _ = emit_stream_error(&mut wr, QUERY_ERR_INTERNAL, msg).await;
-                let _ = wr.flush().await;
-                self.emit_scan_complete(signal, None, rows_total, pool_start, cache_start, t0.elapsed());
-                return Ok(());
-            }
-        };
-
-        let register_result = match signal {
-            Signal::Metrics => {
-                register_metrics_table_from_candidates(
-                    &ctx,
-                    candidates,
-                    self.store.clone(),
-                    Some(self.postings_cache.as_ref()),
-                    &req.query,
-                )
-                .await
-            }
-            Signal::Logs => {
-                register_logs_table_from_candidates(
-                    &ctx,
-                    candidates,
-                    self.store.clone(),
-                    Some(self.postings_cache.as_ref()),
-                    Some(self.bloom_cache.as_ref()),
-                    &req.query,
-                )
-                .await
-            }
-            Signal::Traces => {
-                register_traces_table_from_candidates(
-                    &ctx,
-                    candidates,
-                    self.store.clone(),
-                    Some(self.postings_cache.as_ref()),
-                    &req.query,
-                )
-                .await
-            }
-            Signal::Profiles => {
-                register_profiles_table_from_candidates(
-                    &ctx,
-                    candidates,
-                    self.store.clone(),
-                    Some(self.postings_cache.as_ref()),
-                    &req.query,
-                )
-                .await
-            }
-            other => {
-                Err(anyhow::anyhow!("BUG: unsupported signal {other:?} reached run_query"))
-            }
-        };
-        if let Err(e) = register_result {
-            let _ = emit_stream_error(
-                &mut wr,
-                QUERY_ERR_INTERNAL,
-                format!("register_{}_table: {e:#}", signal_name(signal)),
-            )
-            .await;
-            let _ = wr.flush().await;
-            self.emit_scan_complete(signal, None, rows_total, pool_start, cache_start, t0.elapsed());
-            return Ok(());
-        }
-
-        let t_reg = t0.elapsed();
-        info!(
-            signal = signal_name(signal),
-            elapsed_ms = t_reg.as_millis() as u64,
-            "register_table_done"
-        );
-
-        // ── Build the DataFrame (SQL or default SELECT *) ────────────
-        let default_table = match signal {
-            Signal::Metrics => METRICS_TABLE_NAME,
-            Signal::Logs => LOGS_TABLE_NAME,
-            Signal::Traces => TRACES_TABLE_NAME,
-            Signal::Profiles => PROFILES_TABLE_NAME,
-            // Unreachable: see above guards.
-            _ => METRICS_TABLE_NAME,
-        };
-        let df_res = if let Some(sql) = req.sql.as_deref() {
-            match ctx.sql(sql).await {
-                Ok(df) => Ok(df),
-                Err(e) => Err((QUERY_ERR_SQL_PARSE, format!("SQL parse: {e:#}"))),
-            }
-        } else {
-            match ctx.table(default_table).await {
-                Ok(mut df) => {
-                    if let Some(limit) = req.limit {
-                        match df.limit(0, Some(limit)) {
-                            Ok(d) => df = d,
-                            Err(e) => {
-                                df = match Err::<_, (u16, String)>((
-                                    QUERY_ERR_PLAN,
-                                    format!("applying limit: {e:#}"),
-                                )) {
-                                    Err((code, msg)) => {
-                                        let _ =
-                                            emit_stream_error(&mut wr, code, msg).await;
-                                        let _ = wr.flush().await;
-                                        self.emit_scan_complete(
-                                            signal,
-                                            None,
-                                            rows_total,
-                                            pool_start,
-                                            cache_start,
-                                            t0.elapsed(),
-                                        );
-                                        return Ok(());
-                                    }
-                                    Ok(d) => d,
-                                };
-                            }
-                        }
+        // A peer (compaction reaping a superseded input, retention reaping an
+        // expired block) can hard-delete a block this instance still has a
+        // catalog row for — convergence just hasn't caught up. We wrap the
+        // store in `EvictOnNotFound`: a `NotFound` during the planning reads
+        // (the postings-sidecar GETs for metrics/logs) records the dead
+        // block's UUID. If planning fails with anything recorded, we delete
+        // those stale rows and re-plan **once** — fully transparent, the
+        // client never saw a byte. (Traces/profiles resolve no sidecar at plan
+        // time, so their 404 only surfaces mid-scan, below: we can't re-plan
+        // once the schema is on the wire, so we evict to heal the next query
+        // and return a clean StreamError.)
+        let evict = Arc::new(EvictOnNotFound::new(self.store.clone()));
+        let store: Arc<dyn ObjectStore> = evict.clone();
+        let mut replanned = false;
+        let (mut stream, physical) = loop {
+            match self.plan_and_execute(signal, &req, store.clone()).await {
+                Ok(v) => break v,
+                Err((code, msg)) => {
+                    let evicted = evict.take_evicted();
+                    if !replanned && !evicted.is_empty() {
+                        replanned = true;
+                        self.evict_rows(&evicted);
+                        info!(
+                            signal = signal_name(signal),
+                            evicted = evicted.len(),
+                            "block(s) 404'd during planning; evicted stale catalog rows and re-planning once"
+                        );
+                        continue;
                     }
-                    Ok(df)
+                    let _ = emit_stream_error(&mut wr, code, msg).await;
+                    let _ = wr.flush().await;
+                    self.emit_scan_complete(
+                        signal, None, rows_total, pool_start, cache_start, t0.elapsed(),
+                    );
+                    return Ok(());
                 }
-                Err(e) => Err((QUERY_ERR_INTERNAL, format!("table lookup: {e:#}"))),
-            }
-        };
-        let df = match df_res {
-            Ok(df) => df,
-            Err((code, msg)) => {
-                let _ = emit_stream_error(&mut wr, code, msg).await;
-                let _ = wr.flush().await;
-                self.emit_scan_complete(signal, None, rows_total, pool_start, cache_start, t0.elapsed());
-                return Ok(());
-            }
-        };
-
-        let physical = match df.create_physical_plan().await {
-            Ok(p) => p,
-            Err(e) => {
-                let _ = emit_stream_error(
-                    &mut wr,
-                    QUERY_ERR_PLAN,
-                    format!("create_physical_plan: {e:#}"),
-                )
-                .await;
-                let _ = wr.flush().await;
-                self.emit_scan_complete(signal, None, rows_total, pool_start, cache_start, t0.elapsed());
-                return Ok(());
-            }
-        };
-        let task_ctx = ctx.task_ctx();
-        let t_plan = t0.elapsed();
-        info!(
-            elapsed_ms = t_plan.as_millis() as u64,
-            "physical_plan_done"
-        );
-
-        // ── Execute → RecordBatch stream → IPC encode → wire ────────
-        let mut stream = match execute_stream(physical.clone(), task_ctx) {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = emit_stream_error(
-                    &mut wr,
-                    QUERY_ERR_INTERNAL,
-                    format!("execute_stream: {e:#}"),
-                )
-                .await;
-                let _ = wr.flush().await;
-                self.emit_scan_complete(
-                    signal,
-                    Some(physical.as_ref()),
-                    rows_total,
-                    pool_start,
-                    cache_start,
-                    t0.elapsed(),
-                );
-                return Ok(());
             }
         };
         let schema = stream.schema();
@@ -624,6 +601,22 @@ impl QueryService {
             let batch = match batch_res {
                 Ok(b) => b,
                 Err(e) => {
+                    // A peer may have deleted a block mid-scan (404 from the
+                    // parquet GET). We can't re-plan now — the schema and
+                    // earlier batches are already on the wire — but we evict
+                    // the stale catalog row so the caller's retry (and every
+                    // future query) is clean. This is the only recovery path
+                    // for traces/profiles, which resolve no sidecar at plan
+                    // time and so never trip the transparent re-plan above.
+                    let evicted = evict.take_evicted();
+                    if !evicted.is_empty() {
+                        self.evict_rows(&evicted);
+                        info!(
+                            signal = signal_name(signal),
+                            evicted = evicted.len(),
+                            "block(s) 404'd mid-scan; evicted stale catalog rows (caller should retry)"
+                        );
+                    }
                     let code = if matches!(
                         e.find_root(),
                         DataFusionError::ResourcesExhausted(_)

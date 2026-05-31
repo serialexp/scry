@@ -80,7 +80,7 @@
 
 use anyhow::{Context, Result};
 use object_store::ObjectStore;
-use scry_block::{BlockBuilder, BlockBuilderConfig};
+use scry_block::{BlockBuilder, BlockBuilderConfig, BlockEvent, BlockEventSink};
 use scry_catalog::Catalog;
 use scry_wal::{SegmentId, Wal, WalConfig};
 use std::{path::PathBuf, sync::Arc, time::Instant};
@@ -192,7 +192,7 @@ pub struct Pipeline<B: BlockBuilder> {
     /// fail the ingest path, because the bucket is the source of
     /// truth and a future `scry-list --reconcile` would re-derive the
     /// row anyway.
-    catalog: Option<Arc<Mutex<Catalog>>>,
+    catalog: Option<Arc<std::sync::Mutex<Catalog>>>,
     writer_uuid: Uuid,
     cfg: BlockBuilderConfig,
     decode: DecodeFn<B>,
@@ -217,6 +217,12 @@ pub struct Pipeline<B: BlockBuilder> {
     /// using the static `cfg.compression_level`. Set via
     /// [`Pipeline::with_adaptive_compression`] (`--compression auto`).
     adaptive_compression: bool,
+    /// Optional block-lifecycle event sink. When set (multi-instance mode),
+    /// every successful block upload emits a [`BlockEvent::Created`] so peers
+    /// converge their catalogs via pub/sub. `None` (single-instance / tests)
+    /// means uploads emit nothing — convergence isn't needed. Set via
+    /// [`Pipeline::set_event_sink`] / [`ShardedPipeline::with_event_sink`].
+    event_sink: Option<Arc<dyn BlockEventSink>>,
 }
 
 impl<B: BlockBuilder> Pipeline<B> {
@@ -229,7 +235,7 @@ impl<B: BlockBuilder> Pipeline<B> {
     pub async fn open(
         wal_dir: PathBuf,
         store: Arc<dyn ObjectStore>,
-        catalog: Option<Arc<Mutex<Catalog>>>,
+        catalog: Option<Arc<std::sync::Mutex<Catalog>>>,
         writer_uuid: Uuid,
         decode: DecodeFn<B>,
     ) -> Result<Self> {
@@ -251,7 +257,7 @@ impl<B: BlockBuilder> Pipeline<B> {
     pub async fn open_with_config(
         wal_dir: PathBuf,
         store: Arc<dyn ObjectStore>,
-        catalog: Option<Arc<Mutex<Catalog>>>,
+        catalog: Option<Arc<std::sync::Mutex<Catalog>>>,
         writer_uuid: Uuid,
         decode: DecodeFn<B>,
         cfg: BlockBuilderConfig,
@@ -291,6 +297,7 @@ impl<B: BlockBuilder> Pipeline<B> {
             upload_sem: Arc::new(Semaphore::new(MAX_INFLIGHT_UPLOADS)),
             upload_stats: None,
             adaptive_compression: false,
+            event_sink: None,
         })
     }
 
@@ -320,6 +327,13 @@ impl<B: BlockBuilder> Pipeline<B> {
     pub fn with_adaptive_compression(mut self, on: bool) -> Self {
         self.adaptive_compression = on;
         self
+    }
+
+    /// Attach a block-lifecycle event sink (multi-instance convergence). Every
+    /// successful upload thereafter emits a [`BlockEvent::Created`]. Off by
+    /// default, so the single-instance path is byte-for-byte unchanged.
+    pub fn set_event_sink(&mut self, sink: Arc<dyn BlockEventSink>) {
+        self.event_sink = Some(sink);
     }
 
     /// Choose the ZSTD level for the block about to be encoded, from the
@@ -498,6 +512,7 @@ impl<B: BlockBuilder> Pipeline<B> {
         let wal = self.wal.clone();
         let catalog = self.catalog.clone();
         let stats = self.upload_stats.clone();
+        let event_sink = self.event_sink.clone();
         if let Some(s) = stats.as_ref() {
             s.start_inflight();
         }
@@ -505,7 +520,16 @@ impl<B: BlockBuilder> Pipeline<B> {
             // Hold the permit for the upload's lifetime; dropping it
             // when the task ends frees a slot for the next block.
             let _permit = permit;
-            run_upload::<B>(old_builder, sealed, store, wal, catalog, stats.as_ref()).await;
+            run_upload::<B>(
+                old_builder,
+                sealed,
+                store,
+                wal,
+                catalog,
+                stats.as_ref(),
+                event_sink.as_ref(),
+            )
+            .await;
             if let Some(s) = stats.as_ref() {
                 s.finish_inflight();
             }
@@ -590,7 +614,7 @@ impl<B: BlockBuilder> ShardedPipeline<B> {
         n: usize,
         wal_dir: PathBuf,
         store: Arc<dyn ObjectStore>,
-        catalog: Option<Arc<Mutex<Catalog>>>,
+        catalog: Option<Arc<std::sync::Mutex<Catalog>>>,
         writer_uuid: Uuid,
         decode: DecodeFn<B>,
         upload_sem: Arc<Semaphore>,
@@ -626,7 +650,7 @@ impl<B: BlockBuilder> ShardedPipeline<B> {
         n: usize,
         wal_dir: PathBuf,
         store: Arc<dyn ObjectStore>,
-        catalog: Option<Arc<Mutex<Catalog>>>,
+        catalog: Option<Arc<std::sync::Mutex<Catalog>>>,
         writer_uuid: Uuid,
         decode: DecodeFn<B>,
         cfg: BlockBuilderConfig,
@@ -660,6 +684,17 @@ impl<B: BlockBuilder> ShardedPipeline<B> {
         })
     }
 
+    /// Attach a block-lifecycle event sink to every shard (multi-instance
+    /// convergence). Call once at startup, before serving. Async because the
+    /// shards are behind `tokio::sync::Mutex`; there's no contention yet, so
+    /// this is just N uncontended locks. Off by default (single-instance).
+    pub async fn with_event_sink(self, sink: Arc<dyn BlockEventSink>) -> Self {
+        for shard in self.shards.iter() {
+            shard.lock().await.set_event_sink(sink.clone());
+        }
+        self
+    }
+
     /// The shard a connection's batches for this signal go to. Pinned by
     /// session id so a connection always hits the same shard (stable WAL
     /// ordering); modulo `N` spreads connections evenly across shards.
@@ -679,13 +714,15 @@ impl<B: BlockBuilder> ShardedPipeline<B> {
 /// returns an error (so a single failed block doesn't poison the
 /// JoinSet), but a failed upload leaves the sealed WAL segment in
 /// place for the next process start to replay.
+#[allow(clippy::too_many_arguments)]
 async fn run_upload<B: BlockBuilder>(
     builder: B,
     sealed: SegmentId,
     store: Arc<dyn ObjectStore>,
     wal: Arc<Mutex<Wal>>,
-    catalog: Option<Arc<Mutex<Catalog>>>,
+    catalog: Option<Arc<std::sync::Mutex<Catalog>>>,
     stats: Option<&Arc<UploadStats>>,
+    event_sink: Option<&Arc<dyn BlockEventSink>>,
 ) {
     let upload_start = Instant::now();
     let upload_result = builder.finish_and_upload(store.as_ref()).await;
@@ -727,7 +764,7 @@ async fn run_upload<B: BlockBuilder>(
             // always re-derive a missing row. We don't want a
             // transient sqlite hiccup to fail the ingest path.
             if let Some(cat) = catalog.as_ref() {
-                match cat.lock().await.insert_block(&meta) {
+                match cat.lock().expect("catalog mutex poisoned").insert_block(&meta) {
                     Ok(true) => {}
                     Ok(false) => {
                         tracing::debug!(block_uuid = %meta.uuid, "catalog row already present");
@@ -741,6 +778,16 @@ async fn run_upload<B: BlockBuilder>(
                         );
                     }
                 }
+            }
+            // Multi-instance convergence: announce the new block so peers
+            // insert it into their catalogs without waiting for a poll / full
+            // walk. Emitted on every successful upload regardless of the local
+            // catalog insert result — the bucket has the data and peers need
+            // to know. `emit` is non-blocking and never fails at the call
+            // site (drop-on-full); polling backstops a dropped publish. No-op
+            // when no sink is attached (single-instance).
+            if let Some(sink) = event_sink {
+                sink.emit(BlockEvent::Created { meta: meta.clone() });
             }
             info!(
                 signal = B::SIGNAL,

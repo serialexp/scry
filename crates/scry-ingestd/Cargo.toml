@@ -14,9 +14,15 @@ anyhow            = { workspace = true }
 clap              = { workspace = true }
 mimalloc          = { workspace = true }
 num_cpus          = { workspace = true }
+object_store      = { workspace = true }
+scry-block        = { workspace = true }
 scry-catalog      = { workspace = true }
+scry-cluster      = { workspace = true }
+scry-compact      = { workspace = true }
 scry-objstore     = { workspace = true }
+scry-retention    = { workspace = true }
 scry-server       = { workspace = true }
+scry-valkey       = { workspace = true }
 tokio             = { workspace = true }
 tracing           = { workspace = true }
 tracing-subscriber = { workspace = true }

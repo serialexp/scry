@@ -15,17 +15,32 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
+use object_store::ObjectStore;
+use scry_block::{BlockEventSink, NoopSink};
 use scry_catalog::Catalog;
+use scry_cluster::{
+    apply_event, full_walk, poll_once, run_compaction_pass, run_retention_pass, LeaseProvider,
+    LocalLeaseProvider,
+};
+use scry_compact::CompactConfig;
 use scry_objstore::{open as open_objstore, ObjStoreConfig};
+use scry_retention::RetentionConfig;
 use scry_server::{
     decode, serve_stats, BlockBuilderConfig, DummyShards, LogsShards, MetricsShards,
     ProfilesShards, Server, ServerConfig, ServerMetrics, ShardedPipeline, TracesShards,
     INGEST_SHARDS,
 };
-use std::{path::PathBuf, sync::Arc};
-use tokio::sync::{Mutex, Semaphore};
+use scry_valkey::{
+    parse_envelope, subscribe_blocks, ValkeyClient, ValkeyLeaseProvider, ValkeySink, VALKEY_URL_ENV,
+};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
+use tokio::sync::Semaphore;
 use tracing::{info, warn};
 use uuid::Uuid;
+
+/// The convergence/maintenance channels cover every signal that has a
+/// pipeline (Dummy included — the smoke harness exercises it).
+const ALL_SIGNALS: [&str; 5] = ["dummy", "metrics", "logs", "traces", "profiles"];
 
 /// Swap glibc's malloc for mimalloc.
 ///
@@ -105,6 +120,105 @@ struct Args {
     /// keeps the default. Only meaningful with `--storage`.
     #[arg(long)]
     block_max_rows: Option<u64>,
+
+    // ---- Multi-instance coordination (v0.9) ----------------------------
+    /// Valkey URL for multi-instance coordination (lease + pub/sub
+    /// convergence). Falls back to `$SCRY_VALKEY_URL`. When neither is set
+    /// the daemon runs a correct single-instance path: catalog convergence
+    /// falls back to polling/full-walk and maintenance pauses (no lease ⇒
+    /// no destructive work) unless `--allow-unfenced-maintenance`.
+    #[arg(long)]
+    valkey_url: Option<String>,
+
+    /// Instance role. `full` ingests, converges, and contends for
+    /// maintenance leases; `ingest-only` ingests + converges but never runs
+    /// maintenance; `query-only` only converges (no ingest pipelines, no
+    /// maintenance — `--storage` still builds catalogs for the convergence
+    /// loops). Default `full`.
+    #[arg(long, value_enum, default_value_t = Mode::Full)]
+    mode: Mode,
+
+    /// Force-disable the maintenance loop even in `full` mode.
+    #[arg(long)]
+    no_maintenance: bool,
+
+    /// Run maintenance even without a Valkey lease (single-instance:
+    /// asserts sole ownership). Without this, maintenance pauses when Valkey
+    /// is absent. Dangerous with >1 instance on one bucket.
+    #[arg(long)]
+    allow_unfenced_maintenance: bool,
+
+    /// Seconds between catalog convergence polls (incremental cursor poll).
+    #[arg(long, default_value_t = 5)]
+    poll_interval: u64,
+
+    /// Seconds between exhaustive full-walk reconciles (the ultimate
+    /// convergence backstop; discovers brand-new prefixes).
+    #[arg(long, default_value_t = 1800)]
+    full_walk_interval: u64,
+
+    /// Seconds between compaction passes.
+    #[arg(long, default_value_t = 60)]
+    compact_interval: u64,
+
+    /// Seconds between retention passes.
+    #[arg(long, default_value_t = 3600)]
+    retention_interval: u64,
+
+    /// Lease TTL (seconds) for compaction/retention partitions. Renewed at
+    /// ttl/3; a held lease auto-expires server-side this long after the last
+    /// renew, so a crashed holder's partition frees up within ~this window.
+    #[arg(long, default_value_t = 30)]
+    lease_ttl: u64,
+
+    /// Number of blocks merged per compaction step (the `fanout` smallest in
+    /// a `(signal, date, level)` partition).
+    #[arg(long, default_value_t = 8)]
+    compact_fanout: usize,
+
+    /// Grace seconds between superseding merged-away inputs and deleting
+    /// their objects. Default 0 single-instance; 600 when a Valkey lease
+    /// provider is present (peers may still hold stale catalog rows briefly).
+    #[arg(long)]
+    compact_grace: Option<u64>,
+
+    /// Blanket retention TTL applied to every signal (opt-in: omit to leave
+    /// all signals un-reaped). Accepts `s`/`m`/`h`/`d` suffixes.
+    #[arg(long, value_parser = parse_duration)]
+    ttl: Option<Duration>,
+    /// Per-signal retention TTL override (metrics).
+    #[arg(long, value_parser = parse_duration)]
+    ttl_metrics: Option<Duration>,
+    /// Per-signal retention TTL override (logs).
+    #[arg(long, value_parser = parse_duration)]
+    ttl_logs: Option<Duration>,
+    /// Per-signal retention TTL override (traces).
+    #[arg(long, value_parser = parse_duration)]
+    ttl_traces: Option<Duration>,
+    /// Per-signal retention TTL override (profiles).
+    #[arg(long, value_parser = parse_duration)]
+    ttl_profiles: Option<Duration>,
+
+    /// Actually delete expired blocks. Without it retention is dry-run
+    /// (reports candidates, deletes nothing).
+    #[arg(long)]
+    retention_apply: bool,
+
+    /// Grace seconds between marking a block deleted and removing its
+    /// objects (retention). Default 0 single-instance; 600 with a lease.
+    #[arg(long)]
+    retention_grace: Option<u64>,
+}
+
+/// Instance role; see `--mode`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum Mode {
+    /// Ingest + converge + maintenance.
+    Full,
+    /// Ingest + converge, no maintenance.
+    IngestOnly,
+    /// Converge only (no ingest, no maintenance).
+    QueryOnly,
 }
 
 /// Block compression mode. Maps to a zstd level; see `--compression`.
@@ -150,7 +264,16 @@ async fn main() -> Result<()> {
     let writer_id = args
         .writer_id
         .unwrap_or_else(|| format!("scry-ingestd-{}", rand_short()));
-    let writer_uuid = Uuid::now_v7();
+    // Stable instance identity. When a WAL dir is configured we persist it to
+    // `<wal_dir>/writer_id` so a restart reuses its prefix (every block path
+    // is `<signal>/.../<writer_uuid>/<block>`, and the poll cursors fan out
+    // per `(signal, writer, date)` — a fresh UUID each restart would bloat
+    // that fan-out indefinitely). With no WAL dir (no-storage mode) it's
+    // ephemeral.
+    let writer_uuid = match args.wal_dir.as_ref() {
+        Some(dir) => load_or_create_writer_uuid(dir)?,
+        None => Uuid::now_v7(),
+    };
 
     // Shared upload-concurrency cap = physical core count. The dominant
     // cost of closing a block is the parquet encode (sort + Arrow build +
@@ -174,6 +297,52 @@ async fn main() -> Result<()> {
         .stats_listen
         .as_ref()
         .map(|_| Arc::new(ServerMetrics::new(upload_concurrency)));
+
+    // ---- Multi-instance coordination (v0.9) -------------------------------
+    // Resolve the Valkey URL (flag overrides env). When present we connect a
+    // command handle (used for the lease + the pub/sub publish side) and spawn
+    // the `ValkeySink` that fans block-lifecycle events to peers. With it
+    // absent everything degrades to a correct single-instance path: no sink,
+    // no lease (maintenance pauses unless `--allow-unfenced-maintenance`),
+    // convergence falls back to polling + full-walk against the bucket.
+    let valkey_url = args
+        .valkey_url
+        .clone()
+        .or_else(|| std::env::var(VALKEY_URL_ENV).ok());
+    let valkey = match valkey_url.as_deref() {
+        Some(url) => Some(
+            ValkeyClient::connect(url, writer_uuid)
+                .await
+                .with_context(|| format!("connecting to Valkey at {url}"))?,
+        ),
+        None => {
+            info!("{VALKEY_URL_ENV} unset and no --valkey-url; running single-instance (no pub/sub; maintenance paused unless --allow-unfenced-maintenance)");
+            None
+        }
+    };
+    // The pub/sub event sink, injected into every ingest pipeline so each
+    // uploaded block is announced to peers. `None` (single-instance) makes
+    // `with_event_sink` a no-op.
+    let (event_sink, sink_task): (Option<Arc<dyn BlockEventSink>>, _) = match valkey.as_ref() {
+        Some(c) => {
+            let (sink, task) = ValkeySink::spawn(c.inner().clone(), writer_uuid);
+            (Some(Arc::new(sink)), Some(task))
+        }
+        None => (None, None),
+    };
+
+    // Background-task context captured out of the storage block: the shared
+    // object store, bucket name, online catalog, and block config that the
+    // convergence loops + maintenance loop need. Only `Some` when `--storage`
+    // built an online catalog (`--catalog`); without a catalog there's nothing
+    // to converge into.
+    struct BgCtx {
+        store: Arc<dyn ObjectStore>,
+        bucket: String,
+        catalog: Arc<std::sync::Mutex<Catalog>>,
+        block_cfg: BlockBuilderConfig,
+    }
+    let mut bg_ctx: Option<BgCtx> = None;
 
     // Build the storage pipelines up front. Failing fast on a missing
     // bucket or unreadable WAL dir is much better than failing on the
@@ -206,7 +375,7 @@ async fn main() -> Result<()> {
         );
         let store = open_objstore(&cfg)?;
         let catalog = match args.catalog.as_ref() {
-            Some(p) => Some(Arc::new(Mutex::new(
+            Some(p) => Some(Arc::new(std::sync::Mutex::new(
                 Catalog::open(p, &bucket)
                     .with_context(|| format!("opening catalog at {}", p.display()))?,
             ))),
@@ -243,82 +412,114 @@ async fn main() -> Result<()> {
             adaptive_compression,
             "per-signal ingest sharding (connections striped across shards by session id)"
         );
-        // Each signal becomes INGEST_SHARDS independent pipelines, one
-        // WAL subtree per shard, all sharing store/catalog/sem and the
-        // per-signal upload-stats gauge (so the endpoint aggregates
-        // across shards).
-        let dummy = ShardedPipeline::open_with_config(
-            INGEST_SHARDS,
-            wal_dir.clone(),
-            store.clone(),
-            catalog.clone(),
-            writer_uuid,
-            decode::dummy,
-            block_cfg,
-            upload_sem.clone(),
-            stats_metrics.as_ref().map(|m| m.dummy_upload()),
-            adaptive_compression,
-        )
-        .await?;
-        let metrics = ShardedPipeline::open_with_config(
-            INGEST_SHARDS,
-            wal_dir.clone(),
-            store.clone(),
-            catalog.clone(),
-            writer_uuid,
-            decode::metrics,
-            block_cfg,
-            upload_sem.clone(),
-            stats_metrics.as_ref().map(|m| m.metrics_upload()),
-            adaptive_compression,
-        )
-        .await?;
-        let logs = ShardedPipeline::open_with_config(
-            INGEST_SHARDS,
-            wal_dir.clone(),
-            store.clone(),
-            catalog.clone(),
-            writer_uuid,
-            decode::logs,
-            block_cfg,
-            upload_sem.clone(),
-            stats_metrics.as_ref().map(|m| m.logs_upload()),
-            adaptive_compression,
-        )
-        .await?;
-        let traces = ShardedPipeline::open_with_config(
-            INGEST_SHARDS,
-            wal_dir.clone(),
-            store.clone(),
-            catalog.clone(),
-            writer_uuid,
-            decode::traces,
-            block_cfg,
-            upload_sem.clone(),
-            stats_metrics.as_ref().map(|m| m.traces_upload()),
-            adaptive_compression,
-        )
-        .await?;
-        let profiles = ShardedPipeline::open_with_config(
-            INGEST_SHARDS,
-            wal_dir,
-            store,
-            catalog,
-            writer_uuid,
-            decode::profiles,
-            block_cfg,
-            upload_sem.clone(),
-            stats_metrics.as_ref().map(|m| m.profiles_upload()),
-            adaptive_compression,
-        )
-        .await?;
-        (
-            Some(dummy),
-            Some(metrics),
-            Some(logs),
-            Some(traces),
-            Some(profiles),
-        )
+        // Capture the background-task context before `store`/`catalog` get
+        // moved into the last pipeline below. Only when an online catalog
+        // exists — the convergence loops and maintenance loop have nothing to
+        // converge into otherwise.
+        if let Some(cat) = catalog.clone() {
+            bg_ctx = Some(BgCtx {
+                store: store.clone(),
+                bucket: bucket.clone(),
+                catalog: cat,
+                block_cfg,
+            });
+        }
+
+        // `query-only` instances build the catalog (for convergence) but no
+        // ingest pipelines — they never accept data, only follow the bucket.
+        if args.mode == Mode::QueryOnly {
+            info!("mode=query-only: catalog convergence only, no ingest pipelines");
+            (None, None, None, None, None)
+        } else {
+            // Each signal becomes INGEST_SHARDS independent pipelines, one
+            // WAL subtree per shard, all sharing store/catalog/sem and the
+            // per-signal upload-stats gauge (so the endpoint aggregates
+            // across shards). When a Valkey sink is configured it's attached
+            // to every shard so each uploaded block is announced to peers.
+            let dummy = ShardedPipeline::open_with_config(
+                INGEST_SHARDS,
+                wal_dir.clone(),
+                store.clone(),
+                catalog.clone(),
+                writer_uuid,
+                decode::dummy,
+                block_cfg,
+                upload_sem.clone(),
+                stats_metrics.as_ref().map(|m| m.dummy_upload()),
+                adaptive_compression,
+            )
+            .await?;
+            let metrics = ShardedPipeline::open_with_config(
+                INGEST_SHARDS,
+                wal_dir.clone(),
+                store.clone(),
+                catalog.clone(),
+                writer_uuid,
+                decode::metrics,
+                block_cfg,
+                upload_sem.clone(),
+                stats_metrics.as_ref().map(|m| m.metrics_upload()),
+                adaptive_compression,
+            )
+            .await?;
+            let logs = ShardedPipeline::open_with_config(
+                INGEST_SHARDS,
+                wal_dir.clone(),
+                store.clone(),
+                catalog.clone(),
+                writer_uuid,
+                decode::logs,
+                block_cfg,
+                upload_sem.clone(),
+                stats_metrics.as_ref().map(|m| m.logs_upload()),
+                adaptive_compression,
+            )
+            .await?;
+            let traces = ShardedPipeline::open_with_config(
+                INGEST_SHARDS,
+                wal_dir.clone(),
+                store.clone(),
+                catalog.clone(),
+                writer_uuid,
+                decode::traces,
+                block_cfg,
+                upload_sem.clone(),
+                stats_metrics.as_ref().map(|m| m.traces_upload()),
+                adaptive_compression,
+            )
+            .await?;
+            let profiles = ShardedPipeline::open_with_config(
+                INGEST_SHARDS,
+                wal_dir,
+                store,
+                catalog,
+                writer_uuid,
+                decode::profiles,
+                block_cfg,
+                upload_sem.clone(),
+                stats_metrics.as_ref().map(|m| m.profiles_upload()),
+                adaptive_compression,
+            )
+            .await?;
+            // Attach the pub/sub event sink to every shard (no-op when None).
+            let (dummy, metrics, logs, traces, profiles) = match event_sink.as_ref() {
+                Some(s) => (
+                    dummy.with_event_sink(s.clone()).await,
+                    metrics.with_event_sink(s.clone()).await,
+                    logs.with_event_sink(s.clone()).await,
+                    traces.with_event_sink(s.clone()).await,
+                    profiles.with_event_sink(s.clone()).await,
+                ),
+                None => (dummy, metrics, logs, traces, profiles),
+            };
+            (
+                Some(dummy),
+                Some(metrics),
+                Some(logs),
+                Some(traces),
+                Some(profiles),
+            )
+        }
     } else {
         if args.wal_dir.is_some() {
             warn!("--wal-dir set but --storage is not; ignoring WAL");
@@ -362,16 +563,325 @@ async fn main() -> Result<()> {
         _ => None,
     };
 
+    // ---- Multi-instance background loops (v0.9) ---------------------------
+    // Spawned as siblings to the stats task; aborted after the serve future
+    // completes. All are no-ops / absent in the single-instance path (no
+    // catalog ⇒ no `bg_ctx`; no Valkey ⇒ no consumer and paused maintenance).
+    let mut bg_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    if let Some(ctx) = bg_ctx {
+        let BgCtx {
+            store,
+            bucket,
+            catalog,
+            block_cfg,
+        } = ctx;
+
+        // 1. pub/sub convergence consumer (low-latency hint; only with Valkey).
+        if let Some(url) = valkey_url.clone() {
+            let cat = catalog.clone();
+            bg_tasks.push(tokio::spawn(run_consumer(url, cat)));
+        }
+
+        // 2. incremental cursor poller (backstops dropped events).
+        {
+            let store = store.clone();
+            let bucket = bucket.clone();
+            let cat = catalog.clone();
+            let interval = Duration::from_secs(args.poll_interval.max(1));
+            bg_tasks.push(tokio::spawn(async move {
+                let mut tick = tokio::time::interval(interval);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tick.tick().await;
+                    match poll_once(store.as_ref(), cat.as_ref(), &bucket).await {
+                        Ok(r) if r.inserted > 0 => info!(
+                            inserted = r.inserted,
+                            cursors = r.cursors,
+                            "convergence poll applied new blocks"
+                        ),
+                        Ok(_) => {}
+                        Err(e) => warn!(error = %e, "convergence poll failed"),
+                    }
+                }
+            }));
+        }
+
+        // 3. periodic full walk (ultimate backstop; discovers new prefixes).
+        {
+            let store = store.clone();
+            let bucket = bucket.clone();
+            let cat = catalog.clone();
+            let interval = Duration::from_secs(args.full_walk_interval.max(1));
+            bg_tasks.push(tokio::spawn(async move {
+                let mut tick = tokio::time::interval(interval);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tick.tick().await;
+                    match full_walk(store.as_ref(), cat.as_ref(), &bucket).await {
+                        Ok(r) if r.inserted > 0 => info!(
+                            inserted = r.inserted,
+                            seen = r.seen,
+                            "convergence full-walk applied new blocks"
+                        ),
+                        Ok(_) => {}
+                        Err(e) => warn!(error = %e, "convergence full-walk failed"),
+                    }
+                }
+            }));
+        }
+
+        // 4. lease-guarded maintenance loop (compaction + retention). `full`
+        // mode only; pauses without a lease unless --allow-unfenced-maintenance.
+        let maintenance_enabled = args.mode == Mode::Full && !args.no_maintenance;
+        if maintenance_enabled {
+            // Grace defaults: 0 single-instance (list_blocks already filters
+            // superseded/deleted), 600s with a lease provider (peers may hold
+            // stale catalog rows until their next poll).
+            let grace_default = if valkey.is_some() { 600 } else { 0 };
+            let compact_cfg = CompactConfig {
+                fanout: args.compact_fanout,
+                grace: Duration::from_secs(args.compact_grace.unwrap_or(grace_default)),
+                ..Default::default()
+            };
+            let mut overrides = BTreeMap::new();
+            if let Some(d) = args.ttl_metrics {
+                overrides.insert("metrics".to_string(), d);
+            }
+            if let Some(d) = args.ttl_logs {
+                overrides.insert("logs".to_string(), d);
+            }
+            if let Some(d) = args.ttl_traces {
+                overrides.insert("traces".to_string(), d);
+            }
+            if let Some(d) = args.ttl_profiles {
+                overrides.insert("profiles".to_string(), d);
+            }
+            let retention_cfg = RetentionConfig {
+                default_ttl: args.ttl,
+                overrides,
+                grace: Duration::from_secs(args.retention_grace.unwrap_or(grace_default)),
+                apply: args.retention_apply,
+            };
+            let lease_ttl = Duration::from_secs(args.lease_ttl.max(1));
+            let compact_interval = Duration::from_secs(args.compact_interval.max(1));
+            let retention_interval = Duration::from_secs(args.retention_interval.max(1));
+
+            match valkey.as_ref() {
+                Some(c) => {
+                    let provider = ValkeyLeaseProvider::new(c.inner().clone());
+                    bg_tasks.push(tokio::spawn(run_maintenance_loop(
+                        provider,
+                        store,
+                        bucket,
+                        catalog,
+                        compact_cfg,
+                        block_cfg,
+                        retention_cfg,
+                        event_sink.clone(),
+                        compact_interval,
+                        retention_interval,
+                        lease_ttl,
+                    )));
+                }
+                None if args.allow_unfenced_maintenance => {
+                    warn!("--allow-unfenced-maintenance: running maintenance under a local single-process lease; UNSAFE with >1 instance on one bucket");
+                    let provider = LocalLeaseProvider::new();
+                    bg_tasks.push(tokio::spawn(run_maintenance_loop(
+                        provider,
+                        store,
+                        bucket,
+                        catalog,
+                        compact_cfg,
+                        block_cfg,
+                        retention_cfg,
+                        event_sink.clone(),
+                        compact_interval,
+                        retention_interval,
+                        lease_ttl,
+                    )));
+                }
+                None => info!(
+                    "no Valkey lease and no --allow-unfenced-maintenance: maintenance paused (convergence still runs via polling)"
+                ),
+            }
+        }
+    }
+
     let serve_result = server
         .serve_with_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })
         .await;
 
+    // Stop the convergence/maintenance loops and the pub/sub publisher; the
+    // process is exiting, so abort rather than draining (events are advisory).
+    for t in &bg_tasks {
+        t.abort();
+    }
+    if let Some(t) = &sink_task {
+        t.abort();
+    }
+    if let Some(c) = valkey {
+        c.quit().await;
+    }
     if let Some(task) = stats_task {
         let _ = task.await;
     }
     serve_result
+}
+
+/// Background pub/sub convergence consumer: subscribe to every block-event
+/// channel and apply each event to the catalog idempotently. Reconnects on a
+/// closed subscription; lag just drops events (the cursor poller backstops).
+async fn run_consumer(url: String, catalog: Arc<std::sync::Mutex<Catalog>>) {
+    use tokio::sync::broadcast::error::RecvError;
+    loop {
+        match subscribe_blocks(&url, &ALL_SIGNALS).await {
+            Ok((_sub, mut rx)) => {
+                info!("subscribed to block-event channels for catalog convergence");
+                loop {
+                    match rx.recv().await {
+                        Ok(msg) => {
+                            if let Some(env) = parse_envelope(&msg) {
+                                if let Err(e) = apply_event(catalog.as_ref(), &env.event) {
+                                    warn!(error = %e, "applying block event to catalog failed");
+                                }
+                            }
+                        }
+                        Err(RecvError::Lagged(n)) => {
+                            warn!(skipped = n, "convergence consumer lagged; polling will backstop")
+                        }
+                        Err(RecvError::Closed) => {
+                            warn!("convergence subscription closed; reconnecting");
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) => warn!(error = %e, "subscribing to Valkey block channels failed; retrying"),
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// The lease-guarded maintenance loop: fire a compaction pass on
+/// `compact_interval` and (if any TTL is configured) a retention pass on
+/// `retention_interval`. Generic over the lease provider so the Valkey
+/// provider and the single-process `LocalLeaseProvider` share one body.
+#[allow(clippy::too_many_arguments)]
+async fn run_maintenance_loop<L: LeaseProvider>(
+    provider: L,
+    store: Arc<dyn ObjectStore>,
+    bucket: String,
+    catalog: Arc<std::sync::Mutex<Catalog>>,
+    compact_cfg: CompactConfig,
+    block_cfg: BlockBuilderConfig,
+    retention_cfg: RetentionConfig,
+    sink: Option<Arc<dyn BlockEventSink>>,
+    compact_interval: Duration,
+    retention_interval: Duration,
+    lease_ttl: Duration,
+) {
+    let noop = NoopSink;
+    let retention_active = retention_cfg.any_ttl_configured();
+    let mut compact_tick = tokio::time::interval(compact_interval);
+    compact_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut retention_tick = tokio::time::interval(retention_interval);
+    retention_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    info!(
+        retention_active,
+        apply = retention_cfg.apply,
+        "maintenance loop started"
+    );
+    loop {
+        let sink_ref: &dyn BlockEventSink = match sink.as_ref() {
+            Some(s) => s.as_ref(),
+            None => &noop,
+        };
+        tokio::select! {
+            _ = compact_tick.tick() => {
+                match run_compaction_pass(
+                    &provider, store.clone(), catalog.as_ref(), &bucket,
+                    &compact_cfg, &block_cfg, sink_ref, lease_ttl,
+                ).await {
+                    Ok(r) if r.merges > 0 => info!(
+                        merges = r.merges, blocks_in = r.blocks_in,
+                        blocks_out = r.blocks_out, "compaction pass merged partitions"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => warn!(error = %e, "compaction pass failed"),
+                }
+            }
+            _ = retention_tick.tick(), if retention_active => {
+                let now = now_unix_nano();
+                match run_retention_pass(
+                    &provider, store.clone(), catalog.as_ref(),
+                    &retention_cfg, now, sink_ref, lease_ttl,
+                ).await {
+                    Ok(r) if r.reaped > 0 => info!(
+                        reaped = r.reaped, bytes = r.bytes_reaped,
+                        dry_run = r.dry_run, "retention pass"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => warn!(error = %e, "retention pass failed"),
+                }
+            }
+        }
+    }
+}
+
+/// Current wall-clock time as nanoseconds since the Unix epoch (retention age
+/// cutoff). Injected into the engine so reaping is deterministic per pass.
+fn now_unix_nano() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
+}
+
+/// Parse a duration with an optional `ms`/`s`/`m`/`h`/`d` suffix (bare number
+/// = seconds). Mirrors `scry-retention`'s CLI parser.
+fn parse_duration(s: &str) -> Result<Duration, String> {
+    let s = s.trim();
+    let (num, unit) = s
+        .find(|c: char| c.is_alphabetic())
+        .map(|i| (&s[..i], &s[i..]))
+        .unwrap_or((s, "s"));
+    let n: u64 = num
+        .trim()
+        .parse()
+        .map_err(|_| format!("bad number in {s:?}"))?;
+    let dur = match unit.trim() {
+        "ms" => Duration::from_millis(n),
+        "s" | "" => Duration::from_secs(n),
+        "m" => Duration::from_secs(n * 60),
+        "h" => Duration::from_secs(n * 3600),
+        "d" => Duration::from_secs(n * 86_400),
+        other => return Err(format!("unknown duration unit {other:?}")),
+    };
+    Ok(dur)
+}
+
+/// Load this instance's stable writer UUID from `<wal_dir>/writer_id`, or
+/// generate one and persist it there. See the call site for why persistence
+/// matters (prefix/cursor-fan-out stability across restarts).
+fn load_or_create_writer_uuid(wal_dir: &std::path::Path) -> Result<Uuid> {
+    let path = wal_dir.join("writer_id");
+    match std::fs::read_to_string(&path) {
+        Ok(s) => Uuid::parse_str(s.trim())
+            .with_context(|| format!("parsing writer id from {}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(wal_dir)
+                .with_context(|| format!("creating wal dir {}", wal_dir.display()))?;
+            let uuid = Uuid::now_v7();
+            std::fs::write(&path, uuid.to_string())
+                .with_context(|| format!("persisting writer id to {}", path.display()))?;
+            info!(writer_uuid = %uuid, path = %path.display(), "generated and persisted writer id");
+            Ok(uuid)
+        }
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
 }
 
 fn rand_short() -> String {
