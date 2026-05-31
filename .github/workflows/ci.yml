@@ -1,0 +1,75 @@
+name: CI
+
+# Build + lint + test on every push to main and every PR — the green-gate
+# that was missing (only the tag-triggered release workflow existed before).
+# Runs on Depot GitHub Actions runners, same as release.yml.
+#
+# Scope: the core cargo workspace (the desktop crate is excluded from the
+# workspace and checked separately below). Tests are hermetic — the Valkey /
+# Garage integration tests are #[ignore]'d unless those services are present,
+# so no service containers are needed here. The MULTI/smoke end-to-end
+# (scripts/smoke.sh, needs Garage + Valkey) is intentionally NOT run here.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Rust workspace: build, clippy, test ────────────────────────────────
+  rust:
+    runs-on: depot-ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+
+      - name: Format check (non-blocking)
+        # The tree isn't rustfmt-enforced; surface drift as an annotation
+        # without failing the build.
+        continue-on-error: true
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        # Not `-D warnings` yet: there are pre-existing warnings, several in
+        # the vendored (generated) binschema-runtime crate. Reports lints
+        # without gating until a cleanup pass lands.
+        run: cargo clippy --workspace --all-targets
+
+      - name: Build
+        run: cargo build --workspace --locked
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+  # ── Desktop app: TypeScript typecheck + frontend build ─────────────────
+  desktop:
+    runs-on: depot-ubuntu-22.04
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Build frontend
+        run: bun run build
