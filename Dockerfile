@@ -1,11 +1,13 @@
 # syntax=docker/dockerfile:1
 #
 # One image, several roles. The same binary set runs the scry ingest server
-# (scry-ingestd), the log-collection agent (scry-agent), and the foreign-protocol
-# push gateway (scry-gateway, terminating OTLP traces / Pyroscope profiles /
-# Prometheus remote-write); the Kubernetes manifests pick the role via
-# `command:`. scry-list ships too for catalog reconcile/inspection from inside
-# the cluster.
+# (scry-ingestd), the query daemon (scry-queryd — the architectural counterpart
+# to scry-ingestd, serving QueryService over the binschema-over-TCP wire), the
+# log-collection agent (scry-agent), and the foreign-protocol push gateway
+# (scry-gateway, terminating OTLP traces / Pyroscope profiles / Prometheus
+# remote-write); the Kubernetes manifests pick the role via `command:`.
+# scry-list ships too for catalog reconcile/inspection from inside the cluster
+# (also runs as a long-running `--interval` reconciler sidecar beside queryd).
 #
 # kube-rs 3.x sets the toolchain floor (MSRV 1.88) and uses rustls, so the
 # runtime needs no OpenSSL — only CA certificates for TLS to R2/Hetzner.
@@ -28,11 +30,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release \
         --bin scry-ingestd \
+        --bin scry-queryd \
         --bin scry-agent \
         --bin scry-list \
         --bin scry-gateway \
     && mkdir -p /out \
-    && cp target/release/scry-ingestd target/release/scry-agent target/release/scry-list target/release/scry-gateway /out/
+    && cp target/release/scry-ingestd target/release/scry-queryd target/release/scry-agent target/release/scry-list target/release/scry-gateway /out/
 
 # ── runtime ────────────────────────────────────────────────────────────
 # distroless/cc-debian12 ships glibc + libgcc + the CA bundle and nothing else
@@ -40,6 +43,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 
 COPY --from=builder /out/scry-ingestd /usr/local/bin/scry-ingestd
+COPY --from=builder /out/scry-queryd  /usr/local/bin/scry-queryd
 COPY --from=builder /out/scry-agent   /usr/local/bin/scry-agent
 COPY --from=builder /out/scry-list    /usr/local/bin/scry-list
 COPY --from=builder /out/scry-gateway /usr/local/bin/scry-gateway

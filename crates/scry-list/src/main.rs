@@ -19,8 +19,16 @@
 //! ```bash
 //! scry-list --catalog ./catalog.sqlite
 //! ```
+//!
+//! With `--interval <secs>` it instead runs as a long-running reconciler:
+//! reconcile against the bucket every `<secs>` seconds forever, logging a
+//! summary each cycle (no per-block listing). This is the sidecar mode that
+//! keeps `scry-queryd`'s catalog fresh — queryd opens the same SQLite file and
+//! SQLite's WAL makes the sidecar's cross-process writes visible to queryd's
+//! per-query catalog lookups.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -41,6 +49,14 @@ struct Args {
     /// without depending on the bucket.
     #[arg(long)]
     no_reconcile: bool,
+
+    /// Run as a long-running reconciler: reconcile against the bucket every
+    /// `<secs>` seconds forever, logging a summary each cycle instead of
+    /// reconciling once and printing the block listing. This is the sidecar
+    /// mode that keeps scry-queryd's catalog fresh. Conflicts with
+    /// `--no-reconcile`.
+    #[arg(long, value_name = "SECS", conflicts_with = "no_reconcile")]
+    interval: Option<u64>,
 }
 
 #[tokio::main]
@@ -59,6 +75,36 @@ async fn main() -> Result<()> {
 
     let catalog = Catalog::open(&args.catalog, &bucket)
         .with_context(|| format!("opening catalog at {}", args.catalog.display()))?;
+
+    // Long-running reconciler sidecar mode: reconcile on a fixed interval
+    // forever, beside scry-queryd, so queryd's per-query catalog lookups see
+    // newly-flushed blocks. Never returns; the one-shot listing below is the
+    // non-`--interval` path.
+    if let Some(secs) = args.interval {
+        let store = open_objstore(&cfg)?;
+        let period = Duration::from_secs(secs.max(1));
+        tracing::info!(
+            interval_secs = secs,
+            catalog = %args.catalog.display(),
+            bucket = %bucket,
+            "scry-list reconciler: starting periodic catalog reconcile"
+        );
+        loop {
+            match catalog.reconcile_from_bucket(store.as_ref()).await {
+                Ok(report) => tracing::info!(
+                    seen = report.seen,
+                    inserted = report.inserted,
+                    already_present = report.already_present,
+                    failed = report.failed,
+                    "reconcile cycle complete"
+                ),
+                // A transient bucket/network error must not kill the sidecar;
+                // log it and retry on the next tick.
+                Err(e) => tracing::error!(error = %e, "reconcile cycle failed; will retry next tick"),
+            }
+            tokio::time::sleep(period).await;
+        }
+    }
 
     if !args.no_reconcile {
         let store = open_objstore(&cfg)?;

@@ -1,0 +1,111 @@
+# The scry query daemon (the scry-queryd binary) — the architectural
+# counterpart to scry-ingestd. It serves scry-server::QueryService over the
+# binschema-over-TCP wire on :4100, reading parquet blocks straight from the
+# object-storage bucket. Clients connect with `scry-query --remote <addr>:4100`.
+#
+# Single replica. The daemon keeps its own SQLite catalog (NOT shared with the
+# ingest server's WAL volume): an init container seeds it from the bucket once,
+# then a `scry-list --interval` sidecar reconciles it on a loop. queryd opens
+# the same file and SQLite's WAL makes the sidecar's cross-process writes
+# visible to queryd's per-query catalog lookups. The catalog is fully
+# rebuildable from the bucket, so it lives on an emptyDir — no PVC needed.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scry-queryd
+  namespace: scry
+  labels:
+    app: scry-queryd
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: scry-queryd
+  template:
+    metadata:
+      labels:
+        app: scry-queryd
+    spec:
+      # The image runs as UID 65532 (distroless :nonroot). fsGroup makes the
+      # kubelet chown the emptyDir to that group on mount so the non-root
+      # process can write the SQLite catalog + WAL.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      initContainers:
+        # Seed the catalog from the bucket once before queryd starts, so the
+        # first query has a populated catalog to plan against.
+        - name: catalog-seed
+          image: serialexp/scry:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - scry-list
+            - --catalog
+            - /catalog/catalog.sqlite
+          envFrom:
+            - secretRef:
+                name: scry-objstore
+          volumeMounts:
+            - name: catalog
+              mountPath: /catalog
+      containers:
+        - name: queryd
+          image: serialexp/scry:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - scry-queryd
+            # Bind all interfaces (default is loopback) so the ClusterIP
+            # Service can route to the pod IP. Not publicly exposed — the pod
+            # network is cluster-internal and the Service is ClusterIP-only.
+            - --listen
+            - 0.0.0.0:4100
+            - --catalog
+            - /catalog/catalog.sqlite
+          envFrom:
+            - secretRef:
+                name: scry-objstore
+          ports:
+            - name: query
+              containerPort: 4100
+          readinessProbe:
+            tcpSocket:
+              port: 4100
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              # Headroom over the daemon's default 1024 MiB DataFusion budget
+              # (streaming operators aren't accounted, so true RSS runs higher).
+              memory: "1536Mi"
+          volumeMounts:
+            - name: catalog
+              mountPath: /catalog
+        - name: catalog-reconcile
+          image: serialexp/scry:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - scry-list
+            - --catalog
+            - /catalog/catalog.sqlite
+            - --interval
+            - "60"
+          envFrom:
+            - secretRef:
+                name: scry-objstore
+          resources:
+            requests:
+              cpu: "25m"
+              memory: "64Mi"
+            limits:
+              memory: "256Mi"
+          volumeMounts:
+            - name: catalog
+              mountPath: /catalog
+      volumes:
+        - name: catalog
+          emptyDir: {}
