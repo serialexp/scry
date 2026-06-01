@@ -22,8 +22,11 @@ export class HttpTransport implements Transport {
     const res = await fetch("/api/query", {
       method: "POST",
       headers: { "content-type": "application/octet-stream" },
-      // Send exactly the framed bytes (respecting byteOffset/byteLength).
-      body: request,
+      // Send exactly the framed bytes (respecting byteOffset/byteLength). The
+      // cast bridges a TS 5.7 lib lag: `Uint8Array` is now generic
+      // (`Uint8Array<ArrayBufferLike>`) but DOM's `BodyInit` hasn't adopted the
+      // type parameter — a Uint8Array is a valid fetch body at runtime.
+      body: request as BodyInit,
       credentials: "same-origin",
     });
     if (res.status === 401) {
