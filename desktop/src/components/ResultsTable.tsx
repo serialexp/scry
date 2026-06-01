@@ -59,7 +59,47 @@ interface LogRow {
   ts: bigint;
   sev: number;
   body: string;
+  /** Stream labels (the service identity) — joined from the postings
+   *  sidecar onto every row by the query engine. Shown as primary chips. */
+  labels: [string, string][];
+  /** Per-entry attributes (stream=stdout/stderr, trace_id, …). Secondary. */
   attrs: [string, string][];
+}
+
+/** Stream-label keys promoted to always-visible chips, in display order.
+ *  These answer "which service / workload is this?" — the rest fold into
+ *  the expander. */
+const PRIMARY_LABEL_KEYS = [
+  "container",
+  "pod",
+  "namespace",
+  "node",
+  "service",
+  "k8s_app.kubernetes.io/name",
+  "k8s_app.kubernetes.io/instance",
+  "k8s_app.kubernetes.io/component",
+];
+
+/** Pick the identifying labels to show inline. Falls back to the first few
+ *  labels when none of the curated keys are present. */
+function primaryLabels(labels: [string, string][]): [string, string][] {
+  if (labels.length === 0) return [];
+  const byKey = new Map(labels);
+  const out: [string, string][] = [];
+  for (const k of PRIMARY_LABEL_KEYS) {
+    const v = byKey.get(k);
+    if (v !== undefined) out.push([k, v]);
+  }
+  return out.length > 0 ? out : labels.slice(0, 4);
+}
+
+/** Shorten a label key for chip display: drop the agent's `k8s_` prefix and
+ *  collapse `app.kubernetes.io/name` → `name`. */
+function shortKey(k: string): string {
+  let s = k.startsWith("k8s_") ? k.slice(4) : k;
+  const slash = s.lastIndexOf("/");
+  if (slash >= 0) s = s.slice(slash + 1);
+  return s;
 }
 
 function attrVal(v: unknown): string {
@@ -133,6 +173,7 @@ const ResultsTable: Component = () => {
         ts: typeof tsRaw === "bigint" ? tsRaw : BigInt((tsRaw as number | string) ?? 0),
         sev: Number(o.severity ?? 0),
         body: stripAnsi(String(o.body ?? "")),
+        labels: attrEntries(o.labels),
         attrs: attrEntries(o.attributes),
       });
     }
@@ -144,10 +185,13 @@ const ResultsTable: Component = () => {
     if (!lv) return [];
     const q = filter().trim().toLowerCase();
     if (q === "") return lv.rows;
+    const matches = (k: string, v: string) =>
+      k.toLowerCase().includes(q) || v.toLowerCase().includes(q);
     return lv.rows.filter(
       (r) =>
         r.body.toLowerCase().includes(q) ||
-        r.attrs.some(([k, v]) => k.toLowerCase().includes(q) || v.toLowerCase().includes(q)),
+        r.labels.some(([k, v]) => matches(k, v)) ||
+        r.attrs.some(([k, v]) => matches(k, v)),
     );
   });
 
@@ -222,6 +266,8 @@ const ResultsTable: Component = () => {
                   {(r) => {
                     const sev = severity(r.sev);
                     const ts = fmtTs(r.ts);
+                    const primary = primaryLabels(r.labels);
+                    const extra = r.labels.length + r.attrs.length;
                     return (
                       <div class={`log-entry ${sev.cls}`}>
                         <div class="log-head">
@@ -231,21 +277,48 @@ const ResultsTable: Component = () => {
                           <span class={`log-sev ${sev.cls}`}>{sev.label}</span>
                           <span class="log-body">{r.body}</span>
                         </div>
-                        <Show when={r.attrs.length > 0}>
+                        <Show when={primary.length > 0}>
+                          <div class="log-labels">
+                            <For each={primary}>
+                              {([k, v]) => (
+                                <span class="chip lbl" title={k}>
+                                  <b>{shortKey(k)}</b>
+                                  <span>{v}</span>
+                                </span>
+                              )}
+                            </For>
+                          </div>
+                        </Show>
+                        <Show when={extra > 0}>
                           <details class="log-attrs">
                             <summary>
-                              {r.attrs.length} label{r.attrs.length === 1 ? "" : "s"}
+                              {r.labels.length} label{r.labels.length === 1 ? "" : "s"} ·{" "}
+                              {r.attrs.length} attr{r.attrs.length === 1 ? "" : "s"}
                             </summary>
-                            <div class="log-attr-chips">
-                              <For each={r.attrs}>
-                                {([k, v]) => (
-                                  <span class="chip">
-                                    <b>{k}</b>
-                                    <span>{v}</span>
-                                  </span>
-                                )}
-                              </For>
-                            </div>
+                            <Show when={r.labels.length > 0}>
+                              <div class="log-attr-chips">
+                                <For each={r.labels}>
+                                  {([k, v]) => (
+                                    <span class="chip">
+                                      <b>{k}</b>
+                                      <span>{v}</span>
+                                    </span>
+                                  )}
+                                </For>
+                              </div>
+                            </Show>
+                            <Show when={r.attrs.length > 0}>
+                              <div class="log-attr-chips">
+                                <For each={r.attrs}>
+                                  {([k, v]) => (
+                                    <span class="chip attr">
+                                      <b>{k}</b>
+                                      <span>{v}</span>
+                                    </span>
+                                  )}
+                                </For>
+                              </div>
+                            </Show>
                           </details>
                         </Show>
                       </div>

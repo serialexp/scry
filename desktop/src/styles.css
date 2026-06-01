@@ -503,6 +503,20 @@ textarea {
   color: var(--text);
 }
 
+/* Primary stream-label chips — the service identity, always visible just
+   under the body. Indented to line up roughly with the body column. */
+.log-labels {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 6px;
+  margin: 3px 0 1px 56px;
+}
+
+.log-labels .chip.lbl {
+  background: rgba(106, 163, 255, 0.1);
+  border-color: rgba(106, 163, 255, 0.35);
+}
+
 .log-attrs {
   margin: 2px 0 2px 56px;
 }
@@ -532,6 +546,11 @@ textarea {
   flex-wrap: wrap;
   gap: 4px 6px;
   margin-top: 4px;
+}
+
+/* Per-entry attributes (vs stream labels) — dimmer key to set them apart. */
+.log-attr-chips .chip.attr b {
+  color: var(--muted);
 }
 
 .chip {

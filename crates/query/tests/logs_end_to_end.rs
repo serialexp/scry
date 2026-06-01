@@ -402,3 +402,129 @@ async fn logs_body_contains_bloom_skip_equals_scan() {
     let (miss_batches, _plan) = run_query(&catalog, store.clone(), &q_miss).await;
     assert_eq!(total_rows(&miss_batches), 0);
 }
+
+/// Collect `(stream_fingerprint, labels)` per row, decoding the synthesised
+/// `labels` `Map<Utf8,Utf8>` column into a sorted `Vec<(String,String)>`.
+fn collect_fp_labels(
+    batches: &[arrow::record_batch::RecordBatch],
+) -> Vec<(u64, Vec<(String, String)>)> {
+    use arrow::array::MapArray;
+    let mut out = Vec::new();
+    for b in batches {
+        let fp_idx = b.schema().index_of("stream_fingerprint").unwrap();
+        let fps = b
+            .column(fp_idx)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let lbl_idx = b.schema().index_of("labels").unwrap();
+        let map = b
+            .column(lbl_idx)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .expect("labels column is a MapArray");
+        for i in 0..b.num_rows() {
+            let entries = map.value(i);
+            let keys = entries
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let values = entries
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let mut pairs: Vec<(String, String)> = (0..keys.len())
+                .map(|j| (keys.value(j).to_string(), values.value(j).to_string()))
+                .collect();
+            pairs.sort();
+            out.push((fps.value(i), pairs));
+        }
+    }
+    out
+}
+
+/// The query-side label join: stream labels live only in the postings
+/// sidecar (keyed by fingerprint), but the `labels` column must surface
+/// them on every row so log results describe the service they came from.
+#[tokio::test]
+async fn logs_query_surfaces_stream_labels() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let writer = Uuid::now_v7();
+
+    let l_api: u64 = 0xA001;
+    let l_db: u64 = 0xA002;
+    let mut block_a = LogsBlockBuilder::new(writer, test_cfg());
+    block_a.observe_stream(
+        l_api,
+        labels(&[
+            ("service", "api"),
+            ("env", "prod"),
+            ("k8s_app.kubernetes.io/name", "api"),
+        ]),
+    );
+    block_a.observe_stream(l_db, labels(&[("service", "db"), ("env", "prod")]));
+    entries_for(&mut block_a, l_api, 1_000_000, 10, 9);
+    entries_for(&mut block_a, l_db, 1_000_100, 10, 6);
+    let meta_a = block_a
+        .finish_and_upload(store.as_ref())
+        .await
+        .unwrap()
+        .expect("block A non-empty");
+
+    let tmp = TempDir::new().unwrap();
+    let catalog = Catalog::open(&tmp.path().join("cat.sqlite"), BUCKET).unwrap();
+    assert!(catalog.insert_block(&meta_a).unwrap());
+
+    // ── (1) Empty-matcher SELECT * (the UI path) surfaces labels ──────
+    let q = Query::default();
+    let (batches, _plan) = run_query(&catalog, store.clone(), &q).await;
+    assert_eq!(total_rows(&batches), 20);
+
+    // The table schema carries `labels` as a Map column.
+    assert!(
+        batches[0].schema().index_of("labels").is_ok(),
+        "result schema must expose the synthesised labels column"
+    );
+
+    let fp_labels = collect_fp_labels(&batches);
+    assert_eq!(fp_labels.len(), 20);
+
+    let api_expected: Vec<(String, String)> = {
+        let mut v = vec![
+            ("env".to_string(), "prod".to_string()),
+            ("k8s_app.kubernetes.io/name".to_string(), "api".to_string()),
+            ("service".to_string(), "api".to_string()),
+        ];
+        v.sort();
+        v
+    };
+    let db_expected: Vec<(String, String)> = {
+        let mut v = vec![
+            ("env".to_string(), "prod".to_string()),
+            ("service".to_string(), "db".to_string()),
+        ];
+        v.sort();
+        v
+    };
+    for (fp, pairs) in &fp_labels {
+        match *fp {
+            x if x == l_api => assert_eq!(pairs, &api_expected, "api stream labels"),
+            x if x == l_db => assert_eq!(pairs, &db_expected, "db stream labels"),
+            other => panic!("unexpected fp {other:#x}"),
+        }
+    }
+
+    // ── (2) A matcher query still surfaces labels for the matched fp ──
+    let q2 = Query {
+        matchers: vec![("service".into(), "api".into())],
+        ..Default::default()
+    };
+    let (batches, _plan) = run_query(&catalog, store.clone(), &q2).await;
+    assert_eq!(total_rows(&batches), 10);
+    for (fp, pairs) in collect_fp_labels(&batches) {
+        assert_eq!(fp, l_api);
+        assert_eq!(pairs, api_expected);
+    }
+}

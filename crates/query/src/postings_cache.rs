@@ -177,6 +177,31 @@ impl PostingsIndex {
         self.entries.get(name)?.get(value)
     }
 
+    /// Invert this `(name → value → fingerprints)` index into a
+    /// per-fingerprint label set, merging the result into `acc`.
+    ///
+    /// Each stored `(name, value)` entry contributes its pair to every
+    /// fingerprint that carries it. The logs query path calls this across
+    /// the candidate blocks to build the `fingerprint → labels` map it
+    /// uses to surface stream labels as a result column — fingerprints are
+    /// global xxh3 hashes, so the same stream resolves to the same labels
+    /// in every block. `acc` is a `BTreeSet` so the resulting label list is
+    /// deduplicated and in a stable order.
+    pub fn invert_into(
+        &self,
+        acc: &mut HashMap<u64, std::collections::BTreeSet<(String, String)>>,
+    ) {
+        for (name, inner) in &self.entries {
+            for (value, fps) in inner {
+                for &fp in fps.iter() {
+                    acc.entry(fp)
+                        .or_default()
+                        .insert((name.clone(), value.clone()));
+                }
+            }
+        }
+    }
+
     fn estimate(
         entries: &HashMap<String, HashMap<String, Arc<Vec<u64>>>>,
     ) -> usize {
