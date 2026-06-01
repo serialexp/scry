@@ -396,6 +396,163 @@ textarea {
   background: rgba(106, 163, 255, 0.08);
 }
 
+/* ── Logs reader view ─────────────────────────────────────────────── */
+
+.log-search {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 4px;
+  padding: 3px 8px;
+  font-size: 12px;
+  font-family: var(--sans);
+  min-width: 160px;
+}
+
+.raw-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.raw-toggle input {
+  margin: 0;
+}
+
+.log-list {
+  flex: 1;
+  overflow: auto;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.log-entry {
+  border-bottom: 1px solid var(--border);
+  border-left: 3px solid transparent;
+  padding: 3px 12px;
+}
+
+.log-entry:hover {
+  background: rgba(106, 163, 255, 0.06);
+}
+
+.log-entry.sev-fatal {
+  border-left-color: #ff5cc8;
+}
+.log-entry.sev-error {
+  border-left-color: var(--danger);
+}
+.log-entry.sev-warn {
+  border-left-color: var(--warn);
+}
+.log-entry.sev-info {
+  border-left-color: var(--accent);
+}
+
+.log-head {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+}
+
+.log-ts {
+  flex: 0 0 auto;
+  color: var(--muted);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.log-sev {
+  flex: 0 0 46px;
+  align-self: center;
+  text-align: center;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  padding: 1px 4px;
+  border-radius: 3px;
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.log-sev.sev-fatal {
+  color: #ff7ad0;
+  background: rgba(255, 122, 208, 0.16);
+}
+.log-sev.sev-error {
+  color: var(--danger);
+  background: rgba(255, 107, 107, 0.14);
+}
+.log-sev.sev-warn {
+  color: var(--warn);
+  background: rgba(240, 180, 41, 0.14);
+}
+.log-sev.sev-info {
+  color: var(--accent);
+  background: rgba(106, 163, 255, 0.12);
+}
+
+.log-body {
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text);
+}
+
+.log-attrs {
+  margin: 2px 0 2px 56px;
+}
+
+.log-attrs summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 11px;
+  list-style: none;
+  user-select: none;
+}
+
+.log-attrs summary::-webkit-details-marker {
+  display: none;
+}
+
+.log-attrs summary::before {
+  content: "▸ ";
+}
+
+.log-attrs[open] summary::before {
+  content: "▾ ";
+}
+
+.log-attr-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 6px;
+  margin-top: 4px;
+}
+
+.chip {
+  display: inline-flex;
+  gap: 4px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 1px 6px;
+  font-size: 11px;
+}
+
+.chip b {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.chip span {
+  color: var(--text);
+}
+
 /* ── Mobile / narrow viewports ────────────────────────────────────── */
 
 /* The default layout is a fixed-width sidebar beside a flexible results
