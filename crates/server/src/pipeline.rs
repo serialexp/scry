@@ -875,7 +875,7 @@ async fn run_upload<B: BlockBuilder>(
             warn!(
                 signal = B::SIGNAL,
                 sealed_seq = sealed.0,
-                error = %e,
+                error = ?e,
                 "block upload failed; WAL segment retained for replay"
             );
         }
