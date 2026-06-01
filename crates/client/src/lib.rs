@@ -28,9 +28,36 @@ use tokio::{
 };
 use tracing::{info, warn};
 
+/// The immutable parameters of a connection, retained so the session can be
+/// re-established transparently after the server restarts or the link drops.
+#[derive(Clone)]
+struct ConnectParams {
+    addr: String,
+    agent_id: [u8; 16],
+    hostname: String,
+    signals: u8,
+    resource_attrs: Vec<LabelPair>,
+}
+
+/// The per-connection pieces replaced wholesale on every (re)connect.
+struct Established {
+    wr: BufWriter<OwnedWriteHalf>,
+    ack_rx: mpsc::Receiver<()>,
+    max_inflight: usize,
+    session_id: u64,
+    reader: JoinHandle<()>,
+}
+
 /// A connected, handshaken ingest session. Drop or call [`Client::shutdown`]
 /// to end it.
+///
+/// The client retains its [`ConnectParams`] so [`Client::reconnect`] can
+/// re-run the handshake against a restarted server. Each reconnect yields a
+/// **new** server-assigned `session_id`, which the server validates on every
+/// batch — so callers must send via [`Client::send_batch_stamped`], which
+/// stamps the current session id into the frame on each attempt.
 pub struct Client {
+    params: ConnectParams,
     wr: BufWriter<OwnedWriteHalf>,
     ack_rx: mpsc::Receiver<()>,
     max_inflight: usize,
@@ -50,11 +77,34 @@ impl Client {
         signals: u8,
         resource_attrs: Vec<LabelPair>,
     ) -> Result<Self> {
-        let stream = TcpStream::connect(addr)
+        let params = ConnectParams {
+            addr: addr.to_string(),
+            agent_id,
+            hostname: hostname.to_string(),
+            signals,
+            resource_attrs,
+        };
+        let est = Self::handshake(&params).await?;
+        Ok(Self {
+            params,
+            wr: est.wr,
+            ack_rx: est.ack_rx,
+            max_inflight: est.max_inflight,
+            inflight: 0,
+            session_id: est.session_id,
+            reader: est.reader,
+        })
+    }
+
+    /// Open a fresh TCP connection, run the Hello/HelloAck handshake, and spawn
+    /// the ack-draining reader task. Used by both [`Client::connect`] and
+    /// [`Client::reconnect`].
+    async fn handshake(params: &ConnectParams) -> Result<Established> {
+        let stream = TcpStream::connect(&params.addr)
             .await
-            .with_context(|| format!("connecting to {addr}"))?;
+            .with_context(|| format!("connecting to {}", params.addr))?;
         stream.set_nodelay(true)?;
-        info!(addr, "connected to ingest server");
+        info!(addr = %params.addr, "connected to ingest server");
 
         let (rd, wr) = stream.into_split();
         let mut rd = BufReader::new(rd);
@@ -64,12 +114,12 @@ impl Client {
             &mut wr,
             &build::hello(build::HelloArgs {
                 protocol_version: PROTOCOL_VERSION_V0,
-                agent_id,
+                agent_id: params.agent_id,
                 agent_version: env!("CARGO_PKG_VERSION"),
-                hostname,
-                signals,
+                hostname: &params.hostname,
+                signals: params.signals,
                 capabilities: 0,
-                resource_attrs,
+                resource_attrs: params.resource_attrs.clone(),
             }),
         )
         .await?;
@@ -95,20 +145,49 @@ impl Client {
         let (ack_tx, ack_rx) = mpsc::channel::<()>(1024);
         let reader = tokio::spawn(reader_loop(rd, ack_tx));
 
-        Ok(Self {
-            wr,
-            ack_rx,
-            max_inflight,
-            inflight: 0,
-            session_id,
-            reader,
-        })
+        Ok(Established { wr, ack_rx, max_inflight, session_id, reader })
+    }
+
+    /// Re-establish the session against the (possibly restarted) server,
+    /// replacing the write half, reader task, session id, and inflight budget.
+    /// A single attempt — callers own the retry/backoff policy. On success the
+    /// new server-assigned `session_id` is live and the inflight count is reset
+    /// to zero (the old connection's unacked batches are gone with it).
+    pub async fn reconnect(&mut self) -> Result<()> {
+        // Tear down the old reader task; its read half (and thus the old TCP
+        // connection) drops with it.
+        self.reader.abort();
+        let est = Self::handshake(&self.params).await?;
+        self.wr = est.wr;
+        self.ack_rx = est.ack_rx;
+        self.max_inflight = est.max_inflight;
+        self.session_id = est.session_id;
+        self.reader = est.reader;
+        self.inflight = 0;
+        Ok(())
     }
 
     /// The session id assigned by the server; callers stamp it into each
     /// `BatchArgs.session_id`.
     pub fn session_id(&self) -> u64 {
         self.session_id
+    }
+
+    /// Stamp the current session id into a built Batch frame and send it.
+    ///
+    /// The server assigns a fresh session id on every (re)connect and rejects
+    /// any batch whose `session_id` doesn't match the live session
+    /// (`ERR_SESSION_MISMATCH`). Building a frame and then reconnecting would
+    /// leave it carrying a stale id; this re-stamps in place (zero-copy — the
+    /// payload `Vec` is untouched) immediately before the write, so it is
+    /// always correct against the *current* session. Callers that may
+    /// reconnect between building and sending must use this rather than
+    /// [`Client::send_batch`].
+    pub async fn send_batch_stamped(&mut self, frame: &mut Frame) -> Result<()> {
+        if let FrameMsg::Batch(b) = &mut frame.msg {
+            b.session_id = self.session_id;
+        }
+        self.send_batch(frame).await
     }
 
     /// Send one already-built Batch frame, blocking on the inflight budget
@@ -121,9 +200,20 @@ impl Client {
             }
             self.inflight = self.inflight.saturating_sub(1);
         }
-        // Opportunistically reclaim any acks already queued.
-        while self.ack_rx.try_recv().is_ok() {
-            self.inflight = self.inflight.saturating_sub(1);
+        // Opportunistically reclaim any acks already queued. A disconnected
+        // reader (server closed the connection) surfaces here even while we're
+        // under the inflight cap — without this, a low-volume producer that
+        // never blocks on the budget would keep writing into a half-open
+        // socket and only notice much later. Treat it as a lost connection so
+        // the caller can reconnect.
+        loop {
+            match self.ack_rx.try_recv() {
+                Ok(()) => self.inflight = self.inflight.saturating_sub(1),
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    bail!("ingest server closed connection (reader gone)");
+                }
+            }
         }
 
         write_frame(&mut self.wr, frame).await?;

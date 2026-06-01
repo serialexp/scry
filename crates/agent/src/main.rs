@@ -135,7 +135,17 @@ async fn main() -> Result<()> {
         ],
     )
     .await?;
-    let session_id = conn.session_id();
+
+    // ── Signal → watch, observable from both the batcher loop and a flush
+    // stuck mid-reconnect (so SIGTERM can't be swallowed by a backoff sleep).
+    let (sig_tx, sig_rx) = watch::channel(false);
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        info!("shutdown signal received");
+        let _ = sig_tx.send(true);
+    });
+    let mut main_sig = sig_rx.clone();
+    let mut flush_sig = sig_rx;
 
     // ── Batcher loop ───────────────────────────────────────────────────
     let mut pending = Pending::default();
@@ -153,7 +163,7 @@ async fn main() -> Result<()> {
                         if pending.record_count >= args.batch_max_lines
                             || pending.approx_bytes >= args.batch_max_bytes
                         {
-                            flush(&mut conn, &mut pending, session_id, &mut batch_id).await?;
+                            flush(&mut conn, &mut pending, &mut batch_id, &mut flush_sig).await?;
                         }
                     }
                     None => {
@@ -163,10 +173,9 @@ async fn main() -> Result<()> {
                 }
             }
             _ = flush_timer.tick() => {
-                flush(&mut conn, &mut pending, session_id, &mut batch_id).await?;
+                flush(&mut conn, &mut pending, &mut batch_id, &mut flush_sig).await?;
             }
-            _ = shutdown_signal() => {
-                info!("shutdown signal received");
+            _ = main_sig.changed() => {
                 shutting_down = true;
             }
         }
@@ -177,8 +186,12 @@ async fn main() -> Result<()> {
     while let Ok(rec) = log_rx.try_recv() {
         ingest(&mut pending, &registry, &node, rec).await;
     }
-    flush(&mut conn, &mut pending, session_id, &mut batch_id).await?;
-    conn.shutdown("agent shutdown").await?;
+    flush(&mut conn, &mut pending, &mut batch_id, &mut flush_sig).await?;
+    // Best-effort Goodbye: if the upstream is down at shutdown the socket is
+    // dead and there's nothing to gracefully close.
+    if let Err(e) = conn.shutdown("agent shutdown").await {
+        warn!(error = %e, "graceful goodbye failed (upstream likely down)");
+    }
 
     if let Some(h) = watcher_handle {
         let _ = h.await;
@@ -248,12 +261,18 @@ async fn ingest(
         .push(entry);
 }
 
-/// Encode + compress the pending batch and ship it. No-op when empty.
+/// Encode + compress the pending batch and ship it, reconnecting with capped
+/// exponential backoff if the ingest server has gone away (e.g. a rolling
+/// restart). No-op when empty.
+///
+/// Logs are at-most-once, so when `shutdown` is signalled mid-reconnect we
+/// abandon the in-flight batch rather than block process termination behind a
+/// dead upstream.
 async fn flush(
     conn: &mut Client,
     pending: &mut Pending,
-    session_id: u64,
     batch_id: &mut u64,
+    shutdown: &mut watch::Receiver<bool>,
 ) -> Result<()> {
     if pending.record_count == 0 {
         return Ok(());
@@ -269,8 +288,10 @@ async fn flush(
     let compressed = zstd::encode_all(payload.as_slice(), ZSTD_LEVEL)
         .expect("zstd encode_all is infallible on Vec input");
 
-    let frame = build::batch(build::BatchArgs {
-        session_id,
+    // The session id changes on every reconnect, so `send_batch_stamped`
+    // stamps the live one into the frame on each attempt — build a placeholder.
+    let mut frame = build::batch(build::BatchArgs {
+        session_id: 0,
         batch_id: *batch_id,
         signal: Signal::Logs.as_u8(),
         ts_min_unix_nano: ts_min,
@@ -281,11 +302,43 @@ async fn flush(
         payload: compressed,
     });
 
-    conn.send_batch(&frame).await?;
-    info!(batch_id = *batch_id, records = record_count, "shipped log batch");
-    *batch_id += 1;
-    pending.reset();
-    Ok(())
+    let mut backoff = Duration::from_millis(200);
+    loop {
+        match conn.send_batch_stamped(&mut frame).await {
+            Ok(()) => {
+                info!(batch_id = *batch_id, records = record_count, "shipped log batch");
+                *batch_id += 1;
+                pending.reset();
+                return Ok(());
+            }
+            Err(e) => {
+                warn!(error = %e, "batch send failed; reconnecting to ingest server");
+            }
+        }
+        // Re-establish the session, backing off between failed attempts, then
+        // loop back to re-stamp + resend the same frame.
+        loop {
+            if *shutdown.borrow() {
+                warn!("shutdown during reconnect; dropping in-flight log batch");
+                pending.reset();
+                return Ok(());
+            }
+            match conn.reconnect().await {
+                Ok(()) => {
+                    info!("reconnected to ingest server");
+                    break;
+                }
+                Err(re) => {
+                    warn!(error = %re, "reconnect attempt failed; will retry");
+                    tokio::select! {
+                        _ = shutdown.changed() => {}
+                        _ = tokio::time::sleep(backoff) => {}
+                    }
+                    backoff = (backoff * 2).min(Duration::from_secs(5));
+                }
+            }
+        }
+    }
 }
 
 /// Resolve on SIGINT or (on unix) SIGTERM — the latter is what Kubernetes

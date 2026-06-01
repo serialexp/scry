@@ -13,5 +13,9 @@ scry-proto = { workspace = true }
 tokio      = { workspace = true }
 tracing    = { workspace = true }
 
+[dev-dependencies]
+tokio      = { workspace = true }
+scry-proto = { workspace = true }
+
 [lints]
 workspace = true

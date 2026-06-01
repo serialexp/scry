@@ -23,21 +23,20 @@ use tokio::sync::Mutex;
 
 const ZSTD_LEVEL: i32 = 3;
 
-/// Axum handler state: the shared wire client, the server-assigned session id,
-/// and a monotonic batch-id counter. Cheap to clone (all `Arc`/`Copy`).
+/// Axum handler state: the shared wire client and a monotonic batch-id
+/// counter. Cheap to clone (all `Arc`/`Copy`). The session id is **not** cached
+/// here — it changes on every reconnect, so `send` reads it from the client
+/// under the lock (via `send_batch_stamped`) on each attempt.
 #[derive(Clone)]
 pub struct AppState {
     client: Arc<Mutex<Client>>,
-    session_id: u64,
     batch_id: Arc<AtomicU64>,
 }
 
 impl AppState {
     pub fn new(client: Client) -> Self {
-        let session_id = client.session_id();
         Self {
             client: Arc::new(Mutex::new(client)),
-            session_id,
             batch_id: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -108,8 +107,10 @@ async fn send(
     let payload = zstd::encode_all(payload_uncompressed.as_slice(), ZSTD_LEVEL)
         .expect("zstd encode_all is infallible on Vec input");
 
-    let frame = build::batch(build::BatchArgs {
-        session_id: state.session_id,
+    // session_id is stamped by the client under the lock (it changes on every
+    // reconnect), so build with a placeholder.
+    let mut frame = build::batch(build::BatchArgs {
+        session_id: 0,
         batch_id: state.next_batch_id(),
         signal: signal.as_u8(),
         ts_min_unix_nano: ts_min,
@@ -121,7 +122,23 @@ async fn send(
     });
 
     let mut client = state.client.lock().await;
-    client.send_batch(&frame).await
+    match client.send_batch_stamped(&mut frame).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // The upstream likely restarted. Try a single reconnect + resend so
+            // this request can succeed and, more importantly, so the shared
+            // client is healthy for subsequent requests. We deliberately do
+            // *not* loop with backoff while holding the shared lock — a longer
+            // outage surfaces as a 502 and the HTTP caller retries.
+            tracing::warn!(error = %e, "upstream send failed; reconnecting once");
+            client.reconnect().await.map_err(|re| {
+                tracing::warn!(error = %re, "upstream reconnect failed");
+                re
+            })?;
+            tracing::info!("reconnected to upstream ingest server");
+            client.send_batch_stamped(&mut frame).await
+        }
+    }
 }
 
 /// Encode a binschema value to bytes — mirrors `noise-spewer::gen::encode`.
