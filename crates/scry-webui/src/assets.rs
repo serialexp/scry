@@ -6,7 +6,10 @@
 //! re-run `bun run build` in `desktop/`, no `cargo` rebuild needed).
 //!
 //! Because the embed happens at compile time, `desktop/dist` must exist when
-//! `cargo build -p scry-webui` runs. Run `bun run build` in `desktop/` first.
+//! `cargo build -p scry-webui` runs — so `build.rs` creates it (empty) if it's
+//! absent, letting the crate compile in a clean checkout (CI, fresh clone).
+//! An empty bundle serves the "bundle missing" 500 below; run `bun run build`
+//! in `desktop/` first for the real assets.
 
 use axum::http::{header, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
