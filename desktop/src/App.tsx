@@ -31,6 +31,9 @@ const App: Component = () => {
       <header class="app-header">
         <h1>scry</h1>
         <span class="subtitle">query</span>
+        <span class="version" title="scry version">
+          v{__APP_VERSION__}
+        </span>
         <Show when={inBrowser && authed()}>
           <button type="button" class="logout" onClick={() => void logout()}>
             Log out

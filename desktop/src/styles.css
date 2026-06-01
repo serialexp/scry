@@ -58,8 +58,15 @@ body {
   font-size: 12px;
 }
 
-.app-header .logout {
+/* Pushed to the right edge; the logout button (when shown) follows it. */
+.app-header .version {
   margin-left: auto;
+  color: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.app-header .logout {
   background: var(--panel-2);
   color: var(--text);
   border: 1px solid var(--border);

@@ -1,6 +1,6 @@
 {
   "name": "scry-desktop",
-  "version": "0.1.0",
+  "version": "0.9.1",
   "description": "scry desktop query app — a TypeScript client for the scry-queryd binschema wire protocol, wrapped in a Tauri window.",
   "type": "module",
   "private": true,
