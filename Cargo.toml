@@ -20,6 +20,7 @@ members = [
     "crates/retention",
     "crates/cluster",
     "crates/valkey",
+    "crates/scry-webui",
 ]
 # The desktop query app (Tauri + SolidJS) is its own crate with a heavy,
 # unrelated dependency tree (tauri, webkit bindings). It is intentionally
@@ -58,16 +59,19 @@ anyhow    = "1"
 arrow     = "58"
 async-trait = "0.1"
 axum      = { version = "0.8", features = ["multipart"] }
+axum-extra = { version = "0.10", features = ["cookie", "cookie-signed"] }
 datafusion = "53"
 bytes     = "1"
 fred      = "10"
 chrono    = { version = "0.4", default-features = false, features = ["clock"] }
 clap      = { version = "4", features = ["derive"] }
+cookie    = { version = "0.18", features = ["key-expansion"] }
 crc32fast = "1"
 futures   = "0.3"
 k8s-openapi = { version = "0.27", features = ["latest"] }
 kube      = { version = "3", default-features = false, features = ["client", "runtime", "rustls-tls", "ring"] }
 mimalloc  = { version = "0.1", default-features = false }
+mime_guess = "2"
 num_cpus  = "1"
 object_store = "0.13"
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "trace"] }
@@ -75,10 +79,12 @@ parquet   = "58"
 prost     = "0.14"
 rand      = "0.8"
 rand_distr = "0.4"
+rust-embed = { version = "8", features = ["interpolate-folder-path"] }
 serde     = "1"
 serde_json = "1"
 snap      = "1"
 thiserror = "1"
+time      = "0.3"
 tokio     = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "sync", "time", "signal", "fs"] }
 tracing   = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
