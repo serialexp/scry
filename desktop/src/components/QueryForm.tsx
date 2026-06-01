@@ -22,6 +22,24 @@ const SIGNAL_HINTS: Record<string, string> = {
   Profiles: "Retrieval only: filter by time + SQL against the labels map. Label matchers are rejected — use SQL.",
 };
 
+/** Quick time-range presets: label → span in milliseconds. */
+const QUICK_RANGES: { label: string; ms: number }[] = [
+  { label: "5m", ms: 5 * 60_000 },
+  { label: "15m", ms: 15 * 60_000 },
+  { label: "1h", ms: 60 * 60_000 },
+  { label: "6h", ms: 6 * 60 * 60_000 },
+  { label: "24h", ms: 24 * 60 * 60_000 },
+  { label: "7d", ms: 7 * 24 * 60 * 60_000 },
+];
+
+/** Set ts_min/ts_max to [now - span, now] in unix nanoseconds. */
+function applyQuickRange(ms: number): void {
+  const nowNs = BigInt(Date.now()) * 1_000_000n;
+  const spanNs = BigInt(ms) * 1_000_000n;
+  setField("tsMin", String(nowNs - spanNs));
+  setField("tsMax", String(nowNs));
+}
+
 const QueryForm: Component = () => {
   const isRunning = () => state.status === "running";
 
@@ -115,6 +133,38 @@ const QueryForm: Component = () => {
           />
         </div>
       </Show>
+
+      <div class="field">
+        <div class="field-head">
+          <label>Quick range</label>
+          <button
+            type="button"
+            class="link"
+            onClick={() => {
+              setField("tsMin", "");
+              setField("tsMax", "");
+            }}
+          >
+            clear
+          </button>
+        </div>
+        <div class="quick-ranges">
+          <For each={QUICK_RANGES}>
+            {(r) => (
+              <button
+                type="button"
+                class="chip"
+                onClick={() => applyQuickRange(r.ms)}
+              >
+                {r.label}
+              </button>
+            )}
+          </For>
+        </div>
+        <p class="hint">
+          Sets ts_min/ts_max to the last N relative to your browser clock (unix ns).
+        </p>
+      </div>
 
       <div class="field-grid">
         <div class="field">
