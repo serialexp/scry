@@ -5,6 +5,7 @@
 import { For, Show, type Component } from "solid-js";
 
 import { SIGNAL_NAMES } from "../protocol/constants";
+import { isTauri } from "../env";
 import {
   state,
   setField,
@@ -32,17 +33,22 @@ const QueryForm: Component = () => {
         if (!isRunning()) void runCurrentQuery();
       }}
     >
-      <div class="field">
-        <label for="addr">Daemon address</label>
-        <input
-          id="addr"
-          type="text"
-          value={state.addr}
-          spellcheck={false}
-          onInput={(e) => setField("addr", e.currentTarget.value)}
-          placeholder="127.0.0.1:4100"
-        />
-      </div>
+      {/* The daemon address only matters for the desktop shell, which dials
+          it directly. In the browser, scry-webui relays to its own configured
+          upstream, so the field is hidden. */}
+      <Show when={isTauri()}>
+        <div class="field">
+          <label for="addr">Daemon address</label>
+          <input
+            id="addr"
+            type="text"
+            value={state.addr}
+            spellcheck={false}
+            onInput={(e) => setField("addr", e.currentTarget.value)}
+            placeholder="127.0.0.1:4100"
+          />
+        </div>
+      </Show>
 
       <div class="field">
         <label for="signal">Signal</label>

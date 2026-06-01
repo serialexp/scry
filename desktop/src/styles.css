@@ -58,6 +58,52 @@ body {
   font-size: 12px;
 }
 
+.app-header .logout {
+  margin-left: auto;
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 12px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.app-header .logout:hover {
+  border-color: var(--accent);
+}
+
+.app-loading {
+  margin: auto;
+  padding: 48px;
+  color: var(--muted);
+}
+
+/* ── Login ────────────────────────────────────────────────────────── */
+
+.login-form {
+  width: 320px;
+  margin: 64px auto;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 24px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.login-form h2 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.login-error {
+  margin: 0;
+  color: var(--danger);
+  font-size: 12px;
+}
+
 .app-body {
   display: flex;
   flex: 1;

@@ -12,7 +12,9 @@ import { createStore } from "solid-js/store";
 import type { Table } from "apache-arrow";
 
 import { Signal, type SignalName } from "./protocol/constants";
-import { TauriTransport } from "./protocol/transport";
+import type { Transport } from "./protocol/transport";
+import { UnauthorizedError } from "./protocol/transport-http";
+import { isTauri } from "./env";
 import { runQuery, QueryError, type QuerySpec } from "./protocol/client";
 
 export interface MatcherRow {
@@ -66,6 +68,57 @@ const [resultTable, setResultTable] = createSignal<Table | null>(null);
 
 export { state, resultTable };
 
+// ── Auth (browser only) ──────────────────────────────────────────────
+//
+// The desktop (Tauri) shell talks straight to the daemon over a native
+// socket — no gate. The browser shell goes through `scry-webui`, which
+// requires a password → signed-cookie session. `inBrowser` decides which.
+
+/** True when running in a browser tab (vs the Tauri desktop window). */
+export const inBrowser = !isTauri();
+
+// `authed`: is there a usable session? Desktop is always authed. `authChecked`:
+// has the initial `/api/me` probe completed (avoids a login-screen flash on a
+// page load that already has a valid cookie)? Desktop needs no probe.
+const [authed, setAuthed] = createSignal(!inBrowser);
+const [authChecked, setAuthChecked] = createSignal(!inBrowser);
+export { authed, authChecked };
+
+/** Probe the existing session cookie once on startup (browser only). */
+export async function checkSession(): Promise<void> {
+  if (!inBrowser) return;
+  try {
+    const res = await fetch("/api/me", { credentials: "same-origin" });
+    setAuthed(res.status === 204);
+  } catch {
+    setAuthed(false);
+  } finally {
+    setAuthChecked(true);
+  }
+}
+
+/** Attempt a login; returns true on success. */
+export async function login(password: string): Promise<boolean> {
+  const res = await fetch("/api/login", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ password }),
+    credentials: "same-origin",
+  });
+  const ok = res.status === 204;
+  setAuthed(ok);
+  return ok;
+}
+
+/** Clear the session and drop back to the login screen. */
+export async function logout(): Promise<void> {
+  try {
+    await fetch("/api/logout", { method: "POST", credentials: "same-origin" });
+  } finally {
+    setAuthed(false);
+  }
+}
+
 // ── Field + matcher mutators ─────────────────────────────────────────
 
 export function setField<K extends keyof FormState>(key: K, value: FormState[K]): void {
@@ -86,7 +139,19 @@ export function setMatcher(index: number, field: keyof MatcherRow, value: string
 
 // ── Run ──────────────────────────────────────────────────────────────
 
-const transport = new TauriTransport();
+// Pick the transport for the current shell, lazily and once. The Tauri adapter
+// statically imports `@tauri-apps/api`, so it's loaded via dynamic `import()`
+// only when actually running under Tauri — keeping it out of the browser bundle.
+let transportPromise: Promise<Transport> | null = null;
+
+function getTransport(): Promise<Transport> {
+  if (!transportPromise) {
+    transportPromise = isTauri()
+      ? import("./protocol/transport-tauri").then((m) => new m.TauriTransport())
+      : import("./protocol/transport-http").then((m) => new m.HttpTransport());
+  }
+  return transportPromise;
+}
 
 function parseBigIntOpt(raw: string): bigint | undefined {
   const t = raw.trim();
@@ -149,6 +214,7 @@ export async function runCurrentQuery(): Promise<void> {
 
   setState({ status: "running", error: null });
   try {
+    const transport = await getTransport();
     const res = await runQuery(transport, state.addr.trim(), spec);
     setResultTable(res.table);
     setState({
@@ -160,6 +226,18 @@ export async function runCurrentQuery(): Promise<void> {
     });
   } catch (e) {
     setResultTable(null);
+    // A 401 from the relay means our session lapsed mid-use: drop back to the
+    // login screen rather than showing a cryptic query error.
+    if (e instanceof UnauthorizedError) {
+      setAuthed(false);
+      setState({
+        status: "error",
+        error: "Session expired — please log in again.",
+        rowCount: 0,
+        totalRows: 0n,
+      });
+      return;
+    }
     const message =
       e instanceof QueryError
         ? e.message

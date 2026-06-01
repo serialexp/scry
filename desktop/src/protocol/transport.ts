@@ -4,11 +4,16 @@
 //! receive the full ordered response byte stream — the daemon's "one
 //! connection per query" lifecycle makes that a clean request/response
 //! shape. Keeping it behind an interface means the protocol logic is
-//! transport-agnostic: the Tauri adapter below opens a native TCP
-//! socket, but a future WebSocket bridge (for a pure-browser build)
-//! would implement the same `Transport`.
-
-import { invoke } from "@tauri-apps/api/core";
+//! transport-agnostic.
+//!
+//! Two implementations live alongside this interface, each in its own module so
+//! the browser bundle never statically imports the Tauri API:
+//!   - `transport-tauri.ts` — `TauriTransport`, a native TCP socket via the
+//!     Rust `run_query` command (desktop app).
+//!   - `transport-http.ts` — `HttpTransport`, a `fetch` to the `scry-webui`
+//!     server's `/api/query` relay (browser).
+//!
+//! `store.ts` picks one at runtime via `getTransport()` (see `env.ts`).
 
 export interface Transport {
   /**
@@ -16,21 +21,10 @@ export interface Transport {
    * complete response byte stream. Rejects on connection/IO failure;
    * protocol-level `StreamError`s arrive *inside* the returned bytes and
    * are surfaced by the client, not here.
+   *
+   * Note: the HTTP transport ignores `addr` — the `scry-webui` server dials
+   * its own configured upstream `scry-queryd` (SSRF-safe). Only the desktop
+   * (Tauri) transport honours `addr`.
    */
   query(addr: string, request: Uint8Array): Promise<Uint8Array>;
-}
-
-/** Transport backed by the Rust `run_query` command (native TCP socket). */
-export class TauriTransport implements Transport {
-  async query(addr: string, request: Uint8Array): Promise<Uint8Array> {
-    // The request frame is small (tens of bytes to a few KB), so passing
-    // it as a JSON number array is fine. The *response* comes back as a
-    // raw ArrayBuffer (the Rust command returns `tauri::ipc::Response`),
-    // avoiding a number-array round-trip for multi-MB Arrow payloads.
-    const res = await invoke<ArrayBuffer>("run_query", {
-      addr,
-      request: Array.from(request),
-    });
-    return new Uint8Array(res);
-  }
 }
