@@ -372,3 +372,31 @@ textarea {
 .data-table tbody tr:hover {
   background: rgba(106, 163, 255, 0.08);
 }
+
+/* ── Mobile / narrow viewports ────────────────────────────────────── */
+
+/* The default layout is a fixed-width sidebar beside a flexible results
+   pane — fine on a desktop, but on a phone the 320px-min sidebar crowds the
+   results into a sliver. Below 720px, stack the form above the results and
+   let the page scroll vertically instead of reserving horizontal sidebar
+   space that doesn't fit. */
+@media (max-width: 720px) {
+  .app-body {
+    flex-direction: column;
+    overflow-y: auto;
+  }
+
+  .sidebar {
+    width: 100%;
+    min-width: 0;
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+    /* size to content and scroll with the page, not internally */
+    overflow-y: visible;
+  }
+
+  .main {
+    /* keep the results table tall enough to be usable once stacked */
+    min-height: 60vh;
+  }
+}
