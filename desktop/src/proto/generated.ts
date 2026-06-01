@@ -235,7 +235,7 @@ export class QueryFrameDecoder extends SeekableBitStreamDecoder {
 }
 
 /**
- * Sent by the client at the start of every query connection. Carries the target signal byte (1 = metrics, 2 = logs, 3 = traces, 4 = profiles — values match scry_proto::constants::Signal), the AND'd matcher set + time bounds (the postings preselect), optional SQL against the registered table for that signal, an optional row limit, an optional caller-supplied tracing correlation id, and an optional trace_id (16 raw bytes; empty = absent) for the traces signal's by-id lookup. Receiver fails with QUERY_ERR_BAD_REQUEST if `signal` is 0 or names an unimplemented signal. NOTE: 'optional' fields would be the natural shape here, but as of binschema 0.5.x the Rust generator emits NotImplemented when 'optional' appears inside a discriminated_union variant (works fine in plain structs — see ingest's Span.parent_span_id). We model each optional with an explicit '*_present: uint8' companion (0 = absent, 1 = present); when absent the value field is still serialised but should be ignored by the receiver. Switch back to 'optional' once binschema gains support.
+ * Sent by the client at the start of every query connection. Carries the target signal byte (1 = metrics, 2 = logs, 3 = traces, 4 = profiles — values match scry_proto::constants::Signal), the AND'd matcher set + time bounds (the postings preselect), optional SQL against the registered table for that signal, an optional row limit, an optional caller-supplied tracing correlation id, and an optional trace_id (16 raw bytes; empty = absent) for the traces signal's by-id lookup, and an optional body_contains substring (empty = absent) for the logs signal's full-text search. Receiver fails with QUERY_ERR_BAD_REQUEST if `signal` is 0 or names an unimplemented signal. NOTE: 'optional' fields would be the natural shape here, but as of binschema 0.5.x the Rust generator emits NotImplemented when 'optional' appears inside a discriminated_union variant (works fine in plain structs — see ingest's Span.parent_span_id). We model each optional with an explicit '*_present: uint8' companion (0 = absent, 1 = present); when absent the value field is still serialised but should be ignored by the receiver. Switch back to 'optional' once binschema gains support.
  */
 export interface QueryRequestInput {
   /**
@@ -295,10 +295,16 @@ export interface QueryRequestInput {
    * Raw byte array. Sugar for array of uint8 — same wire format, simpler schema definition.
    */
   trace_id: number[];
+  /**
+   * String kind: length_prefixed
+   * Encoding: utf8
+   * Length prefix type: uint32
+   */
+  body_contains: string;
 }
 
 /**
- * Sent by the client at the start of every query connection. Carries the target signal byte (1 = metrics, 2 = logs, 3 = traces, 4 = profiles — values match scry_proto::constants::Signal), the AND'd matcher set + time bounds (the postings preselect), optional SQL against the registered table for that signal, an optional row limit, an optional caller-supplied tracing correlation id, and an optional trace_id (16 raw bytes; empty = absent) for the traces signal's by-id lookup. Receiver fails with QUERY_ERR_BAD_REQUEST if `signal` is 0 or names an unimplemented signal. NOTE: 'optional' fields would be the natural shape here, but as of binschema 0.5.x the Rust generator emits NotImplemented when 'optional' appears inside a discriminated_union variant (works fine in plain structs — see ingest's Span.parent_span_id). We model each optional with an explicit '*_present: uint8' companion (0 = absent, 1 = present); when absent the value field is still serialised but should be ignored by the receiver. Switch back to 'optional' once binschema gains support.
+ * Sent by the client at the start of every query connection. Carries the target signal byte (1 = metrics, 2 = logs, 3 = traces, 4 = profiles — values match scry_proto::constants::Signal), the AND'd matcher set + time bounds (the postings preselect), optional SQL against the registered table for that signal, an optional row limit, an optional caller-supplied tracing correlation id, and an optional trace_id (16 raw bytes; empty = absent) for the traces signal's by-id lookup, and an optional body_contains substring (empty = absent) for the logs signal's full-text search. Receiver fails with QUERY_ERR_BAD_REQUEST if `signal` is 0 or names an unimplemented signal. NOTE: 'optional' fields would be the natural shape here, but as of binschema 0.5.x the Rust generator emits NotImplemented when 'optional' appears inside a discriminated_union variant (works fine in plain structs — see ingest's Span.parent_span_id). We model each optional with an explicit '*_present: uint8' companion (0 = absent, 1 = present); when absent the value field is still serialised but should be ignored by the receiver. Switch back to 'optional' once binschema gains support.
  */
 export interface QueryRequestOutput {
   /**
@@ -363,6 +369,12 @@ export interface QueryRequestOutput {
    * Raw byte array. Sugar for array of uint8 — same wire format, simpler schema definition.
    */
   trace_id: number[];
+  /**
+   * String kind: length_prefixed
+   * Encoding: utf8
+   * Length prefix type: uint32
+   */
+  body_contains: string;
 }
 
 export type QueryRequest = QueryRequestOutput;
@@ -409,6 +421,11 @@ export class QueryRequestEncoder extends BitStreamEncoder {
       const value_trace_id__iter = value.trace_id[value_trace_id__iter_index];
       this.writeUint8(value_trace_id__iter);
     }
+    const value_body_contains_bytes = new TextEncoder().encode(value.body_contains);
+    this.writeUint32(value_body_contains_bytes.length, "big_endian");
+    for (const byte of value_body_contains_bytes) {
+      this.writeUint8(byte);
+    }
     return this.finish();
   }
 
@@ -437,6 +454,8 @@ export class QueryRequestEncoder extends BitStreamEncoder {
     // trace_id: custom type (bytes)
     const trace_id_encoder = new bytesEncoder();
     size += trace_id_encoder.calculateSize(value.trace_id);
+    // body_contains: string (utf8)
+    size += new TextEncoder().encode(value.body_contains).length;
     return size;
   }
 }
@@ -494,6 +513,13 @@ export class QueryRequestDecoder extends SeekableBitStreamDecoder {
       let trace_id__iter: any;
       trace_id__iter = this.readUint8();
       value.trace_id.push(trace_id__iter);
+    }
+    const body_contains_length = this.readUint32("big_endian");
+    const body_contains_bytes = this.readBytesSlice(body_contains_length);
+    try {
+      value.body_contains = new TextDecoder("utf-8", { fatal: true }).decode(body_contains_bytes);
+    } catch (e) {
+      throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
     }
     return value;
   }

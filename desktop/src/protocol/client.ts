@@ -62,6 +62,8 @@ export interface QuerySpec {
   requestId?: string;
   /** 16 raw bytes — traces by-id lookup. Omit for non-traces / no lookup. */
   traceId?: Uint8Array;
+  /** Full-text substring over log `body` (logs only). Omit / "" = absent. */
+  bodyContains?: string;
 }
 
 export interface QueryResult {
@@ -100,6 +102,7 @@ function buildRequestFrame(spec: QuerySpec): Uint8Array {
     limit: spec.limit ?? 0n,
     request_id: spec.requestId ?? "",
     trace_id: spec.traceId ? Array.from(spec.traceId) : [],
+    body_contains: spec.bodyContains ?? "",
   };
   // Cast: the runtime encoder wants the tagged `{ type, value }` shape
   // (see TaggedFrame note above), which the declared `QueryFrameInput`
