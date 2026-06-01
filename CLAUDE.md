@@ -46,6 +46,21 @@ For `metrics`/`logs`/`both` the script additionally reconciles a fresh catalog a
 
 The smoke script also wraps `scry-ingestd` in `/usr/bin/time -v` and prints a service-performance block at the end — peak RSS, user/sys CPU, records/sec, and **CPU-µs / record** (the headline regression sentinel; rate-independent, unlike `%CPU` which slides with the inter-batch idle gap). Full `time -v` output is kept in `$SMOKE_DIR/sink.time` for context (ctx switches, page faults, etc.). The script sends SIGINT directly to the scry-ingestd PID, not to `time`, because GNU time does not forward signals to its child.
 
+Smoke-test the browser web UI end-to-end (builds the bundle + release `scry-webui`, stub upstream, no Garage/Valkey):
+
+```bash
+scripts/smoke-webui.sh             # asserts SPA serve + auth + /api/query relay + logout
+```
+
+Run it for real against a live daemon:
+
+```bash
+(cd desktop && bun run build)
+cargo build --release -p scry-webui
+SCRY_WEBUI_PASSWORD=secret ./target/release/scry-webui \
+  --listen 0.0.0.0:8080 --queryd 127.0.0.1:4100              # then open http://<host>:8080/
+```
+
 Regenerate Rust bindings from the wire schema (only path that should touch `crates/proto/src/generated.rs` or `crates/binschema-runtime/src/*.rs`):
 
 ```bash
@@ -91,11 +106,16 @@ Crates in `crates/`:
 - **`scry-queryd`** — the query daemon. **v0.9:** with `--valkey-url`/`SCRY_VALKEY_URL` it runs the same three-tier convergence (consumer + poller + full-walk) **query-only** — no maintenance loop, no lease contention.
 - **`scry-list`** — catalog inspector. Opens a SQLite catalog (creates the schema if missing), runs `reconcile_from_bucket` unless `--no-reconcile`, prints one line per block + a `# total rows=N bytes=N` trailer.
 
+**Web UI**
+- **`scry-webui`** — standalone axum 0.8 server that serves the SolidJS query app to a browser and relays queries to `scry-queryd`, so the UI is reachable remotely without the desktop binary. It is a **dumb byte-pipe**, exactly like the Tauri shell: `POST /api/query` dials the server's *own* configured `--queryd` (browser-supplied addresses ignored — SSRF-safe), writes the already-framed request, reads to EOF, returns the bytes. Zero protocol knowledge — the whole wire protocol lives in the TypeScript frontend. Auth is a single shared password (`SCRY_WEBUI_PASSWORD`, never argv) → a signed session cookie (`axum-extra` `SignedCookieJar`, key HKDF-derived from the password so sessions survive a restart). The SolidJS bundle is embedded via `rust-embed` (single self-contained binary in release; reads `desktop/dist` from disk in debug — run `bun run build` in `desktop/` before `cargo build -p scry-webui`). `src/{main,lib,auth,query,assets}.rs`; integration tests in `tests/{auth,query}.rs`. **Home-machine deployment only — deliberately not in the Docker image / k8s manifests.** See D-040.
+- **`desktop/`** — the Tauri + SolidJS desktop query app (not a workspace member; heavy tauri/webkit deps). The frontend is **dual-mode**: the `Transport` interface (`src/protocol/transport.ts`) has two impls — `transport-tauri.ts` (native socket) and `transport-http.ts` (`fetch` to scry-webui's `/api/query`) — picked at runtime by `isTauri()` (`src/env.ts`) via a dynamic `import()`, so the browser bundle never imports `@tauri-apps`. Build the bundle with `bun run build` (= `tsc && vite build`).
+
 **Tooling**
 - `docker/garage/` — single-node Garage (`dxflrs/garage:v1.0.1`) for local development. `scripts/dev-garage-up.sh` brings it up and runs `init.sh` (idempotent layout + bucket + key creation; writes credentials to `docker/garage/.env`).
 - `docker/valkey/` — single-node Valkey for local development. `scripts/dev-valkey-up.sh` brings it up (used by the `MULTI=1` smoke leg).
 - `scripts/smoke.sh` — the v0.1 scripted exit criterion; see Commands. Dispatches to `scripts/smoke-multi.sh` when `MULTI=1`.
 - `scripts/smoke-multi.sh` — the v0.9 two-instance exit criterion; see Commands.
+- `scripts/smoke-webui.sh` — the `scry-webui` exit criterion: builds the SolidJS bundle + release binary, stands up a stub `scry-queryd`, and asserts the full web surface (SPA served, `/api/me` 401→204, wrong/right login, `/api/query` auth gate + byte-pipe relay, logout). Self-contained — no Garage/Valkey needed. Needs `bun`, `python3`, `curl`.
 
 ## Architecture you have to read multiple files to grasp
 

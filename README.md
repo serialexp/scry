@@ -133,6 +133,7 @@ crates/
   query/               DataFusion query engine + scry-query CLI (scry-query)
   scry-queryd/         remote query daemon (binschema-framed wire)
   scry-list/           catalog inspector / bucket reconciler
+  scry-webui/          browser query UI server: serves the SolidJS app + relays queries to scry-queryd (D-040)
   client/              reusable native-wire client, shared by agent + gateway (scry-client)
   agent/               per-node log-collection agent: tails CRI logs, ships over the wire (scry-agent)
   gateway/             foreign-protocol push gateway (scry-gateway): OTLP traces, Pyroscope, Prometheus remote-write

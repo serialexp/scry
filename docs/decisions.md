@@ -1542,3 +1542,63 @@ constraint shows up":
   initially; revisit if query staleness becomes a complaint.
 - **License.** TBD. Probably MIT or Apache-2.0; pick before any
   external contributor shows up.
+
+---
+
+## D-040: Browser query UI as a password-gated byte-pipe (`scry-webui`) (v1.0-wip)
+
+**Context.** The query UI already exists as a Tauri + SolidJS desktop app
+(`desktop/`). Crucially, its architecture puts the *entire* query wire protocol
+(binschema framing, the `QueryFrame` union, Arrow IPC decode) in TypeScript; the
+Tauri Rust shell is a **dumb byte-pipe** — its one `run_query` command opens a
+TCP socket to `scry-queryd`, writes the framed request, reads to EOF, and returns
+the bytes. The transport is already abstracted behind a `Transport` interface.
+Bart wanted to reach the UI from a phone / other machines without running the
+desktop binary there: serve it as a web service on his home machine that
+connects to `scry-queryd` exactly the way the desktop app does, gated by a simple
+password.
+
+**Decision.** Add a standalone **`scry-webui`** crate (axum 0.8) that (a) serves
+the SolidJS bundle (embedded via `rust-embed`, so the binary is self-contained)
+and (b) exposes `POST /api/query` as the same dumb byte-pipe the Tauri shell
+implements — dial the server's *own configured* `--queryd`, write the framed
+request, read to EOF, return the bytes. Auth is a single shared password
+(`SCRY_WEBUI_PASSWORD`, never argv) → a signed session cookie (`axum-extra`
+`SignedCookieJar`, key HKDF-derived from the password so sessions survive a
+restart and a password change invalidates them). The frontend stays
+**dual-mode**: the `Transport` interface gets two impls in separate modules —
+`TauriTransport` (native socket, desktop) and `HttpTransport` (`fetch` to
+`/api/query`, browser) — selected at runtime by `isTauri()` via a dynamic
+`import()`, so the browser bundle never pulls in `@tauri-apps`.
+
+**Rationale.**
+- *Byte-pipe symmetry.* The server having zero protocol knowledge means the web
+  path can never drift from the desktop path — both ship the identical framed
+  bytes the TypeScript client produces. New signals / protocol changes need no
+  server change.
+- *SSRF-safe.* The browser cannot choose the upstream: the server ignores any
+  client-supplied address and always dials its configured `--queryd`. The
+  desktop `addr` field is hidden in the browser shell.
+- *Single binary.* `rust-embed` over `ServeDir` keeps deployment to one file
+  (run `bun run build` in `desktop/` before `cargo build -p scry-webui`; debug
+  builds read `desktop/dist` from disk for fast frontend iteration).
+- *Cookie hardening level matches the threat.* `HttpOnly` + `SameSite=Strict`,
+  but **not `Secure`** — the server speaks plain HTTP on a home LAN and a
+  `Secure` cookie is dropped over `http://`. Put it behind a TLS reverse proxy
+  to harden, then flip `Secure`.
+- *502 on upstream failure* so a down `scry-queryd` is a clear gateway error,
+  not a hung request or a 500.
+
+**Alternatives weighed.** Folding the server into `scry-queryd` (rejected: keeps
+the query daemon free of HTML/auth/static-asset concerns, and the UI host is a
+home-machine deployment, not part of the clustered query tier — it is
+deliberately **not** in the Docker image / k8s manifests). A WebSocket bridge
+(unnecessary — the one-request-per-connection lifecycle is a clean
+request/response, so plain `POST` suffices). Browser-only (rejected: Bart wanted
+to keep the desktop app too).
+
+**Status.** Implemented. Sealed by `scripts/smoke-webui.sh` (builds the bundle +
+release binary, stands up a stub upstream, asserts the SPA serves and the
+login → `/api/me` → `/api/query` relay → logout surface) plus the `scry-webui`
+Rust integration tests (`tests/auth.rs`, `tests/query.rs`). The real protocol
+round-trip is covered by `scripts/smoke.sh`'s per-signal query legs.

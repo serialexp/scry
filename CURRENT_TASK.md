@@ -1,103 +1,87 @@
-# CURRENT_TASK — handoff
+# CURRENT TASK — scry-webui (browser query UI) — COMPLETE
 
-## v0.9 — scry is now multi-instance (Valkey lease + pub/sub convergence)
+## What this was
 
-All 7 phases of the v0.9 plan are implemented and green. Phases 1–6 are
-committed (Phase 6 = `32aaece`); **Phase 7 (this session) is in the working
-tree, not yet committed**. Rationale: `docs/decisions.md § D-038` (Valkey lease,
-supersedes D-013) + `§ D-039` (three-tier convergence).
+Turn the existing Tauri + SolidJS desktop query app (`desktop/`) into a
+browser-accessible web service so the query console is reachable remotely
+(home-machine deployment) without the desktop binary. Confirmed design with Bart:
+- Remote access by running the UI on the home machine; it connects to
+  `scry-queryd` exactly as the Tauri client does.
+- Gated by a simple password → cookie.
+- **Keep both** desktop and browser (dual-mode frontend).
+- **New standalone binary** (`scry-webui`), not folded into `scry-queryd`.
 
-The single-instance path is preserved byte-for-byte: with no `SCRY_VALKEY_URL`,
-the convergence loops spawn but idle, maintenance pauses (no lease ⇒ no
-destructive work), and the standalone `scry-compact`/`scry-retention` CLIs run
-unfenced exactly as in v0.8. `SIGNAL=both scripts/smoke.sh` + `cargo test
---workspace` stay green.
+All 7 plan phases are implemented, built, and tested green. See **D-040** for the
+full rationale.
 
----
+## What shipped
 
-## What shipped (the shape of it)
+**New crate `crates/scry-webui`** (axum 0.8):
+- `src/assets.rs` — `rust-embed` of `desktop/dist` (single binary in release;
+  disk-read in debug). `#[folder = "../../desktop/dist"]` (relative to crate
+  root — NOT `$CARGO_MANIFEST_DIR/...`, which needs the `interpolate-folder-path`
+  feature). `use rust_embed::RustEmbed;` alone suffices (the derive generates an
+  inherent `get`).
+- `src/auth.rs` — `/api/login` `/api/logout` `/api/me`; signed session cookie
+  `scry_session` (value = expiry unix-secs), `HttpOnly` + `SameSite=Strict`, NOT
+  `Secure` (plain HTTP over LAN). Constant-time password compare.
+- `src/query.rs` — `POST /api/query`: auth-gated dumb byte-pipe. Dials the
+  server's own `--queryd` (ignores any client addr → SSRF-safe), writes the
+  framed request, reads to EOF, returns bytes. 401 unauth, 502 upstream-down.
+- `src/lib.rs` — `AppState(Arc<Inner>)` + `FromRef<AppState> for Key`; `router()`.
+- `src/main.rs` — clap `--listen`/`--queryd`/`--session-ttl`; password from
+  `SCRY_WEBUI_PASSWORD` (never argv); cookie `Key` HKDF-derived from the password
+  (domain-separated + padded to the ≥32-byte floor `Key::derive_from` requires).
+- `tests/auth.rs` (4) + `tests/query.rs` (3) — tower `oneshot` integration tests.
 
-**Two new crates:**
-- **`scry-valkey`** — the only crate that talks to Valkey (`fred` 10.1). The
-  `ValkeyClient` handle, the `SET NX PX` + Lua compare-and-set lease
-  (`LeaseProvider`/`ValkeyLeaseProvider`, auto-renew every `ttl/3`, latches
-  invalid before server-side expiry), pub/sub (`subscribe_blocks`,
-  `parse_envelope`), and `ValkeySink: BlockEventSink`.
-- **`scry-cluster`** — Valkey-agnostic orchestration: `apply_event` (idempotent
-  catalog mutations), `poll_once` + `full_walk` (cursor-poll + full-reconcile
-  tiers), `run_maintenance_loop<L: LeaseProvider>` (drives
-  `run_compaction_pass`/`run_retention_pass`), `LocalLeaseProvider`.
+**Root `Cargo.toml`** — added `crates/scry-webui` member + workspace deps
+`axum-extra` (0.10, `cookie`+`cookie-signed`), `cookie` (0.18, `key-expansion`),
+`rust-embed` (8, `mime-guess`), `mime_guess`, `time`.
 
-**Edited crates:** `scry-block` seams (`Fence`/`AlwaysValid`, `BlockEvent`/
-`Envelope`, `BlockEventSink`/`NoopSink`); `scry-catalog` `poll_cursors` table;
-`scry-compact` `compact_partition` + commit-point fence in `merge_blocks`;
-`scry-retention` `retain_planned`; `scry-query` `EvictOnNotFound` + one-shot
-re-plan; `scry-server::pipeline` catalog → `std::sync::Mutex<Catalog>` + an
-`event_sink` emitted in `run_upload`; `scry-ingestd`/`scry-queryd` wiring.
+**Frontend (`desktop/src/`) — dual-mode:**
+- `protocol/transport.ts` — now the `Transport` interface ONLY (no `@tauri-apps`).
+- `protocol/transport-tauri.ts` — `TauriTransport` (native socket).
+- `protocol/transport-http.ts` — `HttpTransport` (`fetch` `/api/query`) +
+  `UnauthorizedError`.
+- `env.ts` — `isTauri()` (checks `window.__TAURI_INTERNALS__`).
+- `store.ts` — lazy `getTransport()` (dynamic `import()`); auth state (`authed`,
+  `authChecked`, `inBrowser`, `checkSession`/`login`/`logout`); relay 401 → logout.
+- `components/LoginForm.tsx` (new, default export); `App.tsx` (gate + logout
+  button, browser only — default export, matches `index.tsx`); `QueryForm.tsx`
+  (Daemon field hidden when `!isTauri()`).
+- `styles.css` — login form + logout button styles (CSS lives here, NOT App.css).
 
-**Correctness invariants (load-bearing):**
-- Blocks are addressed by random **UUID v7, not content hash** → single-winner
-  compaction is a *correctness* requirement, not just efficiency.
-- **Commit-point fence:** `merge_blocks` uploads `main → [postings] → [bloom]`
-  then `meta.json` LAST; reconcile keys on `meta.json`. The fence is checked
-  immediately before the `meta.json` PUT, so a lost lease leaves only harmless
-  uncommitted bytes (no row, no events, inputs untouched).
-- **grace=0 closes the sequential re-merge window:** the winner deletes inputs
-  immediately, so a stale peer's re-merge 404s at the input GET and aborts
-  before its own `meta.json` commit. This is what makes the multi smoke
-  deterministic.
+**`scripts/smoke-webui.sh`** — builds bundle + release binary, stub upstream,
+asserts SPA serve + `/api/me` 401→204 + wrong/right login + `/api/query` auth
+gate + byte-pipe relay + logout. Self-contained. **PASSES (8/8).**
 
----
+**Docs:** D-040 in `docs/decisions.md`; CLAUDE.md (Web UI crate + desktop
+dual-mode + smoke-webui command/tooling); README.md (workspace line).
 
-## Phase 7 (this session) — what's in the tree
+## Verification status (all green)
 
-- **`scripts/smoke-multi.sh`** (NEW) — two `scry-ingestd --mode full` instances
-  sharing one bucket + Valkey. Phase 1: spew logs to both, wait for both
-  catalogs to converge to the same total live row count (pub/sub + cursor
-  poll, no double-count), assert `level ≥ 1` after a compaction round with rows
-  unchanged. Phase 2: restart with `--ttl-logs 1s --retention-apply
-  --retention-grace 0`, assert both catalogs reap to zero, bucket reconcile = 0,
-  no panic / no "pass failed" in either daemon log.
-- **`scripts/smoke.sh`** — `if [[ "${MULTI:-0}" == "1" ]]; then exec
-  scripts/smoke-multi.sh "$@"; fi` after `cd "$ROOT"`.
-- **Docs:** `docs/decisions.md` (D-013 → SUPERSEDED, full D-038 + D-039, three
-  deferred entries flipped to ✅, orphan-GC deferred entry added); `README.md`
-  (v0.9 row → ✅); `CLAUDE.md` (status paragraph + Workspace layout + Commands +
-  decisions range); this file.
+- `cargo test -p scry-webui` → 4 auth + 3 query tests pass.
+- `cargo build --workspace` → clean.
+- `desktop` `bun run build` → clean (163 modules; transport-tauri in its own
+  chunk so the browser bundle never loads `@tauri-apps`).
+- `scripts/smoke-webui.sh` → ALL 8 CHECKS PASSED.
 
-### Smoke gotchas (don't re-trip)
+## NOT yet done
 
-- The pass/fail grep must be `grep -iEq "panicked|pass failed"`. A looser
-  `ERROR`/`error` grep false-positives on the benign lowercase `error=io:
-  unexpected end of file` field inside a WARN — that WARN is caused by the
-  smoke's own `wait_bind` TCP probe disconnecting without a handshake.
-- Assert via the daemons' **own** catalogs (which track `superseded_by`
-  correctly), not a fresh bucket reconcile mid-merge. Total live rows is the
-  stable convergence / no-duplication signal.
-- A native host redis on `127.0.0.1:6379` collides with the dev
-  `scry-valkey` container (host networking). Run a throwaway
-  `docker run -d -p 6380:6379 valkey/valkey:8.0-alpine` and pass
-  `SCRY_VALKEY_URL=redis://127.0.0.1:6380`. The committed script defaults to
-  6379 but honors `SCRY_VALKEY_URL`.
+- **No commits.** Per the per-phase workflow, nothing committed — Bart commits
+  when he asks. Suggested whole-file split (Rule #13): (1) scry-webui crate +
+  root Cargo.toml + Cargo.lock, (2) frontend dual-mode (desktop/src/*), (3)
+  smoke-webui.sh, (4) docs (README/CLAUDE/decisions). Or bundle as Bart prefers.
+- TLS: cookie is not `Secure`; for non-LAN exposure put it behind a TLS proxy
+  and flip `Secure`.
 
-The multi smoke passed deterministically 3× against Valkey on 6380.
+## Environment caveat this session
 
----
-
-## Remaining
-
-- **Commit Phase 7** as a single whole-file feature commit — ONLY my Phase 7
-  files (`scripts/smoke-multi.sh`, `scripts/smoke.sh`, `docs/decisions.md`,
-  `README.md`, `CLAUDE.md`, `CURRENT_TASK.md`). **Exclude** parallel/unrelated
-  working-tree changes: `Dockerfile`, `crates/scry-list/src/main.rs`,
-  `deploy/k8s/queryd-*.yaml`. (Per Rule #13: whole files only — verify the
-  split is clean before staging.)
-- **Cleanup:** remove the throwaway `scry-valkey-smoke` container (port 6380)
-  once Bart's clean dev Valkey is the target.
-
-## Deferred to future rounds (out of v0.9 scope)
-Catalog snapshot bootstrap (the O(GB) cold-start optimisation); multi-bucket
-pool + sealing/auto-provisioning; orphan-object GC for uncommitted merge
-leftovers; partial-block rewriting at the TTL boundary; agent↔server discovery
-via a Valkey service registry. Next milestone is v1.0 (Grafana adapters / own
-UI).
+The tool-output renderer intermittently corrupted/duplicated/blanked Bash and
+Read output. Two real consequences were caught and repaired: (a) `App.tsx` got
+overwritten against fabricated file contents (wrong export style, imports of a
+nonexistent `./components/ResultTable` + `./App.css`) — rewritten to match the
+real conventions (default exports, `ResultsTable`, `styles.css`); (b) the
+CLAUDE.md doc edits silently no-op'd because the file hadn't been Read — re-applied
+after a real Read. Everything was re-verified via `cargo`/`bun`/smoke exit codes
+and `git status`, not by trusting rendered stdout.
