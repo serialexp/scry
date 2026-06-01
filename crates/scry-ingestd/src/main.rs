@@ -121,6 +121,16 @@ struct Args {
     #[arg(long)]
     block_max_rows: Option<u64>,
 
+    /// Maximum age (seconds) of an open block before it's sealed +
+    /// uploaded regardless of size. Without this a low-volume or idle
+    /// signal never crosses the size-based seal threshold
+    /// (`block_max_rows` / 128 MiB), so its records sit in RAM (and
+    /// re-replay from the WAL on every restart) and never become
+    /// queryable. Default 60s. Set to 0 to disable (size-only sealing).
+    /// Only meaningful with `--storage`.
+    #[arg(long, default_value_t = 60)]
+    block_max_age_secs: u64,
+
     // ---- Multi-instance coordination (v0.9) ----------------------------
     /// Valkey URL for multi-instance coordination (lease + pub/sub
     /// convergence). Falls back to `$SCRY_VALKEY_URL`. When neither is set
@@ -545,6 +555,13 @@ async fn main() -> Result<()> {
     if let Some(m) = stats_metrics.as_ref() {
         server = server.with_metrics(m.clone());
     }
+    // Time-based block flush: seal idle/low-volume blocks so they become
+    // queryable promptly (0 = disabled). Only relevant when storage is on
+    // — with no pipelines there's nothing to flush.
+    server = server.with_block_max_age(
+        (args.storage && args.block_max_age_secs > 0)
+            .then(|| Duration::from_secs(args.block_max_age_secs)),
+    );
 
     // Optional stats HTTP endpoint. It shares its shutdown signal with
     // the ingest server: both listen for Ctrl-C independently (tokio's

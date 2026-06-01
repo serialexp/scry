@@ -110,6 +110,12 @@ pub struct Server {
     /// bumps it at batch granularity and the connection count is
     /// tracked; the stats HTTP endpoint reads from the same `Arc`.
     metrics: Option<Arc<ServerMetrics>>,
+    /// Maximum age of an open block before it's sealed regardless of
+    /// size. `None` disables the time-based flush (size-only — the old
+    /// behaviour). Set via [`Server::with_block_max_age`]. Without it a
+    /// low-volume/idle signal never crosses the size threshold, so its
+    /// records never seal and never become queryable.
+    block_max_age: Option<Duration>,
 }
 
 impl Server {
@@ -130,6 +136,7 @@ impl Server {
             traces_pipeline,
             profiles_pipeline,
             metrics: None,
+            block_max_age: None,
         }
     }
 
@@ -138,6 +145,16 @@ impl Server {
     /// `serve_stats` so the endpoint and the ingest path share state.
     pub fn with_metrics(mut self, metrics: Arc<ServerMetrics>) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// Seal any open block older than `max_age`, regardless of size, via
+    /// a per-signal background ticker. Builder-style; `None`/unset keeps
+    /// the size-only behaviour. This is what makes low-volume and idle
+    /// signals queryable in a timely way (and bounds WAL growth /
+    /// restart-replay cost). See [`Pipeline::flush_if_aged`].
+    pub fn with_block_max_age(mut self, max_age: Option<Duration>) -> Self {
+        self.block_max_age = max_age;
         self
     }
 
@@ -159,6 +176,31 @@ impl Server {
             writer_uuid = %self.config.writer_uuid,
             "scry-server listening"
         );
+
+        // Per-signal time-based flush tickers. Each seals its signal's
+        // open block once it's older than `block_max_age`, so a trickle
+        // of data still lands in the bucket promptly instead of waiting
+        // for the size threshold. Aborted on shutdown; the final
+        // `flush_all_shards` below drains whatever remains.
+        let mut flushers: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        if let Some(max_age) = self.block_max_age {
+            if let Some(p) = self.dummy_pipeline.as_ref() {
+                flushers.push(spawn_age_flusher(p, max_age, "dummy"));
+            }
+            if let Some(p) = self.metrics_pipeline.as_ref() {
+                flushers.push(spawn_age_flusher(p, max_age, "metrics"));
+            }
+            if let Some(p) = self.logs_pipeline.as_ref() {
+                flushers.push(spawn_age_flusher(p, max_age, "logs"));
+            }
+            if let Some(p) = self.traces_pipeline.as_ref() {
+                flushers.push(spawn_age_flusher(p, max_age, "traces"));
+            }
+            if let Some(p) = self.profiles_pipeline.as_ref() {
+                flushers.push(spawn_age_flusher(p, max_age, "profiles"));
+            }
+            info!(max_age_secs = max_age.as_secs(), "time-based block flush enabled");
+        }
 
         let next_session_id = Arc::new(AtomicU64::new(1));
         let config = Arc::new(self.config);
@@ -202,6 +244,15 @@ impl Server {
             _ = shutdown    => { info!("shutdown signalled; flushing"); }
         }
 
+        // Stop the time-based flush tickers before the final drain so
+        // they don't race the shutdown flush for the shard locks. Abort
+        // is safe: a ticker only ever holds a shard lock briefly across
+        // `flush_if_aged`, and dropping the task releases it; the WAL is
+        // the source of truth for anything mid-flight.
+        for h in &flushers {
+            h.abort();
+        }
+
         // Flush every active pipeline shard. Order doesn't matter; each
         // shard owns its own WAL + JoinSet of inflight uploads.
         if let Some(sharded) = self.dummy_pipeline.as_ref() {
@@ -222,6 +273,39 @@ impl Server {
 
         Ok(())
     }
+}
+
+/// Spawn a background ticker that seals each shard's open block once it
+/// is older than `max_age` (see [`Pipeline::flush_if_aged`]). The check
+/// runs every `max_age / 4` (clamped to 1..=30s), so a block is sealed
+/// within roughly `max_age + max_age/4` of its first record. The
+/// [`ShardedPipeline`] handle is a cheap `Arc` clone; the task loops
+/// until aborted on shutdown.
+fn spawn_age_flusher<B: BlockBuilder>(
+    sharded: &ShardedPipeline<B>,
+    max_age: Duration,
+    signal: &'static str,
+) -> tokio::task::JoinHandle<()> {
+    let sharded = sharded.clone();
+    let check = (max_age / 4).clamp(Duration::from_secs(1), Duration::from_secs(30));
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(check);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The first tick fires immediately; skip it so we don't seal a
+        // block that was just opened this instant.
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            for (k, shard) in sharded.shards().iter().enumerate() {
+                let mut guard = shard.lock().await;
+                match guard.flush_if_aged(max_age).await {
+                    Ok(true) => info!(signal, shard = k, "time-based flush sealed block"),
+                    Ok(false) => {}
+                    Err(e) => warn!(signal, shard = k, error = %e, "time-based flush failed"),
+                }
+            }
+        }
+    })
 }
 
 /// Flush every shard of one signal's [`ShardedPipeline`] on shutdown,

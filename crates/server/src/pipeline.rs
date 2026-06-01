@@ -83,7 +83,11 @@ use object_store::ObjectStore;
 use scry_block::{BlockBuilder, BlockBuilderConfig, BlockEvent, BlockEventSink};
 use scry_catalog::Catalog;
 use scry_wal::{SegmentId, Wal, WalConfig};
-use std::{path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::{
     sync::{Mutex, Semaphore},
     task::JoinSet,
@@ -223,6 +227,15 @@ pub struct Pipeline<B: BlockBuilder> {
     /// means uploads emit nothing — convergence isn't needed. Set via
     /// [`Pipeline::set_event_sink`] / [`ShardedPipeline::with_event_sink`].
     event_sink: Option<Arc<dyn BlockEventSink>>,
+    /// When the current (open) block first received a record, or `None`
+    /// when the builder is empty. Drives the time-based flush
+    /// ([`Pipeline::flush_if_aged`]): a low-volume or idle signal would
+    /// otherwise never cross the size-based `should_close` threshold, so
+    /// its records would sit in RAM (and re-replay from the WAL on every
+    /// restart) and never become queryable. Invariant: `Some` iff the
+    /// builder is non-empty. Set on the empty→non-empty transition in the
+    /// ingest paths (and after WAL replay), cleared in `spawn_upload`.
+    block_started_at: Option<Instant>,
 }
 
 impl<B: BlockBuilder> Pipeline<B> {
@@ -285,6 +298,12 @@ impl<B: BlockBuilder> Pipeline<B> {
             );
         }
 
+        // Records replayed from the WAL populate the builder before any
+        // live ingest. Stamp the block's start now so the time-based flush
+        // will seal it even if this signal then goes idle (the exact case
+        // that left 22.7M replayed-but-never-uploaded rows stuck in RAM).
+        let block_started_at = (!builder.is_empty()).then(Instant::now);
+
         Ok(Self {
             wal: Arc::new(Mutex::new(wal)),
             builder,
@@ -298,6 +317,7 @@ impl<B: BlockBuilder> Pipeline<B> {
             upload_stats: None,
             adaptive_compression: false,
             event_sink: None,
+            block_started_at,
         })
     }
 
@@ -396,6 +416,7 @@ impl<B: BlockBuilder> Pipeline<B> {
             .context("WAL append")?;
 
         self.builder.merge(scratch);
+        self.mark_block_started();
 
         if self.builder.should_close() {
             self.spawn_upload().await?;
@@ -425,6 +446,7 @@ impl<B: BlockBuilder> Pipeline<B> {
             .context("WAL append")?;
 
         let n = (self.decode)(payload, &mut self.builder)? as u64;
+        self.mark_block_started();
 
         if self.builder.should_close() {
             self.spawn_upload().await?;
@@ -498,6 +520,8 @@ impl<B: BlockBuilder> Pipeline<B> {
 
         let new_builder = B::new(self.writer_uuid, self.cfg);
         let mut old_builder = std::mem::replace(&mut self.builder, new_builder);
+        // The fresh builder is empty: the next record starts a new block.
+        self.block_started_at = None;
 
         // Adaptive compression: decide *this* block's ZSTD level from the
         // current load now that we hold a permit and know the upload pool's
@@ -547,6 +571,39 @@ impl<B: BlockBuilder> Pipeline<B> {
                 warn!(error = %e, "upload task join error");
             }
         }
+    }
+
+    /// Stamp the open block's start time on the empty→non-empty
+    /// transition. Idempotent while a block stays open (only the first
+    /// record after a fresh builder sets it); cleared by `spawn_upload`.
+    fn mark_block_started(&mut self) {
+        if self.block_started_at.is_none() && !self.builder.is_empty() {
+            self.block_started_at = Some(Instant::now());
+        }
+    }
+
+    /// Seal + upload the open block if it has been accumulating for at
+    /// least `max_age`, regardless of size. This is what makes a
+    /// low-volume or idle signal queryable: without it a block only
+    /// closes on the size-based `should_close` threshold (1M rows / 128
+    /// MiB), so a trickle of data never seals and never lands in the
+    /// bucket. Returns `true` if a block was sealed. Empty builders and
+    /// not-yet-aged blocks are no-ops. Called on an interval by the
+    /// server's per-signal flush ticker while holding the shard lock.
+    pub async fn flush_if_aged(&mut self, max_age: Duration) -> Result<bool> {
+        if self.builder.is_empty() {
+            return Ok(false);
+        }
+        // `None` while non-empty shouldn't happen (the ingest paths and
+        // replay both stamp it), but treat it as "seal now" rather than
+        // leaking the block forever.
+        let aged = self.block_started_at.map(|t| t.elapsed() >= max_age).unwrap_or(true);
+        if !aged {
+            return Ok(false);
+        }
+        self.spawn_upload().await?;
+        self.reap_finished();
+        Ok(true)
     }
 
     /// Drain everything: rotate any remaining records into a final
@@ -1093,5 +1150,68 @@ mod tests {
             objs += 1;
         }
         assert_eq!(objs, N * 2, "each closed block uploads parquet + meta.json");
+    }
+
+    /// The time-based flush seals an open block that is below the
+    /// size-based `should_close` threshold — the case a low-volume or
+    /// idle signal would otherwise never upload. `max_age = 0` makes any
+    /// non-empty block immediately "aged".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flush_if_aged_seals_below_size_threshold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        // A high threshold so size-based sealing never fires in this test.
+        let cfg = BlockBuilderConfig { max_rows: 1_000_000, ..Default::default() };
+
+        let mut pipeline = Pipeline::<DummyBlockBuilder>::open_with_config(
+            tmp.path().to_path_buf(),
+            store.clone(),
+            None,
+            Uuid::now_v7(),
+            append_one,
+            cfg,
+        )
+        .await
+        .unwrap();
+
+        // An empty builder is a no-op regardless of age.
+        assert!(
+            !pipeline.flush_if_aged(std::time::Duration::ZERO).await.unwrap(),
+            "empty builder never seals"
+        );
+
+        // One record — well under max_rows, so `should_close` stays false.
+        pipeline.ingest(b"x").await.unwrap();
+
+        // A large max_age means the block isn't old enough yet.
+        assert!(
+            !pipeline
+                .flush_if_aged(std::time::Duration::from_secs(3600))
+                .await
+                .unwrap(),
+            "a fresh block younger than max_age is not sealed"
+        );
+
+        // max_age = 0 ⇒ aged ⇒ seal it even though it's tiny.
+        assert!(
+            pipeline.flush_if_aged(std::time::Duration::ZERO).await.unwrap(),
+            "an aged non-empty block seals regardless of size"
+        );
+        pipeline.flush().await.unwrap();
+
+        use futures::StreamExt;
+        let mut listing = store.list(None);
+        let mut objs = 0u64;
+        while listing.next().await.is_some() {
+            objs += 1;
+        }
+        assert_eq!(objs, 2, "the time-based flush uploaded parquet + meta.json");
+
+        // After sealing, the builder is empty again — another aged flush
+        // is a no-op (no duplicate block).
+        assert!(
+            !pipeline.flush_if_aged(std::time::Duration::ZERO).await.unwrap(),
+            "no block to seal after a flush"
+        );
     }
 }
