@@ -106,8 +106,7 @@ pub fn spawn_log_scanner(
             let found_set: HashSet<PathBuf> = found.iter().map(|(_, p)| p.clone()).collect();
 
             for (pod, path) in found {
-                if let std::collections::hash_map::Entry::Vacant(slot) =
-                    active.entry(path.clone())
+                if let std::collections::hash_map::Entry::Vacant(slot) = active.entry(path.clone())
                 {
                     info!(path = %path.display(), "tailing new container log");
                     let h = spawn_tailer(
@@ -187,9 +186,5 @@ async fn scan(logs_root: &PathBuf) -> Vec<(PodPath, PathBuf)> {
 }
 
 async fn is_dir(entry: &tokio::fs::DirEntry) -> bool {
-    entry
-        .file_type()
-        .await
-        .map(|t| t.is_dir())
-        .unwrap_or(false)
+    entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false)
 }

@@ -44,7 +44,10 @@ of it. That's `scry`.
 - **Two ways to feed it:**
   - the **agent** (`scry-agent`) — a per-node collector that tails CRI
     container logs and ships them over the native wire (logs today;
-    Prometheus scrape and pprof pull are planned);
+    Prometheus scrape and pprof pull are planned). A node-side
+    **keep-only label allow-list** (`--keep`, opt-in) lets a busy node
+    forward only the streams that match, dropping the rest before they
+    hit the wire (D-043);
   - the **gateway** (`scry-gateway`) — a **fan-out hub**. It terminates
     *foreign push protocols* (**OTLP/HTTP traces**, **legacy Pyroscope
     `/ingest`**, **Prometheus remote-write**) over HTTP and, opt-in, the
@@ -125,7 +128,9 @@ in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); decisions in
   `<prefix>-<service>` (or `<prefix>-general`), and the sink creates and
   continuously re-asserts the ISM rollover policy (size+age, no
   auto-delete) and an index template with `flat_object` label mappings —
-  so cluster-side drift can't silently break ingest.
+  so cluster-side drift can't silently break ingest. For Amazon OpenSearch
+  Service / Serverless, `--opensearch-aws-sigv4` signs every request with
+  AWS SigV4 (creds + region from the default AWS chain — never argv).
   `scripts/smoke-gateway.sh` drives the three HTTP protocols end to end
   against a Garage-backed server.
 
@@ -199,6 +204,16 @@ To accept foreign push protocols, run the gateway alongside the server:
 ./target/release/scry-gateway \
   --listen 0.0.0.0:4318 \
   --loki-url http://loki:3100 --opensearch-url http://opensearch:9200
+
+# Amazon OpenSearch Service (managed) / Serverless: sign every request (bulk
+# writes AND the self-management calls) with AWS SigV4. Creds + region come
+# from the default AWS chain (env / profile / EKS IRSA / IMDS) — never argv.
+./target/release/scry-gateway \
+  --listen 0.0.0.0:4318 \
+  --opensearch-url https://search-foo.us-east-1.es.amazonaws.com \
+  --opensearch-index scry-logs \
+  --opensearch-aws-sigv4 --opensearch-aws-region us-east-1
+  # --opensearch-aws-service defaults to `es`; use `aoss` for Serverless.
 ```
 
 Every sink is opt-in (`--upstream`, `--loki-url`, `--opensearch-url`); at
@@ -339,7 +354,30 @@ downstream outage is bounded by each sink's in-memory queue depth (D-041).
   attributes as structured metadata) and/or the OpenSearch `_bulk` NDJSON
   (one doc per entry, `@timestamp` + `body` + `severity` + labels) and
   shipped alongside the scry sink. Logs only; metrics/traces/profiles go to
-  scry alone.
+  scry alone. For Amazon OpenSearch Service / Serverless, add
+  `--opensearch-aws-sigv4 --opensearch-aws-region <region>` (and
+  `--opensearch-aws-service aoss` for Serverless) to sign every request via
+  AWS SigV4; credentials + region resolve from the default AWS chain (env,
+  shared profile, EKS IRSA, EC2/ECS IMDS).
+
+- **Restrict what a busy node forwards (`scry-agent --keep`).** By default
+  the agent ships every container log stream it finds. A repeatable
+  keep-only allow-list forwards only matching streams and drops the rest at
+  the node, before they go on the wire:
+
+  ```bash
+  scry-agent --server-addr scry:4000 \
+    --keep 'namespace=~"prod-.*"' \
+    --keep k8s_app=api
+  # ships only streams in a prod-* namespace AND with pod label app=api;
+  # everything else is dropped on the node.
+  ```
+
+  Matchers are `key=value` | `key!=value` | `key=~regex` | `key!~regex`
+  (regex whole-string-anchored; values may be double-quoted), ANDed
+  together, and match against the stream labels `namespace` / `pod` /
+  `container` / `node` plus pod labels as `k8s_<key>`. Omit `--keep`
+  entirely to ship everything (the default).
 
 ## Scope (v0 → v1)
 

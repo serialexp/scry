@@ -86,7 +86,12 @@ impl PodPath {
         if namespace.is_empty() || pod.is_empty() || uid.is_empty() || container.is_empty() {
             return None;
         }
-        Some(PodPath { namespace, pod, uid, container })
+        Some(PodPath {
+            namespace,
+            pod,
+            uid,
+            container,
+        })
     }
 }
 

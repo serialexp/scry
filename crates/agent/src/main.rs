@@ -13,7 +13,7 @@ use anyhow::Result;
 use clap::Parser;
 use scry_proto::{
     build,
-    constants::{COMPRESSION_ZSTD, Signal, SIGNAL_BIT_LOGS},
+    constants::{Signal, COMPRESSION_ZSTD, SIGNAL_BIT_LOGS},
     generated::{LogEntry, LogStream, LogsBatch},
     LabelPair,
 };
@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 mod cri;
 mod discovery;
+mod filter;
 mod stream;
 
 use cri::RawLog;
@@ -79,18 +80,37 @@ struct Args {
     /// How often to rescan `logs_root` for new/removed container log files.
     #[arg(long, value_parser = parse_duration, default_value = "5s")]
     scan_interval: Duration,
+
+    /// Keep-only label allow-list (repeatable). A log stream is shipped only if
+    /// it matches ALL `--keep` matchers; everything else is dropped at the node
+    /// before it goes on the wire. Omit to ship everything (the default).
+    ///
+    /// Each matcher is `key=value` | `key!=value` | `key=~regex` | `key!~regex`
+    /// (regex is whole-string-anchored; values may be double-quoted). Matches
+    /// against stream labels: `namespace`, `pod`, `container`, `node`, and pod
+    /// labels exposed as `k8s_<key>` — e.g. `--keep 'namespace=~"prod-.*"'
+    /// --keep k8s_app=api`. An absent label is treated as empty.
+    #[arg(long = "keep")]
+    keep: Vec<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
     let args = Args::parse();
+
+    let keep_filter = filter::LabelFilter::parse(&args.keep)?;
+    if !keep_filter.is_empty() {
+        info!(
+            matchers = keep_filter.len(),
+            "keep-only label allow-list active"
+        );
+    }
 
     let hostname = hostname_string();
     let node = args.node_name.clone().unwrap_or_else(|| hostname.clone());
@@ -130,8 +150,14 @@ async fn main() -> Result<()> {
         &hostname,
         SIGNAL_BIT_LOGS,
         vec![
-            LabelPair { key: "service".into(), value: "scry-agent".into() },
-            LabelPair { key: "node".into(), value: node.clone() },
+            LabelPair {
+                key: "service".into(),
+                value: "scry-agent".into(),
+            },
+            LabelPair {
+                key: "node".into(),
+                value: node.clone(),
+            },
         ],
     )
     .await?;
@@ -149,6 +175,12 @@ async fn main() -> Result<()> {
 
     // ── Batcher loop ───────────────────────────────────────────────────
     let mut pending = Pending::default();
+    // Per-fingerprint keep/drop decision, so the (possibly regex) allow-list
+    // runs once per distinct stream rather than once per line. Lives across
+    // flushes (Pending is drained each flush); a stream's labels — and thus its
+    // fingerprint — are stable, so the cached decision stays valid.
+    let mut keep_cache: HashMap<u64, bool> = HashMap::new();
+    let mut dropped: u64 = 0;
     let mut batch_id: u64 = 0;
     let mut flush_timer = tokio::time::interval(args.flush_interval);
     flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -159,7 +191,7 @@ async fn main() -> Result<()> {
             maybe = log_rx.recv() => {
                 match maybe {
                     Some(rec) => {
-                        ingest(&mut pending, &registry, &node, rec).await;
+                        ingest(&mut pending, &registry, &node, rec, &keep_filter, &mut keep_cache, &mut dropped).await;
                         if pending.record_count >= args.batch_max_lines
                             || pending.approx_bytes >= args.batch_max_bytes
                         {
@@ -184,7 +216,16 @@ async fn main() -> Result<()> {
     // ── Drain + graceful close ─────────────────────────────────────────
     let _ = shutdown_tx.send(true);
     while let Ok(rec) = log_rx.try_recv() {
-        ingest(&mut pending, &registry, &node, rec).await;
+        ingest(
+            &mut pending,
+            &registry,
+            &node,
+            rec,
+            &keep_filter,
+            &mut keep_cache,
+            &mut dropped,
+        )
+        .await;
     }
     flush(&mut conn, &mut pending, &mut batch_id, &mut flush_sig).await?;
     // Best-effort Goodbye: if the upstream is down at shutdown the socket is
@@ -197,7 +238,11 @@ async fn main() -> Result<()> {
         let _ = h.await;
     }
     let _ = scanner_handle.await;
-    info!(batches = batch_id, "agent done");
+    info!(
+        batches = batch_id,
+        dropped_by_filter = dropped,
+        "agent done"
+    );
     Ok(())
 }
 
@@ -222,16 +267,43 @@ impl Pending {
 }
 
 /// Fold one tailed log line into the pending batch.
+///
+/// Records whose stream labels don't pass the keep-only allow-list are dropped
+/// here — before any batch state is touched — so they never go on the wire. The
+/// keep/drop decision is cached per fingerprint (`keep_cache`) to keep the
+/// allow-list off the per-line hot path.
+#[allow(clippy::too_many_arguments)]
 async fn ingest(
     pending: &mut Pending,
     registry: &discovery::PodRegistry,
     node: &str,
     rec: RawLog,
+    keep_filter: &filter::LabelFilter,
+    keep_cache: &mut HashMap<u64, bool>,
+    dropped: &mut u64,
 ) {
     let (fp, labels) = {
         let guard = registry.read().await;
         stream::stream_labels(&rec.pod, node, guard.get(&rec.pod.uid))
     };
+
+    if !keep_filter.is_empty() {
+        let keep = *keep_cache
+            .entry(fp)
+            .or_insert_with(|| keep_filter.keeps(&labels));
+        if !keep {
+            *dropped += 1;
+            // Sparse heartbeat so operators can see the filter cutting volume
+            // without flooding the log on every dropped line.
+            if dropped.is_multiple_of(100_000) {
+                info!(
+                    dropped = *dropped,
+                    "dropping log streams not matching --keep allow-list"
+                );
+            }
+            return;
+        }
+    }
 
     if pending.record_count == 0 {
         pending.ts_min = rec.ts_unix_nano;
@@ -256,7 +328,11 @@ async fn ingest(
     pending
         .streams
         .entry(fp)
-        .or_insert_with(|| LogStream { fingerprint: fp, labels, entries: Vec::new() })
+        .or_insert_with(|| LogStream {
+            fingerprint: fp,
+            labels,
+            entries: Vec::new(),
+        })
         .entries
         .push(entry);
 }
@@ -306,7 +382,11 @@ async fn flush(
     loop {
         match conn.send_batch_stamped(&mut frame).await {
             Ok(()) => {
-                info!(batch_id = *batch_id, records = record_count, "shipped log batch");
+                info!(
+                    batch_id = *batch_id,
+                    records = record_count,
+                    "shipped log batch"
+                );
                 *batch_id += 1;
                 pending.reset();
                 return Ok(());

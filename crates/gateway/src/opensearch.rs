@@ -37,9 +37,11 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
+    sync::Arc,
     time::Duration,
 };
 
+use anyhow::Context;
 use reqwest::{header::CONTENT_TYPE, StatusCode};
 use scry_proto::generated::{LogStream, LogsBatch};
 use serde::Serialize;
@@ -47,7 +49,7 @@ use serde_json::{json, Value};
 use tokio::{sync::mpsc, time::MissedTickBehavior};
 use tracing::{info, warn};
 
-use crate::sink::Fanout;
+use crate::{aws_sign::SigV4Signer, sink::Fanout};
 
 /// Label keys that carry a service name, in priority order. The first present,
 /// non-empty value becomes the per-service index segment; if none match, the
@@ -257,6 +259,9 @@ pub struct OpenSearchConfig {
     pub rollover_age: String,
     /// How often to re-assert managed assets (drift correction).
     pub reconcile_interval: Duration,
+    /// AWS SigV4 signer. `Some` for Amazon OpenSearch Service / Serverless
+    /// (which reject unsigned requests); `None` for a self-hosted cluster.
+    pub signer: Option<Arc<SigV4Signer>>,
 }
 
 /// Worker that ships fanned-out log batches to OpenSearch and (by default)
@@ -276,6 +281,9 @@ pub struct OpenSearchSink {
     ensured: HashSet<String>,
     /// Set after a write error so the next loop turn re-asserts managed assets.
     needs_reconcile: bool,
+    /// AWS SigV4 signer applied to every request when targeting Amazon
+    /// OpenSearch Service / Serverless; `None` for a self-hosted cluster.
+    signer: Option<Arc<SigV4Signer>>,
 }
 
 impl OpenSearchSink {
@@ -293,7 +301,19 @@ impl OpenSearchSink {
             reconcile_interval: cfg.reconcile_interval,
             ensured: HashSet::new(),
             needs_reconcile: false,
+            signer: cfg.signer,
         }
+    }
+
+    /// Build, optionally SigV4-sign, and execute one request. All HTTP the sink
+    /// makes (bulk writes + management calls) goes through here so AWS-managed
+    /// endpoints are authorized uniformly.
+    async fn send(&self, builder: reqwest::RequestBuilder) -> anyhow::Result<reqwest::Response> {
+        let mut req = builder.build().context("building OpenSearch request")?;
+        if let Some(signer) = &self.signer {
+            signer.sign(&mut req).await?;
+        }
+        self.http.execute(req).await.map_err(Into::into)
     }
 
     pub async fn run(mut self, mut rx: mpsc::Receiver<Fanout>) {
@@ -360,11 +380,12 @@ impl OpenSearchSink {
             return Ok(());
         }
         let resp = self
-            .http
-            .post(format!("{}/_bulk", self.base))
-            .header(CONTENT_TYPE, "application/x-ndjson")
-            .body(body)
-            .send()
+            .send(
+                self.http
+                    .post(format!("{}/_bulk", self.base))
+                    .header(CONTENT_TYPE, "application/x-ndjson")
+                    .body(body),
+            )
             .await?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -398,10 +419,7 @@ impl OpenSearchSink {
     async fn put_index_template(&self) -> anyhow::Result<()> {
         let url = format!("{}/_index_template/{}", self.base, self.template_name);
         let resp = self
-            .http
-            .put(&url)
-            .json(&index_template_doc(&self.prefix))
-            .send()
+            .send(self.http.put(&url).json(&index_template_doc(&self.prefix)))
             .await?;
         ensure_success(resp, "put index template").await
     }
@@ -412,9 +430,9 @@ impl OpenSearchSink {
         let url = format!("{}/_plugins/_ism/policies/{}", self.base, self.policy_id);
         let doc = ism_policy_doc(&self.prefix, &self.rollover_size, &self.rollover_age);
 
-        let get = self.http.get(&url).send().await?;
+        let get = self.send(self.http.get(&url)).await?;
         if get.status() == StatusCode::NOT_FOUND {
-            let resp = self.http.put(&url).json(&doc).send().await?;
+            let resp = self.send(self.http.put(&url).json(&doc)).await?;
             return ensure_success(resp, "create ISM policy").await;
         }
         if !get.status().is_success() {
@@ -429,7 +447,7 @@ impl OpenSearchSink {
             (Some(seq), Some(term)) => format!("{url}?if_seq_no={seq}&if_primary_term={term}"),
             _ => url.clone(),
         };
-        let resp = self.http.put(&put_url).json(&doc).send().await?;
+        let resp = self.send(self.http.put(&put_url).json(&doc)).await?;
         if resp.status() == StatusCode::CONFLICT {
             // Someone updated it between our GET and PUT; next reconcile retries.
             warn!("opensearch: ISM policy update conflicted; will retry next reconcile");
@@ -442,10 +460,10 @@ impl OpenSearchSink {
     /// race ("resource_already_exists").
     async fn ensure_data_stream(&self, name: &str) -> anyhow::Result<()> {
         let url = format!("{}/_data_stream/{}", self.base, name);
-        if self.http.get(&url).send().await?.status().is_success() {
+        if self.send(self.http.get(&url)).await?.status().is_success() {
             return Ok(());
         }
-        let put = self.http.put(&url).send().await?;
+        let put = self.send(self.http.put(&url)).await?;
         let status = put.status();
         if status.is_success() {
             return Ok(());

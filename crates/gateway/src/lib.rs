@@ -22,6 +22,7 @@
 //! `loki::to_push_request`, `opensearch::to_bulk_ndjson`, …) are pure and
 //! unit-tested; the handlers and sink workers are thin shells over them.
 
+pub mod aws_sign;
 pub mod loki;
 pub mod opensearch;
 pub mod otlp;

@@ -22,14 +22,29 @@ pub fn stream_labels(
     pod_labels: Option<&BTreeMap<String, String>>,
 ) -> (u64, Vec<LabelPair>) {
     let mut labels = Vec::with_capacity(4 + pod_labels.map_or(0, |m| m.len()));
-    labels.push(LabelPair { key: "namespace".into(), value: pod.namespace.clone() });
-    labels.push(LabelPair { key: "pod".into(), value: pod.pod.clone() });
-    labels.push(LabelPair { key: "container".into(), value: pod.container.clone() });
-    labels.push(LabelPair { key: "node".into(), value: node.to_string() });
+    labels.push(LabelPair {
+        key: "namespace".into(),
+        value: pod.namespace.clone(),
+    });
+    labels.push(LabelPair {
+        key: "pod".into(),
+        value: pod.pod.clone(),
+    });
+    labels.push(LabelPair {
+        key: "container".into(),
+        value: pod.container.clone(),
+    });
+    labels.push(LabelPair {
+        key: "node".into(),
+        value: node.to_string(),
+    });
 
     if let Some(m) = pod_labels {
         for (k, v) in m {
-            labels.push(LabelPair { key: format!("k8s_{k}"), value: v.clone() });
+            labels.push(LabelPair {
+                key: format!("k8s_{k}"),
+                value: v.clone(),
+            });
         }
     }
 
@@ -53,8 +68,12 @@ mod tests {
     #[test]
     fn core_labels_present() {
         let (_fp, labels) = stream_labels(&pp(), "node-1", None);
-        assert!(labels.iter().any(|l| l.key == "namespace" && l.value == "ns"));
-        assert!(labels.iter().any(|l| l.key == "node" && l.value == "node-1"));
+        assert!(labels
+            .iter()
+            .any(|l| l.key == "namespace" && l.value == "ns"));
+        assert!(labels
+            .iter()
+            .any(|l| l.key == "node" && l.value == "node-1"));
         assert_eq!(labels.len(), 4);
     }
 
@@ -64,7 +83,9 @@ mod tests {
         let mut m = BTreeMap::new();
         m.insert("app".to_string(), "api".to_string());
         let (fp_enriched, labels) = stream_labels(&pp(), "n", Some(&m));
-        assert!(labels.iter().any(|l| l.key == "k8s_app" && l.value == "api"));
+        assert!(labels
+            .iter()
+            .any(|l| l.key == "k8s_app" && l.value == "api"));
         assert_ne!(fp_bare, fp_enriched);
     }
 }

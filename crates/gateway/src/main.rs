@@ -6,11 +6,12 @@
 //! OpenSearch — the latter two logs-only, with the OpenSearch sink self-managing
 //! its per-service rolling data streams + lifecycle assets.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use scry_gateway::{
+    aws_sign::SigV4Signer,
     loki::LokiSink,
     opensearch::{OpenSearchConfig, OpenSearchSink},
     router, serve_wire,
@@ -87,6 +88,24 @@ struct Args {
     #[arg(long, value_parser = parse_duration, default_value = "5m")]
     opensearch_reconcile_interval: Duration,
 
+    /// Sign OpenSearch requests with **AWS SigV4** — required for Amazon
+    /// OpenSearch Service (managed domains) and OpenSearch Serverless, which
+    /// reject unsigned requests. Credentials come from the standard AWS chain
+    /// (env vars, shared profile, EKS IRSA, EC2/ECS IMDS). Leave off for a
+    /// self-hosted cluster.
+    #[arg(long)]
+    opensearch_aws_sigv4: bool,
+
+    /// AWS region for SigV4 signing. Falls back to the resolved AWS config
+    /// (`AWS_REGION` / profile) when unset. Only used with `--opensearch-aws-sigv4`.
+    #[arg(long)]
+    opensearch_aws_region: Option<String>,
+
+    /// SigV4 signing name: `es` for Amazon OpenSearch Service (managed domains),
+    /// `aoss` for OpenSearch Serverless. Only used with `--opensearch-aws-sigv4`.
+    #[arg(long, default_value = "es")]
+    opensearch_aws_service: String,
+
     /// Per-sink queue depth. Each sink drains its own bounded queue; on overflow
     /// it drops + counts (best-effort), so this bounds buffering during a
     /// downstream outage.
@@ -154,6 +173,17 @@ async fn main() -> Result<()> {
         }
         if let Some(url) = args.opensearch_url.clone() {
             let managed = !args.opensearch_unmanaged;
+            let signer = if args.opensearch_aws_sigv4 {
+                Some(Arc::new(
+                    build_sigv4_signer(
+                        args.opensearch_aws_region.clone(),
+                        args.opensearch_aws_service.clone(),
+                    )
+                    .await?,
+                ))
+            } else {
+                None
+            };
             let sink = OpenSearchSink::new(
                 http.clone(),
                 OpenSearchConfig {
@@ -163,6 +193,7 @@ async fn main() -> Result<()> {
                     rollover_size: args.opensearch_rollover_size.clone(),
                     rollover_age: args.opensearch_rollover_age.clone(),
                     reconcile_interval: args.opensearch_reconcile_interval,
+                    signer,
                 },
             );
             sinks.push(spawn_sink(
@@ -175,6 +206,7 @@ async fn main() -> Result<()> {
                 url = %url,
                 prefix = %args.opensearch_index,
                 managed,
+                sigv4 = args.opensearch_aws_sigv4,
                 "opensearch sink enabled (logs)"
             );
         }
@@ -271,6 +303,27 @@ async fn shutdown_signal() {
         _ = ctrl_c => {}
         _ = terminate => {}
     }
+}
+
+/// Resolve AWS credentials + region from the standard chain and build the SigV4
+/// signer for the OpenSearch sink. Region precedence: `--opensearch-aws-region`,
+/// then whatever the AWS config resolves (`AWS_REGION` / profile).
+async fn build_sigv4_signer(region: Option<String>, service: String) -> Result<SigV4Signer> {
+    let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
+    if let Some(r) = region.clone() {
+        loader = loader.region(aws_config::Region::new(r));
+    }
+    let cfg = loader.load().await;
+    let resolved_region = cfg
+        .region()
+        .map(|r| r.as_ref().to_string())
+        .or(region)
+        .context("no AWS region for OpenSearch SigV4: set --opensearch-aws-region or AWS_REGION")?;
+    let provider = cfg
+        .credentials_provider()
+        .context("no AWS credentials resolved for OpenSearch SigV4 (env, profile, IRSA, IMDS)")?;
+    tracing::info!(region = %resolved_region, service = %service, "opensearch SigV4 signing enabled");
+    Ok(SigV4Signer::new(provider, resolved_region, service))
 }
 
 fn hostname_string() -> String {

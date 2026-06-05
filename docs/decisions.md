@@ -1769,15 +1769,108 @@ which is where the type conflicts come from in the first place.
   `flat_object` keeps subfields keyword-searchable by dot-path
   (`labels.service`, `attributes.status`) with one stable mapping entry.
 
+**AWS SigV4 (managed OpenSearch / Serverless).** Amazon OpenSearch Service domains
+and OpenSearch Serverless collections reject unsigned requests, so a self-managing
+sink that fires management calls (ISM policy, index template, data streams) *and*
+bulk writes must sign **all** of them. `--opensearch-aws-sigv4` turns on AWS SigV4
+signing via `crates/gateway/src/aws_sign.rs` (`SigV4Signer`, built on `aws-sigv4` +
+`aws-config`):
+- **Credentials + region from the standard chain.** `aws-config`'s default provider
+  resolves env vars, the shared profile, EKS IRSA (web-identity), or EC2/ECS IMDS —
+  whichever the deployment offers — so nothing secret ever reaches argv. Region is
+  taken from the resolved config or `--opensearch-aws-region`; absence is a startup
+  error rather than a silent unsigned request.
+- **Signing name is explicit.** `--opensearch-aws-service` selects `es` (managed
+  domains) vs `aoss` (Serverless) — they sign under different service names.
+- **Sign just before send.** Each request is built as a `reqwest::Request`, a
+  `SignableRequest` view (method/url/headers/body) is signed, and the resulting
+  `Authorization` + `X-Amz-*` headers are copied back. `host` is derived by aws-sigv4
+  from the URL (matching what hyper sends), and `x-amz-content-sha256` is emitted
+  (`PayloadChecksumKind::XAmzSha256`) so the body is covered — required by Serverless,
+  accepted by managed domains. Credentials are cached in the single-threaded worker
+  and refreshed only within 5 min of expiry, so steady-state signing never round-trips
+  to IMDS/STS. When the flag is off the sink sends plain requests (self-hosted
+  OpenSearch with basic/no auth), so the signing path is zero-cost for non-AWS users.
+
 **Status.** Implemented in `crates/gateway/src/opensearch.rs` (pure
 `service_segment`/`data_stream_name`/`to_bulk_ndjson`/`ism_policy_doc`/
 `index_template_doc` + the `OpenSearchSink` worker) and wired in `main.rs`
 (`--opensearch-unmanaged`/`--opensearch-rollover-size`/`--opensearch-rollover-age`/
 `--opensearch-reconcile-interval`). Unit tests cover service-key priority, the
 `general` fallback, segment sanitization, per-stream bulk routing, and the
-policy/template JSON shapes. Validated live against `opensearchproject/opensearch:
+policy/template JSON shapes, plus `aws_sign.rs` (SigV4 header structure for both `es`
+and `aoss` signing names). Validated live against `opensearchproject/opensearch:
 2.17.1`: per-service data streams auto-created, policy auto-attached to backing
 indices, `flat_object` subfields + full-text `body` queryable, and an operator's
 hand-edit to the ISM policy (min_size `999gb`, edited description) reverted on the
-next reconcile. Still out of scope: auto-delete/retention in ISM (deliberate),
-non-log signals to OpenSearch, and auth beyond a static URL/header cred.
+next reconcile. SigV4 against Amazon OpenSearch is not exercised by the smoke (no AWS
+endpoint in CI); the signer is covered by a deterministic header-shape unit test.
+Still out of scope: auto-delete/retention in ISM (deliberate), non-log signals to
+OpenSearch, and auth beyond a static URL/header cred or AWS SigV4.
+
+## D-043: scry-agent keep-only label allow-list (node-side admission control)
+
+**Context.** `scry-agent` tails every container log file under `/var/log/pods` on
+its node and ships all of it over the wire. On a busy node that means forwarding
+the world — including chatty system/sidecar containers nobody queries — which
+wastes node→upstream bandwidth and upstream ingest/storage. The forwarding work
+needed a way to say "only forward these streams." This is the agent counterpart to
+the gateway's all-in/all-out stance (D-041): the gateway deliberately has *no*
+routing config ("run two gateways"), but the agent is the volume source, so a valve
+belongs here.
+
+**Decision.** Add an opt-in, node-side, **keep-only (allow-list)** label filter to
+the agent.
+
+- **Where: the agent, at admission.** Confirmed with Bart against the alternatives
+  (gateway-side, per-sink). Filtering at the per-node tailer cuts volume at the
+  source — the dropped bytes never enter a batch, never go on the wire, never reach
+  the upstream. A gateway-side filter would still pay the node→gateway hop; a
+  per-sink filter would reintroduce exactly the routing config D-041 rejects.
+- **Semantics: keep-only, global, AND-of-matchers.** A stream is forwarded only if
+  its labels satisfy **every** configured matcher (logical AND). "Global" because
+  the agent has a single upstream — there is nothing to route *between*. Cross-label
+  OR is expressed with a regex alternation (`namespace=~"a|b"`); the rarer
+  cross-label OR is out of scope (run intent through labels, or a second concern).
+- **Opt-in, keep-all default.** No `--keep` flags ⇒ the filter is empty ⇒ everything
+  ships, byte-for-byte today's behavior. The feature can never silently start
+  dropping logs.
+- **Matcher syntax: Prometheus-style + regex.** `key=value` | `key!=value` |
+  `key=~regex` | `key!~regex`. scry-query's existing `--matcher` is equality-only and
+  returns a bare `(String,String)` for SQL, so it can't carry an op/regex and isn't
+  worth generalizing across crates for one consumer — the agent gets its own small
+  `filter.rs`. Regex is genuinely needed for an allow-list that "cuts the world"
+  (`namespace=~"prod-.*"`), justifying a new `regex` workspace dependency. Regexes
+  are **whole-string-anchored** (`^(?:…)$`) exactly like Prometheus, so `=~"prod"`
+  does not match `production`. Values may be optionally double-quoted. A label the
+  stream doesn't carry is treated as the empty string, so `key=~".+"` means
+  "present and non-empty".
+
+**Why these specifics.**
+- *Drop before any batch state changes.* The check lives in `ingest()` right after
+  `stream::stream_labels` computes `(fingerprint, labels)` and before the ts/byte/
+  count updates and the per-fingerprint `LogStream` insert — so a dropped line
+  leaves zero trace and cannot be shipped.
+- *Cache the verdict per fingerprint.* A stream's label set (and thus its
+  fingerprint) is stable, so the keep/drop decision is computed once per distinct
+  stream and cached in a `HashMap<u64, bool>` that lives across flushes (not in
+  `Pending`, which is drained each flush). This keeps the possibly-regex matchers
+  off the per-line hot path — steady state is one map lookup, zero allocations per
+  line. (`stream_labels` already allocates per line today; that pre-existing cost is
+  not addressed here.)
+- *Observability.* A dropped-line counter is emitted on a sparse `info!` (every
+  100k) and in the final `agent done` log, so operators can confirm the filter is
+  cutting volume without flooding the log.
+
+**Consequence.** A dropped log is gone — there is no node-side spool and the agent
+is already at-most-once (a batch in flight during a crash is lost). The allow-list
+is a deliberate, operator-chosen data-loss valve, not a buffering or sampling
+mechanism.
+
+**Status.** Implemented in `crates/agent/src/filter.rs` (`MatchOp` / `Matcher` /
+`LabelFilter` with `parse`/`keeps`, all pure + unit-tested) and wired into
+`crates/agent/src/main.rs` (`--keep`, the keep-cache, and the drop in `ingest`).
+Unit tests cover the four operators, quoted values, malformed/invalid-regex specs,
+AND semantics, absent-label-as-empty, whole-string anchoring, and the empty-filter
+keep-all case. Out of scope: per-sink/gateway-side filtering, deny-list semantics,
+dynamic/hot-reloaded matchers, and dropping non-log signals.
