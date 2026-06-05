@@ -4401,6 +4401,7 @@ dependencies = [
  "kube",
  "mimalloc",
  "regex",
+ "reqwest",
  "scry-client",
  "scry-proto",
  "tokio",

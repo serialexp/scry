@@ -43,8 +43,10 @@ of it. That's `scry`.
   in speaks this one protocol.
 - **Two ways to feed it:**
   - the **agent** (`scry-agent`) — a per-node collector that tails CRI
-    container logs and ships them over the native wire (logs today;
-    Prometheus scrape and pprof pull are planned). A node-side
+    container logs **and scrapes Prometheus `/metrics` endpoints**
+    (static `--scrape-target` + Kubernetes `prometheus.io/scrape`
+    annotation discovery), shipping both over the native wire (pprof
+    pull is still planned). A node-side
     **keep-only label allow-list** (`--keep`, opt-in) lets a busy node
     forward only the streams that match, dropping the rest before they
     hit the wire (D-043);
@@ -54,9 +56,9 @@ of it. That's `scry`.
     **native binschema wire** (so the agent can point at it too) — then
     forwards every accepted record, best-effort, to *all* configured
     downstream sinks at once: any of the scry ingest server, **Grafana
-    Loki**, and/or **OpenSearch** (Loki/OpenSearch take logs only). Every
-    sink is opt-in — a gateway that only tees logs to Loki/OpenSearch needs
-    no scry server at all. All in → all out, no routing config (for
+    Loki**, **OpenSearch** (both logs only), and/or **Mimir** (metrics only,
+    via remote-write). Every sink is opt-in — a gateway that only tees logs
+    to Loki/OpenSearch needs no scry server at all. All in → all out, no routing config (for
     anything more selective, run a second gateway). See [Point existing
     telemetry at scry](#point-existing-telemetry-at-scry).
 - **Parquet on S3-compatible object storage** as the single source of
@@ -156,8 +158,8 @@ crates/
   scry-list/           catalog inspector / bucket reconciler
   scry-webui/          browser query UI server: serves the SolidJS app + relays queries to scry-queryd (D-040)
   client/              reusable native-wire client, shared by agent + gateway (scry-client)
-  agent/               per-node log-collection agent: tails CRI logs, ships over the wire (scry-agent)
-  gateway/             fan-out hub (scry-gateway): native wire + OTLP/Pyroscope/remote-write in → scry + Loki + OpenSearch out
+  agent/               per-node agent: tails CRI logs + scrapes Prometheus /metrics, ships over the wire (scry-agent)
+  gateway/             fan-out hub (scry-gateway): native wire + OTLP/Pyroscope/remote-write in → scry + Loki + OpenSearch + Mimir out
   noise-spewer/        TCP client; emits random metrics/logs/traces/profiles
   scry-ingestd/        ingest server daemon binary (wraps scry-server)
 proto/                 binschema source-of-truth schemas
@@ -214,15 +216,25 @@ To accept foreign push protocols, run the gateway alongside the server:
   --opensearch-index scry-logs \
   --opensearch-aws-sigv4 --opensearch-aws-region us-east-1
   # --opensearch-aws-service defaults to `es`; use `aoss` for Serverless.
+
+# Tee metrics to Mimir (remote-write out). --mimir-tenant sets X-Scope-OrgID
+# for multi-tenant Mimir; --ca-cert adds a private CA for the HTTPS sinks:
+./target/release/scry-gateway \
+  --listen 0.0.0.0:4318 \
+  --upstream scry-server:4000 \
+  --mimir-url https://mimir:9009 --mimir-tenant team-a \
+  --ca-cert /etc/scry/internal-ca.pem
 ```
 
-Every sink is opt-in (`--upstream`, `--loki-url`, `--opensearch-url`); at
-least one must be configured. `--listen-wire` is opt-in too: with no native
-listener bound, the gateway serves only the foreign HTTP protocols. The scry
-sink connects lazily, so a down/absent scry server never blocks startup.
-Loki/OpenSearch are logs-only; metrics, traces, and profiles go to the scry
-sink alone. Delivery is best-effort and independent per sink — a slow or down
-sink drops + counts without blocking
+Every sink is opt-in (`--upstream`, `--loki-url`, `--opensearch-url`,
+`--mimir-url`); at least one must be configured. `--listen-wire` is opt-in too:
+with no native listener bound, the gateway serves only the foreign HTTP
+protocols. The scry sink connects lazily, so a down/absent scry server never
+blocks startup. Loki/OpenSearch are logs-only; Mimir is metrics-only (remote-
+write to `{url}/api/v1/push`); traces and profiles go to the scry sink alone.
+`--ca-cert` (a PEM bundle) adds a custom CA on top of the built-in roots for
+the Loki/OpenSearch/Mimir HTTPS clients. Delivery is best-effort and
+independent per sink — a slow or down sink drops + counts without blocking
 the inbound or the other sinks (D-041).
 
 End-to-end smoke tests (require a local Garage — `scripts/dev-garage-up.sh`):
@@ -344,7 +356,7 @@ downstream outage is bounded by each sink's in-memory queue depth (D-041).
   the gateway with `--listen-wire 0.0.0.0:4000` and point `scry-agent
   --server-addr <gateway>:4000` (or any native producer) at it. This makes
   the gateway a fan-out front-end for the native wire too — the same
-  records then tee to scry + Loki + OpenSearch.
+  records then tee to scry + Loki + OpenSearch + Mimir.
 
 - **Tee logs to Loki and/or OpenSearch.** Add `--loki-url
   http://loki:3100` and/or `--opensearch-url http://opensearch:9200`
@@ -359,6 +371,17 @@ downstream outage is bounded by each sink's in-memory queue depth (D-041).
   `--opensearch-aws-service aoss` for Serverless) to sign every request via
   AWS SigV4; credentials + region resolve from the default AWS chain (env,
   shared profile, EKS IRSA, EC2/ECS IMDS).
+
+- **Tee metrics to Mimir (`--mimir-url`).** Every metric batch that reaches
+  the gateway — from remote-write or the native wire — is re-emitted as
+  Prometheus remote-write to `{url}/api/v1/push` (the inverse of the
+  remote-write inbound). Add `--mimir-tenant <id>` to set `X-Scope-OrgID` for
+  multi-tenant Mimir. Metrics only; logs/traces/profiles go to scry alone.
+
+- **Trust a private CA (`--ca-cert`).** The Loki/OpenSearch/Mimir HTTPS
+  clients trust only the system roots by default. Point `--ca-cert` at a PEM
+  file (may be a bundle) to add a custom CA on top of the built-in roots for
+  endpoints fronted by an internal CA.
 
 - **Restrict what a busy node forwards (`scry-agent --keep`).** By default
   the agent ships every container log stream it finds. A repeatable
@@ -377,7 +400,31 @@ downstream outage is bounded by each sink's in-memory queue depth (D-041).
   (regex whole-string-anchored; values may be double-quoted), ANDed
   together, and match against the stream labels `namespace` / `pod` /
   `container` / `node` plus pod labels as `k8s_<key>`. Omit `--keep`
-  entirely to ship everything (the default).
+  entirely to ship everything (the default). The same allow-list also
+  filters scraped metric series.
+
+- **Scrape Prometheus metrics (`scry-agent`).** The agent doubles as an
+  Alloy-replacement for the metrics path: it pulls Prometheus `/metrics`
+  endpoints and ships them over the same wire as logs. Targets come from
+  static `--scrape-target` URLs and/or Kubernetes pods annotated
+  `prometheus.io/scrape: "true"` (honoring `prometheus.io/{port,path,scheme}`):
+
+  ```bash
+  scry-agent --server-addr scry:4000 \
+    --scrape-target http://127.0.0.1:9100/metrics \
+    --scrape-interval 15s
+  # plus: any pod on this node with prometheus.io/scrape=true is
+  # discovered and scraped automatically (pod watch must be enabled).
+  ```
+
+  Each series carries `__name__` + the target's `job`/`instance`/k8s
+  labels (a colliding exposed label is renamed `exported_<key>`), and
+  every scrape synthesizes `up` + `scrape_duration_seconds`. Auth is
+  plain HTTP + optional `--scrape-bearer @/path/to/token`. The text
+  parser is hand-rolled (no extra dependency); known gaps vs Alloy —
+  relabeling, Service/Endpoints SD, per-target TLS/mTLS, native
+  histograms, scrape-WAL durability — are deferred (run a real Alloy
+  through `scry-gateway` if you need them).
 
 ## Scope (v0 → v1)
 

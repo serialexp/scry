@@ -19,6 +19,7 @@ k8s-openapi       = { workspace = true }
 kube              = { workspace = true }
 mimalloc          = { workspace = true }
 regex             = { workspace = true }
+reqwest           = { workspace = true }
 scry-client       = { workspace = true }
 scry-proto        = { workspace = true }
 tokio             = { workspace = true }

@@ -5,7 +5,7 @@
 //! binschema wire to a scry ingest server. Logs only, ingest only — the
 //! first dogfood signal.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -13,8 +13,8 @@ use anyhow::Result;
 use clap::Parser;
 use scry_proto::{
     build,
-    constants::{Signal, COMPRESSION_ZSTD, SIGNAL_BIT_LOGS},
-    generated::{LogEntry, LogStream, LogsBatch},
+    constants::{Signal, COMPRESSION_ZSTD, SIGNAL_BIT_LOGS, SIGNAL_BIT_METRICS},
+    generated::{LogEntry, LogStream, LogsBatch, MetricSample, MetricsBatch, SeriesDictEntry},
     LabelPair,
 };
 use tokio::sync::{mpsc, watch};
@@ -24,6 +24,8 @@ use uuid::Uuid;
 mod cri;
 mod discovery;
 mod filter;
+mod promparse;
+mod scrape;
 mod stream;
 
 use cri::RawLog;
@@ -90,8 +92,35 @@ struct Args {
     /// against stream labels: `namespace`, `pod`, `container`, `node`, and pod
     /// labels exposed as `k8s_<key>` — e.g. `--keep 'namespace=~"prod-.*"'
     /// --keep k8s_app=api`. An absent label is treated as empty.
+    ///
+    /// The same allow-list is applied to scraped metric series (matched against
+    /// their full label set, including `job`/`instance`/`__name__`).
     #[arg(long = "keep")]
     keep: Vec<String>,
+
+    /// Static Prometheus scrape target URL (repeatable), e.g.
+    /// `--scrape-target http://127.0.0.1:9100/metrics`. Scraped in addition to
+    /// any pods discovered via `prometheus.io/scrape` annotations.
+    #[arg(long = "scrape-target")]
+    scrape_target: Vec<String>,
+
+    /// Bearer token presented to every static scrape target. Prefer
+    /// `@/path/to/file` (read from a file) over passing the secret on argv.
+    #[arg(long)]
+    scrape_bearer: Option<String>,
+
+    /// `job` label for static scrape targets (discovered targets derive `job`
+    /// from pod labels).
+    #[arg(long, default_value = "scrape")]
+    scrape_default_job: String,
+
+    /// How often to scrape each target.
+    #[arg(long, value_parser = parse_duration, default_value = "15s")]
+    scrape_interval: Duration,
+
+    /// Per-scrape HTTP timeout.
+    #[arg(long, value_parser = parse_duration, default_value = "10s")]
+    scrape_timeout: Duration,
 }
 
 #[tokio::main]
@@ -118,8 +147,14 @@ async fn main() -> Result<()> {
 
     // ── Shared state + shutdown ────────────────────────────────────────
     let registry = discovery::new_registry();
+    let target_registry = discovery::new_target_registry();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (log_tx, mut log_rx) = mpsc::channel::<RawLog>(8192);
+    let (metrics_tx, mut metrics_rx) = mpsc::channel::<scrape::ScrapeResult>(1024);
+
+    // Metrics scraping is active when there are static targets, or when the pod
+    // watch is on (so `prometheus.io/scrape` annotations can be honored).
+    let mut metrics_enabled = !args.no_discovery || !args.scrape_target.is_empty();
 
     // ── Discovery: pod watch (optional) + filesystem scan ──────────────
     let watcher_handle = if args.no_discovery {
@@ -129,6 +164,7 @@ async fn main() -> Result<()> {
         Some(discovery::spawn_pod_watcher(
             node.clone(),
             registry.clone(),
+            target_registry.clone(),
             shutdown_rx.clone(),
         ))
     };
@@ -143,12 +179,44 @@ async fn main() -> Result<()> {
     );
     drop(log_tx); // only the scanner's tailers should keep the channel alive
 
+    // ── Metrics: scrape scheduler (optional) ───────────────────────────
+    let scheduler_handle = if metrics_enabled {
+        let http = reqwest::Client::builder()
+            .timeout(args.scrape_timeout)
+            .build()?;
+        let bearer = resolve_bearer(args.scrape_bearer.clone())?;
+        let static_targets =
+            build_static_targets(&args.scrape_target, &args.scrape_default_job, &node, bearer);
+        info!(
+            static_targets = static_targets.len(),
+            discovery = !args.no_discovery,
+            "metrics scraping enabled"
+        );
+        Some(discovery::spawn_scrape_scheduler(
+            target_registry.clone(),
+            static_targets,
+            http,
+            args.scrape_interval,
+            args.scan_interval,
+            metrics_tx.clone(),
+            shutdown_rx.clone(),
+        ))
+    } else {
+        None
+    };
+    drop(metrics_tx); // only the scheduler's scrape tasks keep the channel alive
+
     // ── Connect ────────────────────────────────────────────────────────
+    let signals = if metrics_enabled {
+        SIGNAL_BIT_LOGS | SIGNAL_BIT_METRICS
+    } else {
+        SIGNAL_BIT_LOGS
+    };
     let mut conn = Client::connect(
         &args.server_addr,
         agent_id,
         &hostname,
-        SIGNAL_BIT_LOGS,
+        signals,
         vec![
             LabelPair {
                 key: "service".into(),
@@ -175,13 +243,18 @@ async fn main() -> Result<()> {
 
     // ── Batcher loop ───────────────────────────────────────────────────
     let mut pending = Pending::default();
+    let mut metrics_pending = MetricsPending::default();
     // Per-fingerprint keep/drop decision, so the (possibly regex) allow-list
     // runs once per distinct stream rather than once per line. Lives across
     // flushes (Pending is drained each flush); a stream's labels — and thus its
-    // fingerprint — are stable, so the cached decision stays valid.
+    // fingerprint — are stable, so the cached decision stays valid. Logs and
+    // metrics keep separate caches (distinct fingerprint spaces).
     let mut keep_cache: HashMap<u64, bool> = HashMap::new();
+    let mut metrics_keep_cache: HashMap<u64, bool> = HashMap::new();
     let mut dropped: u64 = 0;
+    let mut metrics_dropped: u64 = 0;
     let mut batch_id: u64 = 0;
+    let mut metrics_batch_id: u64 = 0;
     let mut flush_timer = tokio::time::interval(args.flush_interval);
     flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -204,8 +277,25 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+            maybe = metrics_rx.recv(), if metrics_enabled => {
+                match maybe {
+                    Some(result) => {
+                        ingest_metrics(&mut metrics_pending, result, &keep_filter, &mut metrics_keep_cache, &mut metrics_dropped);
+                        if metrics_pending.record_count >= args.batch_max_lines
+                            || metrics_pending.approx_bytes >= args.batch_max_bytes
+                        {
+                            flush_metrics(&mut conn, &mut metrics_pending, &mut metrics_batch_id, &mut flush_sig).await?;
+                        }
+                    }
+                    None => {
+                        // Scheduler gone; disable the arm so we don't spin.
+                        metrics_enabled = false;
+                    }
+                }
+            }
             _ = flush_timer.tick() => {
                 flush(&mut conn, &mut pending, &mut batch_id, &mut flush_sig).await?;
+                flush_metrics(&mut conn, &mut metrics_pending, &mut metrics_batch_id, &mut flush_sig).await?;
             }
             _ = main_sig.changed() => {
                 shutting_down = true;
@@ -227,7 +317,23 @@ async fn main() -> Result<()> {
         )
         .await;
     }
+    while let Ok(result) = metrics_rx.try_recv() {
+        ingest_metrics(
+            &mut metrics_pending,
+            result,
+            &keep_filter,
+            &mut metrics_keep_cache,
+            &mut metrics_dropped,
+        );
+    }
     flush(&mut conn, &mut pending, &mut batch_id, &mut flush_sig).await?;
+    flush_metrics(
+        &mut conn,
+        &mut metrics_pending,
+        &mut metrics_batch_id,
+        &mut flush_sig,
+    )
+    .await?;
     // Best-effort Goodbye: if the upstream is down at shutdown the socket is
     // dead and there's nothing to gracefully close.
     if let Err(e) = conn.shutdown("agent shutdown").await {
@@ -237,10 +343,15 @@ async fn main() -> Result<()> {
     if let Some(h) = watcher_handle {
         let _ = h.await;
     }
+    if let Some(h) = scheduler_handle {
+        let _ = h.await;
+    }
     let _ = scanner_handle.await;
     info!(
         batches = batch_id,
+        metrics_batches = metrics_batch_id,
         dropped_by_filter = dropped,
+        metrics_dropped_by_filter = metrics_dropped,
         "agent done"
     );
     Ok(())
@@ -259,6 +370,30 @@ struct Pending {
 impl Pending {
     fn reset(&mut self) {
         self.streams.clear();
+        self.record_count = 0;
+        self.approx_bytes = 0;
+        self.ts_min = 0;
+        self.ts_max = 0;
+    }
+}
+
+/// A metrics batch under construction: a deduplicated series dictionary plus the
+/// samples that reference it. `record_count` counts samples (the batch's record
+/// unit), matching the wire `Batch.record_count` semantics for metrics.
+#[derive(Default)]
+struct MetricsPending {
+    series: HashMap<u64, SeriesDictEntry>,
+    samples: Vec<MetricSample>,
+    record_count: u32,
+    approx_bytes: usize,
+    ts_min: u64,
+    ts_max: u64,
+}
+
+impl MetricsPending {
+    fn reset(&mut self) {
+        self.series.clear();
+        self.samples.clear();
         self.record_count = 0;
         self.approx_bytes = 0;
         self.ts_min = 0;
@@ -337,6 +472,55 @@ async fn ingest(
         .push(entry);
 }
 
+/// Fold one scrape result into the pending metrics batch.
+///
+/// Series whose labels don't pass the keep-only allow-list are dropped (along
+/// with their samples) before any batch state is touched. The keep/drop
+/// decision is cached per fingerprint, like the log path.
+fn ingest_metrics(
+    pending: &mut MetricsPending,
+    result: scrape::ScrapeResult,
+    keep_filter: &filter::LabelFilter,
+    keep_cache: &mut HashMap<u64, bool>,
+    dropped: &mut u64,
+) {
+    // Decide keep/drop per series; insert kept series into the dictionary.
+    let mut kept: HashSet<u64> = HashSet::with_capacity(result.series.len());
+    for s in result.series {
+        let keep = keep_filter.is_empty()
+            || *keep_cache
+                .entry(s.fingerprint)
+                .or_insert_with(|| keep_filter.keeps(&s.labels));
+        if keep {
+            kept.insert(s.fingerprint);
+            pending.series.entry(s.fingerprint).or_insert(s);
+        }
+    }
+
+    for smp in result.samples {
+        if !kept.contains(&smp.fingerprint) {
+            *dropped += 1;
+            if dropped.is_multiple_of(100_000) {
+                info!(
+                    dropped = *dropped,
+                    "dropping metric series not matching --keep allow-list"
+                );
+            }
+            continue;
+        }
+        if pending.record_count == 0 {
+            pending.ts_min = smp.ts_unix_nano;
+            pending.ts_max = smp.ts_unix_nano;
+        } else {
+            pending.ts_min = pending.ts_min.min(smp.ts_unix_nano);
+            pending.ts_max = pending.ts_max.max(smp.ts_unix_nano);
+        }
+        pending.approx_bytes += 24; // fingerprint + ts + value, roughly
+        pending.record_count += 1;
+        pending.samples.push(smp);
+    }
+}
+
 /// Encode + compress the pending batch and ship it, reconnecting with capped
 /// exponential backoff if the ingest server has gone away (e.g. a rolling
 /// restart). No-op when empty.
@@ -378,19 +562,79 @@ async fn flush(
         payload: compressed,
     });
 
+    if ship_frame(conn, &mut frame, shutdown).await? {
+        info!(
+            batch_id = *batch_id,
+            records = record_count,
+            "shipped log batch"
+        );
+        *batch_id += 1;
+    }
+    pending.reset();
+    Ok(())
+}
+
+/// Encode + compress the pending metrics batch and ship it. Same reconnect /
+/// at-most-once semantics as [`flush`]; no-op when empty.
+async fn flush_metrics(
+    conn: &mut Client,
+    pending: &mut MetricsPending,
+    batch_id: &mut u64,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<()> {
+    if pending.record_count == 0 {
+        return Ok(());
+    }
+    let series: Vec<SeriesDictEntry> = pending.series.drain().map(|(_, v)| v).collect();
+    let samples = std::mem::take(&mut pending.samples);
+    let record_count = pending.record_count;
+    let (ts_min, ts_max) = (pending.ts_min, pending.ts_max);
+
+    let payload = MetricsBatch { series, samples }
+        .encode()
+        .expect("MetricsBatch encode is infallible for well-formed inputs");
+    let uncompressed_size = payload.len() as u32;
+    let compressed = zstd::encode_all(payload.as_slice(), ZSTD_LEVEL)
+        .expect("zstd encode_all is infallible on Vec input");
+
+    let mut frame = build::batch(build::BatchArgs {
+        session_id: 0,
+        batch_id: *batch_id,
+        signal: Signal::Metrics.as_u8(),
+        ts_min_unix_nano: ts_min,
+        ts_max_unix_nano: ts_max,
+        record_count,
+        compression: COMPRESSION_ZSTD,
+        uncompressed_size,
+        payload: compressed,
+    });
+
+    if ship_frame(conn, &mut frame, shutdown).await? {
+        info!(
+            batch_id = *batch_id,
+            samples = record_count,
+            "shipped metrics batch"
+        );
+        *batch_id += 1;
+    }
+    pending.reset();
+    Ok(())
+}
+
+/// Send a built batch frame, reconnecting with capped exponential backoff if the
+/// ingest server has gone away. Returns `Ok(true)` once shipped, `Ok(false)` if
+/// `shutdown` fired mid-reconnect (the caller drops the in-flight batch —
+/// at-most-once, like logs). `send_batch_stamped` re-stamps the live session id
+/// on each attempt.
+async fn ship_frame(
+    conn: &mut Client,
+    frame: &mut scry_proto::Frame,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<bool> {
     let mut backoff = Duration::from_millis(200);
     loop {
-        match conn.send_batch_stamped(&mut frame).await {
-            Ok(()) => {
-                info!(
-                    batch_id = *batch_id,
-                    records = record_count,
-                    "shipped log batch"
-                );
-                *batch_id += 1;
-                pending.reset();
-                return Ok(());
-            }
+        match conn.send_batch_stamped(frame).await {
+            Ok(()) => return Ok(true),
             Err(e) => {
                 warn!(error = %e, "batch send failed; reconnecting to ingest server");
             }
@@ -399,9 +643,8 @@ async fn flush(
         // loop back to re-stamp + resend the same frame.
         loop {
             if *shutdown.borrow() {
-                warn!("shutdown during reconnect; dropping in-flight log batch");
-                pending.reset();
-                return Ok(());
+                warn!("shutdown during reconnect; dropping in-flight batch");
+                return Ok(false);
             }
             match conn.reconnect().await {
                 Ok(()) => {
@@ -470,4 +713,62 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
     };
     let base: u64 = num.parse().map_err(|_| format!("invalid duration: {s}"))?;
     Ok(Duration::from_millis(base * mult))
+}
+
+/// Resolve a `--scrape-bearer` argument: a literal token, or `@/path` to read
+/// the token from a file (trimmed). Prefer the file form so the secret never
+/// appears in argv / process listings.
+fn resolve_bearer(arg: Option<String>) -> Result<Option<String>> {
+    match arg {
+        None => Ok(None),
+        Some(s) => match s.strip_prefix('@') {
+            Some(path) => {
+                let tok = std::fs::read_to_string(path)
+                    .map_err(|e| anyhow::anyhow!("reading scrape bearer file {path}: {e}"))?;
+                Ok(Some(tok.trim().to_string()))
+            }
+            None => Ok(Some(s)),
+        },
+    }
+}
+
+/// Build [`scrape::ScrapeTarget`]s for the static `--scrape-target` URLs. Each
+/// carries `job` (the configured default), `instance` (host:port parsed from the
+/// URL), and `node`, mirroring the discovered-target label convention.
+fn build_static_targets(
+    urls: &[String],
+    job: &str,
+    node: &str,
+    bearer: Option<String>,
+) -> Vec<scrape::ScrapeTarget> {
+    urls.iter()
+        .map(|url| scrape::ScrapeTarget {
+            url: url.clone(),
+            labels: vec![
+                LabelPair {
+                    key: "job".into(),
+                    value: job.to_string(),
+                },
+                LabelPair {
+                    key: "instance".into(),
+                    value: instance_from_url(url),
+                },
+                LabelPair {
+                    key: "node".into(),
+                    value: node.to_string(),
+                },
+            ],
+            bearer: bearer.clone(),
+        })
+        .collect()
+}
+
+/// Extract the `host:port` authority from a URL for the `instance` label.
+fn instance_from_url(url: &str) -> String {
+    let after_scheme = url.split("://").nth(1).unwrap_or(url);
+    after_scheme
+        .split('/')
+        .next()
+        .unwrap_or(after_scheme)
+        .to_string()
 }

@@ -1874,3 +1874,109 @@ Unit tests cover the four operators, quoted values, malformed/invalid-regex spec
 AND semantics, absent-label-as-empty, whole-string anchoring, and the empty-filter
 keep-all case. Out of scope: per-sink/gateway-side filtering, deny-list semantics,
 dynamic/hot-reloaded matchers, and dropping non-log signals.
+
+## D-044: gateway Mimir metrics sink + custom CA for the HTTP sinks
+
+**Context.** The fan-out hub (D-041) grew a gap as producers started pushing
+metrics through it: the gateway *accepts* metrics (the Prometheus remote-write
+inbound and the native wire) but the only sink that consumes them is the scry sink.
+A deployment that sends metrics through the gateway could land them in scry but not
+in Mimir — the metrics counterpart to the Loki/OpenSearch logs sinks was simply
+missing. Separately, all three HTTP sinks reach their endpoints with a stock
+`reqwest::Client` trusting only the built-in webpki roots, so any endpoint fronted
+by a private/internal CA fails TLS.
+
+**Decision.** Add a **Mimir remote-write output sink** (metrics only) and a
+**custom CA certificate** option shared by every HTTP sink.
+
+- *Mimir sink is the inverse of the remote-write inbound.* `mimir::to_write_request`
+  reverses `promwrite::map_remote_write`: build a `fingerprint → labels` map from the
+  batch's series dictionary, group `samples` by fingerprint into one `TimeSeries`
+  each (first-seen order), ns → ms timestamps, drop a sample whose fingerprint has no
+  dict entry. It **reuses** `promwrite`'s prost wire types + `encode_snappy` rather
+  than redeclaring the protobuf, so encode is guaranteed symmetric with decode (a
+  round-trip unit test asserts it). POST to `{url}/api/v1/push` (the Mimir
+  distributor remote-write path) with `Content-Type: application/x-protobuf`,
+  `Content-Encoding: snappy`, `X-Prometheus-Remote-Write-Version: 0.1.0`, and
+  `X-Scope-OrgID: <tenant>` when `--mimir-tenant` is set (multi-tenant Mimir). Mask
+  `SIGNAL_BIT_METRICS`; best-effort drop-on-failure like the other sinks (D-041).
+- *Custom CA augments, not replaces.* `tls::build_http_client(timeout, ca_cert)`
+  parses a PEM bundle (`reqwest::Certificate::from_pem_bundle`) and *adds* each cert
+  as a trusted root — public-CA endpoints keep working, the private CA is trusted on
+  top. One global `--ca-cert` applies to all HTTP sinks; the scry sink uses the
+  native binschema TCP wire (no TLS) so it's unaffected. A bundle file covers the
+  "different CA per endpoint" case without per-sink flags.
+
+**Why these specifics.** Reusing the remote-write codec keeps a single source of
+truth for the wire format; same v1 limits as the inbound (no remote-write v2, native
+histograms, exemplars, per-series metadata). Augmenting the trust store (rather than
+a `--tls-insecure` skip-verify) is the correct mechanism for private CAs and keeps
+verification on. Per-endpoint CA files and mTLS client certs are out of scope.
+
+**Status.** Implemented in `crates/gateway/src/mimir.rs` (`to_write_request` +
+`MimirSink`, pure mapper unit-tested incl. a remote-write round-trip) and
+`crates/gateway/src/tls.rs` (`build_http_client`), wired into `main.rs` (`--mimir-url`
+/ `--mimir-tenant` / `--ca-cert`, shared HTTP client across Loki/OpenSearch/Mimir,
+sink registration + `bail!` guard). Verified end-to-end against a stub Mimir server:
+metrics pushed to the remote-write inbound arrive at `/api/v1/push` snappy-encoded
+with the tenant + version headers and a non-empty body.
+
+## D-045: scry-agent scrapes Prometheus endpoints (Alloy-replacement for metrics)
+
+**Context.** `scry-agent` was logs-only: it tails CRI container logs and ships
+`LogsBatch`. Metrics reaching scry therefore had to come from *some other* collector
+(Alloy, the Prometheus agent, an OTel collector) pushing through `scry-gateway`'s
+remote-write inbound. To "go full scry" — one node agent, no second collector — the
+agent needs to *pull* Prometheus `/metrics` endpoints itself and ship `MetricsBatch`.
+The pod watch it already runs for log-label enrichment makes Kubernetes
+annotation-based target discovery a natural extension.
+
+**Decision.** Teach the agent to scrape, over the **same wire connection** as logs
+(Hello declares `SIGNAL_BIT_LOGS | SIGNAL_BIT_METRICS` when scraping is active).
+
+- *Discovery = annotations + static, unioned.* `prometheus.io/{scrape,port,path,scheme}`
+  pod annotations (extend `apply_event` to also capture `metadata.annotations` +
+  `status.podIP` and build a `ScrapeTarget`) **plus** repeatable `--scrape-target <url>`
+  for non-k8s targets. `spawn_scrape_scheduler` mirrors `spawn_log_scanner`: reconcile
+  the desired set (static ∪ discovered) against running per-target scrape tasks (spawn
+  new, abort vanished), each task feeding a `metrics_tx` mpsc the batcher folds into a
+  `MetricsBatch`. Target labels follow the `stream_labels` convention
+  (`namespace`/`pod`/`node` + `k8s_<label>`) plus the Prometheus-conventional
+  `job`/`instance`.
+- *Hand-rolled text-exposition parser.* `promparse.rs` parses the format ourselves —
+  no parser dependency. Bart's call: this is fundamental to ingest and we want to be
+  able to modify it. Lenient (malformed sample lines skipped + counted, not fatal);
+  handles HELP/TYPE, all four metric families + untyped, Go floats (NaN/±Inf/exponents),
+  escaped label values, optional ms timestamps; type resolution strips
+  `_bucket`/`_sum`/`_count` to the family. The pure mapping `scrape_to_series` is
+  unit-tested in isolation from the HTTP fetch.
+- *Label semantics match the remote-write inbound.* Every series carries
+  `__name__=<metric>` as a label, fingerprinted with the same `fingerprint()`, so a
+  metric ingested via scrape is byte-identical in identity to the same metric ingested
+  via the gateway. Target labels are authoritative: a colliding exposed label is
+  renamed `exported_<key>` (Prometheus `honor_labels: false`).
+- *Synthesize `up` + `scrape_duration_seconds`.* Like Prometheus, so a down/erroring
+  target is recorded as `up=0` data rather than silent absence.
+- *Auth = plain HTTP + optional bearer.* `--scrape-bearer` accepts `@/path` to read the
+  token from a file (keep secrets off argv). HTTPS/mTLS to targets is deferred.
+
+**Why these specifics.** Sharing the existing connection + batcher (rather than a
+second client) keeps the agent one process, one socket; the `--keep` allow-list and
+the per-fingerprint decision cache extend to metric series unchanged. Reusing the
+fingerprint convention is what makes scrape-ingested and push-ingested metrics
+interchangeable at query time.
+
+**Known gaps vs Alloy (deferred, not built).** Relabeling / `metric_relabel`;
+Service/Endpoints/EC2/Consul/DNS SD; HTTPS/mTLS to targets; native (sparse)
+histograms; exemplars/OpenMetrics extras; per-target `honor_labels`/`honor_timestamps`;
+scrape WAL/durability — the agent stays at-most-once, same as the log path. A
+deployment needing any of these still runs a real Alloy/Prometheus and pushes through
+the gateway.
+
+**Status.** Implemented in `crates/agent/src/{promparse.rs,scrape.rs}` (new, fully
+unit-tested) + `discovery.rs` (annotation SD + `spawn_scrape_scheduler`) + `main.rs`
+(metrics batcher arm, `flush_metrics`, shared `ship_frame` reconnect helper,
+dual-signal Hello, `--scrape-*` flags). Sealed by `scripts/smoke-agent-metrics.sh`:
+a stub `/metrics` (3 exposed samples) → agent (`--no-discovery --scrape-target`) →
+scry-ingestd → bucket → `scry-list`/`scry-query` asserts exactly 5 rows land (3 exposed
++ synthesized `up` + `scrape_duration_seconds`) and query back loss-free.

@@ -17,6 +17,7 @@
 //! - [`sink_scry`]: the scry ingest server (native wire) — accepts all signals.
 //! - [`loki`]: Grafana Loki push — logs only.
 //! - [`opensearch`]: OpenSearch `_bulk` — logs only.
+//! - [`mimir`]: Mimir remote-write push — metrics only.
 //!
 //! The signal-mapping functions (`otlp::map_traces`, `promwrite::map_remote_write`,
 //! `loki::to_push_request`, `opensearch::to_bulk_ndjson`, …) are pure and
@@ -24,12 +25,14 @@
 
 pub mod aws_sign;
 pub mod loki;
+pub mod mimir;
 pub mod opensearch;
 pub mod otlp;
 pub mod promwrite;
 pub mod pyroscope;
 pub mod sink;
 pub mod sink_scry;
+pub mod tls;
 pub mod wire;
 
 use axum::{routing::post, Router};

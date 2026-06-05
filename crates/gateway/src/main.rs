@@ -6,17 +6,19 @@
 //! OpenSearch — the latter two logs-only, with the OpenSearch sink self-managing
 //! its per-service rolling data streams + lifecycle assets.
 
-use std::{sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use scry_gateway::{
     aws_sign::SigV4Signer,
     loki::LokiSink,
+    mimir::MimirSink,
     opensearch::{OpenSearchConfig, OpenSearchSink},
     router, serve_wire,
     sink::{spawn_sink, AppState, SinkHandle, ACCEPT_ALL},
     sink_scry::{ScryConnect, ScrySink},
+    tls::build_http_client,
 };
 use scry_proto::{
     constants::{SIGNAL_BIT_LOGS, SIGNAL_BIT_METRICS, SIGNAL_BIT_PROFILES, SIGNAL_BIT_TRACES},
@@ -106,13 +108,29 @@ struct Args {
     #[arg(long, default_value = "es")]
     opensearch_aws_service: String,
 
+    /// Mimir base URL (e.g. http://mimir:9009). When set, metrics are also
+    /// re-emitted as Prometheus remote-write to `{url}/api/v1/push`. Metrics only.
+    #[arg(long)]
+    mimir_url: Option<String>,
+
+    /// Mimir tenant ID, sent as the `X-Scope-OrgID` header on every push.
+    /// Required by multi-tenant Mimir; leave unset for a single-tenant cluster.
+    #[arg(long)]
+    mimir_tenant: Option<String>,
+
+    /// Custom CA certificate (PEM file, may contain a bundle) added to the trust
+    /// store for the HTTPS sinks (Loki / OpenSearch / Mimir). Augments the
+    /// built-in roots — use it for endpoints fronted by a private/internal CA.
+    #[arg(long)]
+    ca_cert: Option<PathBuf>,
+
     /// Per-sink queue depth. Each sink drains its own bounded queue; on overflow
     /// it drops + counts (best-effort), so this bounds buffering during a
     /// downstream outage.
     #[arg(long, default_value_t = 1024)]
     sink_queue_cap: usize,
 
-    /// HTTP client timeout for the Loki/OpenSearch sinks.
+    /// HTTP client timeout for the Loki/OpenSearch/Mimir sinks.
     #[arg(long, value_parser = parse_duration, default_value = "30s")]
     sink_http_timeout: Duration,
 }
@@ -154,12 +172,10 @@ async fn main() -> Result<()> {
         ));
     }
 
-    // Optional logs-only HTTP sinks share one reqwest client.
-    if args.loki_url.is_some() || args.opensearch_url.is_some() {
-        let http = reqwest::Client::builder()
-            .timeout(args.sink_http_timeout)
-            .build()
-            .context("building HTTP client for Loki/OpenSearch sinks")?;
+    // Optional HTTP sinks (Loki/OpenSearch logs, Mimir metrics) share one
+    // reqwest client, which carries any custom CA certificate.
+    if args.loki_url.is_some() || args.opensearch_url.is_some() || args.mimir_url.is_some() {
+        let http = build_http_client(args.sink_http_timeout, args.ca_cert.as_deref())?;
 
         if let Some(url) = args.loki_url.clone() {
             let sink = LokiSink::new(http.clone(), &url);
@@ -210,12 +226,26 @@ async fn main() -> Result<()> {
                 "opensearch sink enabled (logs)"
             );
         }
+        if let Some(url) = args.mimir_url.clone() {
+            let sink = MimirSink::new(http.clone(), &url, args.mimir_tenant.clone());
+            sinks.push(spawn_sink(
+                "mimir",
+                SIGNAL_BIT_METRICS,
+                args.sink_queue_cap,
+                move |rx| sink.run(rx),
+            ));
+            tracing::info!(
+                url = %url,
+                tenant = args.mimir_tenant.as_deref().unwrap_or("(none)"),
+                "mimir sink enabled (metrics)"
+            );
+        }
     }
 
     if sinks.is_empty() {
         bail!(
             "no sinks configured: set at least one of --upstream (scry), \
-             --loki-url, or --opensearch-url"
+             --loki-url, --opensearch-url, or --mimir-url"
         );
     }
 

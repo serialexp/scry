@@ -19,12 +19,23 @@ use kube::{Api, Client};
 use tokio::sync::{mpsc, watch, RwLock};
 use tracing::{info, warn};
 
+use scry_proto::LabelPair;
+
 use crate::cri::{spawn_tailer, PodPath, RawLog};
+use crate::scrape::{self, ScrapeResult, ScrapeTarget};
 
 /// Shared uid → pod-labels map, written by the watcher, read by the batcher.
 pub type PodRegistry = Arc<RwLock<HashMap<String, BTreeMap<String, String>>>>;
 
 pub fn new_registry() -> PodRegistry {
+    Arc::new(RwLock::new(HashMap::new()))
+}
+
+/// Shared uid → scrape-target map for pods that opt in via `prometheus.io/scrape`.
+/// Written by the watcher, read by the scrape scheduler.
+pub type ScrapeTargetRegistry = Arc<RwLock<HashMap<String, ScrapeTarget>>>;
+
+pub fn new_target_registry() -> ScrapeTargetRegistry {
     Arc::new(RwLock::new(HashMap::new()))
 }
 
@@ -35,6 +46,7 @@ pub fn new_registry() -> PodRegistry {
 pub fn spawn_pod_watcher(
     node_name: String,
     registry: PodRegistry,
+    targets: ScrapeTargetRegistry,
     mut shutdown: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -57,7 +69,7 @@ pub fn spawn_pod_watcher(
                 }
                 next = stream.try_next() => {
                     match next {
-                        Ok(Some(event)) => apply_event(&registry, event).await,
+                        Ok(Some(event)) => apply_event(&registry, &targets, &node_name, event).await,
                         Ok(None) => break,
                         Err(e) => {
                             warn!(error = %e, "pod watch error; backing off");
@@ -71,21 +83,114 @@ pub fn spawn_pod_watcher(
     })
 }
 
-async fn apply_event(registry: &PodRegistry, event: watcher::Event<Pod>) {
+async fn apply_event(
+    registry: &PodRegistry,
+    targets: &ScrapeTargetRegistry,
+    node: &str,
+    event: watcher::Event<Pod>,
+) {
     match event {
         watcher::Event::Apply(pod) | watcher::Event::InitApply(pod) => {
             if let Some(uid) = pod.metadata.uid.clone() {
                 let labels = pod.metadata.labels.clone().unwrap_or_default();
-                registry.write().await.insert(uid, labels);
+                registry.write().await.insert(uid.clone(), labels);
+                // A pod that opts in via annotations becomes a scrape target;
+                // one that doesn't (or loses its IP) is removed.
+                match build_scrape_target(&pod, node) {
+                    Some(t) => {
+                        targets.write().await.insert(uid, t);
+                    }
+                    None => {
+                        targets.write().await.remove(&uid);
+                    }
+                }
             }
         }
         watcher::Event::Delete(pod) => {
             if let Some(uid) = pod.metadata.uid.as_ref() {
                 registry.write().await.remove(uid);
+                targets.write().await.remove(uid);
             }
         }
         watcher::Event::Init | watcher::Event::InitDone => {}
     }
+}
+
+/// Build a [`ScrapeTarget`] from a pod's `prometheus.io/*` annotations, or
+/// `None` if the pod hasn't opted in (`prometheus.io/scrape != "true"`), has no
+/// IP yet, or declares no port.
+///
+/// The target's identifying labels mirror the log-stream convention
+/// ([`crate::stream::stream_labels`]): `namespace`/`pod`/`node` + `k8s_<label>`,
+/// plus the Prometheus-conventional `job` and `instance`. `job` is the first
+/// present of the pod's `app.kubernetes.io/name` / `app` / `k8s-app` labels,
+/// falling back to the pod name.
+fn build_scrape_target(pod: &Pod, node: &str) -> Option<ScrapeTarget> {
+    let ann = pod.metadata.annotations.as_ref()?;
+    if ann.get("prometheus.io/scrape").map(String::as_str) != Some("true") {
+        return None;
+    }
+    let pod_ip = pod.status.as_ref().and_then(|s| s.pod_ip.clone())?;
+    let port = ann.get("prometheus.io/port")?.clone();
+    let path = ann
+        .get("prometheus.io/path")
+        .cloned()
+        .unwrap_or_else(|| "/metrics".to_string());
+    let path = if path.starts_with('/') {
+        path
+    } else {
+        format!("/{path}")
+    };
+    let scheme = ann
+        .get("prometheus.io/scheme")
+        .cloned()
+        .unwrap_or_else(|| "http".to_string());
+    let url = format!("{scheme}://{pod_ip}:{port}{path}");
+
+    let namespace = pod.metadata.namespace.clone().unwrap_or_default();
+    let name = pod.metadata.name.clone().unwrap_or_default();
+    let pod_labels = pod.metadata.labels.clone().unwrap_or_default();
+    let job = pod_labels
+        .get("app.kubernetes.io/name")
+        .or_else(|| pod_labels.get("app"))
+        .or_else(|| pod_labels.get("k8s-app"))
+        .cloned()
+        .unwrap_or_else(|| name.clone());
+
+    let mut labels = vec![
+        LabelPair {
+            key: "job".into(),
+            value: job,
+        },
+        LabelPair {
+            key: "instance".into(),
+            value: format!("{pod_ip}:{port}"),
+        },
+        LabelPair {
+            key: "namespace".into(),
+            value: namespace,
+        },
+        LabelPair {
+            key: "pod".into(),
+            value: name,
+        },
+        LabelPair {
+            key: "node".into(),
+            value: node.to_string(),
+        },
+    ];
+    for (k, v) in &pod_labels {
+        labels.push(LabelPair {
+            key: format!("k8s_{k}"),
+            value: v.clone(),
+        });
+    }
+
+    Some(ScrapeTarget {
+        url,
+        labels,
+        bearer: None,
+    })
 }
 
 /// Periodically scan `logs_root` for container log files and keep one tailer
@@ -187,4 +292,98 @@ async fn scan(logs_root: &PathBuf) -> Vec<(PodPath, PathBuf)> {
 
 async fn is_dir(entry: &tokio::fs::DirEntry) -> bool {
     entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false)
+}
+
+/// Reconcile the desired scrape-target set (static `static_targets` ∪ the
+/// discovered `targets` registry) against running per-target scrape tasks:
+/// spawn a task for a newly-seen target URL, abort the task for one that
+/// vanished. Mirrors [`spawn_log_scanner`]. Each task scrapes on `interval`
+/// and feeds [`ScrapeResult`]s into `metrics_tx`.
+pub fn spawn_scrape_scheduler(
+    targets: ScrapeTargetRegistry,
+    static_targets: Vec<ScrapeTarget>,
+    http: reqwest::Client,
+    interval: Duration,
+    reconcile_interval: Duration,
+    metrics_tx: mpsc::Sender<ScrapeResult>,
+    mut shutdown: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // Keyed by target URL so a discovered target and a static one with the
+        // same URL collapse to a single task.
+        let mut active: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+        loop {
+            let mut desired: HashMap<String, ScrapeTarget> = HashMap::new();
+            for t in &static_targets {
+                desired.insert(t.url.clone(), t.clone());
+            }
+            for t in targets.read().await.values() {
+                desired.insert(t.url.clone(), t.clone());
+            }
+
+            for (url, target) in &desired {
+                if let std::collections::hash_map::Entry::Vacant(slot) = active.entry(url.clone()) {
+                    info!(url = %url, "scraping new target");
+                    let h = spawn_scrape_task(
+                        target.clone(),
+                        http.clone(),
+                        interval,
+                        metrics_tx.clone(),
+                        shutdown.clone(),
+                    );
+                    slot.insert(h);
+                }
+            }
+            // Drop tasks whose target vanished.
+            active.retain(|url, h| {
+                if desired.contains_key(url) {
+                    true
+                } else {
+                    info!(url = %url, "scrape target gone");
+                    h.abort();
+                    false
+                }
+            });
+
+            tokio::select! {
+                _ = tokio::time::sleep(reconcile_interval) => {}
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() { break; }
+                }
+            }
+        }
+        for (_, h) in active {
+            h.abort();
+        }
+        info!("scrape scheduler stopped");
+    })
+}
+
+/// One target's scrape loop: GET on `interval`, push the result into `tx`.
+/// The first tick fires immediately so a target is scraped as soon as it's
+/// discovered.
+fn spawn_scrape_task(
+    target: ScrapeTarget,
+    http: reqwest::Client,
+    interval: Duration,
+    tx: mpsc::Sender<ScrapeResult>,
+    mut shutdown: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let result = scrape::scrape_once(&http, &target, scrape::now_unix_nano()).await;
+                    if tx.send(result).await.is_err() {
+                        break; // batcher gone
+                    }
+                }
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() { break; }
+                }
+            }
+        }
+    })
 }
