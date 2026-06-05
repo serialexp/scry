@@ -20,12 +20,16 @@ anyhow              = { workspace = true }
 axum                = { workspace = true }
 binschema-runtime   = { workspace = true }
 bytes               = { workspace = true }
+chrono              = { workspace = true }
 clap                = { workspace = true }
 mimalloc            = { workspace = true }
 opentelemetry-proto = { workspace = true }
 prost               = { workspace = true }
+reqwest             = { workspace = true }
 scry-client         = { workspace = true }
 scry-proto          = { workspace = true }
+serde               = { workspace = true, features = ["derive"] }
+serde_json          = { workspace = true }
 snap                = { workspace = true }
 tokio               = { workspace = true }
 tracing             = { workspace = true }

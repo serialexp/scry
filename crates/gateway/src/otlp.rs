@@ -23,18 +23,25 @@ use scry_proto::{
     LabelPair,
 };
 
-use crate::upstream::{self, AppState};
+use crate::sink::AppState;
 
 /// Handle one OTLP/HTTP protobuf trace export.
-pub async fn handle(State(state): State<AppState>, body: Bytes) -> Result<Response, (StatusCode, String)> {
-    let req = ExportTraceServiceRequest::decode(body)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("OTLP protobuf decode failed: {e}")))?;
+pub async fn handle(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Response, (StatusCode, String)> {
+    let req = ExportTraceServiceRequest::decode(body).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("OTLP protobuf decode failed: {e}"),
+        )
+    })?;
 
     let batch = map_traces(req);
 
-    upstream::send_traces(&state, batch)
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("upstream send failed: {e}")))?;
+    // Best-effort fan-out: enqueue to every sink and return success. A slow/down
+    // downstream never fails the request (see crate::sink / D-041).
+    state.offer_traces(batch);
 
     Ok(ok_response())
 }
@@ -71,10 +78,7 @@ pub fn map_traces(req: ExportTraceServiceRequest) -> TracesBatch {
 
         for ss in rs.scope_spans {
             let scope_idx = scopes.len() as u16;
-            let (name, version) = ss
-                .scope
-                .map(|s| (s.name, s.version))
-                .unwrap_or_default();
+            let (name, version) = ss.scope.map(|s| (s.name, s.version)).unwrap_or_default();
             scopes.push(ScopeEntry { name, version });
 
             for sp in ss.spans {
@@ -124,7 +128,11 @@ pub fn map_traces(req: ExportTraceServiceRequest) -> TracesBatch {
         }
     }
 
-    TracesBatch { resources, scopes, spans }
+    TracesBatch {
+        resources,
+        scopes,
+        spans,
+    }
 }
 
 /// Map OTLP `KeyValue`s to our string→string `LabelPair`s. A missing value
@@ -134,7 +142,11 @@ fn kv_to_labels(attrs: &[KeyValue]) -> Vec<LabelPair> {
         .iter()
         .map(|kv| LabelPair {
             key: kv.key.clone(),
-            value: kv.value.as_ref().map(anyvalue_to_string).unwrap_or_default(),
+            value: kv
+                .value
+                .as_ref()
+                .map(anyvalue_to_string)
+                .unwrap_or_default(),
         })
         .collect()
 }
@@ -196,7 +208,9 @@ pub fn sample_request(n_spans: usize) -> ExportTraceServiceRequest {
     fn str_attr(key: &str, val: &str) -> KeyValue {
         KeyValue {
             key: key.to_string(),
-            value: Some(AnyValue { value: Some(Value::StringValue(val.to_string())) }),
+            value: Some(AnyValue {
+                value: Some(Value::StringValue(val.to_string())),
+            }),
             ..Default::default()
         }
     }
@@ -223,12 +237,20 @@ pub fn sample_request(n_spans: usize) -> ExportTraceServiceRequest {
     let mut spans = Vec::with_capacity(n_spans);
     for i in 0..n_spans {
         let is_root = i == 0;
-        let span_id = if is_root { root_span_id.clone() } else { vec![(0x30 + i) as u8; 8] };
+        let span_id = if is_root {
+            root_span_id.clone()
+        } else {
+            vec![(0x30 + i) as u8; 8]
+        };
         let start = 1_700_000_000_000_000_000u64 + (i as u64) * 1_000_000;
         spans.push(Span {
             trace_id: trace_id.clone(),
             span_id,
-            parent_span_id: if is_root { vec![] } else { root_span_id.clone() },
+            parent_span_id: if is_root {
+                vec![]
+            } else {
+                root_span_id.clone()
+            },
             name: format!("op.{i}"),
             kind: SpanKind::Server as i32,
             start_time_unix_nano: start,
@@ -245,7 +267,10 @@ pub fn sample_request(n_spans: usize) -> ExportTraceServiceRequest {
                 span_id: root_span_id.clone(),
                 ..Default::default()
             }],
-            status: Some(Status { message: String::new(), code: StatusCode::Ok as i32 }),
+            status: Some(Status {
+                message: String::new(),
+                code: StatusCode::Ok as i32,
+            }),
             ..Default::default()
         });
     }

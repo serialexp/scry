@@ -30,7 +30,7 @@ use scry_proto::{
     LabelPair,
 };
 
-use crate::upstream::{self, AppState};
+use crate::sink::AppState;
 
 // ── Prometheus remote-write v1 wire types (hand-written prost) ──────────
 // The full proto is large; we declare only the subset we consume. prost
@@ -76,19 +76,27 @@ pub async fn handle(
     let raw = if wants_snappy(&headers) {
         snap::raw::Decoder::new()
             .decompress_vec(&body)
-            .map_err(|e| (StatusCode::BAD_REQUEST, format!("snappy decompress failed: {e}")))?
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("snappy decompress failed: {e}"),
+                )
+            })?
     } else {
         body.to_vec()
     };
 
-    let req = WriteRequest::decode(raw.as_slice())
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("remote-write protobuf decode failed: {e}")))?;
+    let req = WriteRequest::decode(raw.as_slice()).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("remote-write protobuf decode failed: {e}"),
+        )
+    })?;
 
     let batch = map_remote_write(req);
 
-    upstream::send_metrics(&state, batch)
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("upstream send failed: {e}")))?;
+    // Best-effort fan-out to every configured sink (see crate::sink / D-041).
+    state.offer_metrics(batch);
 
     // Prometheus treats any 2xx as success; 204 is the conventional reply.
     Ok(StatusCode::NO_CONTENT)
@@ -124,7 +132,10 @@ pub fn map_remote_write(req: WriteRequest) -> MetricsBatch {
         let labels: Vec<LabelPair> = ts
             .labels
             .into_iter()
-            .map(|l| LabelPair { key: l.name, value: l.value })
+            .map(|l| LabelPair {
+                key: l.name,
+                value: l.value,
+            })
             .collect();
         let fp = fingerprint(&labels);
         if seen.insert(fp, ()).is_none() {
@@ -156,9 +167,18 @@ pub fn sample_request(n_series: usize, n_samples: usize) -> WriteRequest {
     let mut timeseries = Vec::with_capacity(n_series);
     for s in 0..n_series {
         let labels = vec![
-            Label { name: "__name__".into(), value: format!("scry_demo_metric_{s}") },
-            Label { name: "job".into(), value: "smoke".into() },
-            Label { name: "instance".into(), value: format!("inst-{s}") },
+            Label {
+                name: "__name__".into(),
+                value: format!("scry_demo_metric_{s}"),
+            },
+            Label {
+                name: "job".into(),
+                value: "smoke".into(),
+            },
+            Label {
+                name: "instance".into(),
+                value: format!("inst-{s}"),
+            },
         ];
         let samples = (0..n_samples)
             .map(|i| Sample {
@@ -195,7 +215,10 @@ mod tests {
         assert_eq!(s0.metric_type, METRIC_TYPE_UNKNOWN);
         assert_eq!(s0.fingerprint, fingerprint(&s0.labels));
         assert_eq!(
-            s0.labels.iter().find(|l| l.key == "__name__").map(|l| l.value.as_str()),
+            s0.labels
+                .iter()
+                .find(|l| l.key == "__name__")
+                .map(|l| l.value.as_str()),
             Some("scry_demo_metric_0")
         );
 
@@ -203,7 +226,8 @@ mod tests {
         let first = &batch.samples[0];
         assert_eq!(first.ts_unix_nano, 1_700_000_000_000 * 1_000_000);
         // Every sample references a declared series fingerprint.
-        let fps: std::collections::HashSet<u64> = batch.series.iter().map(|s| s.fingerprint).collect();
+        let fps: std::collections::HashSet<u64> =
+            batch.series.iter().map(|s| s.fingerprint).collect();
         assert!(batch.samples.iter().all(|s| fps.contains(&s.fingerprint)));
     }
 
@@ -220,10 +244,28 @@ mod tests {
     fn drops_empty_and_nonpositive() {
         let req = WriteRequest {
             timeseries: vec![
-                TimeSeries { labels: vec![], samples: vec![Sample { value: 1.0, timestamp: 1 }] },
                 TimeSeries {
-                    labels: vec![Label { name: "__name__".into(), value: "x".into() }],
-                    samples: vec![Sample { value: 1.0, timestamp: 0 }, Sample { value: 2.0, timestamp: 5 }],
+                    labels: vec![],
+                    samples: vec![Sample {
+                        value: 1.0,
+                        timestamp: 1,
+                    }],
+                },
+                TimeSeries {
+                    labels: vec![Label {
+                        name: "__name__".into(),
+                        value: "x".into(),
+                    }],
+                    samples: vec![
+                        Sample {
+                            value: 1.0,
+                            timestamp: 0,
+                        },
+                        Sample {
+                            value: 2.0,
+                            timestamp: 5,
+                        },
+                    ],
                 },
             ],
         };

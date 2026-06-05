@@ -45,12 +45,17 @@ of it. That's `scry`.
   - the **agent** (`scry-agent`) — a per-node collector that tails CRI
     container logs and ships them over the native wire (logs today;
     Prometheus scrape and pprof pull are planned);
-  - the **gateway** (`scry-gateway`) — an HTTP front-end that terminates
-    *foreign push protocols* and forwards them over the same native wire,
-    so you don't have to adopt the agent to get data in. It speaks
-    **OTLP/HTTP traces**, **legacy Pyroscope `/ingest`**, and
-    **Prometheus remote-write**. See [Point existing telemetry at
-    scry](#point-existing-telemetry-at-scry).
+  - the **gateway** (`scry-gateway`) — a **fan-out hub**. It terminates
+    *foreign push protocols* (**OTLP/HTTP traces**, **legacy Pyroscope
+    `/ingest`**, **Prometheus remote-write**) over HTTP and, opt-in, the
+    **native binschema wire** (so the agent can point at it too) — then
+    forwards every accepted record, best-effort, to *all* configured
+    downstream sinks at once: any of the scry ingest server, **Grafana
+    Loki**, and/or **OpenSearch** (Loki/OpenSearch take logs only). Every
+    sink is opt-in — a gateway that only tees logs to Loki/OpenSearch needs
+    no scry server at all. All in → all out, no routing config (for
+    anything more selective, run a second gateway). See [Point existing
+    telemetry at scry](#point-existing-telemetry-at-scry).
 - **Parquet on S3-compatible object storage** as the single source of
   truth. No separate index store, no Cassandra, no Bigtable, no boltdb.
 - **WAL on local SSD** as the ingestion buffer and crash-safety
@@ -108,10 +113,21 @@ in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); decisions in
   substring query skip whole blocks that can't contain the term (one-sided
   error — false positives cost a scan, never a missed match; the exact
   `contains` predicate is the backstop). ~1–3% storage overhead. See D-035.
-- **The gateway** terminates OTLP/HTTP traces, legacy Pyroscope `/ingest`,
-  and Prometheus remote-write, and forwards each over the native wire;
-  `scripts/smoke-gateway.sh` drives all three end to end against a
-  Garage-backed server.
+- **The gateway** is a **fan-out hub**: it terminates OTLP/HTTP traces,
+  legacy Pyroscope `/ingest`, and Prometheus remote-write over HTTP (plus
+  the native binschema wire, opt-in), then forwards every accepted record
+  best-effort to *all* configured downstream sinks — any of the scry
+  server, Grafana Loki, and/or OpenSearch (the latter two take logs only).
+  Every sink is opt-in (no scry server required if you only tee to
+  Loki/OpenSearch). All in → all out, no routing config (D-041). The
+  **OpenSearch sink self-manages** (D-042): `--opensearch-index` is a
+  *prefix*, logs route per service to rolling data streams
+  `<prefix>-<service>` (or `<prefix>-general`), and the sink creates and
+  continuously re-asserts the ISM rollover policy (size+age, no
+  auto-delete) and an index template with `flat_object` label mappings —
+  so cluster-side drift can't silently break ingest.
+  `scripts/smoke-gateway.sh` drives the three HTTP protocols end to end
+  against a Garage-backed server.
 
 Profiles **flamegraph aggregation** (pprof parse + stack-merge; Grafana
 renders pre-aggregated data, so this is backend work for when a UI
@@ -136,7 +152,7 @@ crates/
   scry-webui/          browser query UI server: serves the SolidJS app + relays queries to scry-queryd (D-040)
   client/              reusable native-wire client, shared by agent + gateway (scry-client)
   agent/               per-node log-collection agent: tails CRI logs, ships over the wire (scry-agent)
-  gateway/             foreign-protocol push gateway (scry-gateway): OTLP traces, Pyroscope, Prometheus remote-write
+  gateway/             fan-out hub (scry-gateway): native wire + OTLP/Pyroscope/remote-write in → scry + Loki + OpenSearch out
   noise-spewer/        TCP client; emits random metrics/logs/traces/profiles
   scry-ingestd/        ingest server daemon binary (wraps scry-server)
 proto/                 binschema source-of-truth schemas
@@ -167,7 +183,32 @@ To accept foreign push protocols, run the gateway alongside the server:
 ```bash
 # Terminates OTLP/Pyroscope/remote-write on :4318, forwards to the server:
 ./target/release/scry-gateway --listen 0.0.0.0:4318 --upstream 127.0.0.1:4000
+
+# Fan-out hub: also accept the native wire (so the agent can point here) and
+# tee logs to Loki + OpenSearch alongside scry (all in → all out):
+./target/release/scry-gateway \
+  --listen 0.0.0.0:4318 --listen-wire 0.0.0.0:4000 \
+  --upstream scry-server:4000 \
+  --loki-url http://loki:3100 \
+  # --opensearch-index is a PREFIX: logs route to per-service rolling data
+  # streams <prefix>-<service> (or <prefix>-general); the sink creates and
+  # keeps re-asserting the ISM rollover policy + index template itself.
+  --opensearch-url http://opensearch:9200 --opensearch-index scry-logs
+
+# Logs-only: no scry server at all, just tee to Loki + OpenSearch:
+./target/release/scry-gateway \
+  --listen 0.0.0.0:4318 \
+  --loki-url http://loki:3100 --opensearch-url http://opensearch:9200
 ```
+
+Every sink is opt-in (`--upstream`, `--loki-url`, `--opensearch-url`); at
+least one must be configured. `--listen-wire` is opt-in too: with no native
+listener bound, the gateway serves only the foreign HTTP protocols. The scry
+sink connects lazily, so a down/absent scry server never blocks startup.
+Loki/OpenSearch are logs-only; metrics, traces, and profiles go to the scry
+sink alone. Delivery is best-effort and independent per sink — a slow or down
+sink drops + counts without blocking
+the inbound or the other sinks (D-041).
 
 End-to-end smoke tests (require a local Garage — `scripts/dev-garage-up.sh`):
 
@@ -240,9 +281,13 @@ spec:
 
 ## Point existing telemetry at scry
 
-Aim your existing exporters at the **gateway** (`:4318`). It forwards each
-request over the native wire as one batch; on upstream failure the caller
-sees a `502` and applies its own retry. v0 is best-effort (no local spool).
+Aim your existing exporters at the **gateway** (`:4318`). It decodes each
+request into one batch and fans it out, best-effort, to every configured
+sink (any of scry / Loki / OpenSearch; the latter two logs-only). The
+caller is ACKed once the batch is **enqueued**, not once the downstreams
+confirm —
+delivery is best-effort with no local spool, so durability across a
+downstream outage is bounded by each sink's in-memory queue depth (D-041).
 
 - **OTLP traces (HTTP/protobuf).** Point any OTLP/HTTP exporter at the
   gateway's `/v1/traces`:
@@ -280,6 +325,22 @@ sees a `502` and applies its own retry. v0 is best-effort (no local spool).
   Profiles are stored opaquely (pprof preserved verbatim); flamegraph
   aggregation is a later milestone.
 
+- **The native wire (the agent, or anything that speaks binschema).** Run
+  the gateway with `--listen-wire 0.0.0.0:4000` and point `scry-agent
+  --server-addr <gateway>:4000` (or any native producer) at it. This makes
+  the gateway a fan-out front-end for the native wire too — the same
+  records then tee to scry + Loki + OpenSearch.
+
+- **Tee logs to Loki and/or OpenSearch.** Add `--loki-url
+  http://loki:3100` and/or `--opensearch-url http://opensearch:9200`
+  (`--opensearch-index`, default `scry-logs`). Every log batch that reaches
+  the gateway — from any inbound — is mapped to the Loki push format
+  (`/loki/api/v1/push`, one stream per scry `LogStream`, severity +
+  attributes as structured metadata) and/or the OpenSearch `_bulk` NDJSON
+  (one doc per entry, `@timestamp` + `body` + `severity` + labels) and
+  shipped alongside the scry sink. Logs only; metrics/traces/profiles go to
+  scry alone.
+
 ## Scope (v0 → v1)
 
 Reconciled against what actually shipped: the original plan put logs
@@ -298,6 +359,7 @@ that closed that gap (see D-034). Order updated accordingly.
 | **v0.3**  | ✅     | Query daemon (`scry-queryd`): binschema-framed remote query path (see D-031), shared between CLI and future tools. Streaming Arrow IPC batches with mid-stream resource errors. |
 | **v0.4**  | ✅     | Logs as the second real signal: stream-label postings (same shape as metrics), per-entry attributes as a `Map<Utf8,Utf8>` column, CLI `--signal logs`, signal byte on the query wire. Body-substring search deferred to its own tantivy phase. |
 | **gateway** | ✅   | Push-protocol front-end (`scry-gateway`): OTLP/HTTP traces, legacy Pyroscope `/ingest`, Prometheus remote-write → native wire. Traces + profiles storage paths land end to end. |
+| **gateway fan-out** | ✅ | `scry-gateway` becomes a **fan-out hub**: an opt-in native binschema listener (`--listen-wire`) joins the foreign HTTP inbounds, and every accepted record tees best-effort to *all* configured sinks — any of the scry server, **Grafana Loki**, and/or **OpenSearch** (the latter two logs-only). Every sink is opt-in (no scry server required if you only tee to Loki/OpenSearch); at least one must be configured. All in → all out, no routing config; ACK-on-enqueue, independent per-sink bounded queues (drop + count on overflow). Metrics/traces/profiles go to scry alone (D-041). |
 | **v0.5**  | ✅     | Traces query: `--trace-id` by-id lookup (sorted-column pruning) + promoted resource-column matchers (`service.name`, …) + `SELECT *` round-trip. Predicate pushdown, no postings. |
 | **v0.6**  | ✅     | Profiles query: retrieval by time + label, raw pprof blob streamed back loss-free. Flamegraph aggregation deferred (Grafana renders pre-aggregated data — backend work for when a UI consumes it). |
 | **v0.7**  | ✅     | Full-text log search: first-class `--grep` / `body_contains` substring search accelerated by a per-block byte-trigram **bloom skip sidecar** (built inline at seal; one-sided error, exact `contains` backstop). ~1–3% storage overhead, skips whole blocks that can't match. See D-035. (PromQL demoted — own UI removes the Grafana-compat driver.) |

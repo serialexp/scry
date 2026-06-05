@@ -35,11 +35,17 @@ fn maps_request_to_traces_batch() {
 
     // Child span: parent set to the root span id.
     let child = &batch.spans[1];
-    assert_eq!(child.parent_span_id.as_deref(), Some([0x22u8; 8].as_slice()));
+    assert_eq!(
+        child.parent_span_id.as_deref(),
+        Some([0x22u8; 8].as_slice())
+    );
 
     // Span attribute stringified.
     assert_eq!(
-        root.attributes.iter().find(|l| l.key == "http.method").map(|l| l.value.as_str()),
+        root.attributes
+            .iter()
+            .find(|l| l.key == "http.method")
+            .map(|l| l.value.as_str()),
         Some("GET")
     );
 
@@ -47,7 +53,11 @@ fn maps_request_to_traces_batch() {
     assert_eq!(root.events.len(), 1);
     assert_eq!(root.events[0].name, "checkpoint");
     assert_eq!(
-        root.events[0].attributes.iter().find(|l| l.key == "phase").map(|l| l.value.as_str()),
+        root.events[0]
+            .attributes
+            .iter()
+            .find(|l| l.key == "phase")
+            .map(|l| l.value.as_str()),
         Some("mid")
     );
     assert_eq!(root.links.len(), 1);

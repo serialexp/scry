@@ -19,7 +19,7 @@ use scry_proto::{
     LabelPair,
 };
 
-use crate::upstream::{self, AppState};
+use crate::sink::AppState;
 
 /// Profile format byte: gzipped pprof. Mirrors the wire `ProfileBlob.format`
 /// semantics documented in `scry_proto::streaming`.
@@ -42,16 +42,19 @@ pub async fn handle(
     let meta = parse_ingest_params(&params);
 
     let mut data: Option<Vec<u8>> = None;
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("multipart read failed: {e}")))?
-    {
+    while let Some(field) = multipart.next_field().await.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("multipart read failed: {e}"),
+        )
+    })? {
         if field.name() == Some("profile") {
-            let bytes = field
-                .bytes()
-                .await
-                .map_err(|e| (StatusCode::BAD_REQUEST, format!("reading 'profile' field failed: {e}")))?;
+            let bytes = field.bytes().await.map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("reading 'profile' field failed: {e}"),
+                )
+            })?;
             data = Some(bytes.to_vec());
         }
     }
@@ -69,9 +72,10 @@ pub async fn handle(
         data,
     };
 
-    upstream::send_profiles(&state, ProfilesBatch { samples: vec![blob] })
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("upstream send failed: {e}")))?;
+    // Best-effort fan-out to every configured sink (see crate::sink / D-041).
+    state.offer_profiles(ProfilesBatch {
+        samples: vec![blob],
+    });
 
     Ok(StatusCode::OK)
 }
@@ -80,28 +84,49 @@ pub async fn handle(
 /// missing/garbled timestamps default to 0, an absent `name` yields no service
 /// label. `from`/`until` are unix **seconds** on the wire and converted to ns.
 pub fn parse_ingest_params(params: &HashMap<String, String>) -> IngestMeta {
-    let from_sec = params.get("from").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-    let until_sec = params.get("until").and_then(|s| s.parse::<u64>().ok()).unwrap_or(from_sec);
+    let from_sec = params
+        .get("from")
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    let until_sec = params
+        .get("until")
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(from_sec);
 
     let ts_unix_nano = from_sec.saturating_mul(1_000_000_000);
-    let duration_nano = until_sec.saturating_sub(from_sec).saturating_mul(1_000_000_000);
+    let duration_nano = until_sec
+        .saturating_sub(from_sec)
+        .saturating_mul(1_000_000_000);
 
     let mut labels: Vec<LabelPair> = Vec::new();
     if let Some(name) = params.get("name") {
         let (app, inline) = parse_app_name(name);
         if !app.is_empty() {
-            labels.push(LabelPair { key: "service.name".into(), value: app });
+            labels.push(LabelPair {
+                key: "service.name".into(),
+                value: app,
+            });
         }
         labels.extend(inline);
     }
     if let Some(spy) = params.get("spyName") {
-        labels.push(LabelPair { key: "spy_name".into(), value: spy.clone() });
+        labels.push(LabelPair {
+            key: "spy_name".into(),
+            value: spy.clone(),
+        });
     }
     if let Some(rate) = params.get("sampleRate") {
-        labels.push(LabelPair { key: "sample_rate".into(), value: rate.clone() });
+        labels.push(LabelPair {
+            key: "sample_rate".into(),
+            value: rate.clone(),
+        });
     }
 
-    IngestMeta { ts_unix_nano, duration_nano, labels }
+    IngestMeta {
+        ts_unix_nano,
+        duration_nano,
+        labels,
+    }
 }
 
 /// Split a Pyroscope app name `app{k=v,k2=v2}` into the base app and its inline
@@ -113,7 +138,11 @@ fn parse_app_name(name: &str) -> (String, Vec<LabelPair>) {
     };
     let app = name[..open].to_string();
     let close = name.rfind('}').unwrap_or(name.len());
-    let inner = if close > open { &name[open + 1..close] } else { "" };
+    let inner = if close > open {
+        &name[open + 1..close]
+    } else {
+        ""
+    };
 
     let mut labels = Vec::new();
     for pair in inner.split(',') {
@@ -136,7 +165,10 @@ mod tests {
     use super::*;
 
     fn params(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     #[test]
@@ -154,11 +186,26 @@ mod tests {
         assert_eq!(
             meta.labels,
             vec![
-                LabelPair { key: "service.name".into(), value: "myapp".into() },
-                LabelPair { key: "env".into(), value: "prod".into() },
-                LabelPair { key: "region".into(), value: "eu".into() },
-                LabelPair { key: "spy_name".into(), value: "bunspy".into() },
-                LabelPair { key: "sample_rate".into(), value: "100".into() },
+                LabelPair {
+                    key: "service.name".into(),
+                    value: "myapp".into()
+                },
+                LabelPair {
+                    key: "env".into(),
+                    value: "prod".into()
+                },
+                LabelPair {
+                    key: "region".into(),
+                    value: "eu".into()
+                },
+                LabelPair {
+                    key: "spy_name".into(),
+                    value: "bunspy".into()
+                },
+                LabelPair {
+                    key: "sample_rate".into(),
+                    value: "100".into()
+                },
             ]
         );
     }
@@ -175,6 +222,12 @@ mod tests {
         let meta = parse_ingest_params(&params(&[("name", "x")]));
         assert_eq!(meta.ts_unix_nano, 0);
         assert_eq!(meta.duration_nano, 0);
-        assert_eq!(meta.labels, vec![LabelPair { key: "service.name".into(), value: "x".into() }]);
+        assert_eq!(
+            meta.labels,
+            vec![LabelPair {
+                key: "service.name".into(),
+                value: "x".into()
+            }]
+        );
     }
 }

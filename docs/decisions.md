@@ -1602,3 +1602,182 @@ release binary, stands up a stub upstream, asserts the SPA serves and the
 login → `/api/me` → `/api/query` relay → logout surface) plus the `scry-webui`
 Rust integration tests (`tests/auth.rs`, `tests/query.rs`). The real protocol
 round-trip is covered by `scripts/smoke.sh`'s per-signal query legs.
+
+---
+
+## D-041: `scry-gateway` becomes a fan-out hub (native + foreign in; scry / Loki / OpenSearch out, all opt-in)
+
+**Context.** `scry-gateway` was a one-way, single-destination foreign-protocol
+*terminator*: it accepted OTLP/HTTP traces, Pyroscope profiles, and Prometheus
+remote-write over HTTP, mapped each request to a typed `*Batch`, and forwarded it
+to **one** upstream scry ingest server over a single shared wire client.
+Separately, `scry-agent` tails k8s logs and ships native binschema **straight to a
+scry ingest server** — never touching the gateway. Bart wanted to run the agent
+against a cluster, point it at the gateway, and have the gateway deliver every
+record to the scry backend **and** to Loki and/or OpenSearch in the formats those
+systems consume — so an existing Loki/OpenSearch-based stack keeps working while
+scry runs alongside.
+
+**Decision.** Generalize the gateway from "terminate → forward to one" into a
+**fan-out hub**: decode each inbound into a typed `*Batch`, then tee it
+best-effort to *every* configured sink it is compatible with.
+
+- **Native inbound, opt-in.** Add `wire.rs`, a trimmed native binschema listener
+  (Hello/HelloAck + Batch/Ping/Goodbye), so the agent (and anything that speaks
+  the wire) can point at the gateway. It is enabled only when `--listen-wire` is
+  set — no default bind — so existing HTTP-only deployments and the smoke are
+  unchanged, and there is no surprise grab of a well-known port. `scry-server`'s
+  `Server` is **not** reused: it is hardwired to the WAL+parquet
+  `ShardedPipeline` and its dispatch is private, so the ~150-line handshake is
+  duplicated deliberately (the gateway is a fan-out, not a store).
+- **All in → all out, zero routing config.** Every accepted record goes to every
+  compatible sink. No per-source/per-destination rules; "more complicated stuff =
+  run two gateways." This keeps the gateway a dumb, predictable tee.
+- **Every sink is opt-in; scry is not special.** `--upstream`, `--loki-url`, and
+  `--opensearch-url` are all `Option`s with no default; a sink exists only when
+  configured, and at least one must be (else a startup `bail!`). A logs-only
+  gateway that tees to Loki/OpenSearch needs **no scry server at all** — scry is
+  one optional best-effort sink among several, not a mandatory backend. (Earlier
+  the scry sink was always built against a default `127.0.0.1:4000` and connected
+  eagerly at boot, which wrongly made a scry server a hard dependency of running
+  the gateway.)
+- **The scry sink connects lazily, like the HTTP sinks.** Its worker connects on
+  first use (and reconnects after a drop), so a down/absent scry server at startup
+  is a per-item connect error, not a fatal boot error — symmetric with
+  Loki/OpenSearch, which connect per request. All three sinks behave uniformly:
+  configured ⇒ best-effort delivery that tolerates a down target; unconfigured ⇒
+  absent.
+- **Logs-only foreign sinks.** Loki and OpenSearch receive **logs only**; metrics,
+  traces, and profiles go to the scry sink alone. Loki has no metrics model that
+  fits scry's sample shape, and OpenSearch is scoped to logs for now. Sinks carry
+  a `SIGNAL_BIT_*` accept-mask; a non-matching signal is skipped at offer time.
+- **Best-effort, independent per-sink delivery.** Each sink owns its own bounded
+  `mpsc` queue + worker task; `offer` is a non-blocking `try_send` that drops +
+  counts on a full/closed queue. A slow or down Loki never blocks scry, the other
+  sinks, or the inbound.
+
+**Consequence (accepted).** With best-effort fan-out the inbound **ACKs on
+enqueue**, not on downstream confirmation. The scry sink is just another
+best-effort sink, so the agent's reconnect/retry no longer provides end-to-end
+backpressure *through* the gateway — durability across a downstream outage is
+bounded by each sink's in-memory queue depth (`--sink-queue-cap`). This is
+inherent in the chosen topology (one inbound → N independent sinks) + semantics
+(no head-of-line blocking). A synchronous-scry variant (ACK only after scry
+accepts, Loki/OpenSearch still best-effort) is a small change if the trade-off
+ever bites; not built now. There is no on-disk spool (v0 was already best-effort
+with no spool).
+
+**Rationale.**
+- *Typed `*Batch` is the natural seam.* Every inbound already decodes to a typed
+  batch; fan-out is "offer that batch to N sinks" — the mappers (`map_traces`,
+  `map_remote_write`, `to_push_request`, `to_bulk_ndjson`) stay pure and
+  unit-tested, the workers are thin shells.
+- *Independent queues over a shared one.* A shared queue would let the slowest
+  sink stall the others; per-sink queues isolate failure and make "drop + count"
+  a local decision.
+- *Arc the payload once.* `Fanout` wraps the batch in an `Arc` so fanning to N
+  sinks is N refcount bumps, not N deep copies.
+- *Opt-in native listener.* Defaulting it on would unconditionally bind a port,
+  risking a startup failure / smoke flake for zero benefit to HTTP-only users.
+  Opt-in is the least-surprise, no-regression choice.
+- *Lazy scry connect over eager.* An eager connect made the gateway unable to
+  boot without a reachable scry server even when scry wasn't a configured target.
+  Lazy connect keeps the gateway's start independent of any one sink's
+  availability — the whole point of a best-effort fan-out.
+
+**Loki/OpenSearch mapping.** Loki: one stream per scry `LogStream`; label keys
+sanitized to Loki's `[a-zA-Z_][a-zA-Z0-9_]*` grammar (illegal chars → `_`, leading
+digit gains a `_` prefix); each entry → `[ts_unix_nano_string, body]`, with entry
+`attributes` + severity carried as **structured metadata** (the optional 3rd tuple
+element, dropped when empty so the push is valid against a Loki without structured
+metadata). OpenSearch: `_bulk` NDJSON, one `{"create":{"_index":<index>}}` action
++ doc per entry; `@timestamp` as ISO-8601 millis (auto-detected as a date), plus
+`body`, `severity`, stream labels, and entry attributes as fields.
+
+**Status.** Implemented in `crates/gateway` (`sink.rs`, `sink_scry.rs`, `loki.rs`,
+`opensearch.rs`, `wire.rs`; `upstream.rs` removed). The pure mappers and a wire
+`LogsBatch` encode/decode round-trip are unit-tested; `scripts/smoke-gateway.sh`
+(unchanged) still asserts the HTTP inbounds → scry sink path end to end with exact
+row counts. Live Loki + OpenSearch delivery is manual out-of-CI verification (the
+plan documents the steps). Out of scope: routing/filtering rules, metrics/traces
+to Loki/OpenSearch, remote-write-out, on-disk spool, auth to Loki/OpenSearch
+beyond a static URL/header cred, and any `scry-server`/wire-protocol change.
+
+## D-042: the OpenSearch sink self-manages per-service rolling data streams
+
+**Context.** The OpenSearch sink (D-041) initially wrote every log to a single
+static index named by `--opensearch-index`, and assumed an operator had set up the
+index, mappings, and any lifecycle policy out-of-band. Bart's lived experience is
+that this is exactly what breaks: *"these things always break for me if I don't
+have the service control them — people randomly change them on the cluster."* An
+operator widens a rollover threshold, deletes a template, or a dynamic mapping
+locks a label field to the wrong type and docs start silently dropping at `_bulk`.
+A single shared index also conflates every service's logs into one mapping space,
+which is where the type conflicts come from in the first place.
+
+**Decision.** The sink **owns** its lifecycle assets and **routes per service**.
+
+- **`--opensearch-index` is a prefix, not a name.** Each scry `LogStream` is
+  written to the data stream `<prefix>-<service>`, where `<service>` is the first
+  present, non-empty, sanitized value of `service.name` → `service` → `app` →
+  `k8s_app`, else `general`. This covers the OTLP/Pyroscope convention
+  (`service.name`) and the scry-agent k8s convention (a pod's `app` label surfaces
+  as `k8s_app`); logs with no service identity land in `<prefix>-general` rather
+  than being force-fit to a label that isn't there. Segments are lowercased and
+  coerced to OpenSearch's index-name grammar (`[a-z0-9_-]`, illegal → `-`,
+  collapsed, trimmed).
+
+- **Data streams, not plain indices.** Append-only time-series is exactly the
+  data-stream model; the bulk action was already `create` (required by data
+  streams). Rollover/date handling is therefore the cluster's job, driven by ISM,
+  not a date suffix we compute.
+
+- **Self-management is the default** (`--opensearch-unmanaged` opts out). The sink
+  asserts three things and keeps re-asserting them — **at startup, on a schedule
+  (`--opensearch-reconcile-interval`, default 5m), and after any write error** —
+  *not* boot-only, because the whole point is to correct drift that happens while
+  running:
+  1. an **ISM rollover policy** `<prefix>-rollover`: a single `hot` state with a
+     `rollover` action keyed on `--opensearch-rollover-size` (30gb) +
+     `--opensearch-rollover-age` (1d) and **no delete state** (Bart chose
+     "size+age rollover, no auto-delete" — deletion stays a human/retention
+     decision). It auto-attaches via `ism_template.index_patterns ["<prefix>-*"]`.
+  2. an **index template** `<prefix>` (`index_patterns ["<prefix>-*"]`,
+     `data_stream: {}`, priority 200) with **explicit mappings**: `@timestamp`
+     date, `body` text, `severity` short, and crucially `labels`/`attributes` as
+     **`flat_object`** — arbitrary label keys can never explode the mapping or
+     conflict on type, the root cause of the silent-drop failure mode.
+  3. the per-service **data streams**, created lazily on first sight (tracked in a
+     worker-local set, cleared on each reconcile so a wiped cluster re-bootstraps).
+
+**Why these specifics.**
+- *`ism_template` auto-attach, never manual attach.* For a data stream the policy
+  must match the *data-stream name pattern* and auto-attach; manually attaching to
+  the current write index does **not** survive rollover (the new backing index
+  comes up unmanaged). Validated live: after rollover the backing indices
+  `.ds-<prefix>-<svc>-000001` all report `policy_id = <prefix>-rollover`.
+- *ISM policy is read-then-write, the template is idempotent.* OpenSearch refuses
+  an unconditional overwrite of an existing ISM policy; correcting drift requires
+  GET `_seq_no`/`_primary_term` → conditional PUT. A concurrent-edit `409` is
+  non-fatal (next reconcile retries). The index-template PUT just overwrites.
+- *Reconcile on error, not just on a timer.* A `_bulk` failure is the strongest
+  signal that an asset is wrong *right now*; waiting up to the interval would keep
+  dropping logs. The worker sets a `needs_reconcile` flag the loop drains
+  immediately.
+- *`flat_object` over dynamic/object/nested.* Dynamic mapping is precisely the
+  drift vector; `nested` is overkill and query-hostile for free-form labels;
+  `flat_object` keeps subfields keyword-searchable by dot-path
+  (`labels.service`, `attributes.status`) with one stable mapping entry.
+
+**Status.** Implemented in `crates/gateway/src/opensearch.rs` (pure
+`service_segment`/`data_stream_name`/`to_bulk_ndjson`/`ism_policy_doc`/
+`index_template_doc` + the `OpenSearchSink` worker) and wired in `main.rs`
+(`--opensearch-unmanaged`/`--opensearch-rollover-size`/`--opensearch-rollover-age`/
+`--opensearch-reconcile-interval`). Unit tests cover service-key priority, the
+`general` fallback, segment sanitization, per-stream bulk routing, and the
+policy/template JSON shapes. Validated live against `opensearchproject/opensearch:
+2.17.1`: per-service data streams auto-created, policy auto-attached to backing
+indices, `flat_object` subfields + full-text `body` queryable, and an operator's
+hand-edit to the ISM policy (min_size `999gb`, edited description) reverted on the
+next reconcile. Still out of scope: auto-delete/retention in ISM (deliberate),
+non-log signals to OpenSearch, and auth beyond a static URL/header cred.
