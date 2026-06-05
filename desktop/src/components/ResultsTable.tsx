@@ -9,32 +9,18 @@
 
 import { For, Show, createMemo, createSignal, type Component, type JSX } from "solid-js";
 
+import { attrEntries, fmtCell, fmtTs } from "../format";
+import {
+  buildSpanTree,
+  decodeSpans,
+  layoutSpans,
+  singleTraceId,
+} from "../traces";
 import { state, resultTable } from "../store";
+import TracesView, { type TraceData } from "./TracesView";
 
 /** Cap rendered rows so a large result can't lock up the DOM. */
 const MAX_DISPLAY_ROWS = 2000;
-
-// ── value formatting (generic table) ─────────────────────────────────
-
-function toHex(bytes: Uint8Array): string {
-  let s = "";
-  for (const b of bytes) s += b.toString(16).padStart(2, "0");
-  return s;
-}
-
-function fmtCell(v: unknown): string {
-  if (v === null || v === undefined) return "";
-  if (v instanceof Uint8Array) return toHex(v);
-  if (typeof v === "bigint") return v.toString();
-  if (typeof v === "object") {
-    try {
-      return JSON.stringify(v, (_k, val) => (typeof val === "bigint" ? val.toString() : val));
-    } catch {
-      return String(v);
-    }
-  }
-  return String(v);
-}
 
 // ── log helpers ───────────────────────────────────────────────────────
 
@@ -102,32 +88,6 @@ function shortKey(k: string): string {
   return s;
 }
 
-function attrVal(v: unknown): string {
-  if (v === null || v === undefined) return "";
-  if (typeof v === "bigint") return v.toString();
-  if (typeof v === "object") return fmtCell(v);
-  return String(v);
-}
-
-/** Coerce the Arrow Map cell (object / Map / array-of-pairs) into entries. */
-function attrEntries(v: unknown): [string, string][] {
-  if (v === null || v === undefined) return [];
-  if (v instanceof Map) {
-    return [...v.entries()].map(([k, val]) => [String(k), attrVal(val)]);
-  }
-  if (Array.isArray(v)) {
-    return v.map((e) =>
-      Array.isArray(e)
-        ? [String(e[0]), attrVal(e[1])]
-        : [String((e as { key: unknown }).key), attrVal((e as { value: unknown }).value)],
-    );
-  }
-  if (typeof v === "object") {
-    return Object.entries(v as Record<string, unknown>).map(([k, val]) => [k, attrVal(val)]);
-  }
-  return [];
-}
-
 /** OTEL severity number → display label + CSS class. */
 function severity(sev: number): { label: string; cls: string } {
   if (sev >= 21) return { label: "FATAL", cls: "sev-fatal" };
@@ -137,16 +97,6 @@ function severity(sev: number): { label: string; cls: string } {
   if (sev >= 5) return { label: "DEBUG", cls: "sev-debug" };
   if (sev >= 1) return { label: "TRACE", cls: "sev-trace" };
   return { label: "—", cls: "sev-none" };
-}
-
-const pad = (n: number, w = 2): string => String(n).padStart(w, "0");
-
-/** Unix-nanos → a compact local time plus a full ISO title. */
-function fmtTs(ns: bigint): { short: string; full: string } {
-  const d = new Date(Number(ns / 1_000_000n));
-  if (Number.isNaN(d.getTime())) return { short: "—", full: "" };
-  const short = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`;
-  return { short, full: d.toISOString() };
 }
 
 // ── component ──────────────────────────────────────────────────────────
@@ -193,6 +143,30 @@ const ResultsTable: Component = () => {
         r.labels.some(([k, v]) => matches(k, v)) ||
         r.attrs.some(([k, v]) => matches(k, v)),
     );
+  });
+
+  // Traces waterfall view: only when the result carries the canonical span
+  // columns AND is a single-trace lookup (one distinct trace_id). Multi-trace
+  // results fall through to the generic table.
+  const traces = createMemo<TraceData | null>(() => {
+    const t = resultTable();
+    if (!t) return null;
+    const names = new Set(t.schema.fields.map((f) => f.name));
+    if (!(names.has("trace_id") && names.has("span_id") && names.has("start_unix_nano"))) {
+      return null;
+    }
+    const all = t.toArray();
+    const shown = Math.min(all.length, MAX_DISPLAY_ROWS);
+    const raws: Record<string, unknown>[] = [];
+    for (let i = 0; i < shown; i++) {
+      raws.push((all[i]?.toJSON?.() ?? {}) as Record<string, unknown>);
+    }
+    const traceId = singleTraceId(raws);
+    if (traceId === null) return null;
+    const ordered = buildSpanTree(decodeSpans(raws));
+    const layouts = layoutSpans(ordered);
+    const rows = ordered.map((span, i) => ({ span, layout: layouts[i]! }));
+    return { traceId, rows, shown, total: t.numRows };
   });
 
   // Generic table view (any signal).
@@ -330,16 +304,23 @@ const ResultsTable: Component = () => {
           )}
         </Show>
 
-        {/* Generic table: every non-log signal, or logs in raw mode. Read the
-            `table()` memo in JSX positions so it tracks new results. */}
-        <Show when={(!logs() || raw()) && table()}>
+        {/* Traces waterfall, unless the raw toggle is on. `tv` is a reactive
+            accessor — passed through to TracesView, never captured here. */}
+        <Show when={!raw() && traces()}>
+          {(tv) => <TracesView data={tv} raw={raw} setRaw={setRaw} />}
+        </Show>
+
+        {/* Generic table: any signal with no purpose-built view, or a log/trace
+            result in raw mode. Read the `table()` memo in JSX positions so it
+            tracks new results. */}
+        <Show when={((!logs() && !traces()) || raw()) && table()}>
           {(v) => (
             <>
               <div class="results-meta">
                 {metaCommon(() => v().total)}
                 <span>{v().fields.length} columns</span>
-                <Show when={logs()}>
-                  <label class="raw-toggle" title="back to the logs reader view">
+                <Show when={logs() || traces()}>
+                  <label class="raw-toggle" title="back to the purpose-built view">
                     <input type="checkbox" checked={raw()} onInput={(e) => setRaw(e.currentTarget.checked)} />
                     raw
                   </label>

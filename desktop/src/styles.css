@@ -572,6 +572,187 @@ textarea {
   color: var(--text);
 }
 
+/* ── Traces waterfall ─────────────────────────────────────────────── */
+
+.trace-list {
+  flex: 1;
+  overflow: auto;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.trace-id {
+  color: var(--muted);
+  font-family: var(--mono);
+  max-width: 18ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.trace-root-svc {
+  color: var(--accent);
+}
+
+.trace-span {
+  border-bottom: 1px solid var(--border);
+  border-left: 3px solid transparent;
+}
+
+.trace-span.status-err {
+  border-left-color: var(--danger);
+}
+
+.trace-span > summary {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 3px 12px;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+
+.trace-span > summary::-webkit-details-marker {
+  display: none;
+}
+
+.trace-span > summary:hover {
+  background: rgba(106, 163, 255, 0.06);
+}
+
+.trace-label {
+  flex: 0 0 46%;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  overflow: hidden;
+}
+
+.trace-kind {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0.03em;
+}
+
+.trace-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+  font-weight: 600;
+}
+
+.chip.trace-svc {
+  flex: 0 0 auto;
+  background: hsl(var(--hue, 210), 45%, 20%);
+  border-color: hsl(var(--hue, 210), 45%, 38%);
+}
+
+.trace-status {
+  flex: 0 0 auto;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 0 4px;
+  border-radius: 3px;
+}
+.trace-status.err {
+  color: var(--danger);
+  background: rgba(255, 107, 107, 0.16);
+}
+.trace-status.ok {
+  color: var(--muted);
+}
+
+.trace-track {
+  position: relative;
+  flex: 1 1 auto;
+  height: 16px;
+  display: flex;
+  align-items: center;
+}
+
+.trace-bar {
+  position: absolute;
+  top: 3px;
+  height: 10px;
+  min-width: 2px;
+  border-radius: 2px;
+}
+
+.status-err .trace-bar {
+  outline: 1px solid var(--danger);
+}
+
+.trace-dur {
+  position: absolute;
+  right: 0;
+  color: var(--muted);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  background: linear-gradient(to right, transparent, var(--panel) 40%);
+  padding-left: 8px;
+}
+
+.trace-detail {
+  padding: 4px 12px 8px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.trace-ids,
+.trace-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 6px;
+}
+
+.trace-chips .chip.attr b {
+  color: var(--muted);
+}
+
+.trace-status-msg {
+  color: var(--danger);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.trace-section-h {
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  margin-bottom: 2px;
+}
+
+.trace-event,
+.trace-link {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  margin: 2px 0;
+}
+
+.trace-event-name {
+  color: var(--text);
+}
+
+.trace-ts {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.trace-empty {
+  color: var(--muted);
+  font-style: italic;
+}
+
 /* ── Mobile / narrow viewports ────────────────────────────────────── */
 
 /* The default layout is a fixed-width sidebar beside a flexible results
