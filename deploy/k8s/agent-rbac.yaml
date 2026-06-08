@@ -14,6 +14,13 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
+  # Kubelet/cadvisor scraping (https://${NODE_IP}:10250/metrics{,/cadvisor}):
+  # the kubelet delegates authz to a SubjectAccessReview on these resources, so
+  # the agent's ServiceAccount token must be allowed to GET them. Only needed
+  # when [metrics.kubelet] scraping is enabled in the agent config.
+  - apiGroups: [""]
+    resources: ["nodes/metrics", "nodes/proxy"]
+    verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

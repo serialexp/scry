@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -21,6 +22,7 @@ use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 use uuid::Uuid;
 
+mod config;
 mod cri;
 mod discovery;
 mod filter;
@@ -47,6 +49,12 @@ struct Args {
     /// field selector). In-cluster, wire it from the downward API.
     #[arg(long, env = "NODE_NAME")]
     node_name: Option<String>,
+
+    /// This node's IP, used only to interpolate `${NODE_IP}` in the kubelet
+    /// scrape address. In-cluster, wire it from the downward API
+    /// (`fieldRef: status.hostIP`).
+    #[arg(long, env = "NODE_IP")]
+    node_ip: Option<String>,
 
     /// Root of the CRI pod-log tree.
     #[arg(long, default_value = "/var/log/pods")]
@@ -82,6 +90,14 @@ struct Args {
     /// How often to rescan `logs_root` for new/removed container log files.
     #[arg(long, value_parser = parse_duration, default_value = "5s")]
     scan_interval: Duration,
+
+    /// Path to the TOML processing-pipeline config (usually a k8s
+    /// ConfigMap-mounted file). Read once at startup; restart the DaemonSet to
+    /// apply a change. Owns the per-signal `keep`, label maps, static labels,
+    /// JSON extraction, and metric relabeling. When set, the global `--keep`
+    /// flag is rejected (move it into the file's `[logs]`/`[metrics] keep`).
+    #[arg(long, env = "SCRY_AGENT_CONFIG")]
+    config: Option<PathBuf>,
 
     /// Keep-only label allow-list (repeatable). A log stream is shipped only if
     /// it matches ALL `--keep` matchers; everything else is dropped at the node
@@ -133,11 +149,22 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    let keep_filter = filter::LabelFilter::parse(&args.keep)?;
-    if !keep_filter.is_empty() {
+    // Config owns the processing pipeline; flags own runtime. Without --config,
+    // the global --keep flag is synthesized into a degenerate per-signal config.
+    let (log_pipeline, metric_pipeline) = config::resolve(args.config.as_deref(), &args.keep)?;
+    if let Some(path) = &args.config {
+        info!(config = %path.display(), "loaded agent pipeline config");
+    }
+    if !log_pipeline.keep.is_empty() {
         info!(
-            matchers = keep_filter.len(),
-            "keep-only label allow-list active"
+            matchers = log_pipeline.keep.len(),
+            "logs keep-only allow-list active"
+        );
+    }
+    if !metric_pipeline.keep.is_empty() {
+        info!(
+            matchers = metric_pipeline.keep.len(),
+            "metrics keep-only allow-list active"
         );
     }
 
@@ -152,9 +179,27 @@ async fn main() -> Result<()> {
     let (log_tx, mut log_rx) = mpsc::channel::<RawLog>(8192);
     let (metrics_tx, mut metrics_rx) = mpsc::channel::<scrape::ScrapeResult>(1024);
 
-    // Metrics scraping is active when there are static targets, or when the pod
-    // watch is on (so `prometheus.io/scrape` annotations can be honored).
-    let mut metrics_enabled = !args.no_discovery || !args.scrape_target.is_empty();
+    // Config-driven pod-label SD jobs + kubelet scraping (shared by the
+    // enable-decision, the pod watch, and the scheduler).
+    let scrape_pods = Arc::new(metric_pipeline.scrape_pods.clone());
+    let kubelet_cfg = metric_pipeline.kubelet.clone();
+    let kubelet_enabled = kubelet_cfg.as_ref().is_some_and(|k| k.enabled);
+
+    // Metrics scraping is active when there are static targets, kubelet scraping
+    // is on, a pod-SD job is configured, or the pod watch is on (so
+    // `prometheus.io/scrape` annotations can be honored).
+    let mut metrics_enabled = !args.no_discovery
+        || !args.scrape_target.is_empty()
+        || kubelet_enabled
+        || !scrape_pods.is_empty();
+
+    // Pod-label SD needs the watch; warn if it's configured but discovery is off.
+    if args.no_discovery && !scrape_pods.is_empty() {
+        warn!(
+            jobs = scrape_pods.len(),
+            "[[metrics.scrape_pods]] configured but --no-discovery is set; pod-label SD is inert"
+        );
+    }
 
     // ── Discovery: pod watch (optional) + filesystem scan ──────────────
     let watcher_handle = if args.no_discovery {
@@ -165,6 +210,7 @@ async fn main() -> Result<()> {
             node.clone(),
             registry.clone(),
             target_registry.clone(),
+            scrape_pods.clone(),
             shutdown_rx.clone(),
         ))
     };
@@ -181,12 +227,22 @@ async fn main() -> Result<()> {
 
     // ── Metrics: scrape scheduler (optional) ───────────────────────────
     let scheduler_handle = if metrics_enabled {
-        let http = reqwest::Client::builder()
-            .timeout(args.scrape_timeout)
-            .build()?;
+        let pool = Arc::new(scrape::ClientPool::new(args.scrape_timeout));
         let bearer = resolve_bearer(args.scrape_bearer.clone())?;
-        let static_targets =
+        let mut static_targets =
             build_static_targets(&args.scrape_target, &args.scrape_default_job, &node, bearer);
+        if let Some(kubelet) = &kubelet_cfg {
+            if kubelet.enabled {
+                let kubelet_targets =
+                    build_kubelet_targets(kubelet, &node, args.node_ip.as_deref())?;
+                info!(
+                    targets = kubelet_targets.len(),
+                    address = %kubelet.address,
+                    "kubelet scraping enabled"
+                );
+                static_targets.extend(kubelet_targets);
+            }
+        }
         info!(
             static_targets = static_targets.len(),
             discovery = !args.no_discovery,
@@ -195,11 +251,13 @@ async fn main() -> Result<()> {
         Some(discovery::spawn_scrape_scheduler(
             target_registry.clone(),
             static_targets,
-            http,
+            pool,
             args.scrape_interval,
             args.scan_interval,
             metrics_tx.clone(),
             shutdown_rx.clone(),
+            metric_pipeline.static_labels.clone(),
+            metric_pipeline.label_map.clone(),
         ))
     } else {
         None
@@ -251,6 +309,12 @@ async fn main() -> Result<()> {
     // metrics keep separate caches (distinct fingerprint spaces).
     let mut keep_cache: HashMap<u64, bool> = HashMap::new();
     let mut metrics_keep_cache: HashMap<u64, bool> = HashMap::new();
+    // Enriched (fingerprint, labels) cached by base fingerprint, used only when
+    // the log pipeline enriches but JSON does not add labels — then the enriched
+    // label set is stable per stream, so we rebuild the BTreeMap once per stream
+    // instead of once per line. When JSON adds labels the fingerprint varies per
+    // line and this cache is bypassed.
+    let mut enrich_cache: HashMap<u64, (u64, Vec<LabelPair>)> = HashMap::new();
     let mut dropped: u64 = 0;
     let mut metrics_dropped: u64 = 0;
     let mut batch_id: u64 = 0;
@@ -264,7 +328,7 @@ async fn main() -> Result<()> {
             maybe = log_rx.recv() => {
                 match maybe {
                     Some(rec) => {
-                        ingest(&mut pending, &registry, &node, rec, &keep_filter, &mut keep_cache, &mut dropped).await;
+                        ingest(&mut pending, &registry, &node, rec, &log_pipeline, &mut keep_cache, &mut enrich_cache, &mut dropped).await;
                         if pending.record_count >= args.batch_max_lines
                             || pending.approx_bytes >= args.batch_max_bytes
                         {
@@ -280,7 +344,7 @@ async fn main() -> Result<()> {
             maybe = metrics_rx.recv(), if metrics_enabled => {
                 match maybe {
                     Some(result) => {
-                        ingest_metrics(&mut metrics_pending, result, &keep_filter, &mut metrics_keep_cache, &mut metrics_dropped);
+                        ingest_metrics(&mut metrics_pending, result, &metric_pipeline.keep, &mut metrics_keep_cache, &mut metrics_dropped);
                         if metrics_pending.record_count >= args.batch_max_lines
                             || metrics_pending.approx_bytes >= args.batch_max_bytes
                         {
@@ -311,8 +375,9 @@ async fn main() -> Result<()> {
             &registry,
             &node,
             rec,
-            &keep_filter,
+            &log_pipeline,
             &mut keep_cache,
+            &mut enrich_cache,
             &mut dropped,
         )
         .await;
@@ -321,7 +386,7 @@ async fn main() -> Result<()> {
         ingest_metrics(
             &mut metrics_pending,
             result,
-            &keep_filter,
+            &metric_pipeline.keep,
             &mut metrics_keep_cache,
             &mut metrics_dropped,
         );
@@ -413,19 +478,63 @@ async fn ingest(
     registry: &discovery::PodRegistry,
     node: &str,
     rec: RawLog,
-    keep_filter: &filter::LabelFilter,
+    pipeline: &config::LogPipeline,
     keep_cache: &mut HashMap<u64, bool>,
+    enrich_cache: &mut HashMap<u64, (u64, Vec<LabelPair>)>,
     dropped: &mut u64,
 ) {
-    let (fp, labels) = {
+    // Stream identity comes from the CRI path + pod labels (registry). Hold the
+    // read guard only long enough to build the base labels — JSON parsing and
+    // enrichment happen after it's dropped so a slow parse can't block the watch.
+    let (base_fp, base_labels) = {
         let guard = registry.read().await;
         stream::stream_labels(&rec.pod, node, guard.get(&rec.pod.uid))
     };
 
-    if !keep_filter.is_empty() {
+    // Stream is Copy; capture the cheap scalars before the body is moved.
+    let stream_name = rec.stream.name();
+    let severity = rec.stream.severity();
+    let ts = rec.ts_unix_nano;
+
+    // Resolve final (fingerprint, labels, attributes, body). The no-op pipeline
+    // path is byte-identical to the pre-config behavior.
+    let (fp, labels, attributes, body) = if pipeline.enriches() {
+        // Parse the JSON body once, only when extraction needs it.
+        let parsed = if pipeline.needs_json() {
+            serde_json::from_str::<serde_json::Value>(&rec.body).ok()
+        } else {
+            None
+        };
+        let obj = parsed.as_ref().and_then(|v| v.as_object());
+
+        let (fp, labels) = if pipeline.json_adds_labels() {
+            // JSON labels vary per line → fingerprint isn't cacheable per stream.
+            stream::enrich_labels(&base_labels, pipeline, obj)
+        } else {
+            // Labels stable per stream → rebuild once, cache by base fingerprint.
+            enrich_cache
+                .entry(base_fp)
+                .or_insert_with(|| stream::enrich_labels(&base_labels, pipeline, None))
+                .clone()
+        };
+        let (attrs, body) = stream::enrich_entry(stream_name, rec.body, pipeline, obj);
+        (fp, labels, attrs, body)
+    } else {
+        (
+            base_fp,
+            base_labels,
+            vec![LabelPair {
+                key: "stream".into(),
+                value: stream_name.into(),
+            }],
+            rec.body,
+        )
+    };
+
+    if !pipeline.keep.is_empty() {
         let keep = *keep_cache
             .entry(fp)
-            .or_insert_with(|| keep_filter.keeps(&labels));
+            .or_insert_with(|| pipeline.keep.keeps(&labels));
         if !keep {
             *dropped += 1;
             // Sparse heartbeat so operators can see the filter cutting volume
@@ -433,7 +542,7 @@ async fn ingest(
             if dropped.is_multiple_of(100_000) {
                 info!(
                     dropped = *dropped,
-                    "dropping log streams not matching --keep allow-list"
+                    "dropping log streams not matching keep allow-list"
                 );
             }
             return;
@@ -441,23 +550,20 @@ async fn ingest(
     }
 
     if pending.record_count == 0 {
-        pending.ts_min = rec.ts_unix_nano;
-        pending.ts_max = rec.ts_unix_nano;
+        pending.ts_min = ts;
+        pending.ts_max = ts;
     } else {
-        pending.ts_min = pending.ts_min.min(rec.ts_unix_nano);
-        pending.ts_max = pending.ts_max.max(rec.ts_unix_nano);
+        pending.ts_min = pending.ts_min.min(ts);
+        pending.ts_max = pending.ts_max.max(ts);
     }
-    pending.approx_bytes += rec.body.len() + 48;
+    pending.approx_bytes += body.len() + 48;
     pending.record_count += 1;
 
     let entry = LogEntry {
-        ts_unix_nano: rec.ts_unix_nano,
-        severity: rec.stream.severity(),
-        body: rec.body,
-        attributes: vec![LabelPair {
-            key: "stream".into(),
-            value: rec.stream.name().into(),
-        }],
+        ts_unix_nano: ts,
+        severity,
+        body,
+        attributes,
     };
 
     pending
@@ -503,7 +609,7 @@ fn ingest_metrics(
             if dropped.is_multiple_of(100_000) {
                 info!(
                     dropped = *dropped,
-                    "dropping metric series not matching --keep allow-list"
+                    "dropping metric series not matching keep allow-list"
                 );
             }
             continue;
@@ -716,18 +822,14 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
 }
 
 /// Resolve a `--scrape-bearer` argument: a literal token, or `@/path` to read
-/// the token from a file (trimmed). Prefer the file form so the secret never
-/// appears in argv / process listings.
-fn resolve_bearer(arg: Option<String>) -> Result<Option<String>> {
+/// the token from a file (re-read per scrape, so rotation is followed). Prefer
+/// the file form so the secret never appears in argv / process listings.
+fn resolve_bearer(arg: Option<String>) -> Result<Option<scrape::BearerSource>> {
     match arg {
         None => Ok(None),
         Some(s) => match s.strip_prefix('@') {
-            Some(path) => {
-                let tok = std::fs::read_to_string(path)
-                    .map_err(|e| anyhow::anyhow!("reading scrape bearer file {path}: {e}"))?;
-                Ok(Some(tok.trim().to_string()))
-            }
-            None => Ok(Some(s)),
+            Some(path) => Ok(Some(scrape::BearerSource::File(PathBuf::from(path)))),
+            None => Ok(Some(scrape::BearerSource::Literal(s))),
         },
     }
 }
@@ -739,7 +841,7 @@ fn build_static_targets(
     urls: &[String],
     job: &str,
     node: &str,
-    bearer: Option<String>,
+    bearer: Option<scrape::BearerSource>,
 ) -> Vec<scrape::ScrapeTarget> {
     urls.iter()
         .map(|url| scrape::ScrapeTarget {
@@ -759,8 +861,81 @@ fn build_static_targets(
                 },
             ],
             bearer: bearer.clone(),
+            tls: Default::default(),
+            // Static labels + relabel map are applied uniformly to all targets
+            // by the scrape scheduler (see discovery::stamp_target).
+            label_map: Default::default(),
         })
         .collect()
+}
+
+/// Build the kubelet scrape targets: one per enabled endpoint (`/metrics/cadvisor`
+/// → `job=cadvisor`, `/metrics` → `job=kubelet`), each carrying the kubelet TLS
+/// profile and a file-backed bearer source (re-read per scrape for SA-token
+/// rotation). The address template is interpolated with `${NODE_IP}`/`${NODE_NAME}`.
+fn build_kubelet_targets(
+    cfg: &config::KubeletConfig,
+    node: &str,
+    node_ip: Option<&str>,
+) -> Result<Vec<scrape::ScrapeTarget>> {
+    let base = resolve_kubelet_address(&cfg.address, node_ip, node)?;
+    let base = base.trim_end_matches('/');
+    let bearer = scrape::BearerSource::File(cfg.bearer_file.clone());
+    let mut targets = Vec::new();
+    let mut push = |path: &str, job: &str| {
+        let url = format!("{base}{path}");
+        targets.push(scrape::ScrapeTarget {
+            url: url.clone(),
+            labels: vec![
+                LabelPair {
+                    key: "job".into(),
+                    value: job.to_string(),
+                },
+                LabelPair {
+                    key: "instance".into(),
+                    value: instance_from_url(&url),
+                },
+                LabelPair {
+                    key: "node".into(),
+                    value: node.to_string(),
+                },
+            ],
+            bearer: Some(bearer.clone()),
+            tls: cfg.tls.clone(),
+            label_map: Default::default(),
+        });
+    };
+    if cfg.cadvisor {
+        push("/metrics/cadvisor", "cadvisor");
+    }
+    if cfg.kubelet {
+        push("/metrics", "kubelet");
+    }
+    Ok(targets)
+}
+
+/// Interpolate `${NODE_IP}` / `${NODE_NAME}` in a kubelet address template.
+/// Errors if a referenced token has no value (e.g. `${NODE_IP}` used but
+/// `--node-ip`/`NODE_IP` is unset).
+fn resolve_kubelet_address(template: &str, node_ip: Option<&str>, node: &str) -> Result<String> {
+    let mut out = template.to_string();
+    if out.contains("${NODE_IP}") {
+        let ip = node_ip.filter(|s| !s.is_empty()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "kubelet address {template:?} references ${{NODE_IP}} but --node-ip/NODE_IP is unset"
+            )
+        })?;
+        out = out.replace("${NODE_IP}", ip);
+    }
+    if out.contains("${NODE_NAME}") {
+        if node.is_empty() {
+            anyhow::bail!(
+                "kubelet address {template:?} references ${{NODE_NAME}} but the node name is empty"
+            );
+        }
+        out = out.replace("${NODE_NAME}", node);
+    }
+    Ok(out)
 }
 
 /// Extract the `host:port` authority from a URL for the `instance` label.
@@ -771,4 +946,124 @@ fn instance_from_url(url: &str) -> String {
         .next()
         .unwrap_or(after_scheme)
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scrape::{BearerSource, TlsProfile};
+
+    fn label(t: &scrape::ScrapeTarget, key: &str) -> Option<String> {
+        t.labels
+            .iter()
+            .find(|p| p.key == key)
+            .map(|p| p.value.clone())
+    }
+
+    #[test]
+    fn resolve_kubelet_address_interpolates_node_ip() {
+        let got = resolve_kubelet_address("https://${NODE_IP}:10250", Some("10.0.0.7"), "n1")
+            .expect("ip set");
+        assert_eq!(got, "https://10.0.0.7:10250");
+    }
+
+    #[test]
+    fn resolve_kubelet_address_interpolates_node_name() {
+        let got = resolve_kubelet_address("https://${NODE_NAME}:10250", None, "node-1")
+            .expect("name set");
+        assert_eq!(got, "https://node-1:10250");
+    }
+
+    #[test]
+    fn resolve_kubelet_address_errors_when_node_ip_missing() {
+        assert!(resolve_kubelet_address("https://${NODE_IP}:10250", None, "n1").is_err());
+        // Empty string counts as missing.
+        assert!(resolve_kubelet_address("https://${NODE_IP}:10250", Some(""), "n1").is_err());
+    }
+
+    #[test]
+    fn resolve_kubelet_address_passes_literal_through() {
+        let got = resolve_kubelet_address("https://127.0.0.1:9999", None, "n1").expect("literal");
+        assert_eq!(got, "https://127.0.0.1:9999");
+    }
+
+    fn kubelet_cfg(cadvisor: bool, kubelet: bool) -> config::KubeletConfig {
+        config::KubeletConfig {
+            enabled: true,
+            address: "https://${NODE_IP}:10250".into(),
+            cadvisor,
+            kubelet,
+            bearer_file: PathBuf::from("/var/run/secrets/kubernetes.io/serviceaccount/token"),
+            tls: TlsProfile {
+                insecure_skip_verify: true,
+                ca_file: None,
+            },
+        }
+    }
+
+    #[test]
+    fn build_kubelet_targets_emits_both_endpoints() {
+        let cfg = kubelet_cfg(true, true);
+        let targets = build_kubelet_targets(&cfg, "n1", Some("10.0.0.7")).expect("targets");
+        assert_eq!(targets.len(), 2);
+
+        let cadvisor = &targets[0];
+        assert_eq!(cadvisor.url, "https://10.0.0.7:10250/metrics/cadvisor");
+        assert_eq!(label(cadvisor, "job").as_deref(), Some("cadvisor"));
+        assert_eq!(
+            label(cadvisor, "instance").as_deref(),
+            Some("10.0.0.7:10250")
+        );
+        assert_eq!(label(cadvisor, "node").as_deref(), Some("n1"));
+        assert!(cadvisor.tls.insecure_skip_verify);
+        match &cadvisor.bearer {
+            Some(BearerSource::File(p)) => {
+                assert_eq!(p, &cfg.bearer_file);
+            }
+            other => panic!("expected file bearer, got {other:?}"),
+        }
+
+        let kubelet = &targets[1];
+        assert_eq!(kubelet.url, "https://10.0.0.7:10250/metrics");
+        assert_eq!(label(kubelet, "job").as_deref(), Some("kubelet"));
+    }
+
+    #[test]
+    fn build_kubelet_targets_honors_endpoint_toggles() {
+        let only_cadvisor =
+            build_kubelet_targets(&kubelet_cfg(true, false), "n1", Some("1.2.3.4")).unwrap();
+        assert_eq!(only_cadvisor.len(), 1);
+        assert_eq!(label(&only_cadvisor[0], "job").as_deref(), Some("cadvisor"));
+
+        let only_kubelet =
+            build_kubelet_targets(&kubelet_cfg(false, true), "n1", Some("1.2.3.4")).unwrap();
+        assert_eq!(only_kubelet.len(), 1);
+        assert_eq!(label(&only_kubelet[0], "job").as_deref(), Some("kubelet"));
+
+        let none =
+            build_kubelet_targets(&kubelet_cfg(false, false), "n1", Some("1.2.3.4")).unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn build_kubelet_targets_errors_without_node_ip() {
+        assert!(build_kubelet_targets(&kubelet_cfg(true, true), "n1", None).is_err());
+    }
+
+    #[test]
+    fn resolve_bearer_file_form_is_lazy() {
+        match resolve_bearer(Some("@/some/path".into())).unwrap() {
+            Some(BearerSource::File(p)) => assert_eq!(p, PathBuf::from("/some/path")),
+            other => panic!("expected file bearer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_bearer_literal_form() {
+        match resolve_bearer(Some("tok123".into())).unwrap() {
+            Some(BearerSource::Literal(s)) => assert_eq!(s, "tok123"),
+            other => panic!("expected literal bearer, got {other:?}"),
+        }
+        assert!(resolve_bearer(None).unwrap().is_none());
+    }
 }

@@ -1,0 +1,56 @@
+# Example scry-agent processing-pipeline config, mounted at /etc/scry/agent.toml
+# by the DaemonSet. The agent reads it once at startup — apply changes by
+# restarting the DaemonSet (kubectl rollout restart ds/scry-agent -n scry).
+#
+# Remember: config owns the *pipeline* (label reshaping, JSON extraction,
+# kubelet scraping, pod-label SD); flags/env own *runtime* (server address,
+# intervals, NODE_IP). See the scry-agent README section for the full schema.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scry-agent-config
+  namespace: scry
+data:
+  agent.toml: |
+    # ── Logs ────────────────────────────────────────────────────────────────
+    [logs]
+    # Inject fixed labels on every log stream.
+    static_labels = { cluster = "gothab-prod" }
+    # Surface a pod label under a chosen name (suppresses its k8s_<key> twin),
+    # e.g. so `app="…"` queries keep working.
+    label_map = { "app.kubernetes.io/name" = "app" }
+
+    # Extract fields from JSON log bodies.
+    [logs.json]
+    labels = ["level"]          # → stream labels (postings); keep low-cardinality
+    metadata = ["request_id"]   # → per-entry attributes Map; high-cardinality OK
+    message_field = "msg"       # if present (string), replaces the log body
+
+    # ── Metrics ─────────────────────────────────────────────────────────────
+    [metrics]
+    static_labels = { cluster = "gothab-prod" }
+    # Rename exposed metric label keys before the exported_<key> collision check.
+    label_map = { container_name = "container" }
+
+    # Scrape this node's own kubelet over HTTPS (:10250). Needs the
+    # nodes/metrics + nodes/proxy RBAC rule (see agent-rbac.yaml) and the
+    # NODE_IP downward-API env (see agent-daemonset.yaml).
+    [metrics.kubelet]
+    enabled = true
+    # address  = "https://${NODE_IP}:10250"   # default
+    cadvisor = true   # scrape /metrics/cadvisor (per-container resource metrics)
+    kubelet  = true   # scrape /metrics         (kubelet's own metrics)
+    # bearer_file = "/var/run/secrets/kubernetes.io/serviceaccount/token"  # default
+    [metrics.kubelet.tls]
+    insecure_skip_verify = true   # default; the kubelet cert rarely has a SAN for the IP
+    # ca_file = "/etc/scry/kubelet-ca.pem"   # set to verify instead of skip-verify
+
+    # Node-local pod-label service discovery: turn matching pods on this node
+    # into scrape targets without needing prometheus.io/scrape annotations.
+    # Repeatable.
+    [[metrics.scrape_pods]]
+    job = "node-exporter"
+    selector = { "app.kubernetes.io/name" = "node-exporter" }
+    port = 9100
+    # path   = "/metrics"   # default
+    # scheme = "http"       # default

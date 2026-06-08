@@ -29,11 +29,22 @@ spec:
           imagePullPolicy: IfNotPresent
           command:
             - scry-agent
+          args:
+            # The processing pipeline (per-signal keep, label mapping, JSON
+            # extraction, kubelet scraping, pod-label SD) lives in the mounted
+            # ConfigMap. See agent-config.example.yaml.
+            - --config
+            - /etc/scry/agent.toml
           env:
             - name: NODE_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            # Used to interpolate ${NODE_IP} in the kubelet scrape address.
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
             - name: SCRY_SERVER_ADDR
               value: "scry-server.scry.svc:4000"
             # Tune verbosity via RUST_LOG if needed (default info).
@@ -54,6 +65,9 @@ spec:
             - name: container-logs
               mountPath: /var/log/containers
               readOnly: true
+            - name: agent-config
+              mountPath: /etc/scry
+              readOnly: true
       volumes:
         - name: pod-logs
           hostPath:
@@ -63,3 +77,6 @@ spec:
           hostPath:
             path: /var/log/containers
             type: DirectoryOrCreate
+        - name: agent-config
+          configMap:
+            name: scry-agent-config

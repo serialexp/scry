@@ -2025,3 +2025,173 @@ routing) + frontend (`store.ts` `target`/`targets`/`fetchTargets`,
 `/api/targets` lists both + default and never leaks the addr, header routing hits
 the right upstream, default when header absent, unknown id → 400) + new
 `tests/query.rs` integration tests.
+
+## D-047: Config-driven agent pipeline (TOML)
+
+**Date:** 2026-06-08
+**Status:** accepted
+
+The scry-agent's processing pipeline — how labels are reshaped and which
+fields are extracted before records go on the wire — is owned by a **TOML
+config file** (`--config`, `SCRY_AGENT_CONFIG` env), usually mounted from a
+Kubernetes ConfigMap. The file is read once at startup; a ConfigMap change is
+applied by restarting the DaemonSet (no live reload).
+
+**Decision.** Split the agent's configuration into two domains:
+
+- **Flags own runtime.** Where to connect (`--server-addr`), intervals,
+  batch sizes, `--scrape-target` URLs stay on CLI flags (or their env
+  equivalents). These are deployment-specific but don't need team-level
+  review.
+- **Config owns the pipeline.** Label manipulation, field extraction, and
+  per-signal keep filters go in the TOML file. These are the "how" of
+  processing and benefit from review/version-control.
+
+Six features in the first cut:
+
+1. **Per-signal `keep`** — the global `--keep` flag is rejected when
+   `--config` is set; move matchers into `[logs] keep` and `[metrics] keep`.
+2. **`label_map`** — surface a pod label (`k8s_<key>`) under a chosen
+   stream-label name, suppressing the `k8s_<key>` twin so the value isn't
+   double-indexed.
+3. **`static_labels`** — inject fixed labels on every log stream / metric
+   series (e.g. `cluster = "gothab-prod"`).
+4. **JSON body fields → stream labels** (`[logs.json] labels`) —
+   low-cardinality fields promoted to stream identity (fingerprinted →
+   postings). Each unique value spawns a distinct stream fingerprint, so a
+   high-cardinality field here is expensive (sparse streams, many postings).
+   Deliberately no hard cap — operators are expected to choose low-card
+   fields.
+5. **JSON body fields → per-entry attributes** (`[logs.json] metadata`) —
+   high-cardinality data stored in the `Map<Utf8,Utf8>` attributes column,
+   SQL-queryable without stream proliferation.
+6. **Metric `label_map`** — rename exposed metric label keys (e.g.
+   `container_name` → `container`), applied before the `exported_<key>`
+   collision check.
+
+**Label precedence** (low→high, later wins):
+
+1. Non-core base labels (`k8s_<key>` from pod labels)
+2. `label_map` surfaced names (moved from `k8s_<key>` slots)
+3. `json.labels` extracted fields
+4. `static_labels`
+5. Core keys (`namespace` / `pod` / `container` / `node`) — always
+   authoritative
+
+**`deny_unknown_fields`** is set on every section so a typo'd key
+(`static_label` vs `static_labels`) fails loudly at startup rather than
+silently no-op.
+
+**Rationale.**
+
+- *ConfigMap-native.* Kubernetes operators are used to editing YAML/TOML in
+  ConfigMaps; adding yet another `--flag` for every pipeline concern would
+  bloat the `Args` struct and make per-cluster overrides painful.
+- *Single source of truth for the pipeline.* A team can PR the config file
+  the same way they PR anything else; the `--config` + `--keep` bail ensures
+  there's never ambiguity about which keep filters are active.
+- *No wire/storage changes needed.* The scry backend already stores
+  arbitrary stream labels (→ postings) and per-entry structured metadata
+  (→ `Map<Utf8,Utf8>` column). All six features are purely agent-side
+  transforms.
+- *No live reload.* A restart is cheap and avoids the complexity of
+  watching for file changes, hot-swapping `LabelFilter`s mid-stream, and
+  reasoning about partial application. The DaemonSet is already a restart
+  boundary.
+
+**Status.** Implemented in `crates/agent/src/config.rs` (`FileConfig`,
+`LogsSection`, `JsonSection`, `MetricsSection`, `LogPipeline`,
+`JsonPipeline`, `MetricPipeline`, `resolve()`, `load()`, `compile()`,
+`from_global_keep()`). Integrated in `crates/agent/src/main.rs`
+(`--config`/`SCRY_AGENT_CONFIG` flag, `config::resolve` at startup,
+`enrich_cache` in the batcher loop), `crates/agent/src/stream.rs`
+(`enrich_labels`, `enrich_entry`, `json_scalar`, `json_attr`),
+`crates/agent/src/scrape.rs` (`relabel_scrape`), and
+`crates/agent/src/discovery.rs` (static_labels/label_map parameters on
+`spawn_scrape_scheduler`, `stamp_target`). 20+ unit tests. Sealed by
+`scripts/smoke-agent-config.sh` (CRI log fixture + stub `/metrics` + TOML
+config → agent → scry-ingestd → bucket → scry-query, 10 assertions covering
+features 1/3/4/5/6; feature 2 proven by the `enrich_labels` unit test).
+
+## D-048: scry-agent kubelet/cadvisor scraping + label-selector pod SD
+
+**Date:** 2026-06-08
+**Status:** accepted
+
+D-045 made the agent a Prometheus scraper (static `--scrape-target` +
+`prometheus.io/scrape` annotation SD). Two pieces needed for real k8s parity
+with Prometheus/Alloy were deferred because they need TLS, a ServiceAccount
+bearer token, and new RBAC: **kubelet/cadvisor scraping** (per-container and
+kubelet-self metrics, served over HTTPS on :10250) and **node-exporter-style
+discovery** (scrape pods by a label selector, no annotation required). D-048
+adds both, agent-side, reusing the existing scrape→wire pipeline.
+
+**Decisions (locked with Bart).**
+
+- **node-exporter SD = pod-label selector, node-local.** Reuses the existing
+  node-field-selected pod watch — **no new pod RBAC**. A `[[metrics.scrape_pods]]`
+  job names a `selector` (`matchLabels` AND semantics), `port`, and optional
+  `path`/`scheme`/`job`; a matching pod on this node becomes a scrape target.
+  Annotation SD still takes precedence when both apply. Cluster-wide
+  Service/Endpoints SD stays out of scope (it would need cluster RBAC the
+  per-node DaemonSet shouldn't hold).
+- **Kubelet reached via `https://${NODE_IP}:10250`,** with `NODE_IP` from the
+  **downward API** (`fieldRef: status.hostIP`) wired to the new `--node-ip` /
+  `NODE_IP` flag. The address is a template — `${NODE_IP}` / `${NODE_NAME}`
+  are interpolated at startup, erroring if a referenced token is empty.
+- **Kubelet TLS = configurable, default `insecure_skip_verify = true`.** The
+  kubelet serving cert rarely has a SAN matching the IP we dial, so skip-verify
+  matches Prometheus' stock cadvisor job. A `ca_file` (PEM bundle) opts into
+  verification instead. We dropped a TLS `server_name` override — reqwest+rustls
+  can't cleanly override the verified hostname, and `insecure_skip_verify` /
+  `ca_file` cover the practical cases.
+- **Kubelet endpoints = `/metrics/cadvisor` (job=cadvisor) + `/metrics`
+  (job=kubelet),** both on by default, individually togglable.
+- Consistent with D-047: **config owns the pipeline** (the `[metrics.kubelet]`
+  block + `[[metrics.scrape_pods]]` jobs live in the TOML file), **flags own
+  runtime** (`NODE_IP` is a flag/env).
+
+**Per-target TLS + rotating bearer.** reqwest bakes TLS config at client-build
+time, so a single shared client can't vary verification per request. The agent
+keeps a `ClientPool` — `Mutex<HashMap<TlsProfile, reqwest::Client>>` —
+lazily building (at most) one client per distinct `TlsProfile`
+(`{insecure_skip_verify, ca_file}`). Standard targets all share the default
+verify-on profile (one client); kubelet adds one skip-verify client. The
+`ScrapeTarget` bearer becomes a `BearerSource` (`Literal | File(PathBuf)`),
+and `BearerSource::File` is **re-read inside `fetch` per scrape** — so a
+projected ServiceAccount token (rotated hourly) is followed for free, and the
+existing `--scrape-bearer @file` form folds into the same path. A file read
+every scrape interval is negligible.
+
+**RBAC.** Kubelet scraping needs a new ClusterRole rule —
+`apiGroups:[""] resources:["nodes/metrics","nodes/proxy"] verbs:["get"]` —
+because the kubelet delegates authz to a SubjectAccessReview on those
+resources. Pod-label SD needs **no** new RBAC (the existing pod watch already
+covers it).
+
+**Frozen.** `scrape_to_series` / `relabel_scrape` (the pure scrape→wire
+mapping) and `stamp_target` (static-labels + relabel application) are unchanged
+— their existing tests are untouched. New functionality is layered around them
+(`BearerSource`, `TlsProfile`, `ClientPool`, `pod_matches`,
+`assemble_pod_target`, `build_kubelet_targets`, `resolve_kubelet_address`) to
+minimize regression risk.
+
+**Status.** Implemented in `crates/agent/src/config.rs` (`KubeletSection`,
+`TlsSection`, `PodScrapeJobSection` file structs; `KubeletConfig`,
+`PodScrapeJob` runtime forms on `MetricPipeline`), `crates/agent/src/scrape.rs`
+(`BearerSource`, `TlsProfile`, `ClientPool`, per-scrape bearer re-read in
+`fetch`), `crates/agent/src/discovery.rs` (`pod_matches`, selector path in
+`build_scrape_target`, `assemble_pod_target`; `spawn_scrape_scheduler` takes a
+`ClientPool`), and `crates/agent/src/main.rs` (`--node-ip`,
+`build_kubelet_targets`, `resolve_kubelet_address`, `resolve_bearer` →
+`BearerSource`). Manifests: `deploy/k8s/agent-rbac.yaml` (nodes/metrics+proxy
+rule), `deploy/k8s/agent-daemonset.yaml` (`NODE_IP` env + `--config` arg +
+ConfigMap mount), new `deploy/k8s/agent-config.example.yaml`. Sealed by
+`scripts/smoke-agent-kubelet.sh` (self-signed HTTPS + bearer-gated stub serving
+`/metrics/cadvisor` + `/metrics` → agent `[metrics.kubelet]` config → scry-ingestd
+→ bucket → scry-query; asserts 6 rows land, both endpoints scraped, both
+scrapes auth'd over TLS-skip-verify, and the `cluster` static label rides all
+rows). Pod-label SD needs the k8s pod watch the smoke omits → proven by the
+`pod_matches` / `build_scrape_target` unit tests (same approach as D-047
+feature 2). Known gaps vs Prometheus/Alloy (deferred): Service/Endpoints SD,
+per-job TLS for pod-SD targets, mTLS client certs, hot config reload.

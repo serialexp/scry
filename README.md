@@ -44,9 +44,9 @@ of it. That's `scry`.
 - **Two ways to feed it:**
   - the **agent** (`scry-agent`) — a per-node collector that tails CRI
     container logs **and scrapes Prometheus `/metrics` endpoints**
-    (static `--scrape-target` + Kubernetes `prometheus.io/scrape`
-    annotation discovery), shipping both over the native wire (pprof
-    pull is still planned). A node-side
+    (static `--scrape-target`, `prometheus.io/scrape` annotations, the
+    node's kubelet/cadvisor, and label-selector pod discovery), shipping
+    both over the native wire (pprof pull is still planned). A node-side
     **keep-only label allow-list** (`--keep`, opt-in) lets a busy node
     forward only the streams that match, dropping the rest before they
     hit the wire (D-043);
@@ -143,11 +143,13 @@ in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); decisions in
 - **`scry-agent`** is a per-node collector (Alloy replacement): it tails
   Kubernetes pod logs and **scrapes Prometheus `/metrics` endpoints**,
   shipping both over one native-wire connection. Scrape targets come from
-  static `--scrape-target` URLs and/or pods annotated
-  `prometheus.io/scrape`; a **hand-rolled** exposition parser maps samples
-  to series, each scrape synthesizes `up` + `scrape_duration_seconds`, and
-  a node-side `--keep` allow-list filters both logs and metrics. Sealed by
-  `scripts/smoke-agent-metrics.sh` (D-043, D-045).
+  static `--scrape-target` URLs, pods annotated `prometheus.io/scrape`, the
+  node's own **kubelet/cadvisor** (HTTPS :10250, SA bearer, configurable TLS),
+  and **label-selector pod SD** (`[[metrics.scrape_pods]]`); a **hand-rolled**
+  exposition parser maps samples to series, each scrape synthesizes `up` +
+  `scrape_duration_seconds`, and a node-side `--keep` allow-list filters both
+  logs and metrics. Sealed by `scripts/smoke-agent-metrics.sh` +
+  `scripts/smoke-agent-kubelet.sh` (D-043, D-045, D-048).
 - **Lifecycle: compaction + retention + multi-instance.** Size-tiered
   compaction merges the K smallest blocks in a `(signal, date, level)`
   partition into the next level (DataFusion sort-merge, sidecars rebuilt;
@@ -202,6 +204,7 @@ scripts/gen-proto.sh        regenerate Rust bindings from proto/*.schema.json
 scripts/smoke.sh            end-to-end ingest→store→query exit criterion (metrics/logs; MULTI=1 → two-instance)
 scripts/smoke-gateway.sh    end-to-end push-gateway smoke (OTLP + Pyroscope + remote-write)
 scripts/smoke-agent-metrics.sh  scry-agent Prometheus scrape → store → query smoke
+scripts/smoke-agent-config.sh   scry-agent TOML pipeline (logs json + metric label_map) smoke
 scripts/smoke-webui.sh      scry-webui browser surface (auth + multi-target relay)
 scripts/dev-garage-up.sh    local single-node Garage (S3) for the smokes
 scripts/dev-valkey-up.sh    local single-node Valkey for the multi-instance smoke
@@ -249,6 +252,87 @@ synthesizes `up` + `scrape_duration_seconds` so a down target is data, not
 absence. The same `--keep` allow-list (see below) filters both logs and
 metric series. Bearer auth for a scrape target: `--scrape-bearer
 @/path/to/token` (the `@` reads from a file so the secret isn't on argv).
+
+Processing-pipeline features are owned by a **TOML config file** (`--config`,
+`SCRY_AGENT_CONFIG` env) rather than flags — flags own runtime
+(connection/intervals/targets), the file owns label manipulation and field
+extraction:
+
+```bash
+# agent.toml (usually a ConfigMap mount)
+#   Config owns the pipeline; flags own runtime.
+#
+#   [logs]              per-signal keep, static_labels, label_map
+#   [logs.json]         JSON body field extraction
+#   [metrics]           per-signal keep, static_labels, label_map
+#
+# When --config is set, --keep must be empty (move it into the file).
+
+cat > agent.toml <<'TOML'
+[logs]
+static_labels = { cluster = "gothab-prod" }
+
+[logs.json]
+labels = ["level", "app"]
+metadata = ["request_id", "trace_id"]
+message_field = "msg"
+
+[metrics]
+static_labels = { cluster = "gothab-prod" }
+label_map = { container_name = "container" }
+TOML
+
+scry-agent --server-addr scry:4000 \
+  --config agent.toml \
+  --scrape-target http://127.0.0.1:9100/metrics
+```
+
+Six features (D-047): (1) per-signal `keep`, (2) `label_map` surfacing
+(k8s_<key> → chosen name), (3) `static_labels` injection, (4) JSON body
+fields → stream labels (→ postings, low cardinality), (5) JSON body fields
+→ per-entry structured attributes (`Map<Utf8,Utf8>` column), (6) metric
+label key rename + old-key suppression. `deny_unknown_fields` catches typos
+loudly at startup. Sealed by `scripts/smoke-agent-config.sh`.
+
+The `[metrics]` section also owns two more SD pieces for k8s parity (D-048):
+**kubelet/cadvisor scraping** and **label-selector pod discovery**.
+
+```bash
+cat > agent.toml <<'TOML'
+[metrics]
+static_labels = { cluster = "gothab-prod" }
+
+# Scrape this node's own kubelet over HTTPS (:10250). Needs the NODE_IP
+# downward-API env + the nodes/metrics+nodes/proxy RBAC rule.
+[metrics.kubelet]
+enabled = true
+# address  = "https://${NODE_IP}:10250"   # default; ${NODE_IP}/${NODE_NAME} interpolated
+cadvisor = true   # /metrics/cadvisor → job=cadvisor (per-container metrics)
+kubelet  = true   # /metrics          → job=kubelet  (kubelet self)
+# bearer_file = "/var/run/secrets/kubernetes.io/serviceaccount/token"  # default; re-read per scrape
+[metrics.kubelet.tls]
+insecure_skip_verify = true   # default (kubelet cert rarely has a SAN for the IP)
+# ca_file = "/etc/scry/kubelet-ca.pem"   # verify instead of skip-verify
+
+# Node-local pod-label SD: scrape matching pods without prometheus.io/scrape
+# annotations (no new RBAC — reuses the pod watch). Repeatable.
+[[metrics.scrape_pods]]
+job = "node-exporter"
+selector = { "app.kubernetes.io/name" = "node-exporter" }
+port = 9100
+TOML
+
+# In-cluster, wire NODE_IP from the downward API (fieldRef: status.hostIP):
+scry-agent --server-addr scry:4000 --config agent.toml --node-ip "$NODE_IP"
+```
+
+Kubelet scraping uses a configurable TLS posture (default skip-verify, matching
+Prometheus' stock cadvisor job) and a `bearer_file` re-read on every scrape so a
+rotating ServiceAccount token is followed. It needs a new ClusterRole rule
+(`nodes/metrics` + `nodes/proxy`, GET); pod-label SD needs none. See
+`deploy/k8s/agent-rbac.yaml`, `deploy/k8s/agent-daemonset.yaml`, and
+`deploy/k8s/agent-config.example.yaml`. Sealed by
+`scripts/smoke-agent-kubelet.sh`.
 
 To accept foreign push protocols, run the gateway alongside the server:
 
@@ -310,6 +394,7 @@ SIGNAL=both    scripts/smoke.sh   # metrics + logs through one sink
 MULTI=1        scripts/smoke.sh   # two instances on one bucket (needs dev-valkey-up.sh)
 scripts/smoke-gateway.sh          # OTLP + Pyroscope + remote-write through the gateway
 scripts/smoke-agent-metrics.sh    # scry-agent Prometheus scrape → store → query
+scripts/smoke-agent-config.sh     # scry-agent TOML pipeline (logs json + metric label_map)
 scripts/smoke-webui.sh            # scry-webui browser surface (auth + multi-target relay)
 ```
 
@@ -461,7 +546,7 @@ downstream outage is bounded by each sink's in-memory queue depth (D-041).
   file (may be a bundle) to add a custom CA on top of the built-in roots for
   endpoints fronted by an internal CA.
 
-- **Restrict what a busy node forwards (`scry-agent --keep`).** By default
+- **Restrict what a busy node forwards (`scry-agent --keep` or `--config`).** By default
   the agent ships every container log stream it finds. A repeatable
   keep-only allow-list forwards only matching streams and drops the rest at
   the node, before they go on the wire:
@@ -473,6 +558,10 @@ downstream outage is bounded by each sink's in-memory queue depth (D-041).
   # ships only streams in a prod-* namespace AND with pod label app=api;
   # everything else is dropped on the node.
   ```
+
+  When `--config` is used, per-signal keep moves into the TOML file
+  (`[logs]` and `[metrics]` sections) and the global `--keep` flag must be
+  empty (the agent bails loudly at startup if both are set).
 
   Matchers are `key=value` | `key!=value` | `key=~regex` | `key!~regex`
   (regex whole-string-anchored; values may be double-quoted), ANDed
