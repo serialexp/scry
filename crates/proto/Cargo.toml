@@ -1,6 +1,6 @@
 [package]
 name        = "scry-proto"
-version     = "0.0.1"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "scry ingest wire protocol: generated binschema bindings + framing helpers."

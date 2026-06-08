@@ -1,6 +1,6 @@
 [package]
 name        = "scry-block"
-version     = "0.0.1"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Block builder + reader: arrow RecordBatch in, parquet on object storage out, plus a JSON sidecar of block metadata."

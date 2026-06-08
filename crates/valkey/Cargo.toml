@@ -1,6 +1,6 @@
 [package]
 name        = "scry-valkey"
-version     = "0.0.1"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "v0.9 Valkey transport for scry's multi-instance coordination: lease (SET NX PX + Lua), block-event pub/sub, and a health watch. Implements scry-cluster's LeaseProvider and scry-block's BlockEventSink."

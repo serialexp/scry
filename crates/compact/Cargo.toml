@@ -1,6 +1,6 @@
 [package]
 name        = "scry-compact"
-version     = "0.0.1"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "v0.8 size-tiered compaction: merge many small blocks into fewer larger ones (single-instance)."

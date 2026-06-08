@@ -1,6 +1,6 @@
 [package]
 name        = "scry-wal"
-version     = "0.0.1"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Local SSD write-ahead log for scry. Per-writer, per-signal segments framed with crc32. Records become durable on segment rotation (fsync)."

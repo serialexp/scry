@@ -1,6 +1,6 @@
 [package]
 name        = "scry-cluster"
-version     = "0.0.1"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "v0.9 multi-instance orchestration: catalog convergence (pub/sub apply + cursor poll + full walk) and the lease-guarded maintenance loop. Valkey-agnostic and unit-testable in-process."

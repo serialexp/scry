@@ -1,6 +1,6 @@
 [package]
 name        = "scry-list"
-version     = "0.0.1"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "v0.1 catalog inspector. Reconciles a (possibly empty) local catalog against a bucket and prints one line per block."

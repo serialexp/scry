@@ -1,6 +1,6 @@
 [package]
 name        = "scry-ingestd"
-version     = "0.0.1"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "scry ingest server daemon: thin CLI around scry-server. Listens for agents, optionally enables the storage path (WAL + parquet blocks → object storage + optional online catalog)."

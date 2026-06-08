@@ -1,6 +1,6 @@
 [package]
 name        = "noise-spewer"
-version     = "0.0.1"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Test harness: opens a TCP connection to a scry ingest server and emits random metrics, logs, traces, and profiles."

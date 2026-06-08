@@ -1,6 +1,6 @@
 [package]
 name        = "scry-query"
-version     = "0.0.1"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "DataFusion-backed metrics querier. Exposes blocks as a TableProvider; postings sidecars pre-filter the fingerprint set; DataFusion's ParquetSource handles row-group pruning + row-level predicate pushdown."

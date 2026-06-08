@@ -1,6 +1,6 @@
 [package]
 name        = "scry-retention"
-version     = "0.0.1"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "v0.8 per-signal TTL retention: reap blocks whose data is entirely past an age limit (single-instance)."
