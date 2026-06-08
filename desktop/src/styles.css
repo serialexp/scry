@@ -295,6 +295,17 @@ textarea {
   cursor: default;
 }
 
+.run.secondary {
+  margin-top: 6px;
+  background: transparent;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+}
+
+.run.secondary:hover {
+  background: rgba(120, 170, 255, 0.12);
+}
+
 /* ── Results ──────────────────────────────────────────────────────── */
 
 .error-banner {
@@ -749,6 +760,97 @@ textarea {
 }
 
 .trace-empty {
+  color: var(--muted);
+  font-style: italic;
+}
+
+/* ── Frames overview ──────────────────────────────────────────────── */
+
+.frames-list {
+  flex: 1;
+  overflow: auto;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.frames-sort {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--muted);
+}
+
+.frames-sort select {
+  background: var(--panel, #0e1726);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 4px;
+}
+
+.frame-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 4px 12px;
+  background: none;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.frame-row:hover {
+  background: rgba(106, 163, 255, 0.08);
+}
+
+.frame-num {
+  flex: 0 0 8ch;
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.frame-track {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 16px;
+  display: flex;
+  align-items: center;
+}
+
+.frame-bar {
+  position: absolute;
+  left: 0;
+  height: 10px;
+  border-radius: 3px;
+  background: hsl(210, 55%, 52%);
+  min-width: 1px;
+}
+
+.frame-dur {
+  position: relative;
+  margin-left: auto;
+  padding-left: 8px;
+  color: var(--text);
+}
+
+.frame-spans {
+  flex: 0 0 11ch;
+  color: var(--muted);
+  text-align: right;
+}
+
+.frame-t0 {
+  flex: 0 0 auto;
+  color: var(--muted);
+}
+
+.frames-empty {
+  padding: 12px;
   color: var(--muted);
   font-style: italic;
 }

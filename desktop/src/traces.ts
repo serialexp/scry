@@ -237,3 +237,107 @@ export function serviceHue(name: string): number {
   for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) | 0;
   return ((h % 360) + 360) % 360;
 }
+
+// ── frames overview ───────────────────────────────────────────────────────
+//
+// `tracing-scry` (and any producer that follows the convention) mints a
+// deterministic trace id of `session(8) ++ frame(8)`, big-endian: the high 8
+// bytes identify a process run, the low 8 a frame counter. The frames-overview
+// issues one aggregate row per trace — `{trace_id, t0, t1, dur_ns, spans}` — and
+// this decodes each into a `FrameRow`, splitting the id back into session/frame
+// so the UI can label and sort frames and drill into one by trace id.
+
+/** One aggregated frame (= one trace) in the frames overview. */
+export interface FrameRow {
+  /** Full trace id, hex (32 chars) — drill target. */
+  traceId: string;
+  /** Session id: high 8 bytes, hex (16 chars). */
+  session: string;
+  /** Frame number: low 8 bytes, big-endian. */
+  frame: bigint;
+  /** Earliest span start in the frame (unix nanos). */
+  t0: bigint;
+  /** Latest span end in the frame (unix nanos). */
+  t1: bigint;
+  /** Frame duration (t1 - t0), nanos. */
+  durNs: bigint;
+  /** Number of spans in the frame. */
+  spans: number;
+}
+
+/** Raw bytes of an id cell (FixedSizeBinary → Uint8Array); tolerate hex. */
+function idBytes(v: unknown): Uint8Array {
+  if (v instanceof Uint8Array) return v;
+  if (typeof v === "string") {
+    const clean = v.trim().replace(/^0x/i, "");
+    if (clean.length % 2 === 0 && /^[0-9a-fA-F]*$/.test(clean)) {
+      const out = new Uint8Array(clean.length / 2);
+      for (let i = 0; i < out.length; i++) {
+        out[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
+      }
+      return out;
+    }
+  }
+  return new Uint8Array(0);
+}
+
+/** Read 8 big-endian bytes at `off` as an unsigned bigint. */
+function beU64(b: Uint8Array, off: number): bigint {
+  let x = 0n;
+  for (let i = 0; i < 8; i++) x = (x << 8n) | BigInt(b[off + i] ?? 0);
+  return x;
+}
+
+/** Decode one aggregate row into a `FrameRow`. */
+export function decodeFrameRow(o: Row): FrameRow {
+  const bytes = idBytes(o.trace_id);
+  const t0 = asBigInt(o.t0);
+  const t1 = asBigInt(o.t1);
+  // Prefer the server-computed duration; fall back to t1 - t0.
+  const durRaw = o.dur_ns;
+  const durNs = durRaw === undefined || durRaw === null ? t1 - t0 : asBigInt(durRaw);
+  return {
+    traceId: bytes.length ? toHex(bytes) : "",
+    session: bytes.length >= 8 ? toHex(bytes.slice(0, 8)) : "",
+    frame: bytes.length >= 16 ? beU64(bytes, 8) : 0n,
+    t0,
+    t1,
+    durNs,
+    spans: Number(o.spans ?? 0),
+  };
+}
+
+export function decodeFrameRows(rows: Row[]): FrameRow[] {
+  return rows.map(decodeFrameRow);
+}
+
+/** Summary stats over a set of frames. Durations in nanos. */
+export interface FrameStats {
+  count: number;
+  minNs: bigint;
+  medianNs: bigint;
+  p99Ns: bigint;
+  maxNs: bigint;
+}
+
+/** Percentile (nearest-rank) of a pre-sortable bigint list. `p` in [0, 1]. */
+function percentile(sorted: bigint[], p: number): bigint {
+  if (sorted.length === 0) return 0n;
+  const idx = Math.min(sorted.length - 1, Math.max(0, Math.ceil(p * sorted.length) - 1));
+  return sorted[idx]!;
+}
+
+/** Compute count + duration distribution (min/median/p99/max) over frames. */
+export function frameStats(rows: FrameRow[]): FrameStats {
+  if (rows.length === 0) {
+    return { count: 0, minNs: 0n, medianNs: 0n, p99Ns: 0n, maxNs: 0n };
+  }
+  const durs = rows.map((r) => r.durNs).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  return {
+    count: rows.length,
+    minNs: durs[0]!,
+    medianNs: percentile(durs, 0.5),
+    p99Ns: percentile(durs, 0.99),
+    maxNs: durs[durs.length - 1]!,
+  };
+}

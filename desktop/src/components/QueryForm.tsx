@@ -13,6 +13,8 @@ import {
   removeMatcher,
   setMatcher,
   runCurrentQuery,
+  runFramesOverview,
+  targets,
 } from "../store";
 
 const SIGNAL_HINTS: Record<string, string> = {
@@ -65,6 +67,24 @@ const QueryForm: Component = () => {
             onInput={(e) => setField("addr", e.currentTarget.value)}
             placeholder="127.0.0.1:4100"
           />
+        </div>
+      </Show>
+
+      {/* In the browser, scry-webui dials one of its configured upstreams; the
+          user picks which by id (never a raw address — SSRF-safe). Always shown
+          so it's clear which daemon answers, even with a single target. */}
+      <Show when={!isTauri()}>
+        <div class="field">
+          <label for="target">Query target</label>
+          <select
+            id="target"
+            value={state.target}
+            onChange={(e) => setField("target", e.currentTarget.value)}
+          >
+            <For each={targets()}>
+              {(t) => <option value={t.id}>{t.label}</option>}
+            </For>
+          </select>
         </div>
       </Show>
 
@@ -222,6 +242,19 @@ const QueryForm: Component = () => {
         <button type="submit" class="run" disabled={isRunning()}>
           {isRunning() ? "Running…" : "Run query"}
         </button>
+        <Show when={state.signal === "Traces"}>
+          <button
+            type="button"
+            class="run secondary"
+            disabled={isRunning()}
+            title="Aggregate one row per trace (frame): duration + span count, slowest first. Click a frame to open its waterfall."
+            onClick={() => {
+              if (!isRunning()) void runFramesOverview();
+            }}
+          >
+            Frames overview
+          </button>
+        </Show>
       </div>
     </form>
   );

@@ -12,12 +12,15 @@ import { For, Show, createMemo, createSignal, type Component, type JSX } from "s
 import { attrEntries, fmtCell, fmtTs } from "../format";
 import {
   buildSpanTree,
+  decodeFrameRows,
   decodeSpans,
+  frameStats,
   layoutSpans,
   singleTraceId,
 } from "../traces";
-import { state, resultTable } from "../store";
+import { state, resultTable, resultKind } from "../store";
 import TracesView, { type TraceData } from "./TracesView";
+import FramesView, { type FramesData } from "./FramesView";
 
 /** Cap rendered rows so a large result can't lock up the DOM. */
 const MAX_DISPLAY_ROWS = 2000;
@@ -169,6 +172,23 @@ const ResultsTable: Component = () => {
     return { traceId, rows, shown, total: t.numRows };
   });
 
+  // Frames-overview view: the aggregate-per-frame result. Driven by the
+  // explicit `resultKind` flag the action set (not column sniffing), since the
+  // aggregate shares columns with a generic table.
+  const frames = createMemo<FramesData | null>(() => {
+    if (resultKind() !== "frames") return null;
+    const t = resultTable();
+    if (!t) return null;
+    const all = t.toArray();
+    const shown = Math.min(all.length, MAX_DISPLAY_ROWS);
+    const raws: Record<string, unknown>[] = [];
+    for (let i = 0; i < shown; i++) {
+      raws.push((all[i]?.toJSON?.() ?? {}) as Record<string, unknown>);
+    }
+    const rows = decodeFrameRows(raws);
+    return { rows, stats: frameStats(rows), shown, total: t.numRows };
+  });
+
   // Generic table view (any signal).
   const table = createMemo(() => {
     const t = resultTable();
@@ -310,16 +330,21 @@ const ResultsTable: Component = () => {
           {(tv) => <TracesView data={tv} raw={raw} setRaw={setRaw} />}
         </Show>
 
-        {/* Generic table: any signal with no purpose-built view, or a log/trace
-            result in raw mode. Read the `table()` memo in JSX positions so it
-            tracks new results. */}
-        <Show when={((!logs() && !traces()) || raw()) && table()}>
+        {/* Frames overview (traces aggregate). */}
+        <Show when={!raw() && frames()}>
+          {(fv) => <FramesView data={fv} raw={raw} setRaw={setRaw} />}
+        </Show>
+
+        {/* Generic table: any signal with no purpose-built view, or a
+            log/trace/frames result in raw mode. Read the `table()` memo in JSX
+            positions so it tracks new results. */}
+        <Show when={((!logs() && !traces() && !frames()) || raw()) && table()}>
           {(v) => (
             <>
               <div class="results-meta">
                 {metaCommon(() => v().total)}
                 <span>{v().fields.length} columns</span>
-                <Show when={logs() || traces()}>
+                <Show when={logs() || traces() || frames()}>
                   <label class="raw-toggle" title="back to the purpose-built view">
                     <input type="checkbox" checked={raw()} onInput={(e) => setRaw(e.currentTarget.checked)} />
                     raw

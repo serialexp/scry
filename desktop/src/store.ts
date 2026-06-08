@@ -25,8 +25,11 @@ export interface MatcherRow {
 export type RunStatus = "idle" | "running" | "done" | "error";
 
 export interface FormState {
-  /** `host:port` of the scry-queryd daemon. */
+  /** `host:port` of the scry-queryd daemon (desktop/native transport only). */
   addr: string;
+  /** Selected query target **id** (browser only; resolved server-side against
+   *  the `--queryd` allowlist). Empty ⇒ the server's default target. */
+  target: string;
   signal: SignalName;
   matchers: MatcherRow[];
   /** Inclusive lower time bound, unix nanos (raw text; empty = none). */
@@ -49,6 +52,7 @@ export interface FormState {
 
 const INITIAL: FormState = {
   addr: "127.0.0.1:4100",
+  target: "",
   signal: "Metrics",
   matchers: [{ name: "", value: "" }],
   tsMin: "",
@@ -66,7 +70,13 @@ const INITIAL: FormState = {
 const [state, setState] = createStore<FormState>({ ...INITIAL });
 const [resultTable, setResultTable] = createSignal<Table | null>(null);
 
-export { state, resultTable };
+/** How the current result should be rendered. `"frames"` is the traces
+ *  frames-overview aggregate (one row per frame); `"default"` is everything
+ *  else (the per-signal views + generic table). Set by the action that issued
+ *  the query, so the view dispatch doesn't have to sniff column names. */
+const [resultKind, setResultKind] = createSignal<"default" | "frames">("default");
+
+export { state, resultTable, resultKind };
 
 // ── Auth (browser only) ──────────────────────────────────────────────
 //
@@ -84,12 +94,45 @@ const [authed, setAuthed] = createSignal(!inBrowser);
 const [authChecked, setAuthChecked] = createSignal(!inBrowser);
 export { authed, authChecked };
 
+/** One selectable upstream as exposed by `GET /api/targets` (browser only).
+ *  Only `id` + `label` cross the wire — the raw address stays server-side. */
+export interface TargetInfo {
+  id: string;
+  label: string;
+}
+
+// The target allowlist fetched from `scry-webui` after login (browser only).
+const [targets, setTargets] = createSignal<TargetInfo[]>([]);
+export { targets };
+
+/** Fetch the configured query targets and seed the form selection with the
+ *  server's default. Browser only; a no-op (and harmless) under Tauri. */
+export async function fetchTargets(): Promise<void> {
+  if (!inBrowser) return;
+  try {
+    const res = await fetch("/api/targets", { credentials: "same-origin" });
+    if (!res.ok) return;
+    const body = (await res.json()) as { targets: TargetInfo[]; default: string };
+    setTargets(body.targets);
+    // Seed the selection with the server default unless the user already picked
+    // one that's still valid.
+    const ids = new Set(body.targets.map((t) => t.id));
+    if (!ids.has(state.target)) {
+      setState("target", body.default ?? "");
+    }
+  } catch {
+    // Leave targets empty; the relay still works against the server default.
+  }
+}
+
 /** Probe the existing session cookie once on startup (browser only). */
 export async function checkSession(): Promise<void> {
   if (!inBrowser) return;
   try {
     const res = await fetch("/api/me", { credentials: "same-origin" });
-    setAuthed(res.status === 204);
+    const ok = res.status === 204;
+    setAuthed(ok);
+    if (ok) await fetchTargets();
   } catch {
     setAuthed(false);
   } finally {
@@ -107,6 +150,7 @@ export async function login(password: string): Promise<boolean> {
   });
   const ok = res.status === 204;
   setAuthed(ok);
+  if (ok) await fetchTargets();
   return ok;
 }
 
@@ -203,19 +247,17 @@ function specFromForm(): QuerySpec {
   };
 }
 
-export async function runCurrentQuery(): Promise<void> {
-  let spec: QuerySpec;
-  try {
-    spec = specFromForm();
-  } catch (e) {
-    setState({ status: "error", error: e instanceof Error ? e.message : String(e) });
-    return;
-  }
-
+/** Run a pre-built spec, recording the result under `kind`. Shared by the
+ *  form-driven query and the traces frames-overview / drill-in actions. */
+async function runSpec(spec: QuerySpec, kind: "default" | "frames"): Promise<void> {
   setState({ status: "running", error: null });
   try {
     const transport = await getTransport();
-    const res = await runQuery(transport, state.addr.trim(), spec);
+    // Desktop dials a raw `host:port`; browser sends a target *id* the server
+    // resolves against its allowlist.
+    const dest = inBrowser ? state.target.trim() : state.addr.trim();
+    const res = await runQuery(transport, dest, spec);
+    setResultKind(kind);
     setResultTable(res.table);
     setState({
       status: "done",
@@ -246,4 +288,89 @@ export async function runCurrentQuery(): Promise<void> {
           : String(e);
     setState({ status: "error", error: message, rowCount: 0, totalRows: 0n });
   }
+}
+
+export async function runCurrentQuery(): Promise<void> {
+  let spec: QuerySpec;
+  try {
+    spec = specFromForm();
+  } catch (e) {
+    setState({ status: "error", error: e instanceof Error ? e.message : String(e) });
+    return;
+  }
+  await runSpec(spec, "default");
+}
+
+/** Max frames the overview aggregate returns. Slowest-first, so the cap keeps
+ *  the frames most worth looking at. */
+const FRAMES_LIMIT = 5000;
+
+/** Run the traces frames-overview: one aggregated row per trace (= per frame),
+ *  carrying its [t0, t1] window, duration, and span count. Reuses the form's
+ *  matchers (→ promoted columns) and time bounds; the slowest frames come
+ *  first so the LIMIT keeps the interesting ones. */
+export async function runFramesOverview(): Promise<void> {
+  let matchers: { name: string; value: string }[];
+  let tsMin: bigint | undefined;
+  let tsMax: bigint | undefined;
+  try {
+    matchers = state.matchers
+      .map((m) => ({ name: m.name.trim(), value: m.value }))
+      .filter((m) => m.name !== "");
+    tsMin = parseBigIntOpt(state.tsMin);
+    tsMax = parseBigIntOpt(state.tsMax);
+  } catch (e) {
+    setState({ status: "error", error: e instanceof Error ? e.message : String(e) });
+    return;
+  }
+
+  const sql =
+    "SELECT trace_id, " +
+    "MIN(start_unix_nano) AS t0, " +
+    "MAX(end_unix_nano) AS t1, " +
+    "MAX(end_unix_nano) - MIN(start_unix_nano) AS dur_ns, " +
+    "COUNT(*) AS spans " +
+    "FROM traces GROUP BY trace_id " +
+    `ORDER BY dur_ns DESC LIMIT ${FRAMES_LIMIT}`;
+
+  await runSpec(
+    { signal: Signal.Traces, matchers, tsMin, tsMax, sql },
+    "frames",
+  );
+}
+
+/** Drill from the frames overview into one frame's waterfall: load every span
+ *  for `traceIdHex` (a by-id lookup) and render the standard single-trace view.
+ *  Reflects the selection in the form (trace-id field, SQL cleared). */
+export async function drillIntoFrame(traceIdHex: string): Promise<void> {
+  let traceId: Uint8Array;
+  try {
+    traceId = parseHex16(traceIdHex);
+  } catch (e) {
+    setState({ status: "error", error: e instanceof Error ? e.message : String(e) });
+    return;
+  }
+  setState({ signal: "Traces", traceId: traceIdHex, sql: "" });
+
+  let tsMin: bigint | undefined;
+  let tsMax: bigint | undefined;
+  try {
+    tsMin = parseBigIntOpt(state.tsMin);
+    tsMax = parseBigIntOpt(state.tsMax);
+  } catch {
+    tsMin = undefined;
+    tsMax = undefined;
+  }
+
+  await runSpec(
+    {
+      signal: Signal.Traces,
+      matchers: [],
+      tsMin,
+      tsMax,
+      traceId,
+      limit: parseBigIntOpt(state.limit),
+    },
+    "default",
+  );
 }
