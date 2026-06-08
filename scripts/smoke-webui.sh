@@ -11,15 +11,21 @@
 #   - POST /api/query        401 when unauthenticated (auth gate before dial)
 #   - POST /api/login        204 + signed cookie on the right password
 #   - GET /api/me            204 with the cookie
-#   - POST /api/query        relays bytes to the upstream and streams the reply
+#   - GET /api/targets       401 unauth; lists both configured targets + default
+#   - POST /api/query        relays bytes to the DEFAULT upstream (no header)
+#   - POST /api/query        X-Scry-Target routes to the SELECTED upstream
+#   - POST /api/query        unknown X-Scry-Target → 400
 #   - POST /api/logout       clears the session (subsequent /api/me → 401)
+#
+# Two distinct stub scry-queryds are stood up (each replies a unique marker) so
+# the target-routing assertions prove the header actually selects the upstream.
 #
 # The real query *protocol* round-trip (framing/Arrow) is covered by the
 # scry-webui Rust integration tests and by scripts/smoke.sh's per-signal query
-# legs; here the upstream is a stub so the focus stays on the web layer.
+# legs; here the upstreams are stubs so the focus stays on the web layer.
 #
 # Env knobs: SCRY_WEBUI_PASSWORD (default "smoke-secret"), WEBUI_PORT (18080),
-# FAKE_QUERYD_PORT (14199).
+# FAKE_QUERYD_PORT (14199), FAKE_QUERYD_PORT2 (14200).
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -28,16 +34,20 @@ cd "$ROOT"
 PASS="${SCRY_WEBUI_PASSWORD:-smoke-secret}"
 WEBUI_PORT="${WEBUI_PORT:-18080}"
 FAKE_PORT="${FAKE_QUERYD_PORT:-14199}"
-MARKER="PONG-FROM-FAKE-QUERYD"
+FAKE_PORT2="${FAKE_QUERYD_PORT2:-14200}"
+MARKER="PONG-FROM-LOCAL-QUERYD"
+MARKER2="PONG-FROM-GOTHAB-QUERYD"
 
 COOKIE_JAR=$(mktemp)
 TMP=$(mktemp -d)
 WEBUI_PID=""
 FAKE_PID=""
+FAKE_PID2=""
 
 cleanup() {
   [ -n "$WEBUI_PID" ] && kill "$WEBUI_PID" 2>/dev/null || true
   [ -n "$FAKE_PID" ] && kill "$FAKE_PID" 2>/dev/null || true
+  [ -n "$FAKE_PID2" ] && kill "$FAKE_PID2" 2>/dev/null || true
   rm -rf "$COOKIE_JAR" "$TMP"
 }
 trap cleanup EXIT
@@ -57,8 +67,9 @@ echo "== building release scry-webui (embeds the bundle) =="
 cargo build --release -p scry-webui >"$TMP/cargo.log" 2>&1 \
   || { cat "$TMP/cargo.log"; fail "scry-webui build failed"; }
 
-echo "== starting fake scry-queryd on 127.0.0.1:$FAKE_PORT =="
-python3 - "$FAKE_PORT" "$MARKER" >"$TMP/fake.log" 2>&1 <<'PY' &
+# A tiny stub scry-queryd: accept connections, drain the relayed request, reply
+# a fixed marker, close (so the relay's read_to_end terminates).
+FAKE_PY='
 import socket, sys
 port = int(sys.argv[1]); marker = sys.argv[2].encode()
 srv = socket.socket()
@@ -67,16 +78,25 @@ srv.bind(("127.0.0.1", port)); srv.listen(16)
 while True:
     conn, _ = srv.accept()
     try:
-        conn.recv(1 << 16)   # consume the relayed request frame
-        conn.sendall(marker) # reply, then close → relay's read_to_end ends
+        conn.recv(1 << 16)
+        conn.sendall(marker)
     finally:
         conn.close()
-PY
+'
+
+echo "== starting fake scry-queryd 'local' on 127.0.0.1:$FAKE_PORT =="
+python3 -c "$FAKE_PY" "$FAKE_PORT" "$MARKER" >"$TMP/fake.log" 2>&1 &
 FAKE_PID=$!
 
-echo "== starting scry-webui on 127.0.0.1:$WEBUI_PORT =="
+echo "== starting fake scry-queryd 'gothab' on 127.0.0.1:$FAKE_PORT2 =="
+python3 -c "$FAKE_PY" "$FAKE_PORT2" "$MARKER2" >"$TMP/fake2.log" 2>&1 &
+FAKE_PID2=$!
+
+echo "== starting scry-webui on 127.0.0.1:$WEBUI_PORT (two named targets) =="
 SCRY_WEBUI_PASSWORD="$PASS" ./target/release/scry-webui \
-  --listen "127.0.0.1:$WEBUI_PORT" --queryd "127.0.0.1:$FAKE_PORT" \
+  --listen "127.0.0.1:$WEBUI_PORT" \
+  --queryd "local=127.0.0.1:$FAKE_PORT" \
+  --queryd "gothab=127.0.0.1:$FAKE_PORT2" \
   >"$TMP/webui.log" 2>&1 &
 WEBUI_PID=$!
 
@@ -127,15 +147,51 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -b "$COOKIE_JAR" "$BASE/api/me")
 [ "$code" = 204 ] || fail "/api/me (auth) expected 204, got $code"
 ok "/api/me authenticated → 204"
 
-# 7. /api/query with the cookie → relays to the upstream, returns its bytes
+# 7. /api/targets unauthenticated → 401 (names don't leak before login)
+code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/targets")
+[ "$code" = 401 ] || fail "/api/targets (unauth) expected 401, got $code"
+ok "/api/targets unauthenticated → 401"
+
+# 8. /api/targets with cookie → lists both ids + default, never the raw address
+code=$(curl -s -o "$TMP/targets.json" -w '%{http_code}' -b "$COOKIE_JAR" "$BASE/api/targets")
+[ "$code" = 200 ] || fail "/api/targets (auth) expected 200, got $code"
+grep -q '"id":"local"'  "$TMP/targets.json" || fail "/api/targets missing 'local' id ($(cat "$TMP/targets.json"))"
+grep -q '"id":"gothab"' "$TMP/targets.json" || fail "/api/targets missing 'gothab' id ($(cat "$TMP/targets.json"))"
+grep -q '"default":"local"' "$TMP/targets.json" || fail "/api/targets default should be 'local' ($(cat "$TMP/targets.json"))"
+! grep -q "$FAKE_PORT" "$TMP/targets.json" || fail "/api/targets leaked the raw upstream address"
+ok "/api/targets → lists local+gothab, default local, no raw addr"
+
+# 9. /api/query with no header → routes to the DEFAULT target (local)
 code=$(curl -s -o "$TMP/qresp" -w '%{http_code}' -b "$COOKIE_JAR" \
   -X POST --data-binary 'PING' "$BASE/api/query")
-[ "$code" = 200 ] || fail "/api/query (auth) expected 200, got $code"
+[ "$code" = 200 ] || fail "/api/query (default) expected 200, got $code"
 got=$(cat "$TMP/qresp")
-[ "$got" = "$MARKER" ] || fail "/api/query relay expected '$MARKER', got '$got'"
-ok "/api/query authenticated → relayed to upstream ('$got')"
+[ "$got" = "$MARKER" ] || fail "/api/query default expected '$MARKER', got '$got'"
+ok "/api/query no header → default target ('$got')"
 
-# 8. logout clears the session
+# 10. /api/query X-Scry-Target: local → the local upstream
+code=$(curl -s -o "$TMP/qresp" -w '%{http_code}' -b "$COOKIE_JAR" \
+  -H "X-Scry-Target: local" -X POST --data-binary 'PING' "$BASE/api/query")
+[ "$code" = 200 ] || fail "/api/query (local) expected 200, got $code"
+got=$(cat "$TMP/qresp")
+[ "$got" = "$MARKER" ] || fail "/api/query local expected '$MARKER', got '$got'"
+ok "/api/query X-Scry-Target=local → local upstream ('$got')"
+
+# 11. /api/query X-Scry-Target: gothab → the OTHER upstream (proves routing)
+code=$(curl -s -o "$TMP/qresp" -w '%{http_code}' -b "$COOKIE_JAR" \
+  -H "X-Scry-Target: gothab" -X POST --data-binary 'PING' "$BASE/api/query")
+[ "$code" = 200 ] || fail "/api/query (gothab) expected 200, got $code"
+got=$(cat "$TMP/qresp")
+[ "$got" = "$MARKER2" ] || fail "/api/query gothab expected '$MARKER2', got '$got'"
+ok "/api/query X-Scry-Target=gothab → gothab upstream ('$got')"
+
+# 12. /api/query unknown target → 400 (id not in the allowlist)
+code=$(curl -s -o /dev/null -w '%{http_code}' -b "$COOKIE_JAR" \
+  -H "X-Scry-Target: nope" -X POST --data-binary 'PING' "$BASE/api/query")
+[ "$code" = 400 ] || fail "/api/query (unknown target) expected 400, got $code"
+ok "/api/query X-Scry-Target=nope → 400"
+
+# 13. logout clears the session
 curl -s -o /dev/null -b "$COOKIE_JAR" -c "$COOKIE_JAR" -X POST "$BASE/api/logout"
 code=$(curl -s -o /dev/null -w '%{http_code}' -b "$COOKIE_JAR" "$BASE/api/me")
 [ "$code" = 401 ] || fail "/api/me after logout expected 401, got $code"

@@ -1,22 +1,33 @@
-//! `/api/query` relay tests: auth gate, byte-pipe round-trip, and the 502 path
-//! when the upstream `scry-queryd` is unreachable.
+//! `/api/query` relay tests: auth gate, byte-pipe round-trip, the 502 path when
+//! the upstream `scry-queryd` is unreachable, the `/api/targets` listing, and
+//! `X-Scry-Target` routing across multiple configured targets.
 
 use axum::body::{to_bytes, Body};
 use axum::http::{header, Request, StatusCode};
 use axum::Router;
 use axum_extra::extract::cookie::Key;
-use scry_webui::{router, AppState};
+use scry_webui::{parse_targets, router, AppState};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tower::ServiceExt;
 
 const PASSWORD: &str = "hunter2";
 
-/// Build a router whose byte-pipe dials `queryd`. Fixed key so a cookie minted
-/// by one cloned instance verifies in the next.
+/// Header carrying the selected target id (mirrors `query::TARGET_HEADER`).
+const TARGET_HEADER: &str = "x-scry-target";
+
+/// Build a router whose byte-pipe dials the single `queryd` (id `default`).
+/// Fixed key so a cookie minted by one cloned instance verifies in the next.
 fn app(queryd: &str) -> Router {
+    app_targets(&[queryd.to_string()])
+}
+
+/// Build a router over a parsed target allowlist (raw `--queryd` values).
+fn app_targets(raw: &[String]) -> Router {
+    let (targets, default) = parse_targets(raw).unwrap();
     let state = AppState::new(
-        queryd.to_string(),
+        targets,
+        default,
         PASSWORD.to_string(),
         Key::from(&[9u8; 64]),
         3600,
@@ -127,4 +138,132 @@ async fn query_returns_502_when_queryd_down() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+}
+
+#[tokio::test]
+async fn targets_requires_auth() {
+    let res = app("127.0.0.1:1")
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/targets")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn targets_lists_configured_with_default() {
+    let app = app_targets(&[
+        "local=127.0.0.1:4101".into(),
+        "gothab=127.0.0.1:4100".into(),
+    ]);
+    let cookie = login_cookie(&app).await;
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/targets")
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["default"], "local");
+    let targets = json["targets"].as_array().unwrap();
+    assert_eq!(targets.len(), 2);
+    assert_eq!(targets[0]["id"], "local");
+    assert_eq!(targets[1]["id"], "gothab");
+    // The raw address must never reach the browser.
+    assert!(targets[0].get("addr").is_none());
+}
+
+#[tokio::test]
+async fn query_routes_by_target_header() {
+    // Two distinct fake upstreams; the header picks which one is dialed.
+    let req_a = b"to-a".to_vec();
+    let req_b = b"to-b".to_vec();
+    let resp_a = b"resp-from-a".to_vec();
+    let resp_b = b"resp-from-b".to_vec();
+    let addr_a = fake_queryd(req_a.len(), resp_a.clone()).await;
+    let addr_b = fake_queryd(req_b.len(), resp_b.clone()).await;
+
+    let app = app_targets(&[format!("a={addr_a}"), format!("b={addr_b}")]);
+    let cookie = login_cookie(&app).await;
+
+    // Target b explicitly via the header.
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/query")
+                .header(header::COOKIE, &cookie)
+                .header(TARGET_HEADER, "b")
+                .body(Body::from(req_b))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let got = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(got.as_ref(), resp_b.as_slice());
+}
+
+#[tokio::test]
+async fn query_defaults_when_header_absent() {
+    // No header → the first declared target (a) is dialed.
+    let req_a = b"to-a".to_vec();
+    let resp_a = b"resp-from-a".to_vec();
+    let addr_a = fake_queryd(req_a.len(), resp_a.clone()).await;
+
+    let app = app_targets(&[format!("a={addr_a}"), "b=127.0.0.1:1".into()]);
+    let cookie = login_cookie(&app).await;
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/query")
+                .header(header::COOKIE, cookie)
+                .body(Body::from(req_a))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let got = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(got.as_ref(), resp_a.as_slice());
+}
+
+#[tokio::test]
+async fn query_unknown_target_is_400() {
+    let app = app_targets(&["a=127.0.0.1:4101".into(), "b=127.0.0.1:4100".into()]);
+    let cookie = login_cookie(&app).await;
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/query")
+                .header(header::COOKIE, cookie)
+                .header(TARGET_HEADER, "nope")
+                .body(Body::from(vec![0u8; 8]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 }

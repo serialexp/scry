@@ -1,10 +1,12 @@
 //! Browser transport: POST the framed request to the `scry-webui` server's
-//! `/api/query` relay, which byte-pipes it to the upstream `scry-queryd`.
+//! `/api/query` relay, which byte-pipes it to the selected upstream `scry-queryd`.
 //!
-//! The server dials its own configured `scry-queryd`, so the `addr` argument is
-//! intentionally ignored here (the browser cannot — and must not — choose the
-//! upstream; that would be an SSRF vector). The session cookie rides along
-//! automatically with `credentials: "same-origin"`.
+//! The browser never supplies a raw address — that would be an SSRF vector.
+//! Instead `addr` here is a target **id** from `/api/targets`, sent in the
+//! `X-Scry-Target` header; the server resolves it against its own `--queryd`
+//! allowlist and dials the matching address. An empty `addr` lets the server
+//! pick its default target. The session cookie rides along automatically with
+//! `credentials: "same-origin"`.
 
 import type { Transport } from "./transport";
 
@@ -18,10 +20,17 @@ export class UnauthorizedError extends Error {
 
 /** Transport backed by the `scry-webui` HTTP relay. */
 export class HttpTransport implements Transport {
-  async query(_addr: string, request: Uint8Array): Promise<Uint8Array> {
+  async query(addr: string, request: Uint8Array): Promise<Uint8Array> {
+    const headers: Record<string, string> = {
+      "content-type": "application/octet-stream",
+    };
+    // `addr` is a target id here, not a raw address — forward it so the server
+    // dials the right upstream. Empty ⇒ the server's default target.
+    const target = addr.trim();
+    if (target !== "") headers["x-scry-target"] = target;
     const res = await fetch("/api/query", {
       method: "POST",
-      headers: { "content-type": "application/octet-stream" },
+      headers,
       // Send exactly the framed bytes (respecting byteOffset/byteLength). The
       // cast bridges a TS 5.7 lib lag: `Uint8Array` is now generic
       // (`Uint8Array<ArrayBufferLike>`) but DOM's `BodyInit` hasn't adopted the

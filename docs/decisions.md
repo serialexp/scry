@@ -1980,3 +1980,48 @@ dual-signal Hello, `--scrape-*` flags). Sealed by `scripts/smoke-agent-metrics.s
 a stub `/metrics` (3 exposed samples) → agent (`--no-discovery --scrape-target`) →
 scry-ingestd → bucket → `scry-list`/`scry-query` asserts exactly 5 rows land (3 exposed
 + synthesized `up` + `scrape_duration_seconds`) and query back loss-free.
+
+## D-046: scry-webui multi-target — pick one of N configured queryds by id
+
+**Context.** D-040's `scry-webui` dialed a single `--queryd`. Bart runs more than
+one `scry-queryd` he wants to query from the same browser tab — a local
+dev daemon and the remote gothab one (reached via an SSH `-L` forward) — and
+switching between them meant restarting the server with a different `--queryd`.
+The constraint from D-040 stands: the browser must **never** be able to name a
+raw upstream address (SSRF).
+
+**Decision.** Make `--queryd` **repeatable** as `id=host:port`
+(`--queryd local=127.0.0.1:4101 --queryd gothab=127.0.0.1:4100`); the first
+listed is the default. A single bare `host:port` is still accepted (id
+`default`) for the common one-target case; once there's more than one, every
+entry must be named. The server holds a `Vec<Target { id, label, addr }>`
+allowlist where `addr` is `#[serde(skip)]` — it never crosses the wire. A new
+auth-gated `GET /api/targets` returns the `{id, label}` list + the default id.
+`POST /api/query` reads the selected target from the **`X-Scry-Target` header**
+(a target *id*, resolved server-side against the allowlist): absent/empty → the
+default target; unknown id → **400** (distinct from the 502 an unreachable
+upstream gives). The frontend gains a `target` form field + a `targets()` signal
+seeded from `/api/targets` after login; in browser mode `HttpTransport` sends the
+selected id as `X-Scry-Target`, and `QueryForm` always shows a target `<select>`
+(even with one target, so it's clear which daemon answers). The desktop shell is
+unchanged — `TauriTransport` still dials a raw `addr`.
+
+**Rationale.**
+- *SSRF invariant preserved.* The browser only ever sends an opaque id; the
+  address mapping lives server-side. An attacker-controlled header can at worst
+  pick another already-allowed upstream or get a 400 — never reach an arbitrary
+  host. The raw address is `serde(skip)` so it can't leak through `/api/targets`.
+- *Symmetry with the byte-pipe.* Routing is a one-line id→addr lookup before the
+  existing relay; the server still has zero protocol knowledge.
+- *Always-shown selector.* Even a single target renders the dropdown, so the
+  answering daemon is never ambiguous and adding a second target needs no UI
+  change.
+
+**Status.** Implemented in `crates/scry-webui/src/{lib.rs,query.rs,main.rs}`
+(`Target`/`parse_targets`/`resolve_target`, `/api/targets`, `X-Scry-Target`
+routing) + frontend (`store.ts` `target`/`targets`/`fetchTargets`,
+`transport-http.ts` header, `QueryForm.tsx` selector). Sealed by the extended
+`scripts/smoke-webui.sh` (two stub queryds with distinct markers; asserts
+`/api/targets` lists both + default and never leaks the addr, header routing hits
+the right upstream, default when header absent, unknown id → 400) + new
+`tests/query.rs` integration tests.

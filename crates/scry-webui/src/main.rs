@@ -32,10 +32,14 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1:8080")]
     listen: String,
 
-    /// Upstream `scry-queryd` address. The byte-pipe dials this; any
-    /// browser-supplied address is ignored (SSRF-safe).
-    #[arg(long, default_value = "127.0.0.1:4100")]
-    queryd: String,
+    /// Upstream `scry-queryd` target(s). Repeatable; each is `id=host:port`
+    /// (e.g. `--queryd local=127.0.0.1:4101 --queryd gothab=127.0.0.1:4100`),
+    /// and the first listed is the default. A single bare `host:port` is also
+    /// accepted (id `default`). The browser selects a target by id — never a
+    /// raw address — so the relay stays SSRF-safe. Defaults to
+    /// `127.0.0.1:4100` when omitted.
+    #[arg(long, value_name = "ID=ADDR")]
+    queryd: Vec<String>,
 
     /// Session lifetime in seconds (default 1 day).
     #[arg(long, default_value_t = 86_400)]
@@ -78,8 +82,17 @@ async fn main() -> Result<()> {
     // restart, and rotating the password naturally invalidates old sessions.
     let key = derive_key(&password);
 
+    let (targets, default_target) =
+        scry_webui::parse_targets(&args.queryd).context("parsing --queryd targets")?;
+    let targets_desc = targets
+        .iter()
+        .map(|t| format!("{}={}", t.id, t.addr))
+        .collect::<Vec<_>>()
+        .join(", ");
+
     let state = AppState::new(
-        args.queryd.clone(),
+        targets,
+        default_target.clone(),
         password,
         key,
         args.session_ttl,
@@ -92,7 +105,8 @@ async fn main() -> Result<()> {
         .with_context(|| format!("binding {}", args.listen))?;
     info!(
         listen = %args.listen,
-        queryd = %args.queryd,
+        targets = %targets_desc,
+        default = %default_target,
         session_ttl = args.session_ttl,
         "scry-webui ready"
     );

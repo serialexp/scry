@@ -77,15 +77,18 @@ of it. That's `scry`.
   hundreds of TB/day, `scry` is not the answer; Mimir is.
 - **Not multi-tenant.** One deployment, one tenant. Run more deployments
   if you need more tenants. (The gateway ignores `X-Scope-OrgID`.)
-- **Not a drop-in for their query APIs.** PromQL, LogQL, and TraceQL are
-  later milestones; the native query path is DataFusion SQL today. The
-  gateway translates a curated subset of foreign *push* protocols at the
-  edge, but scry's storage, query, and native wire are its own — the
-  reason the upstream protocols are messy is precisely the kind of
-  accidental complexity we're escaping.
-- **Not a UI.** Grafana adapters and/or our own UI come later, on top of
-  a clean storage and query foundation. The first milestone has no UI
-  at all.
+- **Not a drop-in for their query APIs.** The native query path is
+  DataFusion SQL, surfaced through scry's own UI; PromQL is demoted (the
+  own-UI direction removes the need for a Grafana-compat driver), and
+  LogQL/TraceQL aren't implemented. The gateway translates a curated subset
+  of foreign *push* protocols at the edge, but scry's storage, query, and
+  native wire are its own — the reason the upstream protocols are messy is
+  precisely the kind of accidental complexity we're escaping.
+- **Not (yet) a Grafana drop-in.** scry now has its *own* query UI — a
+  desktop app and a browser server (`scry-webui`) with per-signal views, a
+  single-trace waterfall, a frames overview, and a logs reader — but
+  **Grafana datasource adapters** (keep your existing dashboards) are a
+  later milestone, as is flamegraph rendering for profiles.
 - **Not configurable for the sake of being configurable.** Every knob
   added is a knob someone has to understand, document, and defend. The
   total config file should fit on one screen. If it grows past that
@@ -102,10 +105,10 @@ in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); decisions in
   way and query back: producer → native wire → per-writer WAL → parquet
   blocks on S3-compatible storage → SQLite catalog → DataFusion-backed
   query (local `scry-query` CLI or the `scry-queryd` daemon over a
-  binschema-framed wire). v0.1–v0.7 are sealed; `scripts/smoke.sh`
-  exercises the full ingest → store → query round-trip live for each
-  signal, including a `--trace-id` by-id lookup for traces and a
-  `--grep` ≡ `body LIKE` equivalence check for logs.
+  binschema-framed wire). Milestones v0.1–v0.11 are sealed;
+  `scripts/smoke.sh` exercises the full ingest → store → query round-trip
+  live for each signal, including a `--trace-id` by-id lookup for traces
+  and a `--grep` ≡ `body LIKE` equivalence check for logs.
 - **Metrics** and **logs** preselect via a per-block postings sidecar on
   AND'd label matchers. **Traces** and **profiles** carry no postings —
   matcher / time / trace-id filters push down as parquet row predicates
@@ -122,9 +125,11 @@ in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); decisions in
   legacy Pyroscope `/ingest`, and Prometheus remote-write over HTTP (plus
   the native binschema wire, opt-in), then forwards every accepted record
   best-effort to *all* configured downstream sinks — any of the scry
-  server, Grafana Loki, and/or OpenSearch (the latter two take logs only).
-  Every sink is opt-in (no scry server required if you only tee to
-  Loki/OpenSearch). All in → all out, no routing config (D-041). The
+  server, Grafana Loki, OpenSearch (logs only), and/or **Mimir**
+  (metrics only, remote-write — D-044). Every sink is opt-in (no scry
+  server required if you only tee to Loki/OpenSearch). All in → all out,
+  no routing config (D-041). An optional custom CA (`--ca-cert`) covers
+  the HTTP sinks. The
   **OpenSearch sink self-manages** (D-042): `--opensearch-index` is a
   *prefix*, logs route per service to rolling data streams
   `<prefix>-<service>` (or `<prefix>-general`), and the sink creates and
@@ -135,12 +140,35 @@ in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); decisions in
   AWS SigV4 (creds + region from the default AWS chain — never argv).
   `scripts/smoke-gateway.sh` drives the three HTTP protocols end to end
   against a Garage-backed server.
+- **`scry-agent`** is a per-node collector (Alloy replacement): it tails
+  Kubernetes pod logs and **scrapes Prometheus `/metrics` endpoints**,
+  shipping both over one native-wire connection. Scrape targets come from
+  static `--scrape-target` URLs and/or pods annotated
+  `prometheus.io/scrape`; a **hand-rolled** exposition parser maps samples
+  to series, each scrape synthesizes `up` + `scrape_duration_seconds`, and
+  a node-side `--keep` allow-list filters both logs and metrics. Sealed by
+  `scripts/smoke-agent-metrics.sh` (D-043, D-045).
+- **Lifecycle: compaction + retention + multi-instance.** Size-tiered
+  compaction merges the K smallest blocks in a `(signal, date, level)`
+  partition into the next level (DataFusion sort-merge, sidecars rebuilt;
+  D-036) and per-signal retention reaps wholly-expired blocks (opt-in,
+  dry-run by default; D-037). 1–N identical instances share one bucket,
+  coordinated through **Valkey** — a lease elects a single compaction /
+  retention winner (a *correctness* requirement; blocks are UUID- not
+  content-addressed) and pub/sub + cursor polling + full-walk converge
+  every catalog on the bucket (D-038/D-039). With Valkey absent a single
+  instance stays correct. Sealed by `MULTI=1 scripts/smoke.sh`.
+- **A query UI.** A SolidJS app runs both as a Tauri **desktop** binary
+  (native socket to `scry-queryd`) and in the **browser** via `scry-webui`
+  (a password-gated, SSRF-safe byte-pipe that can fan out to several
+  `scry-queryd` upstreams, picked by id). It has per-signal views, a
+  single-trace waterfall, a frames overview, and a logs reader (D-040,
+  D-046). Sealed by `scripts/smoke-webui.sh`.
 
-Profiles **flamegraph aggregation** (pprof parse + stack-merge; Grafana
-renders pre-aggregated data, so this is backend work for when a UI
-consumes it), compaction + retention (v0.8), and Grafana/UI (v1.0)
-follow; PromQL is demoted now that scry has its own query UI. See the
-milestone table below.
+Still ahead: profiles **flamegraph aggregation** (pprof parse +
+stack-merge — backend work for when a UI renders it; Grafana consumes
+pre-aggregated data) and **Grafana datasource adapters** (v1.0). PromQL is
+demoted now that scry has its own query UI. See the milestone table below.
 
 ## Workspace
 
@@ -156,18 +184,27 @@ crates/
   query/               DataFusion query engine + scry-query CLI (scry-query)
   scry-queryd/         remote query daemon (binschema-framed wire)
   scry-list/           catalog inspector / bucket reconciler
-  scry-webui/          browser query UI server: serves the SolidJS app + relays queries to scry-queryd (D-040)
+  scry-webui/          browser query UI server: serves the SolidJS app + relays queries to one of N configured scry-queryd targets, selected by id (D-040, D-046)
+  compact/             size-tiered compaction engine + scry-compact CLI (D-036)
+  retention/           per-signal TTL retention engine + scry-retention CLI (D-037)
+  valkey/              Valkey client: lease, block-event pub/sub, sink (scry-valkey, D-038)
+  cluster/             multi-instance convergence + lease-guarded maintenance (scry-cluster, D-038/D-039)
   client/              reusable native-wire client, shared by agent + gateway (scry-client)
   agent/               per-node agent: tails CRI logs + scrapes Prometheus /metrics, ships over the wire (scry-agent)
   gateway/             fan-out hub (scry-gateway): native wire + OTLP/Pyroscope/remote-write in → scry + Loki + OpenSearch + Mimir out
   noise-spewer/        TCP client; emits random metrics/logs/traces/profiles
-  scry-ingestd/        ingest server daemon binary (wraps scry-server)
+  scry-ingestd/        ingest server daemon binary (wraps scry-server; --mode full runs maintenance)
 proto/                 binschema source-of-truth schemas
-deploy/k8s/            Kubernetes manifests: ingest server (StatefulSet+PVC) + agent (DaemonSet)
-Dockerfile             one image, four roles: scry-ingestd + scry-agent + scry-gateway + scry-list
+desktop/               Tauri + SolidJS query app (frontend bundle shared with scry-webui; not a workspace member)
+deploy/k8s/            Kubernetes manifests: ingest server (StatefulSet+PVC), query daemon (Deployment), agent (DaemonSet)
+Dockerfile             one image, many roles: scry-ingestd + scry-queryd + scry-agent + scry-gateway + scry-list (scry-webui is home-machine only)
 scripts/gen-proto.sh        regenerate Rust bindings from proto/*.schema.json
-scripts/smoke.sh            end-to-end ingest→store→query exit criterion (metrics/logs)
+scripts/smoke.sh            end-to-end ingest→store→query exit criterion (metrics/logs; MULTI=1 → two-instance)
 scripts/smoke-gateway.sh    end-to-end push-gateway smoke (OTLP + Pyroscope + remote-write)
+scripts/smoke-agent-metrics.sh  scry-agent Prometheus scrape → store → query smoke
+scripts/smoke-webui.sh      scry-webui browser surface (auth + multi-target relay)
+scripts/dev-garage-up.sh    local single-node Garage (S3) for the smokes
+scripts/dev-valkey-up.sh    local single-node Valkey for the multi-instance smoke
 ```
 
 ## Build and run locally
@@ -184,6 +221,34 @@ cargo build --release --workspace
 
 You'll see the sink report something like
 `batches=150 samples=15200 log_entries=2280 spans=740 profiles=37 rejected=0`.
+
+To collect real telemetry, run the **agent** — it tails CRI container logs
+*and* scrapes Prometheus `/metrics` endpoints, shipping both to the server
+over one native-wire connection:
+
+```bash
+# Logs only: tail this node's container logs (pod-watch enriches labels).
+# Local testing against a fixture tree: add --no-discovery --from-start.
+./target/release/scry-agent --server-addr 127.0.0.1:4000
+
+# Metrics: scrape one or more static targets (in addition to any pods
+# annotated prometheus.io/scrape, when the pod watch is on):
+./target/release/scry-agent --server-addr 127.0.0.1:4000 \
+  --scrape-target http://127.0.0.1:9100/metrics \
+  --scrape-target http://127.0.0.1:8080/metrics \
+  --scrape-interval 15s --scrape-default-job node
+
+# Metrics only, no log tailing or k8s — point at static targets:
+./target/release/scry-agent --server-addr 127.0.0.1:4000 \
+  --no-discovery --scrape-target http://127.0.0.1:9100/metrics
+```
+
+Each scraped series carries `__name__` + the target's
+`job`/`instance`/`namespace`/`pod`/`node` labels, and every scrape
+synthesizes `up` + `scrape_duration_seconds` so a down target is data, not
+absence. The same `--keep` allow-list (see below) filters both logs and
+metric series. Bearer auth for a scrape target: `--scrape-bearer
+@/path/to/token` (the `@` reads from a file so the secret isn't on argv).
 
 To accept foreign push protocols, run the gateway alongside the server:
 
@@ -241,7 +306,11 @@ End-to-end smoke tests (require a local Garage — `scripts/dev-garage-up.sh`):
 
 ```bash
 SIGNAL=metrics scripts/smoke.sh   # ingest → store → query round-trip, native wire
+SIGNAL=both    scripts/smoke.sh   # metrics + logs through one sink
+MULTI=1        scripts/smoke.sh   # two instances on one bucket (needs dev-valkey-up.sh)
 scripts/smoke-gateway.sh          # OTLP + Pyroscope + remote-write through the gateway
+scripts/smoke-agent-metrics.sh    # scry-agent Prometheus scrape → store → query
+scripts/smoke-webui.sh            # scry-webui browser surface (auth + multi-target relay)
 ```
 
 ## Deploy (Kubernetes)
@@ -265,7 +334,13 @@ kubectl apply -f deploy/k8s/objstore-secret.yaml
 kubectl apply -f deploy/k8s/server-statefulset.yaml
 kubectl apply -f deploy/k8s/server-service.yaml
 
-# Per-node log agent (DaemonSet + read-only pod-watch RBAC):
+# Query daemon (Deployment + Service) — serves the binschema query wire
+# to scry-query / scry-webui, with its own bucket-reconciled catalog:
+kubectl apply -f deploy/k8s/queryd-deployment.yaml
+kubectl apply -f deploy/k8s/queryd-service.yaml
+
+# Per-node agent: tails container logs + scrapes Prometheus endpoints
+# (DaemonSet + read-only pod-watch RBAC):
 kubectl apply -f deploy/k8s/agent-rbac.yaml
 kubectl apply -f deploy/k8s/agent-daemonset.yaml
 ```
@@ -274,7 +349,10 @@ The server runs with `--storage --wal-dir=/wal --catalog=/wal/catalog.sqlite`
 on a `ReadWriteOnce` PVC, exposes the ingest wire on `:4000` and a live stats
 dashboard on `:4098`, and is reachable in-cluster as `scry-server.scry.svc:4000`.
 The catalog is rebuildable from the bucket at any time with `scry-list`, so the
-PVC is a cache, not a system of record.
+PVC is a cache, not a system of record. The query daemon (`scry-queryd`) reads
+the same bucket and answers on `:4100`. For **multi-instance** operation, set
+`SCRY_VALKEY_URL` and run `scry-ingestd --mode full` so a Valkey lease elects a
+single compaction/retention winner and catalogs converge via pub/sub (D-038/D-039).
 
 ### The gateway
 
@@ -310,9 +388,9 @@ spec:
 
 Aim your existing exporters at the **gateway** (`:4318`). It decodes each
 request into one batch and fans it out, best-effort, to every configured
-sink (any of scry / Loki / OpenSearch; the latter two logs-only). The
-caller is ACKed once the batch is **enqueued**, not once the downstreams
-confirm —
+sink (any of scry / Loki / OpenSearch / Mimir; Loki + OpenSearch are
+logs-only, Mimir is metrics-only). The caller is ACKed once the batch is
+**enqueued**, not once the downstreams confirm —
 delivery is best-effort with no local spool, so durability across a
 downstream outage is bounded by each sink's in-memory queue depth (D-041).
 
@@ -449,7 +527,8 @@ that closed that gap (see D-034). Order updated accordingly.
 | **v0.7**  | ✅     | Full-text log search: first-class `--grep` / `body_contains` substring search accelerated by a per-block byte-trigram **bloom skip sidecar** (built inline at seal; one-sided error, exact `contains` backstop). ~1–3% storage overhead, skips whole blocks that can't match. See D-035. (PromQL demoted — own UI removes the Grafana-compat driver.) |
 | **v0.8**  | ✅     | Size-tiered **compaction** + per-signal **retention**, single-instance. Compaction: standalone `scry-compact` (`--once` / `--watch`) merges the K smallest blocks in a `(signal, date, level)` partition into one at the next level, DataFusion sort-merge, sidecars rebuilt (postings union, logs body bloom, metrics `series_types`); supersede→grace→delete with `superseded_by IS NULL` query-skip making grace=0 safe; `level` promoted into the sidecar (D-036). Retention: standalone `scry-retention` reaps blocks whose newest record is past a per-signal TTL — opt-in (no implicit deletion), **dry-run by default** (`--apply` to delete), whole-block `ts_max` criterion (D-037). |
 | **v0.9**  | ✅     | **Multi-instance**: 1–N identical instances share one bucket via **Valkey**. A **Valkey lease** (`SET NX PX` + Lua compare-and-set renew/release — replacing D-013's `If-None-Match` lease, unbuildable on Garage) gives single-winner compaction/retention; single-winner is a *correctness* requirement because blocks are UUID- not content-addressed (D-038). Catalog **convergence** is three-tier: Valkey pub/sub `BlockEvent`s → cursor-driven incremental poll → periodic full-walk, all converging on the bucket as truth; 404-tolerant reads (`EvictOnNotFound` + one re-plan) heal a peer-deleted block at query time (D-039). Both engines run as background loops in `scry-ingestd --mode full`; `scry-queryd` converges query-only. Sealed by `MULTI=1 scripts/smoke.sh` (two instances: convergence + single-winner compaction + coordinated retention). With Valkey absent the system stays correct: convergence falls back to polling and maintenance pauses. |
-| **v0.10** | ✅     | Gateway becomes a **fan-out hub** + the first own-UI step. Gateway: an opt-in native binschema listener (`--listen-wire`) joins the foreign HTTP inbounds, and every accepted record tees best-effort to *all* configured sinks — any of the scry server, **Grafana Loki**, and/or **OpenSearch** (the latter two logs-only); every sink opt-in, at least one required; all in → all out, no routing config; ACK-on-enqueue, independent per-sink bounded queues (drop + count on overflow). Metrics/traces/profiles go to scry alone (D-041). The OpenSearch sink **self-manages**: `--opensearch-index` is a prefix, logs route to per-service rolling data streams `<prefix>-<service>`, and the sink keeps re-asserting its ISM rollover policy (size+age, no auto-delete) + a `flat_object` index template so cluster-side drift can't silently break ingest (D-042). UI: a purpose-built **single-trace waterfall** in the query app (desktop + web), shown when a result has one distinct `trace_id`. |
+| **v0.10** | ✅     | Gateway becomes a **fan-out hub** + the first own-UI step. Gateway: an opt-in native binschema listener (`--listen-wire`) joins the foreign HTTP inbounds, and every accepted record tees best-effort to *all* configured sinks — any of the scry server, **Grafana Loki**, and/or **OpenSearch** (the latter two logs-only); every sink opt-in, at least one required; all in → all out, no routing config; ACK-on-enqueue, independent per-sink bounded queues (drop + count on overflow). Metrics/traces/profiles go to scry alone (D-041). The OpenSearch sink **self-manages**: `--opensearch-index` is a prefix, logs route to per-service rolling data streams `<prefix>-<service>`, and the sink keeps re-asserting its ISM rollover policy (size+age, no auto-delete) + a `flat_object` index template so cluster-side drift can't silently break ingest (D-042). UI: a purpose-built **single-trace waterfall** in the query app (desktop + web), shown when a result has one distinct `trace_id`. The browser server (`scry-webui`) can be pointed at **several `scry-queryd` upstreams** (`--queryd id=host:port`, repeatable) and the UI switches between them by id — the browser never sends a raw address, so the relay stays SSRF-safe (D-046). |
+| **v0.11** | ✅     | **Metrics shipping** — scry as an Alloy/Mimir replacement on the metrics path. `scry-agent` becomes a Prometheus scraper: a **hand-rolled** text-exposition parser (counter/gauge/histogram/summary/untyped, Go floats incl. NaN/±Inf, escaped labels, optional ms timestamps; malformed lines skipped + counted), targets from **static** `--scrape-target` URLs and/or **discovered** Kubernetes pods annotated `prometheus.io/scrape`, shipped over the *same* wire/connection as logs (Hello declares logs+metrics). Each series carries `__name__` + target labels (`job`/`instance`/`namespace`/`pod`/`node` + `k8s_<label>`; a colliding exposed label is renamed `exported_<key>`), and every scrape synthesizes `up` + `scrape_duration_seconds` so a down target is data, not absence. The node-side `--keep` allow-list applies to metric series too. Sealed by `scripts/smoke-agent-metrics.sh` (D-045). Gateway gains a **Mimir remote-write sink** (`--mimir-url`, metrics-only — the inverse of the remote-write inbound, symmetric snappy+protobuf encode, optional `X-Scope-OrgID`) and an optional **custom CA** (`--ca-cert`) added on top of the system roots for all HTTP sinks (D-044). (Earlier point release v0.10.1: node-side keep-only log filter (D-043) + OpenSearch AWS SigV4 signing.) |
 | later     | —      | Profiles flamegraph aggregation (pprof parse + stack-merge → flame-tree for a UI). |
 | **v1.0**  | —      | Grafana datasource adapters (or our own minimal UI — TBD). |
 

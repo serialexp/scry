@@ -17,10 +17,86 @@ pub mod query;
 
 use std::sync::Arc;
 
+use anyhow::{bail, Result};
 use axum::extract::{DefaultBodyLimit, FromRef};
 use axum::routing::{get, post};
 use axum::Router;
 use axum_extra::extract::cookie::Key;
+
+/// One selectable upstream `scry-queryd` the byte-pipe may dial. The browser
+/// picks a target by its `id` (never by raw address — that would be an SSRF
+/// vector); the server maps the id back to `addr` from this allowlist.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Target {
+    /// Stable identifier the browser sends back (header `X-Scry-Target`).
+    pub id: String,
+    /// Human-friendly label for the UI dropdown.
+    pub label: String,
+    /// The `host:port` the relay actually dials. Not exposed to the browser.
+    #[serde(skip)]
+    pub addr: String,
+}
+
+/// Parse repeatable `--queryd` values into the target allowlist, returning the
+/// targets (in declared order) and the default target id (the first one).
+///
+/// Each value is `id=addr` or a bare `addr`. A bare `addr` is only allowed as
+/// the sole entry (id `"default"`, label = the addr); once there are several,
+/// every entry must be named so the ids are unambiguous. Empty input falls back
+/// to a single `127.0.0.1:4100` default. Ids must be unique and non-empty.
+pub fn parse_targets(raw: &[String]) -> Result<(Vec<Target>, String)> {
+    if raw.is_empty() {
+        let addr = "127.0.0.1:4100".to_string();
+        return Ok((
+            vec![Target {
+                id: "default".into(),
+                label: addr.clone(),
+                addr,
+            }],
+            "default".into(),
+        ));
+    }
+
+    let mut targets: Vec<Target> = Vec::with_capacity(raw.len());
+    for entry in raw {
+        let entry = entry.trim();
+        let target = match entry.split_once('=') {
+            Some((id, addr)) => {
+                let id = id.trim();
+                let addr = addr.trim();
+                if id.is_empty() || addr.is_empty() {
+                    bail!("invalid --queryd '{entry}': expected 'id=host:port'");
+                }
+                Target {
+                    id: id.to_string(),
+                    label: id.to_string(),
+                    addr: addr.to_string(),
+                }
+            }
+            None => {
+                // A bare address is only unambiguous as the only target.
+                if raw.len() > 1 {
+                    bail!(
+                        "invalid --queryd '{entry}': name every target as 'id=host:port' \
+                         when more than one is given"
+                    );
+                }
+                Target {
+                    id: "default".into(),
+                    label: entry.to_string(),
+                    addr: entry.to_string(),
+                }
+            }
+        };
+        if targets.iter().any(|t| t.id == target.id) {
+            bail!("duplicate --queryd id '{}'", target.id);
+        }
+        targets.push(target);
+    }
+
+    let default = targets[0].id.clone();
+    Ok((targets, default))
+}
 
 /// Shared, clone-cheap application state (mirrors `scry-gateway`'s pattern: a
 /// `#[derive(Clone)]` handle over `Arc`-d internals).
@@ -28,8 +104,10 @@ use axum_extra::extract::cookie::Key;
 pub struct AppState(Arc<Inner>);
 
 struct Inner {
-    /// Upstream `scry-queryd` address the byte-pipe dials.
-    queryd: String,
+    /// The selectable upstream `scry-queryd` targets (the allowlist).
+    targets: Vec<Target>,
+    /// Id of the target used when the browser sends no selection.
+    default_target: String,
     /// The shared login password.
     password: String,
     /// Cookie-signing key (derived from the password).
@@ -44,14 +122,16 @@ struct Inner {
 
 impl AppState {
     pub fn new(
-        queryd: String,
+        targets: Vec<Target>,
+        default_target: String,
         password: String,
         key: Key,
         session_ttl: i64,
         secure_cookie: bool,
     ) -> Self {
         Self(Arc::new(Inner {
-            queryd,
+            targets,
+            default_target,
             password,
             key,
             session_ttl,
@@ -59,8 +139,26 @@ impl AppState {
         }))
     }
 
-    pub fn queryd(&self) -> &str {
-        &self.0.queryd
+    pub fn targets(&self) -> &[Target] {
+        &self.0.targets
+    }
+
+    pub fn default_target(&self) -> &str {
+        &self.0.default_target
+    }
+
+    /// Resolve a browser-supplied target id to its upstream address. `None`/
+    /// empty selects the default; an unknown id returns `None` (caller → 400).
+    pub fn resolve_target(&self, id: Option<&str>) -> Option<&str> {
+        let id = match id {
+            Some(s) if !s.is_empty() => s,
+            _ => self.default_target(),
+        };
+        self.0
+            .targets
+            .iter()
+            .find(|t| t.id == id)
+            .map(|t| t.addr.as_str())
     }
 
     pub fn password(&self) -> &str {
@@ -95,8 +193,86 @@ pub fn router(state: AppState) -> Router {
         .route("/api/login", post(auth::login))
         .route("/api/logout", post(auth::logout))
         .route("/api/me", get(auth::me))
+        .route("/api/targets", get(query::targets))
         .route("/api/query", post(query::query))
         .layer(DefaultBodyLimit::max(API_BODY_LIMIT))
         .fallback(assets::serve)
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_falls_back_to_a_single_default() {
+        let (targets, default) = parse_targets(&[]).unwrap();
+        assert_eq!(default, "default");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].id, "default");
+        assert_eq!(targets[0].addr, "127.0.0.1:4100");
+    }
+
+    #[test]
+    fn single_bare_addr_is_the_default() {
+        let (targets, default) = parse_targets(&["127.0.0.1:4200".into()]).unwrap();
+        assert_eq!(default, "default");
+        assert_eq!(targets[0].addr, "127.0.0.1:4200");
+        assert_eq!(targets[0].label, "127.0.0.1:4200");
+    }
+
+    #[test]
+    fn named_targets_keep_order_and_first_is_default() {
+        let (targets, default) = parse_targets(&[
+            "local=127.0.0.1:4101".into(),
+            "gothab=127.0.0.1:4100".into(),
+        ])
+        .unwrap();
+        assert_eq!(default, "local");
+        assert_eq!(
+            targets.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            ["local", "gothab"]
+        );
+        assert_eq!(targets[1].addr, "127.0.0.1:4100");
+    }
+
+    #[test]
+    fn bare_addr_rejected_when_multiple() {
+        assert!(parse_targets(&["127.0.0.1:4101".into(), "g=127.0.0.1:4100".into()]).is_err());
+    }
+
+    #[test]
+    fn duplicate_ids_rejected() {
+        assert!(parse_targets(&["a=127.0.0.1:1".into(), "a=127.0.0.1:2".into()]).is_err());
+    }
+
+    #[test]
+    fn empty_id_or_addr_rejected() {
+        assert!(parse_targets(&["=127.0.0.1:1".into()]).is_err());
+        assert!(parse_targets(&["a=".into()]).is_err());
+    }
+
+    #[test]
+    fn resolve_target_maps_id_and_defaults() {
+        let (targets, default) = parse_targets(&[
+            "local=127.0.0.1:4101".into(),
+            "gothab=127.0.0.1:4100".into(),
+        ])
+        .unwrap();
+        let state = AppState::new(
+            targets,
+            default,
+            "pw".into(),
+            Key::from(&[7u8; 64]),
+            60,
+            false,
+        );
+        assert_eq!(state.resolve_target(Some("gothab")), Some("127.0.0.1:4100"));
+        assert_eq!(state.resolve_target(Some("local")), Some("127.0.0.1:4101"));
+        // Absent / empty → default (local).
+        assert_eq!(state.resolve_target(None), Some("127.0.0.1:4101"));
+        assert_eq!(state.resolve_target(Some("")), Some("127.0.0.1:4101"));
+        // Unknown → None.
+        assert_eq!(state.resolve_target(Some("nope")), None);
+    }
 }

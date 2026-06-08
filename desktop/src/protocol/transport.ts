@@ -22,9 +22,11 @@ export interface Transport {
    * protocol-level `StreamError`s arrive *inside* the returned bytes and
    * are surfaced by the client, not here.
    *
-   * Note: the HTTP transport ignores `addr` — the `scry-webui` server dials
-   * its own configured upstream `scry-queryd` (SSRF-safe). Only the desktop
-   * (Tauri) transport honours `addr`.
+   * Note: `addr` means different things per transport. The desktop (Tauri)
+   * transport dials it as a raw `host:port`. The HTTP transport treats it as a
+   * target **id** sent in `X-Scry-Target`; the `scry-webui` server resolves the
+   * id against its own `--queryd` allowlist (SSRF-safe — the browser never
+   * supplies a raw address). Empty ⇒ the server's default target.
    */
   query(addr: string, request: Uint8Array): Promise<Uint8Array>;
 }

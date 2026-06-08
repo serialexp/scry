@@ -4,7 +4,7 @@
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use axum_extra::extract::cookie::Key;
-use scry_webui::{router, AppState};
+use scry_webui::{parse_targets, router, AppState};
 use tower::ServiceExt;
 
 const PASSWORD: &str = "hunter2";
@@ -12,23 +12,23 @@ const PASSWORD: &str = "hunter2";
 /// Fixed key so signed cookies issued by one router instance verify in another
 /// (each `oneshot` consumes its router, so we rebuild between requests).
 fn state() -> AppState {
-    AppState::new(
-        "127.0.0.1:1".to_string(),
-        PASSWORD.to_string(),
-        Key::from(&[7u8; 64]),
-        3600,
-        false,
-    )
+    state_with_secure(false)
 }
 
 /// Same as `state()` but with `secure_cookie` enabled (HTTPS / TLS-proxy mode).
 fn secure_state() -> AppState {
+    state_with_secure(true)
+}
+
+fn state_with_secure(secure: bool) -> AppState {
+    let (targets, default) = parse_targets(&["127.0.0.1:1".to_string()]).unwrap();
     AppState::new(
-        "127.0.0.1:1".to_string(),
+        targets,
+        default,
         PASSWORD.to_string(),
         Key::from(&[7u8; 64]),
         3600,
-        true,
+        secure,
     )
 }
 
