@@ -5,11 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "scry web UI server: serves the SolidJS query app to a browser and relays framed query bytes to scry-queryd over a password-gated session."
-
-[[bin]]
-name = "scry-webui"
-path = "src/main.rs"
+description = "scry web UI server: serves the SolidJS query app to a browser and relays framed query bytes to the query daemon over a password-gated session."
 
 [dependencies]
 anyhow = { workspace = true }
@@ -20,7 +16,6 @@ chrono = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 cookie = { workspace = true }
 mime_guess = { workspace = true }
-mimalloc = { workspace = true }
 rust-embed = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

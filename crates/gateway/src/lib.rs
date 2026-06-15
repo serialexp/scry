@@ -24,6 +24,7 @@
 //! unit-tested; the handlers and sink workers are thin shells over them.
 
 pub mod aws_sign;
+pub mod cli;
 pub mod loki;
 pub mod mimir;
 pub mod opensearch;

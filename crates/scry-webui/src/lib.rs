@@ -17,11 +17,118 @@ pub mod query;
 
 use std::sync::Arc;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use axum::extract::{DefaultBodyLimit, FromRef};
 use axum::routing::{get, post};
 use axum::Router;
 use axum_extra::extract::cookie::Key;
+use clap::Parser;
+use tracing::info;
+
+/// Env var carrying the shared login password (kept out of argv).
+pub const PASSWORD_ENV: &str = "SCRY_WEBUI_PASSWORD";
+
+/// CLI arguments for the `scry web` subcommand (formerly the `scry-webui` bin).
+#[derive(Parser, Debug)]
+#[command(about = "Browser query UI for the scry query daemon")]
+pub struct Args {
+    /// HTTP listen address.
+    #[arg(long, default_value = "127.0.0.1:8080")]
+    pub listen: String,
+
+    /// Upstream query-daemon target(s). Repeatable; each is `id=host:port`
+    /// (e.g. `--queryd local=127.0.0.1:4101 --queryd gothab=127.0.0.1:4100`),
+    /// and the first listed is the default. A single bare `host:port` is also
+    /// accepted (id `default`). The browser selects a target by id — never a
+    /// raw address — so the relay stays SSRF-safe. Defaults to
+    /// `127.0.0.1:4100` when omitted.
+    #[arg(long, value_name = "ID=ADDR")]
+    pub queryd: Vec<String>,
+
+    /// Session lifetime in seconds (default 1 day).
+    #[arg(long, default_value_t = 86_400)]
+    pub session_ttl: i64,
+
+    /// Set the `Secure` attribute on the session cookie. Enable this only when
+    /// the browser reaches scry-webui over HTTPS (e.g. behind a TLS reverse
+    /// proxy such as Caddy); over plain `http://` a `Secure` cookie is dropped
+    /// by the browser and login silently fails. Also via `SCRY_WEBUI_SECURE_COOKIE`
+    /// (accepts 1/0/true/false/yes/no/on/off). Bare `--secure-cookie` ⇒ true.
+    #[arg(
+        long,
+        env = "SCRY_WEBUI_SECURE_COOKIE",
+        num_args = 0..=1,
+        default_value_t = false,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new(),
+    )]
+    pub secure_cookie: bool,
+}
+
+/// Serve the browser query UI and relay queries to the query daemon.
+pub async fn run(args: Args) -> Result<()> {
+    let password =
+        std::env::var(PASSWORD_ENV).map_err(|_| anyhow::anyhow!("{PASSWORD_ENV} must be set"))?;
+    if password.is_empty() {
+        bail!("{PASSWORD_ENV} must not be empty");
+    }
+
+    // Derive a stable cookie-signing key from the password: sessions survive a
+    // restart, and rotating the password naturally invalidates old sessions.
+    let key = derive_key(&password);
+
+    let (targets, default_target) =
+        parse_targets(&args.queryd).context("parsing --queryd targets")?;
+    let targets_desc = targets
+        .iter()
+        .map(|t| format!("{}={}", t.id, t.addr))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let state = AppState::new(
+        targets,
+        default_target.clone(),
+        password,
+        key,
+        args.session_ttl,
+        args.secure_cookie,
+    );
+    let app = router(state);
+
+    let listener = tokio::net::TcpListener::bind(&args.listen)
+        .await
+        .with_context(|| format!("binding {}", args.listen))?;
+    info!(
+        listen = %args.listen,
+        targets = %targets_desc,
+        default = %default_target,
+        session_ttl = args.session_ttl,
+        "scry-webui ready"
+    );
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await
+        .context("serving HTTP")?;
+
+    Ok(())
+}
+
+/// Derive a 256-bit-class signing key from the password via HKDF
+/// (`Key::derive_from`). That function requires ≥32 bytes of input material, so
+/// we domain-separate with a fixed label and repeat to reach the floor — the
+/// derivation is deterministic (key stable across restarts) and the entropy is
+/// the password's, which is inherent to a single-password scheme.
+fn derive_key(password: &str) -> Key {
+    let mut material = format!("scry-webui-session-v1::{password}").into_bytes();
+    while material.len() < 32 {
+        let again = material.clone();
+        material.extend_from_slice(&again);
+    }
+    Key::derive_from(&material)
+}
 
 /// One selectable upstream `scry-queryd` the byte-pipe may dial. The browser
 /// picks a target by its `id` (never by raw address — that would be an SSRF

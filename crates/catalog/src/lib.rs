@@ -104,8 +104,9 @@ impl Catalog {
         // `blocks.bucket REFERENCES buckets(name)` FK relaxed to plain
         // TEXT. Both come back when multi-bucket lands; nothing about
         // the v0.1 rows needs to change for that migration.
-        self.conn.execute_batch(
-            r#"
+        self.conn
+            .execute_batch(
+                r#"
             CREATE TABLE IF NOT EXISTS blocks (
               uuid                TEXT PRIMARY KEY,
               bucket              TEXT NOT NULL,
@@ -148,8 +149,8 @@ impl Catalog {
               PRIMARY KEY (signal, writer_id, date)
             );
             "#,
-        )
-        .context("initialising catalog schema")?;
+            )
+            .context("initialising catalog schema")?;
         Ok(())
     }
 
@@ -162,8 +163,10 @@ impl Catalog {
     /// was already present.
     pub fn insert_block(&self, meta: &BlockMeta) -> Result<bool> {
         let date = format_date(meta.ts_min_unix_nano);
-        let rows = self.conn.execute(
-            r#"
+        let rows = self
+            .conn
+            .execute(
+                r#"
             INSERT OR IGNORE INTO blocks (
               uuid, bucket, signal, date, writer_id, level,
               ts_min, ts_max, row_count, byte_size,
@@ -178,29 +181,29 @@ impl Catalog {
               ?14, ?15, NULL, NULL
             )
             "#,
-            params![
-                meta.uuid.to_string(),
-                self.bucket,
-                meta.signal,
-                date,
-                meta.writer_id.to_string(),
-                // SQLite stores INTEGER as i64; ts is u64 nanos. The
-                // value fits comfortably into i64 until year 2262, so
-                // a direct cast is fine for the next ~236 years.
-                meta.ts_min_unix_nano as i64,
-                meta.ts_max_unix_nano as i64,
-                meta.row_count as i64,
-                meta.byte_size as i64,
-                meta.postings_size_bytes.map(|v| v as i64),
-                if meta.has_postings { 1i64 } else { 0i64 },
-                meta.body_bloom_size_bytes.map(|v| v as i64),
-                if meta.has_body_bloom { 1i64 } else { 0i64 },
-                meta.schema_version as i64,
-                meta.label_fingerprint_bloom.as_deref(),
-                meta.level as i64,
-            ],
-        )
-        .context("INSERT OR IGNORE block")?;
+                params![
+                    meta.uuid.to_string(),
+                    self.bucket,
+                    meta.signal,
+                    date,
+                    meta.writer_id.to_string(),
+                    // SQLite stores INTEGER as i64; ts is u64 nanos. The
+                    // value fits comfortably into i64 until year 2262, so
+                    // a direct cast is fine for the next ~236 years.
+                    meta.ts_min_unix_nano as i64,
+                    meta.ts_max_unix_nano as i64,
+                    meta.row_count as i64,
+                    meta.byte_size as i64,
+                    meta.postings_size_bytes.map(|v| v as i64),
+                    if meta.has_postings { 1i64 } else { 0i64 },
+                    meta.body_bloom_size_bytes.map(|v| v as i64),
+                    if meta.has_body_bloom { 1i64 } else { 0i64 },
+                    meta.schema_version as i64,
+                    meta.label_fingerprint_bloom.as_deref(),
+                    meta.level as i64,
+                ],
+            )
+            .context("INSERT OR IGNORE block")?;
         Ok(rows > 0)
     }
 
@@ -275,9 +278,8 @@ impl Catalog {
         let merged_str = merged.to_string();
         let tx = self.conn.unchecked_transaction()?;
         {
-            let mut stmt = tx.prepare_cached(
-                "UPDATE blocks SET superseded_by = ?1 WHERE uuid = ?2",
-            )?;
+            let mut stmt =
+                tx.prepare_cached("UPDATE blocks SET superseded_by = ?1 WHERE uuid = ?2")?;
             for input in inputs {
                 stmt.execute(params![merged_str, input.to_string()])
                     .context("UPDATE superseded_by")?;
@@ -334,27 +336,18 @@ impl Catalog {
     /// `(signal, writer_id, date)`, or `None` if the partition has never
     /// been polled. The incremental poller lists `start-after` this value
     /// (see [`advance_cursor`](Self::advance_cursor)).
-    pub fn get_cursor(
-        &self,
-        signal: &str,
-        writer_id: Uuid,
-        date: &str,
-    ) -> Result<Option<Uuid>> {
+    pub fn get_cursor(&self, signal: &str, writer_id: Uuid, date: &str) -> Result<Option<Uuid>> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT highest_uuid FROM poll_cursors \
              WHERE signal = ?1 AND writer_id = ?2 AND date = ?3",
         )?;
         let res: Option<String> = stmt
-            .query_row(
-                params![signal, writer_id.to_string(), date],
-                |r| r.get(0),
-            )
+            .query_row(params![signal, writer_id.to_string(), date], |r| r.get(0))
             .optional()?;
         match res {
             None => Ok(None),
             Some(s) => {
-                let u = Uuid::parse_str(&s)
-                    .with_context(|| format!("parsing cursor uuid {s}"))?;
+                let u = Uuid::parse_str(&s).with_context(|| format!("parsing cursor uuid {s}"))?;
                 Ok(Some(u))
             }
         }
@@ -419,10 +412,7 @@ impl Catalog {
     /// Sidecars that fail to parse are logged and counted in
     /// [`ReconcileReport::failed`] but do not abort the reconcile;
     /// one bad sidecar shouldn't poison the rest of the bucket.
-    pub async fn reconcile_from_bucket(
-        &self,
-        store: &dyn ObjectStore,
-    ) -> Result<ReconcileReport> {
+    pub async fn reconcile_from_bucket(&self, store: &dyn ObjectStore) -> Result<ReconcileReport> {
         let mut report = ReconcileReport::default();
         let mut stream = store.list(None);
         while let Some(item) = stream.next().await {
@@ -554,10 +544,12 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<CatalogEntry> {
     let has_body_bloom_raw: i64 = row.get(14)?;
     let body_bloom_size_bytes: Option<i64> = row.get(15)?;
 
-    let uuid = Uuid::parse_str(&uuid_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
-    let writer_id = Uuid::parse_str(&writer_id_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+    let uuid = Uuid::parse_str(&uuid_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    let writer_id = Uuid::parse_str(&writer_id_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
 
     Ok(CatalogEntry {
         meta: BlockMeta {
@@ -616,4 +608,3 @@ const _ASSERT_SEND: fn() = || {
     fn is_send<T: Send>() {}
     is_send::<Catalog>();
 };
-

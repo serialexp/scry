@@ -97,4 +97,10 @@ cp "$TMP_INGEST/src/generated.rs" "$ROOT/crates/proto/src/generated.rs"
 echo "copying generated -> crates/proto/src/generated_query.rs"
 cp "$TMP_QUERY/src/generated.rs" "$ROOT/crates/proto/src/generated_query.rs"
 
+# Format the freshly-vendored output so it lands rustfmt-clean — otherwise the
+# pre-commit hook (.githooks/pre-commit) would reject the regen commit, and the
+# tree would slowly re-accumulate formatting churn.
+echo "rustfmt -> binschema-runtime + generated proto sources"
+( cd "$ROOT" && cargo fmt -p binschema-runtime -p scry-proto )
+
 echo "done. Review with: git diff crates/binschema-runtime crates/proto/src/generated.rs crates/proto/src/generated_query.rs"

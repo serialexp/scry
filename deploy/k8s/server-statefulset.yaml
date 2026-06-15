@@ -1,24 +1,24 @@
-# The scry ingest server (the scry-ingestd binary). Single replica for
-# dogfooding — the block layout supports multiple writers, but one is enough
-# to start. The WAL needs durable local disk for crash replay; the SQLite
-# catalog lives alongside it and is rebuildable from the bucket via scry-list.
+# The scry ingest server (`scry ingest`). Single replica for dogfooding — the
+# block layout supports multiple writers, but one is enough to start. The WAL
+# needs durable local disk for crash replay; the SQLite catalog lives alongside
+# it and is rebuildable from the bucket via `scry list`.
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: scry-server
+  name: scry-ingest
   namespace: scry
   labels:
-    app: scry-server
+    app: scry-ingest
 spec:
-  serviceName: scry-server
+  serviceName: scry-ingest
   replicas: 1
   selector:
     matchLabels:
-      app: scry-server
+      app: scry-ingest
   template:
     metadata:
       labels:
-        app: scry-server
+        app: scry-ingest
     spec:
       terminationGracePeriodSeconds: 30
       # The image runs as UID 65532 (distroless :nonroot). fsGroup makes the
@@ -31,17 +31,18 @@ spec:
         runAsGroup: 65532
         fsGroup: 65532
       containers:
-        - name: scry-server
+        - name: scry-ingest
           image: serialexp/scry:latest
           imagePullPolicy: IfNotPresent
           command:
-            - scry-ingestd
+            - scry
+            - ingest
             - --listen=0.0.0.0:4000
             - --stats-listen=0.0.0.0:4098
             - --storage
             - --wal-dir=/wal
             - --catalog=/wal/catalog.sqlite
-            - --writer-id=scry-server-0
+            - --writer-id=scry-ingest-0
           envFrom:
             - secretRef:
                 name: scry-objstore

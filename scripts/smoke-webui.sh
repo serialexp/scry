@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# smoke-webui.sh — end-to-end exercise of the scry-webui browser server.
+# smoke-webui.sh — end-to-end exercise of the scry web browser server.
 #
-# Builds the SolidJS bundle + the release scry-webui binary (so the rust-embed
-# single-binary asset path is what's tested), stands up a tiny fake scry-queryd,
+# Builds the SolidJS bundle + the release scry web binary (so the rust-embed
+# single-binary asset path is what's tested), stands up a tiny fake scry query,
 # and asserts the whole web surface:
 #   - GET /                  serves the embedded SPA
 #   - GET /api/me            401 when unauthenticated
@@ -21,7 +21,7 @@
 # the target-routing assertions prove the header actually selects the upstream.
 #
 # The real query *protocol* round-trip (framing/Arrow) is covered by the
-# scry-webui Rust integration tests and by scripts/smoke.sh's per-signal query
+# scry web Rust integration tests and by scripts/smoke.sh's per-signal query
 # legs; here the upstreams are stubs so the focus stays on the web layer.
 #
 # Env knobs: SCRY_WEBUI_PASSWORD (default "smoke-secret"), WEBUI_PORT (18080),
@@ -63,11 +63,11 @@ echo "== building frontend bundle (desktop/dist) =="
 ( cd desktop && bun run build ) >"$TMP/fe-build.log" 2>&1 \
   || { cat "$TMP/fe-build.log"; fail "frontend build failed"; }
 
-echo "== building release scry-webui (embeds the bundle) =="
-cargo build --release -p scry-webui >"$TMP/cargo.log" 2>&1 \
+echo "== building release scry web (embeds the bundle) =="
+cargo build --release -p scry >"$TMP/cargo.log" 2>&1 \
   || { cat "$TMP/cargo.log"; fail "scry-webui build failed"; }
 
-# A tiny stub scry-queryd: accept connections, drain the relayed request, reply
+# A tiny stub scry query: accept connections, drain the relayed request, reply
 # a fixed marker, close (so the relay's read_to_end terminates).
 FAKE_PY='
 import socket, sys
@@ -84,16 +84,16 @@ while True:
         conn.close()
 '
 
-echo "== starting fake scry-queryd 'local' on 127.0.0.1:$FAKE_PORT =="
+echo "== starting fake scry query 'local' on 127.0.0.1:$FAKE_PORT =="
 python3 -c "$FAKE_PY" "$FAKE_PORT" "$MARKER" >"$TMP/fake.log" 2>&1 &
 FAKE_PID=$!
 
-echo "== starting fake scry-queryd 'gothab' on 127.0.0.1:$FAKE_PORT2 =="
+echo "== starting fake scry query 'gothab' on 127.0.0.1:$FAKE_PORT2 =="
 python3 -c "$FAKE_PY" "$FAKE_PORT2" "$MARKER2" >"$TMP/fake2.log" 2>&1 &
 FAKE_PID2=$!
 
-echo "== starting scry-webui on 127.0.0.1:$WEBUI_PORT (two named targets) =="
-SCRY_WEBUI_PASSWORD="$PASS" ./target/release/scry-webui \
+echo "== starting scry web on 127.0.0.1:$WEBUI_PORT (two named targets) =="
+SCRY_WEBUI_PASSWORD="$PASS" ./target/release/scry web \
   --listen "127.0.0.1:$WEBUI_PORT" \
   --queryd "local=127.0.0.1:$FAKE_PORT" \
   --queryd "gothab=127.0.0.1:$FAKE_PORT2" \

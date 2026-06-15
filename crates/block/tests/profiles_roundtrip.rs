@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, BinaryArray, MapArray, StringArray, UInt8Array, UInt64Array};
+use arrow::array::{Array, BinaryArray, MapArray, StringArray, UInt64Array, UInt8Array};
 use bytes::Bytes;
 use object_store::{memory::InMemory, path::Path as ObjPath, ObjectStore, ObjectStoreExt};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -130,11 +130,7 @@ async fn profiles_block_roundtrip() {
         .as_any()
         .downcast_ref::<BinaryArray>()
         .unwrap();
-    let labels_col = batch
-        .column(2)
-        .as_any()
-        .downcast_ref::<MapArray>()
-        .unwrap();
+    let labels_col = batch.column(2).as_any().downcast_ref::<MapArray>().unwrap();
 
     // Sorted by ts: (100, blob_a), (200, blob_b), (300, blob_c).
     let expected: [(u64, u64, u8, &Vec<u8>); 3] = [
@@ -146,7 +142,11 @@ async fn profiles_block_roundtrip() {
         assert_eq!(ts.value(i), *ets, "row {i} ts");
         assert_eq!(dur.value(i), *edur, "row {i} duration");
         assert_eq!(fmt.value(i), *efmt, "row {i} format");
-        assert_eq!(data.value(i), eblob.as_slice(), "row {i} blob bytes verbatim");
+        assert_eq!(
+            data.value(i),
+            eblob.as_slice(),
+            "row {i} blob bytes verbatim"
+        );
     }
 
     // Row 0's labels: profile.type=cpu, service=api.

@@ -1,19 +1,19 @@
 # ClusterIP fronting the query daemon. In-cluster clients connect to
-# scry-queryd.scry.svc:4100. (Out-of-cluster clients that need a static tunnel
+# scry-query.scry.svc:4100. (Out-of-cluster clients that need a static tunnel
 # target — e.g. gothab-oncall reaching this over SSH — pin the clusterIP at the
 # deployment layer; this upstream manifest lets k8s assign one, matching
 # server-service.yaml.)
 apiVersion: v1
 kind: Service
 metadata:
-  name: scry-queryd
+  name: scry-query
   namespace: scry
   labels:
-    app: scry-queryd
+    app: scry-query
 spec:
   type: ClusterIP
   selector:
-    app: scry-queryd
+    app: scry-query
   ports:
     - name: query
       port: 4100

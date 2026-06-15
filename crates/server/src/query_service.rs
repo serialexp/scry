@@ -49,6 +49,7 @@ use datafusion::prelude::SessionConfig;
 use futures::StreamExt;
 use object_store::ObjectStore;
 use scry_catalog::Catalog;
+use scry_catalog::CatalogEntry;
 use scry_objstore::{BufPool, PoolStats};
 use scry_proto::{
     constants::{
@@ -60,24 +61,19 @@ use scry_proto::{
 };
 use scry_query::{
     list_metrics_candidates,
-    logs::{
-        list_logs_candidates, register_logs_table_from_candidates, LOGS_TABLE_NAME,
-    },
+    logs::{list_logs_candidates, register_logs_table_from_candidates, LOGS_TABLE_NAME},
     profiles::{
         list_profiles_candidates, register_profiles_table_from_candidates, PROFILES_TABLE_NAME,
     },
     register_metrics_table_from_candidates,
-    traces::{
-        list_traces_candidates, register_traces_table_from_candidates, TRACES_TABLE_NAME,
-    },
+    traces::{list_traces_candidates, register_traces_table_from_candidates, TRACES_TABLE_NAME},
     BloomCache, BloomCacheStats, EvictOnNotFound, PostingsCache, PostingsCacheStats, QueryRequest,
     METRICS_TABLE_NAME,
 };
-use scry_catalog::CatalogEntry;
-use uuid::Uuid;
 use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, info_span, warn, Instrument, Span};
+use uuid::Uuid;
 
 /// Per-query start snapshots of the two sidecar caches, bundled so the
 /// many `emit_scan_complete` call sites can pass one `cache_start` value
@@ -224,11 +220,7 @@ impl QueryService {
     /// query life-cycle (`register_metrics_table_done`,
     /// `physical_plan_done`, `scan_complete`) gets the same
     /// correlation id.
-    async fn handle_connection(
-        self: Arc<Self>,
-        sock: TcpStream,
-        peer: SocketAddr,
-    ) -> Result<()> {
+    async fn handle_connection(self: Arc<Self>, sock: TcpStream, peer: SocketAddr) -> Result<()> {
         sock.set_nodelay(true)?;
         let (rd, wr) = sock.into_split();
         let mut rd = BufReader::new(rd);
@@ -274,9 +266,7 @@ impl QueryService {
         // QUERY_ERR_BAD_REQUEST than rope it through the rest of
         // the pipeline.
         let signal = match Signal::from_u8(req.signal) {
-            Some(
-                s @ (Signal::Metrics | Signal::Logs | Signal::Traces | Signal::Profiles),
-            ) => s,
+            Some(s @ (Signal::Metrics | Signal::Logs | Signal::Traces | Signal::Profiles)) => s,
             Some(other) => {
                 let _ = emit_stream_error(
                     &mut wr,
@@ -360,14 +350,22 @@ impl QueryService {
                 .lock()
                 .map_err(|e| (QUERY_ERR_INTERNAL, format!("catalog mutex poisoned: {e}")))?;
             match signal {
-                Signal::Metrics => list_metrics_candidates(&guard, &req.query)
-                    .map_err(|e| (QUERY_ERR_INTERNAL, format!("list_metrics_candidates: {e:#}")))?,
+                Signal::Metrics => list_metrics_candidates(&guard, &req.query).map_err(|e| {
+                    (
+                        QUERY_ERR_INTERNAL,
+                        format!("list_metrics_candidates: {e:#}"),
+                    )
+                })?,
                 Signal::Logs => list_logs_candidates(&guard, &req.query)
                     .map_err(|e| (QUERY_ERR_INTERNAL, format!("list_logs_candidates: {e:#}")))?,
                 Signal::Traces => list_traces_candidates(&guard, &req.query)
                     .map_err(|e| (QUERY_ERR_INTERNAL, format!("list_traces_candidates: {e:#}")))?,
-                Signal::Profiles => list_profiles_candidates(&guard, &req.query)
-                    .map_err(|e| (QUERY_ERR_INTERNAL, format!("list_profiles_candidates: {e:#}")))?,
+                Signal::Profiles => list_profiles_candidates(&guard, &req.query).map_err(|e| {
+                    (
+                        QUERY_ERR_INTERNAL,
+                        format!("list_profiles_candidates: {e:#}"),
+                    )
+                })?,
                 other => {
                     return Err((
                         QUERY_ERR_INTERNAL,
@@ -541,7 +539,12 @@ impl QueryService {
                     let _ = emit_stream_error(&mut wr, code, msg).await;
                     let _ = wr.flush().await;
                     self.emit_scan_complete(
-                        signal, None, rows_total, pool_start, cache_start, t0.elapsed(),
+                        signal,
+                        None,
+                        rows_total,
+                        pool_start,
+                        cache_start,
+                        t0.elapsed(),
                     );
                     return Ok(());
                 }
@@ -617,10 +620,7 @@ impl QueryService {
                             "block(s) 404'd mid-scan; evicted stale catalog rows (caller should retry)"
                         );
                     }
-                    let code = if matches!(
-                        e.find_root(),
-                        DataFusionError::ResourcesExhausted(_)
-                    ) {
+                    let code = if matches!(e.find_root(), DataFusionError::ResourcesExhausted(_)) {
                         QUERY_ERR_RESOURCES
                     } else {
                         QUERY_ERR_INTERNAL
@@ -644,29 +644,28 @@ impl QueryService {
             // BatchMsg so a single batch with new dictionaries lands
             // as N+1 BatchMsg frames in order.
             #[allow(deprecated)]
-            let (dict_batches, batch_enc) = match data_gen
-                .encoded_batch(&batch, &mut dict_tracker, &options)
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    let _ = emit_stream_error(
-                        &mut wr,
-                        QUERY_ERR_INTERNAL,
-                        format!("encoded_batch: {e}"),
-                    )
-                    .await;
-                    let _ = wr.flush().await;
-                    self.emit_scan_complete(
-                        signal,
-                        Some(physical.as_ref()),
-                        rows_total,
-                        pool_start,
-                        cache_start,
-                        t0.elapsed(),
-                    );
-                    return Ok(());
-                }
-            };
+            let (dict_batches, batch_enc) =
+                match data_gen.encoded_batch(&batch, &mut dict_tracker, &options) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = emit_stream_error(
+                            &mut wr,
+                            QUERY_ERR_INTERNAL,
+                            format!("encoded_batch: {e}"),
+                        )
+                        .await;
+                        let _ = wr.flush().await;
+                        self.emit_scan_complete(
+                            signal,
+                            Some(physical.as_ref()),
+                            rows_total,
+                            pool_start,
+                            cache_start,
+                            t0.elapsed(),
+                        );
+                        return Ok(());
+                    }
+                };
 
             for d in dict_batches {
                 if let Err(e) = write_one_batch(&mut wr, d, &options).await {
@@ -764,22 +763,22 @@ impl QueryService {
             pool_reuses_delta = pool_delta.reuses,
             pool_allocs_delta = pool_delta.allocs,
             pool_misses_delta = pool_delta.misses,
-            pool_grows_delta  = pool_delta.grows,
-            pool_capacity     = pool_end.capacity,
-            postings_cache_hits_delta         = cache_delta.hits,
-            postings_cache_misses_delta       = cache_delta.misses,
-            postings_cache_evictions_delta    = cache_delta.evictions,
+            pool_grows_delta = pool_delta.grows,
+            pool_capacity = pool_end.capacity,
+            postings_cache_hits_delta = cache_delta.hits,
+            postings_cache_misses_delta = cache_delta.misses,
+            postings_cache_evictions_delta = cache_delta.evictions,
             postings_cache_fetch_errors_delta = cache_delta.fetch_errors,
-            postings_cache_entries            = cache_end.entries,
-            postings_cache_bytes_in           = cache_end.bytes_in,
-            bloom_cache_hits_delta            = bloom_delta.hits,
-            bloom_cache_misses_delta          = bloom_delta.misses,
-            bloom_cache_evictions_delta       = bloom_delta.evictions,
-            bloom_cache_fetch_errors_delta    = bloom_delta.fetch_errors,
-            bloom_cache_entries               = bloom_end.entries,
-            bloom_cache_bytes_in              = bloom_end.bytes_in,
-            query_memory_reserved_bytes_end   = memory_reserved_bytes_end,
-            pool_in_flight    = pool_end.in_flight,
+            postings_cache_entries = cache_end.entries,
+            postings_cache_bytes_in = cache_end.bytes_in,
+            bloom_cache_hits_delta = bloom_delta.hits,
+            bloom_cache_misses_delta = bloom_delta.misses,
+            bloom_cache_evictions_delta = bloom_delta.evictions,
+            bloom_cache_fetch_errors_delta = bloom_delta.fetch_errors,
+            bloom_cache_entries = bloom_end.entries,
+            bloom_cache_bytes_in = bloom_end.bytes_in,
+            query_memory_reserved_bytes_end = memory_reserved_bytes_end,
+            pool_in_flight = pool_end.in_flight,
             wall_ms = wall.as_millis() as u64,
             "scan_complete"
         );
@@ -790,7 +789,7 @@ impl QueryService {
 }
 
 /// Stable, lowercase signal name for tracing fields. Matches the
-/// shape used by `crates/query/src/bin/scry-query.rs::CliSignal::name`,
+/// shape used by `crates/query/src/cli.rs::CliSignal::name`,
 /// so dashboards filtering on `signal="metrics"` agree at both ends.
 fn signal_name(s: Signal) -> &'static str {
     match s {
@@ -814,8 +813,7 @@ where
     W: tokio::io::AsyncWrite + Unpin,
 {
     let mut bytes = Vec::new();
-    write_message(&mut bytes, enc, options)
-        .map_err(|e| anyhow::anyhow!("write_message: {e}"))?;
+    write_message(&mut bytes, enc, options).map_err(|e| anyhow::anyhow!("write_message: {e}"))?;
     let frame = QueryFrame {
         msg: QueryFrameMsg::BatchMsg(BatchMsgInput { ipc_bytes: bytes }.into()),
     };

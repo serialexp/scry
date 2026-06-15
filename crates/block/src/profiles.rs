@@ -183,10 +183,7 @@ impl ProfilesAppender for ProfilesBlockBuilder {
 }
 
 impl ProfilesBlockBuilder {
-    async fn finish_and_upload_impl(
-        self,
-        store: &dyn ObjectStore,
-    ) -> Result<Option<BlockMeta>> {
+    async fn finish_and_upload_impl(self, store: &dyn ObjectStore) -> Result<Option<BlockMeta>> {
         if self.is_empty() {
             return Ok(None);
         }
@@ -262,7 +259,8 @@ impl ProfilesBlockBuilder {
         {
             let mut w = ArrowWriter::try_new(&mut buf, schema, Some(props))
                 .context("ArrowWriter::try_new (profiles main)")?;
-            w.write(&batch).context("ArrowWriter::write (profiles main)")?;
+            w.write(&batch)
+                .context("ArrowWriter::write (profiles main)")?;
             w.close().context("ArrowWriter::close (profiles main)")?;
         }
         let parquet_bytes = Bytes::from(buf);
@@ -305,8 +303,9 @@ impl ProfilesBlockBuilder {
             has_body_bloom: false,
             body_bloom_size_bytes: None,
         };
-        let meta_bytes =
-            Bytes::from(serde_json::to_vec_pretty(&meta).context("serialising profiles BlockMeta")?);
+        let meta_bytes = Bytes::from(
+            serde_json::to_vec_pretty(&meta).context("serialising profiles BlockMeta")?,
+        );
 
         // Upload order: parquet first, meta.json last (the sidecar is the
         // catalog's "block exists" signal).

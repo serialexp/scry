@@ -4390,6 +4390,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
+name = "scry"
+version = "0.12.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "mimalloc",
+ "scry-agent",
+ "scry-compact",
+ "scry-gateway",
+ "scry-ingestd",
+ "scry-list",
+ "scry-query",
+ "scry-queryd",
+ "scry-retention",
+ "scry-webui",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "scry-agent"
 version = "0.12.0"
 dependencies = [
@@ -4399,7 +4419,6 @@ dependencies = [
  "futures",
  "k8s-openapi",
  "kube",
- "mimalloc",
  "regex",
  "reqwest",
  "scry-client",
@@ -4506,7 +4525,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
- "tracing-subscriber",
  "url",
  "uuid",
 ]
@@ -4524,7 +4542,6 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
- "mimalloc",
  "opentelemetry-proto",
  "prost",
  "reqwest",
@@ -4535,7 +4552,6 @@ dependencies = [
  "snap",
  "tokio",
  "tracing",
- "tracing-subscriber",
  "uuid",
  "zstd",
 ]
@@ -4546,7 +4562,6 @@ version = "0.12.0"
 dependencies = [
  "anyhow",
  "clap",
- "mimalloc",
  "num_cpus",
  "object_store",
  "scry-block",
@@ -4559,7 +4574,6 @@ dependencies = [
  "scry-valkey",
  "tokio",
  "tracing",
- "tracing-subscriber",
  "uuid",
 ]
 
@@ -4573,7 +4587,6 @@ dependencies = [
  "scry-objstore",
  "tokio",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -4613,7 +4626,6 @@ dependencies = [
  "datafusion",
  "futures",
  "hashlink",
- "mimalloc",
  "object_store",
  "parquet",
  "scry-block",
@@ -4625,7 +4637,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
- "tracing-subscriber",
  "url",
  "uuid",
 ]
@@ -4637,7 +4648,6 @@ dependencies = [
  "anyhow",
  "clap",
  "datafusion",
- "mimalloc",
  "scry-catalog",
  "scry-cluster",
  "scry-objstore",
@@ -4646,7 +4656,6 @@ dependencies = [
  "scry-valkey",
  "tokio",
  "tracing",
- "tracing-subscriber",
  "uuid",
 ]
 
@@ -4667,7 +4676,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
- "tracing-subscriber",
  "uuid",
 ]
 
@@ -4736,7 +4744,6 @@ dependencies = [
  "clap",
  "cookie",
  "http-body-util",
- "mimalloc",
  "mime_guess",
  "rust-embed",
  "serde",

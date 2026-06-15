@@ -15,8 +15,8 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, FixedSizeBinaryArray, ListArray, MapArray, StringArray, StructArray, UInt8Array,
-    UInt64Array,
+    Array, FixedSizeBinaryArray, ListArray, MapArray, StringArray, StructArray, UInt64Array,
+    UInt8Array,
 };
 use bytes::Bytes;
 use object_store::{memory::InMemory, path::Path as ObjPath, ObjectStore, ObjectStoreExt};
@@ -350,11 +350,7 @@ async fn traces_block_roundtrip() {
     assert_eq!(deployment_environment.value(1), "prod");
     assert_eq!(deployment_environment.value(2), "staging");
     // The promoted values are *copies* — the originals remain in the Map.
-    let resource_labels = batch
-        .column(3)
-        .as_any()
-        .downcast_ref::<MapArray>()
-        .unwrap();
+    let resource_labels = batch.column(3).as_any().downcast_ref::<MapArray>().unwrap();
     assert_eq!(
         map_pairs(
             resource_labels
@@ -388,12 +384,22 @@ async fn traces_block_roundtrip() {
     assert_eq!(ev_ts.value(0), 110);
     assert_eq!(ev_name.value(0), "cache.miss");
     assert_eq!(
-        map_pairs(ev_attr.value(0).as_any().downcast_ref::<StructArray>().unwrap()),
+        map_pairs(
+            ev_attr
+                .value(0)
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap()
+        ),
         vec![("key".to_string(), "abc".to_string())]
     );
     assert_eq!(ev_ts.value(1), 120);
     assert_eq!(ev_name.value(1), "db.query");
-    assert_eq!(ev_attr.value(1).len(), 0, "db.query event has no attributes");
+    assert_eq!(
+        ev_attr.value(1).len(),
+        0,
+        "db.query event has no attributes"
+    );
 
     // Row1 (root span): 1 event, 1 link.
     let ev1 = events.value(1);
@@ -425,7 +431,13 @@ async fn traces_block_roundtrip() {
     assert_eq!(ln_tid.value(0), &[0xCCu8; 16]);
     assert_eq!(ln_sid.value(0), &[0xDDu8; 8]);
     assert_eq!(
-        map_pairs(ln_attr.value(0).as_any().downcast_ref::<StructArray>().unwrap()),
+        map_pairs(
+            ln_attr
+                .value(0)
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap()
+        ),
         vec![("link.kind".to_string(), "follows".to_string())]
     );
 

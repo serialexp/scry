@@ -259,7 +259,11 @@ async fn fence_lost_after_commit_before_supersede_aborts_inputs_live() {
     // The local catalog is clean: only the three live inputs, none superseded,
     // and the merged block was not inserted.
     let live = catalog.list_blocks().unwrap();
-    assert_eq!(live.len(), 3, "inputs stay live; merged block not cataloged");
+    assert_eq!(
+        live.len(),
+        3,
+        "inputs stay live; merged block not cataloged"
+    );
     for m in &metas {
         assert!(catalog.get_block(m.uuid).unwrap().is_some());
     }
@@ -319,7 +323,11 @@ async fn valid_fence_merges_reaps_inputs_and_emits_events() {
         other => panic!("first event should be Created, got {other:?}"),
     }
     match &events[1] {
-        BlockEvent::Superseded { inputs, by, by_meta } => {
+        BlockEvent::Superseded {
+            inputs,
+            by,
+            by_meta,
+        } => {
             assert_eq!(*by, merged_uuid);
             assert_eq!(by_meta.uuid, merged_uuid);
             let mut got = inputs.clone();

@@ -24,7 +24,9 @@ use std::sync::Arc;
 use arrow::array::{Array, StringArray, UInt64Array};
 use datafusion::execution::context::SessionContext;
 use object_store::{memory::InMemory, ObjectStore, ObjectStoreExt};
-use scry_block::{block_path, BlockBuilder, BlockBuilderConfig, LogsBlockBuilder, MetricsBlockBuilder};
+use scry_block::{
+    block_path, BlockBuilder, BlockBuilderConfig, LogsBlockBuilder, MetricsBlockBuilder,
+};
 use scry_catalog::Catalog;
 use scry_compact::{compact_once, CompactConfig};
 use scry_proto::streaming::{LogsAppender, MetricsAppender};
@@ -65,7 +67,10 @@ fn logs_entries(b: &mut LogsBlockBuilder, fp: u64, ts_start: u64, n: u64, severi
     }
 }
 
-async fn fetch_meta(store: &Arc<dyn ObjectStore>, meta: &scry_block::BlockMeta) -> scry_block::BlockMeta {
+async fn fetch_meta(
+    store: &Arc<dyn ObjectStore>,
+    meta: &scry_block::BlockMeta,
+) -> scry_block::BlockMeta {
     let p = block_path(
         &meta.signal,
         meta.ts_min_unix_nano,
@@ -231,7 +236,10 @@ async fn logs_compaction_is_lossless_and_reaps_inputs() {
     assert_eq!(merged.meta.level, 1, "level promoted into the sidecar");
     assert_eq!(merged.meta.row_count, 150, "row count is the exact sum");
     assert!(merged.meta.has_postings, "logs merged block keeps postings");
-    assert!(merged.meta.has_body_bloom, "logs merged block keeps a body bloom");
+    assert!(
+        merged.meta.has_body_bloom,
+        "logs merged block keeps a body bloom"
+    );
     assert_eq!(
         merged.meta.ts_min_unix_nano, 1_000_000,
         "min ts spans all inputs"
@@ -263,7 +271,10 @@ async fn logs_compaction_is_lossless_and_reaps_inputs() {
     let post_all = run_logs_query(&catalog, store.clone(), &q_all).await;
     let mut post_bodies = collect_strings(&post_all, "body");
     post_bodies.sort();
-    assert_eq!(post_bodies, pre_bodies, "every input row survives the merge");
+    assert_eq!(
+        post_bodies, pre_bodies,
+        "every input row survives the merge"
+    );
 
     // The merged main parquet is ordered by (stream_fingerprint, ts);
     // the scan preserves file order, so the streamed rows are sorted.
@@ -324,7 +335,11 @@ async fn metrics_compaction_is_lossless() {
         svc: &str,
     ) -> scry_block::BlockMeta {
         let mut b = MetricsBlockBuilder::new(writer, test_cfg());
-        b.observe_series(fp, mtype, labels(&[("__name__", "http_requests"), ("svc", svc)]));
+        b.observe_series(
+            fp,
+            mtype,
+            labels(&[("__name__", "http_requests"), ("svc", svc)]),
+        );
         for i in 0..40u64 {
             b.append_sample(fp, ts0 + i, i as f64);
         }

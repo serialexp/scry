@@ -131,8 +131,10 @@ pub async fn fetch_and_parse_postings(
         .build()
         .with_context(|| format!("building postings reader {path}"))?;
 
-    let mut entries: std::collections::HashMap<String, std::collections::HashMap<String, Arc<Vec<u64>>>> =
-        std::collections::HashMap::new();
+    let mut entries: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, Arc<Vec<u64>>>,
+    > = std::collections::HashMap::new();
 
     while let Some(batch) = stream.try_next().await.context("postings batch")? {
         let names = batch

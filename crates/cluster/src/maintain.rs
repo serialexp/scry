@@ -26,7 +26,9 @@ use anyhow::{Context, Result};
 use object_store::ObjectStore;
 use scry_block::{BlockBuilderConfig, BlockEventSink};
 use scry_catalog::CatalogHandle;
-use scry_compact::{compact_partition, plan_merges, CompactConfig, CompactReport, PartitionOutcome};
+use scry_compact::{
+    compact_partition, plan_merges, CompactConfig, CompactReport, PartitionOutcome,
+};
 use scry_retention::{plan_reaping, retain_planned, RetentionConfig, RetentionReport};
 use uuid::Uuid;
 
@@ -60,7 +62,9 @@ where
     L: LeaseProvider,
     C: CatalogHandle,
 {
-    let live = catalog.with(|c| c.list_blocks()).context("list live blocks")?;
+    let live = catalog
+        .with(|c| c.list_blocks())
+        .context("list live blocks")?;
     let plans = plan_merges(&live, cfg);
     let mut report = CompactReport::default();
 
@@ -95,8 +99,8 @@ where
         .await;
         // Release promptly regardless of outcome, then surface any error.
         guard.release().await;
-        let outcome =
-            outcome.with_context(|| format!("compacting {} {} partition", plan.signal, plan.date))?;
+        let outcome = outcome
+            .with_context(|| format!("compacting {} {} partition", plan.signal, plan.date))?;
 
         match outcome {
             PartitionOutcome::Merged { bytes_out } => {
@@ -131,7 +135,9 @@ where
     L: LeaseProvider,
     C: CatalogHandle,
 {
-    let live = catalog.with(|c| c.list_blocks()).context("list live blocks")?;
+    let live = catalog
+        .with(|c| c.list_blocks())
+        .context("list live blocks")?;
     let expired = plan_reaping(&live, cfg, now_unix_nano);
 
     let mut report = RetentionReport {

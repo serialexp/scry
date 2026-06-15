@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# scry-gateway end-to-end smoke test.
+# scry gateway end-to-end smoke test.
 #
 # Exercises the foreign-protocol push path:
 #
-#   curl → scry-gateway (OTLP/HTTP + Pyroscope HTTP) → binschema wire
-#        → scry-ingestd (WAL → block → object store → online catalog)
-#        → scry-list reconcile from bucket → row-count assertions
+#   curl → scry gateway (OTLP/HTTP + Pyroscope HTTP) → binschema wire
+#        → scry ingest (WAL → block → object store → online catalog)
+#        → scry list reconcile from bucket → row-count assertions
 #
 # Sends a known number of OTLP trace exports, Pyroscope profile pushes, and
 # Prometheus remote-write requests, then reconciles a fresh catalog from the
 # bucket and asserts, per signal:
 #
 #   * metrics:  catalog rows == METRIC_REQUESTS × SERIES × SAMPLES, ≥1 block
-#     *with* a postings sidecar, and a scry-query round-trip returns the same
+#     *with* a postings sidecar, and a scry get round-trip returns the same
 #     row count (ingest → store → query loss-free, the v0.2 exit criterion).
 #   * traces:   catalog rows == TRACE_REQUESTS × SPANS_PER_REQ
 #   * profiles: catalog rows == PROFILE_REQUESTS
@@ -70,7 +70,7 @@ done
 
 # ── Build ───────────────────────────────────────────────────────────
 echo "[gw-smoke] building release binaries..."
-cargo build --release -p scry-ingestd -p scry-gateway -p scry-list -p scry-query >&2
+cargo build --release -p scry -p scry-gateway >&2
 
 # ── Clean slate ─────────────────────────────────────────────────────
 rm -rf "$SMOKE_DIR"
@@ -83,9 +83,9 @@ AWS_REGION="$SCRY_OBJSTORE_REGION" \
     aws --endpoint-url "$SCRY_OBJSTORE_ENDPOINT" \
         s3 rm "s3://$SCRY_OBJSTORE_BUCKET/" --recursive >/dev/null || true
 
-# ── Start scry-ingestd ──────────────────────────────────────────────
-echo "[gw-smoke] starting scry-ingestd on $INGEST_LISTEN ..."
-RUST_LOG="${RUST_LOG:-info}" ./target/release/scry-ingestd \
+# ── Start scry ingest ──────────────────────────────────────────────
+echo "[gw-smoke] starting scry ingest on $INGEST_LISTEN ..."
+RUST_LOG="${RUST_LOG:-info}" ./target/release/scry ingest \
     --listen "$INGEST_LISTEN" \
     --storage \
     --wal-dir "$SMOKE_DIR/wal" \
@@ -110,21 +110,21 @@ wait_for_port() {
 }
 
 if ! wait_for_port "$INGEST_LISTEN"; then
-    echo "[gw-smoke] scry-ingestd did not bind $INGEST_LISTEN" >&2
+    echo "[gw-smoke] scry ingest did not bind $INGEST_LISTEN" >&2
     tail -20 "$SMOKE_DIR/ingestd.log" >&2 || true
     exit 1
 fi
 
-# ── Start scry-gateway ──────────────────────────────────────────────
-echo "[gw-smoke] starting scry-gateway on $GW_LISTEN (upstream $INGEST_LISTEN) ..."
-RUST_LOG="${RUST_LOG:-info}" ./target/release/scry-gateway \
+# ── Start scry gateway ──────────────────────────────────────────────
+echo "[gw-smoke] starting scry gateway on $GW_LISTEN (upstream $INGEST_LISTEN) ..."
+RUST_LOG="${RUST_LOG:-info}" ./target/release/scry gateway \
     --listen "$GW_LISTEN" \
     --upstream "$INGEST_LISTEN" \
     > "$SMOKE_DIR/gateway.log" 2>&1 &
 GW_PID=$!
 
 if ! wait_for_port "$GW_LISTEN"; then
-    echo "[gw-smoke] scry-gateway did not bind $GW_LISTEN" >&2
+    echo "[gw-smoke] scry gateway did not bind $GW_LISTEN" >&2
     tail -20 "$SMOKE_DIR/gateway.log" >&2 || true
     exit 1
 fi
@@ -173,7 +173,7 @@ done
 # before we trigger the flush. The gateway returns 200 once the frame is
 # written; the server appends asynchronously.
 sleep 2
-echo "[gw-smoke] stopping gateway, then SIGINT scry-ingestd → graceful flush ..."
+echo "[gw-smoke] stopping gateway, then SIGINT scry ingest → graceful flush ..."
 kill "$GW_PID" 2>/dev/null || true
 GW_PID=""
 sleep 1
@@ -183,7 +183,7 @@ trap - EXIT
 
 # ── Verify ──────────────────────────────────────────────────────────
 echo "[gw-smoke] reconciling a fresh catalog from the bucket..."
-./target/release/scry-list \
+./target/release/scry list \
     --catalog "$SMOKE_DIR/recon.sqlite" \
     > "$SMOKE_DIR/scry-list.txt" 2>&1
 cat "$SMOKE_DIR/scry-list.txt"
@@ -240,7 +240,7 @@ assert_zero "profiles postings absent"          "$profiles_postings"
 # Query round-trip for metrics (v0.2 exit criterion): the reconciled catalog
 # must query back exactly the rows the bucket holds — proving ingest → store →
 # query is loss-free, not just that bytes landed.
-./target/release/scry-query \
+./target/release/scry get \
     --catalog "$SMOKE_DIR/recon.sqlite" \
     --signal metrics \
     > "$SMOKE_DIR/query.metrics.txt" 2>&1 || true

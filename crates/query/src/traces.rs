@@ -77,9 +77,7 @@ fn promoted_column_for(key: &str) -> Option<&'static str> {
     match key {
         "service.name" => Some("service_name"),
         "service.namespace" => Some("service_namespace"),
-        "deployment.environment" | "deployment.environment.name" => {
-            Some("deployment_environment")
-        }
+        "deployment.environment" | "deployment.environment.name" => Some("deployment_environment"),
         _ => None,
     }
 }
@@ -186,10 +184,7 @@ impl TableProvider for TracesTable {
 
             for (column, value) in &self.promoted {
                 block_filters.push(
-                    col(*column).eq(Expr::Literal(
-                        ScalarValue::Utf8(Some(value.clone())),
-                        None,
-                    )),
+                    col(*column).eq(Expr::Literal(ScalarValue::Utf8(Some(value.clone())), None)),
                 );
             }
 
@@ -235,8 +230,7 @@ impl TableProvider for TracesTable {
             // No overlapping blocks. Emit a single empty
             // `DataSourceExec` so `SELECT count(*) FROM traces`
             // returns 0 cleanly. Mirrors metrics/logs behaviour.
-            let source =
-                Arc::new(ParquetSource::new(self.schema()).with_pushdown_filters(true));
+            let source = Arc::new(ParquetSource::new(self.schema()).with_pushdown_filters(true));
             let builder = FileScanConfigBuilder::new(self.object_store_url.clone(), source)
                 .with_projection_indices(projection.cloned())?
                 .with_limit(limit);

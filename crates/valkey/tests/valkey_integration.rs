@@ -97,7 +97,10 @@ async fn lease_renews_past_its_initial_ttl() {
 
     // Wait well past the initial TTL; renewal should have extended it.
     tokio::time::sleep(Duration::from_millis(1500)).await;
-    assert!(held.fence().check().is_ok(), "fence still valid after renews");
+    assert!(
+        held.fence().check().is_ok(),
+        "fence still valid after renews"
+    );
 
     // A contender still cannot take it — proof the key didn't expire.
     let contender = provider
@@ -145,9 +148,7 @@ async fn pubsub_round_trips_an_envelope() {
     let pubc = client().await;
     let event = deleted_event(&signal);
     let env = Envelope::new(Uuid::now_v7(), 1, event.clone());
-    publish_envelope(pubc.inner(), &env)
-        .await
-        .expect("publish");
+    publish_envelope(pubc.inner(), &env).await.expect("publish");
 
     let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
         .await

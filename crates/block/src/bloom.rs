@@ -273,7 +273,10 @@ mod tests {
                 back.contains_pattern(needle),
                 "needle {needle:?} differs after roundtrip"
             );
-            assert!(back.contains_pattern(needle), "real substring {needle:?} lost");
+            assert!(
+                back.contains_pattern(needle),
+                "real substring {needle:?} lost"
+            );
         }
     }
 
@@ -306,8 +309,7 @@ mod tests {
             let s: String = (0..len).map(|_| rng.byte() as char).collect();
             bodies.push(s);
         }
-        let bloom =
-            BodyBloom::build_from_bodies(bodies.iter().map(|s| s.as_str()), ngram, 0.01);
+        let bloom = BodyBloom::build_from_bodies(bodies.iter().map(|s| s.as_str()), ngram, 0.01);
 
         for body in &bodies {
             let b = body.as_bytes();
@@ -370,12 +372,17 @@ mod tests {
         let mut fp = 0u32;
         let trials = 5000u32;
         for _ in 0..trials {
-            let g: String = (0..3).map(|_| (b'A' + (rng.next() % 12) as u8) as char).collect();
+            let g: String = (0..3)
+                .map(|_| (b'A' + (rng.next() % 12) as u8) as char)
+                .collect();
             if bloom.contains_pattern(&g) {
                 fp += 1;
             }
         }
         let rate = fp as f64 / trials as f64;
-        assert!(rate < 0.05, "false-positive rate {rate} far above 1% target");
+        assert!(
+            rate < 0.05,
+            "false-positive rate {rate} far above 1% target"
+        );
     }
 }

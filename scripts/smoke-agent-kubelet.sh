@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# scry-agent kubelet/cadvisor-scraping exit criterion — end-to-end (D-048).
+# scry agent kubelet/cadvisor-scraping exit criterion — end-to-end (D-048).
 #
 # Proves the agent's kubelet scrape path — HTTPS + skip-verify TLS + a
 # file-backed (rotating) ServiceAccount bearer token — lands queryable metrics
-# in the bucket, against a real scry-ingestd + Garage:
+# in the bucket, against a real scry ingest + Garage:
 #
 #   self-signed HTTPS stub (/metrics/cadvisor + /metrics, Bearer-gated)
-#       →  scry-agent (--config, [metrics.kubelet])  →  scry-ingestd (--storage)
-#       →  bucket  →  scry-list reconcile  →  scry-query
+#       →  scry agent (--config, [metrics.kubelet])  →  scry ingest (--storage)
+#       →  bucket  →  scry list reconcile  →  scry get
 #
 # The stub serves ONE exposed sample per endpoint and **401s without the right
 # Authorization: Bearer header**, so a successful scrape proves the agent read
@@ -19,7 +19,7 @@
 #
 #   * the reconciled catalog holds exactly 6 metric rows,
 #   * ≥1 metrics block landed with a postings sidecar,
-#   * scry-query --signal metrics scans those 6 rows back,
+#   * scry get --signal metrics scans those 6 rows back,
 #   * job=cadvisor and job=kubelet each select 3 rows (both endpoints scraped),
 #   * __name__=up selects 2 rows (both scrapes succeeded → bearer+TLS worked),
 #   * cluster=gothab-smoke (a static_label) rides all 6 rows.
@@ -55,7 +55,7 @@ done
 
 # ── Build ───────────────────────────────────────────────────────────
 echo "[agent-kubelet] building release binaries..."
-cargo build --release -p scry-ingestd -p scry-list -p scry-query -p scry-agent >&2
+cargo build --release -p scry >&2
 
 # ── Clean slate ─────────────────────────────────────────────────────
 rm -rf "$SMOKE_DIR"; mkdir -p "$SMOKE_DIR"
@@ -126,9 +126,9 @@ bearer_file = "$SMOKE_DIR/token"
 insecure_skip_verify = true
 EOF
 
-# ── scry-ingestd (storage) ──────────────────────────────────────────
-echo "[agent-kubelet] starting scry-ingestd on $LISTEN..."
-RUST_LOG="${RUST_LOG:-info}" ./target/release/scry-ingestd \
+# ── scry ingest (storage) ──────────────────────────────────────────
+echo "[agent-kubelet] starting scry ingest on $LISTEN..."
+RUST_LOG="${RUST_LOG:-info}" ./target/release/scry ingest \
     --listen "$LISTEN" \
     --storage \
     --wal-dir "$SMOKE_DIR/wal" \
@@ -148,9 +148,9 @@ for _ in $(seq 1 50); do
     sleep 0.1
 done
 
-# ── scry-agent: one scrape per kubelet endpoint ─────────────────────
-echo "[agent-kubelet] running scry-agent (kubelet config, one scrape per endpoint)..."
-RUST_LOG="${RUST_LOG:-info}" ./target/release/scry-agent \
+# ── scry agent: one scrape per kubelet endpoint ─────────────────────
+echo "[agent-kubelet] running scry agent (kubelet config, one scrape per endpoint)..."
+RUST_LOG="${RUST_LOG:-info}" ./target/release/scry agent \
     --server-addr "$LISTEN" \
     --no-discovery \
     --config "$SMOKE_DIR/agent.toml" \
@@ -161,18 +161,18 @@ RUST_LOG="${RUST_LOG:-info}" ./target/release/scry-agent \
 AGENT_PID=$!
 
 sleep 3
-echo "[agent-kubelet] SIGINT scry-agent → drain + flush..."
+echo "[agent-kubelet] SIGINT scry agent → drain + flush..."
 kill -INT "$AGENT_PID"
 wait "$AGENT_PID" 2>/dev/null || true
 
-echo "[agent-kubelet] SIGINT scry-ingestd → final block flush..."
+echo "[agent-kubelet] SIGINT scry ingest → final block flush..."
 kill -INT "$INGEST_PID"
 wait "$INGEST_PID" 2>/dev/null || true
 trap 'kill -9 "$STUB_PID" 2>/dev/null || true' EXIT
 
 # ── Verify ──────────────────────────────────────────────────────────
 echo "[agent-kubelet] reconciling a fresh catalog from the bucket..."
-./target/release/scry-list --catalog "$SMOKE_DIR/recon.sqlite" \
+./target/release/scry list --catalog "$SMOKE_DIR/recon.sqlite" \
     > "$SMOKE_DIR/scry-list.txt" 2>&1
 cat "$SMOKE_DIR/scry-list.txt"
 
@@ -182,8 +182,8 @@ metrics_blocks=$(sqlite3 "$SMOKE_DIR/recon.sqlite" \
 metrics_postings=$(sqlite3 "$SMOKE_DIR/recon.sqlite" \
     "SELECT COUNT(*) FROM blocks WHERE signal='metrics' AND has_postings=1 AND postings_size_bytes>0;")
 
-q() {  # run scry-query with the given matchers, echo the scanned row count
-    ./target/release/scry-query --catalog "$SMOKE_DIR/recon.sqlite" --signal metrics "$@" \
+q() {  # run scry get with the given matchers, echo the scanned row count
+    ./target/release/scry get --catalog "$SMOKE_DIR/recon.sqlite" --signal metrics "$@" \
         > "$SMOKE_DIR/q.out" 2>&1 || true
     awk '/^# scan:/ { print $3; exit }' "$SMOKE_DIR/q.out"
 }

@@ -33,14 +33,12 @@ mod stream;
 use cri::RawLog;
 use scry_client::Client;
 
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
 const ZSTD_LEVEL: i32 = 3;
 
+/// CLI arguments for the `scry agent` subcommand.
 #[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
-struct Args {
+#[command(about = "Kubernetes log-collection + Prometheus-scrape agent")]
+pub struct Args {
     /// Ingest server address (host:port).
     #[arg(long, env = "SCRY_SERVER_ADDR", default_value = "127.0.0.1:4000")]
     server_addr: String,
@@ -139,16 +137,8 @@ struct Args {
     scrape_timeout: Duration,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
-
-    let args = Args::parse();
-
+/// Run the log-collection / scrape agent until ctrl-c.
+pub async fn run(args: Args) -> Result<()> {
     // Config owns the processing pipeline; flags own runtime. Without --config,
     // the global --keep flag is synthesized into a degenerate per-signal config.
     let (log_pipeline, metric_pipeline) = config::resolve(args.config.as_deref(), &args.keep)?;

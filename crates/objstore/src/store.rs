@@ -43,8 +43,8 @@ use bytes::Bytes;
 use futures::stream::{BoxStream, TryStreamExt};
 use object_store::{
     coalesce_ranges, path::Path, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload,
-    ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
-    RenameOptions, Result, OBJECT_STORE_COALESCE_DEFAULT,
+    ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
+    Result, OBJECT_STORE_COALESCE_DEFAULT,
 };
 
 use crate::pool::{BufPool, PooledBuf};
@@ -369,12 +369,7 @@ mod tests {
 
     #[async_trait]
     impl ObjectStore for ChunkingStore {
-        async fn put_opts(
-            &self,
-            l: &Path,
-            p: PutPayload,
-            o: PutOptions,
-        ) -> Result<PutResult> {
+        async fn put_opts(&self, l: &Path, p: PutPayload, o: PutOptions) -> Result<PutResult> {
             self.inner.put_opts(l, p, o).await
         }
         async fn put_multipart_opts(

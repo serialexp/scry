@@ -120,9 +120,21 @@ async fn dummy_merge_rebases_csr_and_roundtrips() {
             .await
             .unwrap(),
     );
-    let ts = batch.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
-    let keys = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
-    let vals = batch.column(2).as_any().downcast_ref::<BinaryArray>().unwrap();
+    let ts = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    let keys = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let vals = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .unwrap();
 
     // Sorted by ts ascending; CSR slices reconstruct intact after rebase.
     let expected: [(u64, &str, &[u8]); 4] = [
@@ -199,9 +211,21 @@ async fn metrics_merge_dedups_series_across_boundary() {
     assert_eq!(series_types[1], (fp_b, METRIC_TYPE_GAUGE));
 
     let (batch, _) = fetch_main_and_meta(&store).await;
-    let fps = batch.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
-    let tss = batch.column(1).as_any().downcast_ref::<UInt64Array>().unwrap();
-    let vals = batch.column(2).as_any().downcast_ref::<Float64Array>().unwrap();
+    let fps = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    let tss = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    let vals = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
     // Sorted by (fp, ts): (A,100),(A,200),(B,50).
     let expected = [(fp_a, 100u64, 1.0f64), (fp_a, 200, 3.0), (fp_b, 50, 2.0)];
     for (i, (fp, ts, v)) in expected.iter().enumerate() {
@@ -267,9 +291,21 @@ async fn logs_merge_dedups_streams_across_boundary() {
     assert_eq!(all_fps.len(), 2, "stream A deduped across the merge");
 
     let (batch, _) = fetch_main_and_meta(&store).await;
-    let fps = batch.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
-    let tss = batch.column(1).as_any().downcast_ref::<UInt64Array>().unwrap();
-    let bodies = batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
+    let fps = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    let tss = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    let bodies = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
     // Sorted by (fp, ts): (A,100,"first"),(A,200,"third"),(B,50,"second").
     let expected = [
         (s_a, 100u64, "first"),

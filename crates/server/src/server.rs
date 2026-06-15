@@ -14,14 +14,14 @@ use scry_block::{
 use scry_proto::{
     build,
     constants::{
-        ACK_ACCEPTED, ACK_REJECTED, COMPRESSION_NONE, COMPRESSION_ZSTD,
+        Signal, ACK_ACCEPTED, ACK_REJECTED, COMPRESSION_NONE, COMPRESSION_ZSTD,
         DEFAULT_MAX_BATCH_BYTES, DEFAULT_MAX_INFLIGHT_BATCHES, DEFAULT_SUGGESTED_BATCH_BYTES,
         ERR_HELLO_REQUIRED, ERR_PROTOCOL_VERSION, ERR_SESSION_MISMATCH, GOODBYE_NORMAL,
         PROTOCOL_VERSION_V0, REJECT_BAD_SCHEMA, REJECT_BATCH_TOO_LARGE,
         REJECT_SIGNAL_NOT_ANNOUNCED, SIGNAL_BIT_LOGS, SIGNAL_BIT_METRICS, SIGNAL_BIT_PROFILES,
-        SIGNAL_BIT_TRACES, Signal,
+        SIGNAL_BIT_TRACES,
     },
-    framing::{FrameError, read_frame, write_frame},
+    framing::{read_frame, write_frame, FrameError},
     generated::{FrameMsg, HelloOutput},
 };
 use std::{
@@ -161,8 +161,8 @@ impl Server {
     /// Bind the listener, accept connections until `shutdown`
     /// completes, then flush the pipeline (if any) and return. The
     /// shutdown future is typically `tokio::signal::ctrl_c()`, but
-    /// any `Future<Output = ()>` works — pass an `oneshot::Receiver`
-    /// from the supervisor in the eventual single-binary world.
+    /// any `Future<Output = ()>` works — e.g. pass an `oneshot::Receiver`
+    /// from a supervisor instead of the process-wide ctrl-c.
     pub async fn serve_with_shutdown<F>(self, shutdown: F) -> Result<()>
     where
         F: Future<Output = ()>,
@@ -199,7 +199,10 @@ impl Server {
             if let Some(p) = self.profiles_pipeline.as_ref() {
                 flushers.push(spawn_age_flusher(p, max_age, "profiles"));
             }
-            info!(max_age_secs = max_age.as_secs(), "time-based block flush enabled");
+            info!(
+                max_age_secs = max_age.as_secs(),
+                "time-based block flush enabled"
+            );
         }
 
         let next_session_id = Arc::new(AtomicU64::new(1));
@@ -346,15 +349,15 @@ impl Drop for ConnGuard {
 
 #[derive(Default)]
 struct Counters {
-    batches:           AtomicU64,
-    metric_samples:    AtomicU64,
-    log_entries:       AtomicU64,
-    spans:             AtomicU64,
-    profile_blobs:     AtomicU64,
-    dummy_records:     AtomicU64,
-    payload_bytes_in:  AtomicU64, // compressed
+    batches: AtomicU64,
+    metric_samples: AtomicU64,
+    log_entries: AtomicU64,
+    spans: AtomicU64,
+    profile_blobs: AtomicU64,
+    dummy_records: AtomicU64,
+    payload_bytes_in: AtomicU64,  // compressed
     payload_bytes_out: AtomicU64, // decompressed
-    rejected:          AtomicU64,
+    rejected: AtomicU64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -413,7 +416,11 @@ async fn handle(
     let hello: HelloOutput = match first.msg {
         FrameMsg::Hello(h) => h,
         other => {
-            let _ = write_frame(&mut wr, &build::error(ERR_HELLO_REQUIRED, "Hello required first")).await;
+            let _ = write_frame(
+                &mut wr,
+                &build::error(ERR_HELLO_REQUIRED, "Hello required first"),
+            )
+            .await;
             let _ = wr.flush().await;
             warn!(%peer, kind = short_msg_name(&other), "non-Hello first frame");
             return Ok(());
@@ -510,15 +517,17 @@ async fn handle(
                 // Every real signal must be in the announce mask.
                 let announced_ok = match sig {
                     Some(Signal::Dummy) => true,
-                    Some(Signal::Metrics)  => signals_announced & SIGNAL_BIT_METRICS  != 0,
-                    Some(Signal::Logs)     => signals_announced & SIGNAL_BIT_LOGS     != 0,
-                    Some(Signal::Traces)   => signals_announced & SIGNAL_BIT_TRACES   != 0,
+                    Some(Signal::Metrics) => signals_announced & SIGNAL_BIT_METRICS != 0,
+                    Some(Signal::Logs) => signals_announced & SIGNAL_BIT_LOGS != 0,
+                    Some(Signal::Traces) => signals_announced & SIGNAL_BIT_TRACES != 0,
                     Some(Signal::Profiles) => signals_announced & SIGNAL_BIT_PROFILES != 0,
                     None => false,
                 };
                 if !announced_ok {
                     counters.rejected.fetch_add(1, Ordering::Relaxed);
-                    if let Some(m) = metrics.as_ref() { m.add_rejected(); }
+                    if let Some(m) = metrics.as_ref() {
+                        m.add_rejected();
+                    }
                     write_frame(
                         &mut wr,
                         &build::batch_ack(
@@ -537,7 +546,9 @@ async fn handle(
 
                 if b.uncompressed_size > DEFAULT_MAX_BATCH_BYTES {
                     counters.rejected.fetch_add(1, Ordering::Relaxed);
-                    if let Some(m) = metrics.as_ref() { m.add_rejected(); }
+                    if let Some(m) = metrics.as_ref() {
+                        m.add_rejected();
+                    }
                     write_frame(
                         &mut wr,
                         &build::batch_ack(
@@ -568,7 +579,9 @@ async fn handle(
                         Ok(d) => d,
                         Err(e) => {
                             counters.rejected.fetch_add(1, Ordering::Relaxed);
-                    if let Some(m) = metrics.as_ref() { m.add_rejected(); }
+                            if let Some(m) = metrics.as_ref() {
+                                m.add_rejected();
+                            }
                             warn!(%peer, batch_id = b.batch_id, error = %e, "zstd decompress failed");
                             write_frame(
                                 &mut wr,
@@ -589,7 +602,9 @@ async fn handle(
                     other => {
                         warn!(%peer, batch_id = b.batch_id, compression = other, "unknown compression");
                         counters.rejected.fetch_add(1, Ordering::Relaxed);
-                    if let Some(m) = metrics.as_ref() { m.add_rejected(); }
+                        if let Some(m) = metrics.as_ref() {
+                            m.add_rejected();
+                        }
                         write_frame(
                             &mut wr,
                             &build::batch_ack(
@@ -824,11 +839,19 @@ async fn handle(
                 match decode_result {
                     Ok(records) => {
                         match signal {
-                            Signal::Metrics  => counters.metric_samples.fetch_add(records, Ordering::Relaxed),
-                            Signal::Logs     => counters.log_entries   .fetch_add(records, Ordering::Relaxed),
-                            Signal::Traces   => counters.spans         .fetch_add(records, Ordering::Relaxed),
-                            Signal::Profiles => counters.profile_blobs .fetch_add(records, Ordering::Relaxed),
-                            Signal::Dummy    => counters.dummy_records .fetch_add(records, Ordering::Relaxed),
+                            Signal::Metrics => counters
+                                .metric_samples
+                                .fetch_add(records, Ordering::Relaxed),
+                            Signal::Logs => {
+                                counters.log_entries.fetch_add(records, Ordering::Relaxed)
+                            }
+                            Signal::Traces => counters.spans.fetch_add(records, Ordering::Relaxed),
+                            Signal::Profiles => {
+                                counters.profile_blobs.fetch_add(records, Ordering::Relaxed)
+                            }
+                            Signal::Dummy => {
+                                counters.dummy_records.fetch_add(records, Ordering::Relaxed)
+                            }
                         };
                         if let Some(m) = metrics.as_ref() {
                             m.add_records(signal, records);
@@ -841,7 +864,9 @@ async fn handle(
                     }
                     Err(e) => {
                         counters.rejected.fetch_add(1, Ordering::Relaxed);
-                    if let Some(m) = metrics.as_ref() { m.add_rejected(); }
+                        if let Some(m) = metrics.as_ref() {
+                            m.add_rejected();
+                        }
                         warn!(%peer, batch_id = b.batch_id, error = %e, "payload decode failed");
                         write_frame(
                             &mut wr,
@@ -874,7 +899,11 @@ async fn handle(
             }
 
             FrameMsg::Hello(_) => {
-                let _ = write_frame(&mut wr, &build::error(ERR_HELLO_REQUIRED, "duplicate Hello")).await;
+                let _ = write_frame(
+                    &mut wr,
+                    &build::error(ERR_HELLO_REQUIRED, "duplicate Hello"),
+                )
+                .await;
                 let _ = wr.flush().await;
                 break;
             }
@@ -1009,14 +1038,14 @@ impl scry_proto::streaming::ProfilesAppender for CountProfilesAppender {
 
 fn short_msg_name(m: &FrameMsg) -> &'static str {
     match m {
-        FrameMsg::Hello(_)       => "Hello",
-        FrameMsg::HelloAck(_)    => "HelloAck",
-        FrameMsg::Batch(_)       => "Batch",
-        FrameMsg::BatchAck(_)    => "BatchAck",
+        FrameMsg::Hello(_) => "Hello",
+        FrameMsg::HelloAck(_) => "HelloAck",
+        FrameMsg::Batch(_) => "Batch",
+        FrameMsg::BatchAck(_) => "BatchAck",
         FrameMsg::FlowControl(_) => "FlowControl",
-        FrameMsg::Ping(_)        => "Ping",
-        FrameMsg::Pong(_)        => "Pong",
-        FrameMsg::Goodbye(_)     => "Goodbye",
-        FrameMsg::Error(_)       => "Error",
+        FrameMsg::Ping(_) => "Ping",
+        FrameMsg::Pong(_) => "Pong",
+        FrameMsg::Goodbye(_) => "Goodbye",
+        FrameMsg::Error(_) => "Error",
     }
 }

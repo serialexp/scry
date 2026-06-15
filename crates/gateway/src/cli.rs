@@ -1,16 +1,18 @@
-//! `scry-gateway` daemon: a fan-out hub. It accepts records over the native
-//! binschema wire **and** the foreign HTTP push protocols (OTLP traces,
-//! Pyroscope profiles, Prometheus remote-write) and forwards every record,
-//! best-effort, to every configured downstream sink. Each sink is opt-in (at
-//! least one required): the scry ingest server (`--upstream`), Grafana Loki, and
-//! OpenSearch — the latter two logs-only, with the OpenSearch sink self-managing
-//! its per-service rolling data streams + lifecycle assets.
+//! `scry gateway` — the fan-out hub entry point (was the `scry-gateway` bin).
+//!
+//! Accepts records over the native binschema wire **and** the foreign HTTP push
+//! protocols (OTLP traces, Pyroscope profiles, Prometheus remote-write) and
+//! forwards every record, best-effort, to every configured downstream sink.
+//! Each sink is opt-in (at least one required): the scry ingest server
+//! (`--upstream`), Grafana Loki, OpenSearch, and Mimir.
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use scry_gateway::{
+use uuid::Uuid;
+
+use crate::{
     aws_sign::SigV4Signer,
     loki::LokiSink,
     mimir::MimirSink,
@@ -25,17 +27,13 @@ use scry_proto::{
     LabelPair,
 };
 use tokio::sync::watch;
-use uuid::Uuid;
 
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
+/// CLI arguments for the `scry gateway` subcommand.
 #[derive(Parser, Debug)]
 #[command(
-    name = "scry-gateway",
-    about = "fan-out push gateway for scry (native + OTLP + Pyroscope + remote-write in; scry + Loki + OpenSearch out)"
+    about = "fan-out push gateway for scry (native + OTLP + Pyroscope + remote-write in; scry + Loki + OpenSearch + Mimir out)"
 )]
-struct Args {
+pub struct Args {
     /// HTTP listen address (foreign protocols: /v1/traces, /ingest, /api/v1/write).
     #[arg(long, default_value = "0.0.0.0:4318")]
     listen: String,
@@ -135,16 +133,9 @@ struct Args {
     sink_http_timeout: Duration,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
-
-    let args = Args::parse();
-
+/// Run the fan-out gateway: build the configured sinks, serve the foreign HTTP
+/// protocols (+ the native wire if `--listen-wire`), and tee every record.
+pub async fn run(args: Args) -> Result<()> {
     // ── Build the sinks ────────────────────────────────────────────────
     // Every sink is opt-in; at least one must be configured. The scry sink is
     // not special — a gateway that only tees logs to Loki/OpenSearch needs no

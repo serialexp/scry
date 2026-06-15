@@ -79,10 +79,10 @@ else
 fi
 
 # ── Build (separate step so build time isn't profiled) ──────────────
-echo "==> building scry-query [profile=profiling]"
-cargo build --profile profiling -p scry-query
+echo "==> building scry (get) [profile=profiling]"
+cargo build --profile profiling -p scry
 
-BIN="$ROOT/target/profiling/scry-query"
+BIN="$ROOT/target/profiling/scry"
 if [[ ! -x "$BIN" ]]; then
     echo "error: $BIN not built; cargo output above" >&2
     exit 1
@@ -101,14 +101,14 @@ fi
 # host, either lower the sysctl or add --root back.
 FREQ="${FREQ:-99971}"
 
-echo "==> profiling: $BIN $*"
+echo "==> profiling: $BIN get $*"
 echo "==> output:   $OUT"
 cargo flamegraph \
     --profile profiling \
-    --bin scry-query \
+    --bin scry \
     --output "$OUT" \
     --freq "$FREQ" \
-    -- "$@"
+    -- get "$@"
 
 echo
 echo "flamegraph written: $OUT"

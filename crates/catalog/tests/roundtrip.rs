@@ -49,7 +49,9 @@ fn reopen_preserves_rows() {
     let uuid = Uuid::now_v7();
     {
         let cat = Catalog::open(&path, "scry-dev").unwrap();
-        assert!(cat.insert_block(&meta(uuid, writer, 1_700_000_000_000_000_000, 100)).unwrap());
+        assert!(cat
+            .insert_block(&meta(uuid, writer, 1_700_000_000_000_000_000, 100))
+            .unwrap());
     }
     let cat = Catalog::open(&path, "scry-dev").unwrap();
     assert_eq!(cat.block_count().unwrap(), 1);
@@ -85,9 +87,12 @@ fn list_orders_by_date_then_ts_min() {
     let day1_early = 1_700_000_000_000_000_000;
     let day1_late = day1_early + 3_600_000_000_000;
     let day2 = day1_early + 86_400_000_000_000;
-    cat.insert_block(&meta(Uuid::now_v7(), writer, day2, 30)).unwrap();
-    cat.insert_block(&meta(Uuid::now_v7(), writer, day1_early, 10)).unwrap();
-    cat.insert_block(&meta(Uuid::now_v7(), writer, day1_late, 20)).unwrap();
+    cat.insert_block(&meta(Uuid::now_v7(), writer, day2, 30))
+        .unwrap();
+    cat.insert_block(&meta(Uuid::now_v7(), writer, day1_early, 10))
+        .unwrap();
+    cat.insert_block(&meta(Uuid::now_v7(), writer, day1_late, 20))
+        .unwrap();
     let rows = cat.list_blocks().unwrap();
     let counts: Vec<u64> = rows.iter().map(|r| r.meta.row_count).collect();
     assert_eq!(counts, vec![10, 20, 30]);
@@ -177,7 +182,10 @@ fn marked_deleted_blocks_drop_out_of_list_blocks() {
     let live = cat.list_blocks().unwrap();
     assert_eq!(live.len(), 1, "marked block is hidden from queries");
     assert_eq!(live[0].meta.uuid, b);
-    assert!(cat.get_block(a).unwrap().is_some(), "row survives until delete_blocks");
+    assert!(
+        cat.get_block(a).unwrap().is_some(),
+        "row survives until delete_blocks"
+    );
 
     // Hard delete drops the row.
     cat.delete_blocks(&[a]).unwrap();
@@ -255,11 +263,15 @@ fn poll_cursor_absent_then_advances_monotonically() {
     let writer = Uuid::now_v7();
 
     // No cursor yet for an unseen partition.
-    assert_eq!(cat.get_cursor("metrics", writer, "2026-05-30").unwrap(), None);
+    assert_eq!(
+        cat.get_cursor("metrics", writer, "2026-05-30").unwrap(),
+        None
+    );
 
     // First observation sets it.
     let u1 = Uuid::now_v7();
-    cat.advance_cursor("metrics", writer, "2026-05-30", u1).unwrap();
+    cat.advance_cursor("metrics", writer, "2026-05-30", u1)
+        .unwrap();
     assert_eq!(
         cat.get_cursor("metrics", writer, "2026-05-30").unwrap(),
         Some(u1)
@@ -268,14 +280,16 @@ fn poll_cursor_absent_then_advances_monotonically() {
     // A newer (lexically-greater, since v7) UUID advances the cursor.
     let u2 = Uuid::now_v7();
     assert!(u2 > u1, "v7 UUIDs minted later sort greater");
-    cat.advance_cursor("metrics", writer, "2026-05-30", u2).unwrap();
+    cat.advance_cursor("metrics", writer, "2026-05-30", u2)
+        .unwrap();
     assert_eq!(
         cat.get_cursor("metrics", writer, "2026-05-30").unwrap(),
         Some(u2)
     );
 
     // Re-applying an older observation is a no-op (monotonic high-water mark).
-    cat.advance_cursor("metrics", writer, "2026-05-30", u1).unwrap();
+    cat.advance_cursor("metrics", writer, "2026-05-30", u1)
+        .unwrap();
     assert_eq!(
         cat.get_cursor("metrics", writer, "2026-05-30").unwrap(),
         Some(u2),
@@ -290,18 +304,28 @@ fn poll_cursors_are_keyed_per_signal_writer_date_and_listed() {
     let w1 = Uuid::now_v7();
     let w2 = Uuid::now_v7();
 
-    cat.advance_cursor("metrics", w1, "2026-05-30", Uuid::now_v7()).unwrap();
-    cat.advance_cursor("logs", w1, "2026-05-30", Uuid::now_v7()).unwrap();
-    cat.advance_cursor("metrics", w2, "2026-05-30", Uuid::now_v7()).unwrap();
-    cat.advance_cursor("metrics", w1, "2026-05-29", Uuid::now_v7()).unwrap();
+    cat.advance_cursor("metrics", w1, "2026-05-30", Uuid::now_v7())
+        .unwrap();
+    cat.advance_cursor("logs", w1, "2026-05-30", Uuid::now_v7())
+        .unwrap();
+    cat.advance_cursor("metrics", w2, "2026-05-30", Uuid::now_v7())
+        .unwrap();
+    cat.advance_cursor("metrics", w1, "2026-05-29", Uuid::now_v7())
+        .unwrap();
 
     // Distinct keys → four independent cursors.
     let mut cursors = cat.list_cursors().unwrap();
     assert_eq!(cursors.len(), 4);
 
     // Each is individually retrievable; a different key is absent.
-    assert!(cat.get_cursor("metrics", w1, "2026-05-30").unwrap().is_some());
-    assert!(cat.get_cursor("traces", w1, "2026-05-30").unwrap().is_none());
+    assert!(cat
+        .get_cursor("metrics", w1, "2026-05-30")
+        .unwrap()
+        .is_some());
+    assert!(cat
+        .get_cursor("traces", w1, "2026-05-30")
+        .unwrap()
+        .is_none());
 
     // list_cursors round-trips the (signal, writer, date) tuples.
     cursors.sort();

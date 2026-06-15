@@ -101,10 +101,10 @@ if [[ ! -x "$CARGO_BIN" ]]; then
     exit 1
 fi
 
-echo "==> building scry-query [profile=profiling] as $REAL_USER"
-sudo -u "$REAL_USER" -H bash -c "cd '$ROOT' && '$CARGO_BIN' build --profile profiling -p scry-query"
+echo "==> building scry (get) [profile=profiling] as $REAL_USER"
+sudo -u "$REAL_USER" -H bash -c "cd '$ROOT' && '$CARGO_BIN' build --profile profiling -p scry"
 
-BIN="$ROOT/target/profiling/scry-query"
+BIN="$ROOT/target/profiling/scry"
 if [[ ! -x "$BIN" ]]; then
     echo "error: $BIN not built" >&2
     exit 1
@@ -123,7 +123,7 @@ fi
 FREQ="${FREQ:-49999}"
 STACK_SIZE="${STACK_SIZE:-16384}"
 
-echo "==> profiling: $BIN $*"
+echo "==> profiling: $BIN get $*"
 echo "==> output:    $BASE.*"
 perf record \
     -F "$FREQ" \
@@ -131,7 +131,7 @@ perf record \
     --aio \
     -g \
     -o "$PERF_DATA" \
-    -- "$BIN" "$@" \
+    -- "$BIN" get "$@" \
     >/dev/null
 
 # ── Symbolize + collapse + flamegraph ───────────────────────────────

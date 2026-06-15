@@ -1,13 +1,13 @@
-# scry-webui — browser query UI for scry-queryd, as a systemd *user* service.
+# scry web — browser query UI for the query daemon, as a systemd *user* service.
 #
-# This is the home-machine deployment described in D-040: scry-webui serves the
-# embedded SolidJS app and relays queries to a scry-queryd over a dumb byte-pipe,
-# gated by a password → signed-cookie session. It is deliberately a per-user
-# service (not system-wide) — it needs no root, binds a high port, and runs as
-# you. (The Docker image / k8s manifests intentionally do not ship the UI.)
+# This is the home-machine deployment described in D-040: `scry web` serves the
+# embedded SolidJS app and relays queries to a `scry query` daemon over a dumb
+# byte-pipe, gated by a password → signed-cookie session. It is deliberately a
+# per-user service (not system-wide) — it needs no root, binds a high port, and
+# runs as you. (The Docker image / k8s manifests intentionally do not ship the UI.)
 #
 # Install (one time):
-#   cargo install --path crates/scry-webui          # → ~/.cargo/bin/scry-webui
+#   cargo install --path crates/scry                 # → ~/.cargo/bin/scry
 #   mkdir -p ~/.config/scry-webui ~/.config/systemd/user
 #   cp deploy/systemd/webui.env.example ~/.config/scry-webui/webui.env
 #   chmod 600 ~/.config/scry-webui/webui.env         # then edit: set the password
@@ -24,11 +24,11 @@
 #   systemctl --user restart scry-webui
 
 [Unit]
-Description=scry-webui — browser query UI for scry-queryd
+Description=scry web — browser query UI for the scry query daemon
 Documentation=https://github.com/serialexp/scry
-# scry-queryd usually runs as its own service; if it's a user service too, this
-# orders us after it. Harmless if scry-queryd lives elsewhere (the relay simply
-# returns 502 until the upstream is up).
+# `scry query` usually runs as its own service; if it's a user service too, this
+# orders us after it. Harmless if the query daemon lives elsewhere (the relay
+# simply returns 502 until the upstream is up).
 After=network-online.target
 Wants=network-online.target
 
@@ -39,11 +39,11 @@ Type=exec
 # SCRY_WEBUI_PASSWORD has no default on purpose: the service refuses to start
 # until you set it in webui.env.
 #
-# Bind to loopback on 4180 (next to scry-queryd's 4100; 8080 is too commonly
+# Bind to loopback on 4180 (next to the query daemon's 4100; 8080 is too commonly
 # shared). A TLS reverse proxy (Caddy) terminates HTTPS on
 # scry.home.serial-experiments.com and forwards to this port — so we also set
 # SCRY_WEBUI_SECURE_COOKIE=1, which makes the session cookie `Secure` (the
-# browser only ever sees HTTPS). If you instead expose scry-webui directly over
+# browser only ever sees HTTPS). If you instead expose `scry web` directly over
 # plain HTTP, set this to 0 or the cookie will be dropped and login will fail.
 Environment=SCRY_WEBUI_LISTEN=127.0.0.1:4180
 Environment=SCRY_WEBUI_QUERYD=127.0.0.1:4100
@@ -55,7 +55,7 @@ Environment=SCRY_WEBUI_SECURE_COOKIE=1
 EnvironmentFile=-%h/.config/scry-webui/webui.env
 
 # systemd substitutes ${VAR} from the merged environment above (no shell).
-ExecStart=%h/.cargo/bin/scry-webui --listen ${SCRY_WEBUI_LISTEN} --queryd ${SCRY_WEBUI_QUERYD}
+ExecStart=%h/.cargo/bin/scry web --listen ${SCRY_WEBUI_LISTEN} --queryd ${SCRY_WEBUI_QUERYD}
 
 Restart=on-failure
 RestartSec=2s

@@ -9,25 +9,25 @@
 //!   scry-ingestd --listen 127.0.0.1:4000 &
 //!   noise-spewer --addr   127.0.0.1:4000 --duration 5s
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
 use rand::SeedableRng;
 use scry_proto::{
-    LabelPair, build,
+    build,
     constants::{
-        ACK_ACCEPTED, ACK_REJECTED, ACK_THROTTLED, GOODBYE_NORMAL, PROTOCOL_VERSION_V0,
-        SIGNAL_BIT_LOGS, SIGNAL_BIT_METRICS, SIGNAL_BIT_PROFILES, SIGNAL_BIT_TRACES, Signal,
+        Signal, ACK_ACCEPTED, ACK_REJECTED, ACK_THROTTLED, GOODBYE_NORMAL, PROTOCOL_VERSION_V0,
+        SIGNAL_BIT_LOGS, SIGNAL_BIT_METRICS, SIGNAL_BIT_PROFILES, SIGNAL_BIT_TRACES,
     },
     framing::{read_frame, write_frame},
     generated::FrameMsg,
-    Frame,
+    Frame, LabelPair,
 };
 use std::time::Duration;
 use tokio::{
     io::{AsyncWriteExt, BufReader, BufWriter},
     net::TcpStream,
     sync::mpsc,
-    time::{Instant, sleep_until},
+    time::{sleep_until, Instant},
 };
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -69,13 +69,16 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
         .find(|c: char| c.is_alphabetic())
         .map(|i| (&s[..i], &s[i..]))
         .unwrap_or((s, "s"));
-    let n: u64 = num.trim().parse().map_err(|_| format!("bad number in {s:?}"))?;
+    let n: u64 = num
+        .trim()
+        .parse()
+        .map_err(|_| format!("bad number in {s:?}"))?;
     let dur = match unit.trim() {
-        "ms"        => Duration::from_millis(n),
-        "s" | ""    => Duration::from_secs(n),
-        "m"         => Duration::from_secs(n * 60),
-        "h"         => Duration::from_secs(n * 3600),
-        other       => return Err(format!("unknown duration unit {other:?}")),
+        "ms" => Duration::from_millis(n),
+        "s" | "" => Duration::from_secs(n),
+        "m" => Duration::from_secs(n * 60),
+        "h" => Duration::from_secs(n * 3600),
+        other => return Err(format!("unknown duration unit {other:?}")),
     };
     Ok(dur)
 }
@@ -127,8 +130,14 @@ async fn main() -> Result<()> {
             signals: signal_mask,
             capabilities: 0,
             resource_attrs: vec![
-                LabelPair { key: "service".into(), value: "noise-spewer".into() },
-                LabelPair { key: "host".into(), value: hostname.clone() },
+                LabelPair {
+                    key: "service".into(),
+                    value: "noise-spewer".into(),
+                },
+                LabelPair {
+                    key: "host".into(),
+                    value: hostname.clone(),
+                },
             ],
         }),
     )
@@ -138,7 +147,11 @@ async fn main() -> Result<()> {
     let hello_ack = match read_frame::<Frame, _>(&mut rd).await?.msg {
         FrameMsg::HelloAck(a) => a,
         FrameMsg::Error(e) => {
-            bail!("server rejected handshake: code={} msg={:?}", e.code, e.message)
+            bail!(
+                "server rejected handshake: code={} msg={:?}",
+                e.code,
+                e.message
+            )
         }
         other => bail!("expected HelloAck, got {}", short_msg_name(&other)),
     };
@@ -185,7 +198,10 @@ async fn main() -> Result<()> {
                         break;
                     }
                     other => {
-                        tracing::debug!(kind = short_msg_name(&other), "ignoring unexpected server frame");
+                        tracing::debug!(
+                            kind = short_msg_name(&other),
+                            "ignoring unexpected server frame"
+                        );
                     }
                 },
                 Err(e) => {
@@ -267,12 +283,12 @@ fn parse_signal_selection(s: &str) -> Result<(u8, bool)> {
     let mut dummy = false;
     for sig in s.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
         match sig {
-            "metrics"  => mask |= SIGNAL_BIT_METRICS,
-            "logs"     => mask |= SIGNAL_BIT_LOGS,
-            "traces"   => mask |= SIGNAL_BIT_TRACES,
+            "metrics" => mask |= SIGNAL_BIT_METRICS,
+            "logs" => mask |= SIGNAL_BIT_LOGS,
+            "traces" => mask |= SIGNAL_BIT_TRACES,
             "profiles" => mask |= SIGNAL_BIT_PROFILES,
-            "dummy"    => dummy = true,
-            other      => bail!("unknown signal {other:?}"),
+            "dummy" => dummy = true,
+            other => bail!("unknown signal {other:?}"),
         }
     }
     Ok((mask, dummy))
@@ -280,10 +296,18 @@ fn parse_signal_selection(s: &str) -> Result<(u8, bool)> {
 
 fn expand_mask(mask: u8) -> Vec<Signal> {
     let mut out = Vec::new();
-    if mask & SIGNAL_BIT_METRICS  != 0 { out.push(Signal::Metrics); }
-    if mask & SIGNAL_BIT_LOGS     != 0 { out.push(Signal::Logs); }
-    if mask & SIGNAL_BIT_TRACES   != 0 { out.push(Signal::Traces); }
-    if mask & SIGNAL_BIT_PROFILES != 0 { out.push(Signal::Profiles); }
+    if mask & SIGNAL_BIT_METRICS != 0 {
+        out.push(Signal::Metrics);
+    }
+    if mask & SIGNAL_BIT_LOGS != 0 {
+        out.push(Signal::Logs);
+    }
+    if mask & SIGNAL_BIT_TRACES != 0 {
+        out.push(Signal::Traces);
+    }
+    if mask & SIGNAL_BIT_PROFILES != 0 {
+        out.push(Signal::Profiles);
+    }
     out
 }
 
@@ -300,23 +324,23 @@ fn hostname_string() -> String {
 
 fn ack_name(s: u8) -> &'static str {
     match s {
-        ACK_ACCEPTED  => "accepted",
+        ACK_ACCEPTED => "accepted",
         ACK_THROTTLED => "throttled",
-        ACK_REJECTED  => "rejected",
+        ACK_REJECTED => "rejected",
         _ => "unknown",
     }
 }
 
 fn short_msg_name(m: &FrameMsg) -> &'static str {
     match m {
-        FrameMsg::Hello(_)       => "Hello",
-        FrameMsg::HelloAck(_)    => "HelloAck",
-        FrameMsg::Batch(_)       => "Batch",
-        FrameMsg::BatchAck(_)    => "BatchAck",
+        FrameMsg::Hello(_) => "Hello",
+        FrameMsg::HelloAck(_) => "HelloAck",
+        FrameMsg::Batch(_) => "Batch",
+        FrameMsg::BatchAck(_) => "BatchAck",
         FrameMsg::FlowControl(_) => "FlowControl",
-        FrameMsg::Ping(_)        => "Ping",
-        FrameMsg::Pong(_)        => "Pong",
-        FrameMsg::Goodbye(_)     => "Goodbye",
-        FrameMsg::Error(_)       => "Error",
+        FrameMsg::Ping(_) => "Ping",
+        FrameMsg::Pong(_) => "Pong",
+        FrameMsg::Goodbye(_) => "Goodbye",
+        FrameMsg::Error(_) => "Error",
     }
 }

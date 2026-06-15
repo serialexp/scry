@@ -117,7 +117,10 @@ fn created_apply_is_idempotent_and_advances_cursor() {
     assert_eq!(first.inserted, 1, "first Created inserts");
     // Cursor seeded at this block.
     let date = date_dir(m.ts_min_unix_nano);
-    assert_eq!(catalog.get_cursor("logs", writer, &date).unwrap(), Some(m.uuid));
+    assert_eq!(
+        catalog.get_cursor("logs", writer, &date).unwrap(),
+        Some(m.uuid)
+    );
 
     // Duplicate (e.g. self-delivered, or a publish retry) is a no-op.
     let second = apply_event(&catalog, &ev).unwrap();
@@ -190,14 +193,19 @@ async fn poll_recovers_dropped_block_then_finds_nothing_new() {
     // Simulate pub/sub delivered b1 (catalog + cursor) but DROPPED b2.
     catalog.insert_block(&b1).unwrap();
     let date = date_dir(b1.ts_min_unix_nano);
-    catalog.advance_cursor("logs", writer, &date, b1.uuid).unwrap();
+    catalog
+        .advance_cursor("logs", writer, &date, b1.uuid)
+        .unwrap();
     assert_eq!(catalog.block_count().unwrap(), 1);
 
     // First poll finds exactly the dropped b2.
     let r1 = poll_once(store.as_ref(), &catalog, BUCKET).await.unwrap();
     assert_eq!(r1.inserted, 1, "poll recovers the dropped block");
     assert!(catalog.get_block(b2.uuid).unwrap().is_some());
-    assert_eq!(catalog.get_cursor("logs", writer, &date).unwrap(), Some(b2.uuid));
+    assert_eq!(
+        catalog.get_cursor("logs", writer, &date).unwrap(),
+        Some(b2.uuid)
+    );
 
     // Second poll: cursor advanced past b2, nothing new.
     let r2 = poll_once(store.as_ref(), &catalog, BUCKET).await.unwrap();
@@ -224,7 +232,10 @@ async fn full_walk_discovers_untracked_prefixes() {
 
     // And it seeded the cursor, so a subsequent incremental poll is cheap.
     let date = date_dir(b1.ts_min_unix_nano);
-    assert_eq!(catalog.get_cursor("logs", writer, &date).unwrap(), Some(b2.uuid));
+    assert_eq!(
+        catalog.get_cursor("logs", writer, &date).unwrap(),
+        Some(b2.uuid)
+    );
 }
 
 #[tokio::test]
@@ -255,7 +266,12 @@ async fn concurrent_compaction_has_a_single_winner() {
     // Two instances run a compaction pass concurrently over the same
     // partition, sharing one lease provider.
     let h1 = {
-        let (p, s, c, cfg) = (provider.clone(), store.clone(), catalog.clone(), cfg.clone());
+        let (p, s, c, cfg) = (
+            provider.clone(),
+            store.clone(),
+            catalog.clone(),
+            cfg.clone(),
+        );
         tokio::spawn(async move {
             run_compaction_pass(
                 &p,
@@ -272,7 +288,12 @@ async fn concurrent_compaction_has_a_single_winner() {
         })
     };
     let h2 = {
-        let (p, s, c, cfg) = (provider.clone(), store.clone(), catalog.clone(), cfg.clone());
+        let (p, s, c, cfg) = (
+            provider.clone(),
+            store.clone(),
+            catalog.clone(),
+            cfg.clone(),
+        );
         tokio::spawn(async move {
             run_compaction_pass(
                 &p,
@@ -292,7 +313,11 @@ async fn concurrent_compaction_has_a_single_winner() {
     let r2 = h2.await.unwrap();
 
     // Exactly one merge happened across both instances.
-    assert_eq!(r1.merges + r2.merges, 1, "exactly one instance merged the partition");
+    assert_eq!(
+        r1.merges + r2.merges,
+        1,
+        "exactly one instance merged the partition"
+    );
 
     // The catalog holds exactly one live block — the merged L1 — with the
     // full row count and no duplicates.
@@ -300,7 +325,10 @@ async fn concurrent_compaction_has_a_single_winner() {
     let live = cat.list_blocks().unwrap();
     assert_eq!(live.len(), 1, "no duplicate merged blocks");
     assert_eq!(live[0].level, 1);
-    assert_eq!(live[0].meta.row_count, 150, "every input row survives exactly once");
+    assert_eq!(
+        live[0].meta.row_count, 150,
+        "every input row survives exactly once"
+    );
     for m in &inputs {
         assert!(cat.get_block(m.uuid).unwrap().is_none(), "inputs reaped");
     }
@@ -345,7 +373,10 @@ async fn retention_pass_defers_to_the_global_lease() {
     )
     .await
     .unwrap();
-    assert!(blocked.aborted, "pass aborts when the lease is held by a peer");
+    assert!(
+        blocked.aborted,
+        "pass aborts when the lease is held by a peer"
+    );
     assert!(
         catalog.get_block(old.uuid).unwrap().is_some(),
         "nothing reaped without the lease"
@@ -366,5 +397,8 @@ async fn retention_pass_defers_to_the_global_lease() {
     .unwrap();
     assert!(!done.aborted);
     assert_eq!(done.reaped, 1);
-    assert!(catalog.get_block(old.uuid).unwrap().is_none(), "aged block reaped");
+    assert!(
+        catalog.get_block(old.uuid).unwrap().is_none(),
+        "aged block reaped"
+    );
 }

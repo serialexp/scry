@@ -8,9 +8,9 @@
 pub const PROTOCOL_VERSION_V0: u16 = 0x0001;
 
 // ── Hello.signals bitmask ──────────────────────────────────────────────
-pub const SIGNAL_BIT_METRICS:  u8 = 0x01;
-pub const SIGNAL_BIT_LOGS:     u8 = 0x02;
-pub const SIGNAL_BIT_TRACES:   u8 = 0x04;
+pub const SIGNAL_BIT_METRICS: u8 = 0x01;
+pub const SIGNAL_BIT_LOGS: u8 = 0x02;
+pub const SIGNAL_BIT_TRACES: u8 = 0x04;
 pub const SIGNAL_BIT_PROFILES: u8 = 0x08;
 
 // ── Batch.signal ───────────────────────────────────────────────────────
@@ -27,22 +27,24 @@ pub const SIGNAL_BIT_PROFILES: u8 = 0x08;
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Signal {
-    Metrics  = 1,
-    Logs     = 2,
-    Traces   = 3,
+    Metrics = 1,
+    Logs = 2,
+    Traces = 3,
     Profiles = 4,
-    Dummy    = 0xFE,
+    Dummy = 0xFE,
 }
 
 impl Signal {
-    pub fn as_u8(self) -> u8 { self as u8 }
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
 
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
-            1    => Some(Signal::Metrics),
-            2    => Some(Signal::Logs),
-            3    => Some(Signal::Traces),
-            4    => Some(Signal::Profiles),
+            1 => Some(Signal::Metrics),
+            2 => Some(Signal::Logs),
+            3 => Some(Signal::Traces),
+            4 => Some(Signal::Profiles),
             0xFE => Some(Signal::Dummy),
             _ => None,
         }
@@ -50,11 +52,11 @@ impl Signal {
 
     pub fn name(self) -> &'static str {
         match self {
-            Signal::Metrics  => "metrics",
-            Signal::Logs     => "logs",
-            Signal::Traces   => "traces",
+            Signal::Metrics => "metrics",
+            Signal::Logs => "logs",
+            Signal::Traces => "traces",
             Signal::Profiles => "profiles",
-            Signal::Dummy    => "dummy",
+            Signal::Dummy => "dummy",
         }
     }
 }
@@ -71,50 +73,50 @@ pub const SIGNAL_ALL: u8 = 0xFF;
 // carries no per-series type. Histograms/summaries are exploded into component
 // series (`_bucket`/`_sum`/`_count`) upstream, so they appear here as the
 // constituent series' types, not as a single HISTOGRAM series.
-pub const METRIC_TYPE_UNKNOWN:   u8 = 0;
-pub const METRIC_TYPE_COUNTER:   u8 = 1;
-pub const METRIC_TYPE_GAUGE:     u8 = 2;
+pub const METRIC_TYPE_UNKNOWN: u8 = 0;
+pub const METRIC_TYPE_COUNTER: u8 = 1;
+pub const METRIC_TYPE_GAUGE: u8 = 2;
 pub const METRIC_TYPE_HISTOGRAM: u8 = 3;
-pub const METRIC_TYPE_SUMMARY:   u8 = 4;
+pub const METRIC_TYPE_SUMMARY: u8 = 4;
 
 // ── Batch.compression ──────────────────────────────────────────────────
 pub const COMPRESSION_NONE: u8 = 0;
 pub const COMPRESSION_ZSTD: u8 = 1;
 
 // ── BatchAck.status ────────────────────────────────────────────────────
-pub const ACK_ACCEPTED:  u8 = 0;
+pub const ACK_ACCEPTED: u8 = 0;
 pub const ACK_THROTTLED: u8 = 1;
-pub const ACK_REJECTED:  u8 = 2;
+pub const ACK_REJECTED: u8 = 2;
 
 // ── BatchAck.reason_code (when status == REJECTED) ─────────────────────
-pub const REJECT_BAD_SCHEMA:             u16 = 1;
-pub const REJECT_BAD_FINGERPRINT:        u16 = 2;
-pub const REJECT_UNKNOWN_SERIES:         u16 = 3;
+pub const REJECT_BAD_SCHEMA: u16 = 1;
+pub const REJECT_BAD_FINGERPRINT: u16 = 2;
+pub const REJECT_UNKNOWN_SERIES: u16 = 3;
 pub const REJECT_TIMESTAMP_OUT_OF_RANGE: u16 = 4;
-pub const REJECT_BATCH_TOO_LARGE:        u16 = 5;
-pub const REJECT_SIGNAL_NOT_ANNOUNCED:   u16 = 6;
-pub const REJECT_CARDINALITY_LIMIT:      u16 = 7;
-pub const REJECT_INTERNAL:               u16 = 99;
+pub const REJECT_BATCH_TOO_LARGE: u16 = 5;
+pub const REJECT_SIGNAL_NOT_ANNOUNCED: u16 = 6;
+pub const REJECT_CARDINALITY_LIMIT: u16 = 7;
+pub const REJECT_INTERNAL: u16 = 99;
 
 // ── Error.code (connection-killing) ────────────────────────────────────
 pub const ERR_PROTOCOL_VERSION: u16 = 1;
-pub const ERR_BAD_FRAMING:      u16 = 2;
-pub const ERR_DUPLICATE_HELLO:  u16 = 3;
-pub const ERR_HELLO_REQUIRED:   u16 = 4;
+pub const ERR_BAD_FRAMING: u16 = 2;
+pub const ERR_DUPLICATE_HELLO: u16 = 3;
+pub const ERR_HELLO_REQUIRED: u16 = 4;
 pub const ERR_SESSION_MISMATCH: u16 = 5;
 pub const ERR_INFLIGHT_EXCEEDED: u16 = 6;
-pub const ERR_AUTH:             u16 = 7;
-pub const ERR_INTERNAL:         u16 = 255;
+pub const ERR_AUTH: u16 = 7;
+pub const ERR_INTERNAL: u16 = 255;
 
 // ── Goodbye.reason_code ────────────────────────────────────────────────
-pub const GOODBYE_NORMAL:          u16 = 0;
+pub const GOODBYE_NORMAL: u16 = 0;
 pub const GOODBYE_SERVER_DRAINING: u16 = 1;
-pub const GOODBYE_AGENT_RELOAD:    u16 = 2;
+pub const GOODBYE_AGENT_RELOAD: u16 = 2;
 
 // ── HelloAck defaults ──────────────────────────────────────────────────
 pub const DEFAULT_SUGGESTED_BATCH_BYTES: u32 = 4 * 1024 * 1024;
-pub const DEFAULT_MAX_BATCH_BYTES:       u32 = 16 * 1024 * 1024;
-pub const DEFAULT_MAX_INFLIGHT_BATCHES:  u16 = 64;
+pub const DEFAULT_MAX_BATCH_BYTES: u32 = 16 * 1024 * 1024;
+pub const DEFAULT_MAX_INFLIGHT_BATCHES: u16 = 64;
 
 // ── Query protocol (proto/query.schema.json) ───────────────────────────
 //
@@ -150,10 +152,10 @@ pub const QUERY_ERR_INTERNAL: u16 = 0x00FF;
 pub fn query_err_name(code: u16) -> &'static str {
     match code {
         QUERY_ERR_BAD_REQUEST => "QUERY_ERR_BAD_REQUEST",
-        QUERY_ERR_SQL_PARSE   => "QUERY_ERR_SQL_PARSE",
-        QUERY_ERR_PLAN        => "QUERY_ERR_PLAN",
-        QUERY_ERR_RESOURCES   => "QUERY_ERR_RESOURCES",
-        QUERY_ERR_INTERNAL    => "QUERY_ERR_INTERNAL",
+        QUERY_ERR_SQL_PARSE => "QUERY_ERR_SQL_PARSE",
+        QUERY_ERR_PLAN => "QUERY_ERR_PLAN",
+        QUERY_ERR_RESOURCES => "QUERY_ERR_RESOURCES",
+        QUERY_ERR_INTERNAL => "QUERY_ERR_INTERNAL",
         _ => "QUERY_ERR_UNKNOWN",
     }
 }

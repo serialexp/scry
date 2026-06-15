@@ -62,7 +62,8 @@ pub fn encode_postings(entries: &[PostingsEntry], props: &WriterProperties) -> R
         let mut buf: Vec<u8> = Vec::new();
         let mut w = ArrowWriter::try_new(&mut buf, schema, Some(props.clone()))
             .context("ArrowWriter::try_new (empty postings)")?;
-        w.write(&empty).context("ArrowWriter::write (empty postings)")?;
+        w.write(&empty)
+            .context("ArrowWriter::write (empty postings)")?;
         w.close().context("ArrowWriter::close (empty postings)")?;
         return Ok(Bytes::from(buf));
     }
@@ -184,7 +185,9 @@ mod tests {
     use crate::BlockBuilderConfig;
 
     fn props() -> WriterProperties {
-        BlockBuilderConfig::default().postings_writer_props().unwrap()
+        BlockBuilderConfig::default()
+            .postings_writer_props()
+            .unwrap()
     }
 
     #[test]

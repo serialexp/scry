@@ -100,10 +100,7 @@ where
 }
 
 /// List a prefix and return the locations of every `*.meta.json` object.
-async fn collect_meta_locations<S>(
-    store: &S,
-    prefix: Option<&ObjPath>,
-) -> Result<Vec<ObjPath>>
+async fn collect_meta_locations<S>(store: &S, prefix: Option<&ObjPath>) -> Result<Vec<ObjPath>>
 where
     S: ObjectStore + ?Sized,
 {

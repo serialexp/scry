@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# v0.9 multi-instance exit criterion — two scry-ingestd instances sharing one
+# v0.9 multi-instance exit criterion — two scry ingest instances sharing one
 # bucket + one Valkey, end to end.
 #
 # Also reachable as `MULTI=1 scripts/smoke.sh` (that script execs this one).
@@ -86,7 +86,7 @@ fi
 
 # ── Build ───────────────────────────────────────────────────────────
 echo "[multi] building release binaries..."
-cargo build --release -p scry-ingestd -p noise-spewer -p scry-list >&2
+cargo build --release -p scry -p noise-spewer >&2
 
 # ── Clean slate ─────────────────────────────────────────────────────
 rm -rf "$SMOKE_DIR"
@@ -104,11 +104,11 @@ PIDS=()
 cleanup() { for p in "${PIDS[@]:-}"; do kill -9 "$p" 2>/dev/null || true; done; }
 trap cleanup EXIT
 
-# Start a scry-ingestd; echoes its PID. Extra flags after the 4 positional.
+# Start a scry ingest; echoes its PID. Extra flags after the 4 positional.
 start_ingestd() {
     local name=$1 listen=$2 waldir=$3 catalog=$4; shift 4
     RUST_LOG="${RUST_LOG:-info,scry_compact=debug}" \
-        ./target/release/scry-ingestd \
+        ./target/release/scry ingest \
             --listen "$listen" \
             --storage \
             --wal-dir "$waldir" \
@@ -243,7 +243,7 @@ echo "[multi] after retention: A live blocks=$ra  B live blocks=$rb (expected 0/
 [[ "$reaped" == 1 ]] || fail "retention did not converge to 0 live blocks (A=$ra B=$rb)"
 
 # Bucket truth: a fresh reconcile finds no logs blocks left.
-./target/release/scry-list --catalog "$SMOKE_DIR/recon.sqlite" > "$SMOKE_DIR/recon.txt" 2>&1
+./target/release/scry list --catalog "$SMOKE_DIR/recon.sqlite" > "$SMOKE_DIR/recon.txt" 2>&1
 left=$(sqlite3 "$SMOKE_DIR/recon.sqlite" "SELECT count(*) FROM blocks WHERE signal='logs' AND deleted_at IS NULL;")
 echo "[multi] bucket reconcile: logs blocks remaining = $left (expected 0)"
 [[ "$left" == 0 ]] || fail "bucket still has $left logs blocks after coordinated retention"

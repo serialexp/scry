@@ -36,10 +36,7 @@ async fn roundtrip_put_get_list_delete() {
     let store = open(&cfg).expect("open objstore");
 
     // Use a per-test prefix so concurrent runs don't trample each other.
-    let prefix = format!(
-        "test/roundtrip/{}",
-        uuid_like(std::time::SystemTime::now())
-    );
+    let prefix = format!("test/roundtrip/{}", uuid_like(std::time::SystemTime::now()));
     let key_a = Path::from(format!("{prefix}/a.bin"));
     let key_b = Path::from(format!("{prefix}/b.bin"));
 
@@ -76,7 +73,6 @@ async fn roundtrip_put_get_list_delete() {
     store.delete(&key_a).await.expect("delete a");
     store.delete(&key_b).await.expect("delete b");
 }
-
 
 // Cheap monotonic-ish suffix without pulling in uuid as a dev-dep.
 fn uuid_like(t: std::time::SystemTime) -> String {

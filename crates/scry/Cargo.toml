@@ -1,0 +1,32 @@
+[package]
+name        = "scry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "scry — single-binary observability for metrics, logs, traces, and profiles. One binary, many roles: `scry ingest`, `scry query`, `scry get`, `scry list`, `scry agent`, `scry gateway`, `scry web`, `scry compact`, `scry retention`."
+
+[[bin]]
+name = "scry"
+path = "src/main.rs"
+
+[dependencies]
+anyhow             = { workspace = true }
+clap               = { workspace = true }
+mimalloc           = { workspace = true }
+tokio              = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+scry-ingestd       = { workspace = true }
+scry-queryd        = { workspace = true }
+scry-query         = { workspace = true }
+scry-list          = { workspace = true }
+scry-agent         = { workspace = true }
+scry-gateway       = { workspace = true }
+scry-webui         = { workspace = true }
+scry-compact       = { workspace = true }
+scry-retention     = { workspace = true }
+
+[lints]
+workspace = true

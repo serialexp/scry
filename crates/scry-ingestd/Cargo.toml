@@ -5,14 +5,13 @@ edition.workspace = true
 license.workspace = true
 description = "scry ingest server daemon: thin CLI around scry-server. Listens for agents, optionally enables the storage path (WAL + parquet blocks → object storage + optional online catalog)."
 
-[[bin]]
-name = "scry-ingestd"
-path = "src/main.rs"
+[lib]
+name = "scry_ingestd"
+path = "src/lib.rs"
 
 [dependencies]
 anyhow            = { workspace = true }
 clap              = { workspace = true }
-mimalloc          = { workspace = true }
 num_cpus          = { workspace = true }
 object_store      = { workspace = true }
 scry-block        = { workspace = true }
@@ -25,7 +24,6 @@ scry-server       = { workspace = true }
 scry-valkey       = { workspace = true }
 tokio             = { workspace = true }
 tracing           = { workspace = true }
-tracing-subscriber = { workspace = true }
 uuid              = { workspace = true }
 
 [lints]

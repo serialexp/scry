@@ -228,9 +228,8 @@ impl TableProvider for MetricsTable {
                     .iter()
                     .map(|fp| Expr::Literal(ScalarValue::UInt64(Some(*fp)), None))
                     .collect();
-                block_filters.push(
-                    datafusion::logical_expr::col("series_fingerprint").in_list(lits, false),
-                );
+                block_filters
+                    .push(datafusion::logical_expr::col("series_fingerprint").in_list(lits, false));
             }
             if let Some(min) = self.ts_min {
                 block_filters.push(
@@ -281,9 +280,7 @@ impl TableProvider for MetricsTable {
             // `SELECT count(*) FROM metrics` with no blocks returns
             // 0 cleanly. We bypass `make_branch` here since there's
             // no fingerprint set to apply and no file to attach.
-            let source = Arc::new(
-                ParquetSource::new(self.schema()).with_pushdown_filters(true),
-            );
+            let source = Arc::new(ParquetSource::new(self.schema()).with_pushdown_filters(true));
             let builder = FileScanConfigBuilder::new(self.object_store_url.clone(), source)
                 .with_projection_indices(projection.cloned())?
                 .with_limit(limit);

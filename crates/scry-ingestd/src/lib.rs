@@ -42,22 +42,10 @@ use uuid::Uuid;
 /// pipeline (Dummy included — the smoke harness exercises it).
 const ALL_SIGNALS: [&str; 5] = ["dummy", "metrics", "logs", "traces", "profiles"];
 
-/// Swap glibc's malloc for mimalloc.
-///
-/// The ingest hot path makes ~2 M small allocations/sec in the
-/// happy-path steady state (parquet build buffer, zstd inflate, batch
-/// payload Vecs, tracing string interpolation). glibc's per-thread
-/// arenas hold a high-water mark and rarely return memory to the OS,
-/// which kept measured RSS pinned ~3× the live working set across
-/// stress runs. mimalloc decommits aggressively and runs the small-
-/// allocation path noticeably faster. One line, no behavioural change
-/// — the only artefact is a smaller, less ragged RSS curve.
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
+/// CLI arguments for the `scry ingest` subcommand.
 #[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
-struct Args {
+#[command(about = "Ingest server daemon (native wire; optional storage + multi-instance)")]
+pub struct Args {
     /// Listen address.
     #[arg(long, default_value = "127.0.0.1:4000")]
     listen: String,
@@ -261,16 +249,8 @@ impl Compression {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-    let args = Args::parse();
-
+/// Run the ingest server daemon until ctrl-c / SIGTERM.
+pub async fn run(args: Args) -> Result<()> {
     let writer_id = args
         .writer_id
         .unwrap_or_else(|| format!("scry-ingestd-{}", rand_short()));
@@ -766,7 +746,10 @@ async fn run_consumer(url: String, catalog: Arc<std::sync::Mutex<Catalog>>) {
                             }
                         }
                         Err(RecvError::Lagged(n)) => {
-                            warn!(skipped = n, "convergence consumer lagged; polling will backstop")
+                            warn!(
+                                skipped = n,
+                                "convergence consumer lagged; polling will backstop"
+                            )
                         }
                         Err(RecvError::Closed) => {
                             warn!("convergence subscription closed; reconnecting");
@@ -903,6 +886,9 @@ fn load_or_create_writer_uuid(wal_dir: &std::path::Path) -> Result<Uuid> {
 
 fn rand_short() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let ns = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+    let ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
     format!("{:08x}", ns & 0xFFFF_FFFF)
 }

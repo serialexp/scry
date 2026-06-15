@@ -28,7 +28,8 @@ spec:
           image: serialexp/scry:latest
           imagePullPolicy: IfNotPresent
           command:
-            - scry-agent
+            - scry
+            - agent
           args:
             # The processing pipeline (per-signal keep, label mapping, JSON
             # extraction, kubelet scraping, pod-label SD) lives in the mounted
@@ -46,7 +47,7 @@ spec:
                 fieldRef:
                   fieldPath: status.hostIP
             - name: SCRY_SERVER_ADDR
-              value: "scry-server.scry.svc:4000"
+              value: "scry-ingest.scry.svc:4000"
             # Tune verbosity via RUST_LOG if needed (default info).
             - name: RUST_LOG
               value: "info"

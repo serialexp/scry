@@ -316,9 +316,8 @@ impl TableProvider for LogsTable {
                     .iter()
                     .map(|fp| Expr::Literal(ScalarValue::UInt64(Some(*fp)), None))
                     .collect();
-                block_filters.push(
-                    datafusion::logical_expr::col("stream_fingerprint").in_list(lits, false),
-                );
+                block_filters
+                    .push(datafusion::logical_expr::col("stream_fingerprint").in_list(lits, false));
             }
             if let Some(min) = self.ts_min {
                 block_filters.push(
@@ -375,8 +374,7 @@ impl TableProvider for LogsTable {
                 .with_limit(limit);
             DataSourceExec::from_data_source(builder.build())
         } else {
-            let mut branches: Vec<Arc<dyn ExecutionPlan>> =
-                Vec::with_capacity(self.blocks.len());
+            let mut branches: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(self.blocks.len());
             for block in &self.blocks {
                 let meta = &block.entry.meta;
                 let path = block_path(
@@ -687,7 +685,8 @@ pub async fn build_logs_table_from_candidates(
             let excluded = match bloom_cache {
                 Some(bc) => bc.block_excluded(store.clone(), &entry.meta, pat).await,
                 None => {
-                    crate::body_bloom::block_excluded_by_bloom(store.clone(), &entry.meta, pat).await
+                    crate::body_bloom::block_excluded_by_bloom(store.clone(), &entry.meta, pat)
+                        .await
                 }
             };
             if excluded {

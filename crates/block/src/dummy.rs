@@ -198,10 +198,7 @@ impl DummyBlockBuilder {
     /// `impl Future<Output = …>` and putting the body directly there
     /// loses the `mut self` rebinding ergonomic — the inherent helper
     /// is the easier reading of the same code.
-    async fn finish_and_upload_impl(
-        self,
-        store: &dyn ObjectStore,
-    ) -> Result<Option<BlockMeta>> {
+    async fn finish_and_upload_impl(self, store: &dyn ObjectStore) -> Result<Option<BlockMeta>> {
         if self.is_empty() {
             return Ok(None);
         }
@@ -325,9 +322,8 @@ impl DummyBlockBuilder {
             has_body_bloom: false,
             body_bloom_size_bytes: None,
         };
-        let meta_bytes = Bytes::from(
-            serde_json::to_vec_pretty(&meta).context("serialising BlockMeta")?,
-        );
+        let meta_bytes =
+            Bytes::from(serde_json::to_vec_pretty(&meta).context("serialising BlockMeta")?);
 
         // Upload order: parquet first, meta.json last. The sidecar is
         // the catalog's "block exists" signal; if we crash between the

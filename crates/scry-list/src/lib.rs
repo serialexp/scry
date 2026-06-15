@@ -1,4 +1,4 @@
-//! scry-list — v0.1 catalog inspector.
+//! scry-list — v0.1 catalog inspector (the `scry list` subcommand).
 //!
 //! Opens a SQLite catalog (creating an empty one if it doesn't yet
 //! exist), reconciles it against the bucket via
@@ -17,15 +17,15 @@
 //! Run (after `source docker/garage/.env`):
 //!
 //! ```bash
-//! scry-list --catalog ./catalog.sqlite
+//! scry list --catalog ./catalog.sqlite
 //! ```
 //!
 //! With `--interval <secs>` it instead runs as a long-running reconciler:
 //! reconcile against the bucket every `<secs>` seconds forever, logging a
 //! summary each cycle (no per-block listing). This is the sidecar mode that
-//! keeps `scry-queryd`'s catalog fresh — queryd opens the same SQLite file and
-//! SQLite's WAL makes the sidecar's cross-process writes visible to queryd's
-//! per-query catalog lookups.
+//! keeps `scry query`'s catalog fresh — the query daemon opens the same SQLite
+//! file and SQLite's WAL makes the sidecar's cross-process writes visible to
+//! the daemon's per-query catalog lookups.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -35,40 +35,34 @@ use clap::Parser;
 use scry_catalog::Catalog;
 use scry_objstore::{open as open_objstore, ObjStoreConfig};
 
+/// CLI arguments for the `scry list` subcommand.
 #[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
-struct Args {
+#[command(about = "Catalog inspector: reconcile a local catalog against a bucket and list blocks")]
+pub struct Args {
     /// Path to the SQLite catalog file. Created (with schema) if it
     /// doesn't exist.
     #[arg(long)]
-    catalog: PathBuf,
+    pub catalog: PathBuf,
 
     /// Skip the bucket walk and just print what's already in the
     /// catalog. Useful for sanity-checking the online insert path
-    /// (scry-ingestd's [`scry_catalog::Catalog::insert_block`] calls)
+    /// (`scry ingest`'s [`scry_catalog::Catalog::insert_block`] calls)
     /// without depending on the bucket.
     #[arg(long)]
-    no_reconcile: bool,
+    pub no_reconcile: bool,
 
     /// Run as a long-running reconciler: reconcile against the bucket every
     /// `<secs>` seconds forever, logging a summary each cycle instead of
     /// reconciling once and printing the block listing. This is the sidecar
-    /// mode that keeps scry-queryd's catalog fresh. Conflicts with
+    /// mode that keeps the query daemon's catalog fresh. Conflicts with
     /// `--no-reconcile`.
     #[arg(long, value_name = "SECS", conflicts_with = "no_reconcile")]
-    interval: Option<u64>,
+    pub interval: Option<u64>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-    let args = Args::parse();
-
+/// Reconcile + list (one-shot), or run as a periodic reconciler sidecar
+/// (`--interval`).
+pub async fn run(args: Args) -> Result<()> {
     let cfg = ObjStoreConfig::from_env()
         .context("loading SCRY_OBJSTORE_* env (try `source docker/garage/.env`)")?;
     let bucket = cfg.bucket.clone();
@@ -77,7 +71,7 @@ async fn main() -> Result<()> {
         .with_context(|| format!("opening catalog at {}", args.catalog.display()))?;
 
     // Long-running reconciler sidecar mode: reconcile on a fixed interval
-    // forever, beside scry-queryd, so queryd's per-query catalog lookups see
+    // forever, beside the query daemon, so its per-query catalog lookups see
     // newly-flushed blocks. Never returns; the one-shot listing below is the
     // non-`--interval` path.
     if let Some(secs) = args.interval {
@@ -100,7 +94,9 @@ async fn main() -> Result<()> {
                 ),
                 // A transient bucket/network error must not kill the sidecar;
                 // log it and retry on the next tick.
-                Err(e) => tracing::error!(error = %e, "reconcile cycle failed; will retry next tick"),
+                Err(e) => {
+                    tracing::error!(error = %e, "reconcile cycle failed; will retry next tick")
+                }
             }
             tokio::time::sleep(period).await;
         }

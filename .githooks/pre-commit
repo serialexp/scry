@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+#
+# scry pre-commit hook — keep the tree rustfmt-clean so formatting churn never
+# accumulates into a giant sweep again.
+#
+# Checks ONLY the staged .rs files (fast, no compile). If any is unformatted
+# the commit is rejected with the one command that fixes it. It deliberately
+# does not auto-format or re-stage anything — you stay in control of what lands.
+#
+# Activate (one-time, per clone):
+#     git config core.hooksPath .githooks
+#
+# Bypass for a single commit (use sparingly):
+#     git commit --no-verify
+set -euo pipefail
+
+# Collect staged Rust files (Added/Copied/Modified/Renamed — not Deleted).
+mapfile -t staged < <(git diff --cached --name-only --diff-filter=ACMR -z \
+  | tr '\0' '\n' | grep -E '\.rs$' || true)
+
+if [ ${#staged[@]} -eq 0 ]; then
+  exit 0
+fi
+
+# Only check files that still exist in the working tree (a staged rename's old
+# path, etc., is skipped). rustfmt --check on the working-tree copy is correct
+# here because this repo does not do partial-file commits.
+present=()
+for f in "${staged[@]}"; do
+  [ -f "$f" ] && present+=("$f")
+done
+if [ ${#present[@]} -eq 0 ]; then
+  exit 0
+fi
+
+if ! command -v rustfmt >/dev/null 2>&1; then
+  echo "pre-commit: rustfmt not found on PATH — install it with: rustup component add rustfmt" >&2
+  exit 1
+fi
+
+# --check exits non-zero and prints a diff if any file would be reformatted.
+if ! rustfmt --edition 2021 --check "${present[@]}" >/dev/null 2>&1; then
+  echo "pre-commit: the following staged file(s) are not rustfmt-clean:" >&2
+  for f in "${present[@]}"; do
+    if ! rustfmt --edition 2021 --check "$f" >/dev/null 2>&1; then
+      echo "  - $f" >&2
+    fi
+  done
+  echo >&2
+  echo "  run: cargo fmt   (then re-stage and commit)" >&2
+  echo "  bypass once: git commit --no-verify" >&2
+  exit 1
+fi
+
+exit 0

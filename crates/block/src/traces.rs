@@ -380,7 +380,8 @@ impl BlockBuilder for TracesBlockBuilder {
         self.parent_span_ids.append(&mut other.parent_span_ids);
         self.resource_labels.append(&mut other.resource_labels);
         self.service_names.append(&mut other.service_names);
-        self.service_namespaces.append(&mut other.service_namespaces);
+        self.service_namespaces
+            .append(&mut other.service_namespaces);
         self.deployment_envs.append(&mut other.deployment_envs);
         self.scope_names.append(&mut other.scope_names);
         self.scope_versions.append(&mut other.scope_versions);
@@ -703,7 +704,8 @@ impl TracesBlockBuilder {
         {
             let mut w = ArrowWriter::try_new(&mut buf, schema, Some(props))
                 .context("ArrowWriter::try_new (traces main)")?;
-            w.write(&batch).context("ArrowWriter::write (traces main)")?;
+            w.write(&batch)
+                .context("ArrowWriter::write (traces main)")?;
             w.close().context("ArrowWriter::close (traces main)")?;
         }
         let parquet_bytes = Bytes::from(buf);

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# scry-agent metrics-scraping exit criterion — end-to-end.
+# scry agent metrics-scraping exit criterion — end-to-end.
 #
 # Proves the agent's Prometheus pull path lands queryable metrics in the
-# bucket, against a real scry-ingestd + Garage:
+# bucket, against a real scry ingest + Garage:
 #
-#   stub /metrics  →  scry-agent (--scrape-target)  →  scry-ingestd (--storage)
-#                  →  bucket  →  scry-list reconcile  →  scry-query
+#   stub /metrics  →  scry agent (--scrape-target)  →  scry ingest (--storage)
+#                  →  bucket  →  scry list reconcile  →  scry get
 #
 # A python stub serves a fixed exposition body with 3 explicit samples
 # (2 counter series + 1 gauge). The agent scrapes it exactly once (the
@@ -16,7 +16,7 @@
 #   * the reconciled catalog holds exactly 5 metric rows (3 exposed + the
 #     2 synthesized — so a non-5 count means synthesis or mapping broke),
 #   * ≥1 metrics block landed with a postings sidecar, and
-#   * scry-query --signal metrics scans those 5 rows back (ingest→store→
+#   * scry get --signal metrics scans those 5 rows back (ingest→store→
 #     query is loss-free for scraped metrics).
 #
 # Self-contained except for Garage (needs docker/garage/.env) and python3.
@@ -46,7 +46,7 @@ done
 
 # ── Build ───────────────────────────────────────────────────────────
 echo "[agent-metrics] building release binaries..."
-cargo build --release -p scry-ingestd -p scry-list -p scry-query -p scry-agent >&2
+cargo build --release -p scry >&2
 
 # ── Clean slate ─────────────────────────────────────────────────────
 rm -rf "$SMOKE_DIR"; mkdir -p "$SMOKE_DIR"
@@ -83,9 +83,9 @@ with socketserver.TCPServer(('127.0.0.1', port), H) as s:
 PY
 STUB_PID=$!
 
-# ── scry-ingestd (storage) ──────────────────────────────────────────
-echo "[agent-metrics] starting scry-ingestd on $LISTEN..."
-RUST_LOG="${RUST_LOG:-info}" ./target/release/scry-ingestd \
+# ── scry ingest (storage) ──────────────────────────────────────────
+echo "[agent-metrics] starting scry ingest on $LISTEN..."
+RUST_LOG="${RUST_LOG:-info}" ./target/release/scry ingest \
     --listen "$LISTEN" \
     --storage \
     --wal-dir "$SMOKE_DIR/wal" \
@@ -105,11 +105,11 @@ for _ in $(seq 1 50); do
     sleep 0.1
 done
 
-# ── scry-agent: one scrape of the stub ──────────────────────────────
+# ── scry agent: one scrape of the stub ──────────────────────────────
 # --no-discovery: pure static-target path, no Kubernetes needed.
 # --scrape-interval 600s: only the immediate first tick fires in this run.
-echo "[agent-metrics] running scry-agent against the stub (one scrape)..."
-RUST_LOG="${RUST_LOG:-info}" ./target/release/scry-agent \
+echo "[agent-metrics] running scry agent against the stub (one scrape)..."
+RUST_LOG="${RUST_LOG:-info}" ./target/release/scry agent \
     --server-addr "$LISTEN" \
     --no-discovery \
     --scrape-target "http://127.0.0.1:$STUB_PORT/metrics" \
@@ -121,19 +121,19 @@ AGENT_PID=$!
 # Give it time to connect + scrape + the first flush, then graceful stop
 # (drains the pending metrics batch).
 sleep 3
-echo "[agent-metrics] SIGINT scry-agent → drain + flush..."
+echo "[agent-metrics] SIGINT scry agent → drain + flush..."
 kill -INT "$AGENT_PID"
 wait "$AGENT_PID" 2>/dev/null || true
 
 # Stop the ingest server so its final block flush completes, then reconcile.
-echo "[agent-metrics] SIGINT scry-ingestd → final block flush..."
+echo "[agent-metrics] SIGINT scry ingest → final block flush..."
 kill -INT "$INGEST_PID"
 wait "$INGEST_PID" 2>/dev/null || true
 trap 'kill -9 "$STUB_PID" 2>/dev/null || true' EXIT
 
 # ── Verify ──────────────────────────────────────────────────────────
 echo "[agent-metrics] reconciling a fresh catalog from the bucket..."
-./target/release/scry-list --catalog "$SMOKE_DIR/recon.sqlite" \
+./target/release/scry list --catalog "$SMOKE_DIR/recon.sqlite" \
     > "$SMOKE_DIR/scry-list.txt" 2>&1
 cat "$SMOKE_DIR/scry-list.txt"
 
@@ -143,7 +143,7 @@ metrics_blocks=$(sqlite3 "$SMOKE_DIR/recon.sqlite" \
 metrics_postings=$(sqlite3 "$SMOKE_DIR/recon.sqlite" \
     "SELECT COUNT(*) FROM blocks WHERE signal='metrics' AND has_postings=1 AND postings_size_bytes>0;")
 
-./target/release/scry-query \
+./target/release/scry get \
     --catalog "$SMOKE_DIR/recon.sqlite" \
     --signal metrics \
     > "$SMOKE_DIR/query.metrics.txt" 2>&1 || true

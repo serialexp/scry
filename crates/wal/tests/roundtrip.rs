@@ -110,10 +110,16 @@ async fn replay_skips_torn_tail() {
     // Hand-corrupt the trailing bytes of seg 0 to simulate a torn
     // tail. Append a partial header (4 bytes — looks like a len, no
     // crc or payload to follow).
-    let seg0 = tmp.path().join("dummy").join("wal-00000000000000000000.log");
+    let seg0 = tmp
+        .path()
+        .join("dummy")
+        .join("wal-00000000000000000000.log");
     {
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new().append(true).open(&seg0).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&seg0)
+            .unwrap();
         f.write_all(&[0, 0, 0, 8]).unwrap(); // claims an 8-byte payload, nothing follows
     }
     let w2 = Wal::open(cfg(&tmp, 1024 * 1024)).await.unwrap();

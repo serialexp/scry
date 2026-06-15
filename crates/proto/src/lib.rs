@@ -35,30 +35,17 @@ pub mod framing;
 pub mod streaming;
 
 pub use generated::{
-    Frame, FrameMsg,
-    Hello, HelloInput, HelloOutput,
-    HelloAck, HelloAckInput, HelloAckOutput,
-    Batch, BatchInput, BatchOutput,
-    BatchAck, BatchAckInput, BatchAckOutput,
-    FlowControl, FlowControlInput, FlowControlOutput,
-    Ping, PingInput, PingOutput,
-    Pong, PongInput, PongOutput,
-    Goodbye, GoodbyeInput, GoodbyeOutput,
-    Error as ErrorMsg, ErrorInput, ErrorOutput,
-    LabelPair,
-    MetricsBatch, SeriesDictEntry, MetricSample,
-    LogsBatch, LogStream, LogEntry,
-    TracesBatch, ResourceEntry, ScopeEntry, Span, SpanEvent, SpanLink,
-    ProfilesBatch, ProfileBlob,
-    DummyBatch, DummyRecord,
+    Batch, BatchAck, BatchAckInput, BatchAckOutput, BatchInput, BatchOutput, DummyBatch,
+    DummyRecord, Error as ErrorMsg, ErrorInput, ErrorOutput, FlowControl, FlowControlInput,
+    FlowControlOutput, Frame, FrameMsg, Goodbye, GoodbyeInput, GoodbyeOutput, Hello, HelloAck,
+    HelloAckInput, HelloAckOutput, HelloInput, HelloOutput, LabelPair, LogEntry, LogStream,
+    LogsBatch, MetricSample, MetricsBatch, Ping, PingInput, PingOutput, Pong, PongInput,
+    PongOutput, ProfileBlob, ProfilesBatch, ResourceEntry, ScopeEntry, SeriesDictEntry, Span,
+    SpanEvent, SpanLink, TracesBatch,
 };
 
 pub use generated_query::{
-    QueryFrame, QueryFrameMsg,
-    QueryRequest, QueryRequestInput, QueryRequestOutput,
-    Matcher,
-    SchemaMsg, SchemaMsgInput, SchemaMsgOutput,
-    BatchMsg, BatchMsgInput, BatchMsgOutput,
-    EndOfStream, EndOfStreamInput, EndOfStreamOutput,
-    StreamError, StreamErrorInput, StreamErrorOutput,
+    BatchMsg, BatchMsgInput, BatchMsgOutput, EndOfStream, EndOfStreamInput, EndOfStreamOutput,
+    Matcher, QueryFrame, QueryFrameMsg, QueryRequest, QueryRequestInput, QueryRequestOutput,
+    SchemaMsg, SchemaMsgInput, SchemaMsgOutput, StreamError, StreamErrorInput, StreamErrorOutput,
 };

@@ -202,9 +202,7 @@ impl PostingsIndex {
         }
     }
 
-    fn estimate(
-        entries: &HashMap<String, HashMap<String, Arc<Vec<u64>>>>,
-    ) -> usize {
+    fn estimate(entries: &HashMap<String, HashMap<String, Arc<Vec<u64>>>>) -> usize {
         // Approximate per-entry overhead:
         //   - outer HashMap node       ~48 bytes
         //   - String key heap          name.len() (capacity ≈ len here)
@@ -427,19 +425,16 @@ impl PostingsCache {
             // in insertion (refresh) order — head is LRU. Walk
             // forward, skipping unevictable slots, until we find one
             // we can drop.
-            let victim_uuid: Option<Uuid> = state
-                .map
-                .iter()
-                .find_map(|(uuid, slot)| {
-                    if *uuid == protect_uuid {
-                        return None;
-                    }
-                    let w = slot.weight.load(Ordering::Relaxed);
-                    if w == 0 {
-                        return None; // still loading; skip
-                    }
-                    Some(*uuid)
-                });
+            let victim_uuid: Option<Uuid> = state.map.iter().find_map(|(uuid, slot)| {
+                if *uuid == protect_uuid {
+                    return None;
+                }
+                let w = slot.weight.load(Ordering::Relaxed);
+                if w == 0 {
+                    return None; // still loading; skip
+                }
+                Some(*uuid)
+            });
             let Some(uuid) = victim_uuid else {
                 // Nothing evictable (every other entry is the
                 // protected one or still loading). Bail; we'll come
@@ -484,11 +479,7 @@ mod tests {
     /// Build a small `PostingsIndex` directly without going through
     /// parquet — keeps the unit tests focused on cache behaviour
     /// instead of postings parsing.
-    fn synthetic_index(
-        name: &str,
-        value: &str,
-        fps: &[u64],
-    ) -> Arc<PostingsIndex> {
+    fn synthetic_index(name: &str, value: &str, fps: &[u64]) -> Arc<PostingsIndex> {
         let mut inner = HashMap::new();
         inner.insert(value.to_string(), fp_list(fps));
         let mut outer = HashMap::new();
@@ -678,11 +669,7 @@ mod tests {
                     .get_or_try_init(|| async move {
                         fetch_count.fetch_add(1, Ordering::Relaxed);
                         tokio::time::sleep(Duration::from_millis(50)).await;
-                        Ok::<_, anyhow::Error>(synthetic_index(
-                            "env",
-                            "prod",
-                            &[1, 2, 3],
-                        ))
+                        Ok::<_, anyhow::Error>(synthetic_index("env", "prod", &[1, 2, 3]))
                     })
                     .await
                     .unwrap();

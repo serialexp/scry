@@ -61,9 +61,14 @@ async fn run_query(
     catalog: &Catalog,
     store: Arc<dyn ObjectStore>,
     q: &Query,
-) -> (Vec<arrow::record_batch::RecordBatch>, Arc<dyn ExecutionPlan>) {
+) -> (
+    Vec<arrow::record_batch::RecordBatch>,
+    Arc<dyn ExecutionPlan>,
+) {
     let ctx = SessionContext::new();
-    register_metrics_table(&ctx, catalog, store, q).await.unwrap();
+    register_metrics_table(&ctx, catalog, store, q)
+        .await
+        .unwrap();
     let df = ctx.table(METRICS_TABLE_NAME).await.unwrap();
     let physical = df.create_physical_plan().await.unwrap();
     let batches = datafusion::physical_plan::collect(physical.clone(), ctx.task_ctx())

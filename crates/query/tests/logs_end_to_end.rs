@@ -81,7 +81,10 @@ async fn run_query(
     catalog: &Catalog,
     store: Arc<dyn ObjectStore>,
     q: &Query,
-) -> (Vec<arrow::record_batch::RecordBatch>, Arc<dyn ExecutionPlan>) {
+) -> (
+    Vec<arrow::record_batch::RecordBatch>,
+    Arc<dyn ExecutionPlan>,
+) {
     let ctx = SessionContext::new();
     register_logs_table(&ctx, catalog, store, q).await.unwrap();
     let df = ctx.table(LOGS_TABLE_NAME).await.unwrap();
@@ -141,10 +144,7 @@ async fn logs_querier_end_to_end() {
     let mut block_a = LogsBlockBuilder::new(writer, test_cfg());
     block_a.observe_stream(l_api, labels(&[("service", "api"), ("env", "prod")]));
     block_a.observe_stream(l_db, labels(&[("service", "db"), ("env", "prod")]));
-    block_a.observe_stream(
-        l_cache,
-        labels(&[("service", "cache"), ("env", "stage")]),
-    );
+    block_a.observe_stream(l_cache, labels(&[("service", "cache"), ("env", "stage")]));
     entries_for(&mut block_a, l_api, 1_000_000, 100, 9);
     entries_for(&mut block_a, l_db, 1_000_100, 100, 6);
     entries_for(&mut block_a, l_cache, 1_000_200, 100, 3);

@@ -28,9 +28,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use object_store::ObjectStore;
-use scry_block::{
-    delete_block_objects, AlwaysValid, BlockEvent, BlockEventSink, Fence, NoopSink,
-};
+use scry_block::{delete_block_objects, AlwaysValid, BlockEvent, BlockEventSink, Fence, NoopSink};
 use scry_catalog::{Catalog, CatalogEntry, CatalogHandle};
 use uuid::Uuid;
 

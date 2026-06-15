@@ -353,8 +353,8 @@ impl BufPool {
             // checkin's eviction decision.
             let mut cap_guard = self.inner.capacity.lock().unwrap();
             if new_in_flight > *cap_guard && *cap_guard < self.inner.max_capacity {
-                let target = (*cap_guard + self.inner.autoscale_headroom)
-                    .min(self.inner.max_capacity);
+                let target =
+                    (*cap_guard + self.inner.autoscale_headroom).min(self.inner.max_capacity);
                 if target > *cap_guard {
                     *cap_guard = target;
                     self.inner.grows.fetch_add(1, Ordering::Relaxed);
@@ -487,13 +487,19 @@ impl PooledBuf {
 
     /// True when no bytes have been written.
     pub fn is_empty(&self) -> bool {
-        self.buf.as_ref().expect("buf is Some until Drop").is_empty()
+        self.buf
+            .as_ref()
+            .expect("buf is Some until Drop")
+            .is_empty()
     }
 
     /// Capacity of the inner buffer. Useful for tests.
     #[cfg(test)]
     pub fn capacity(&self) -> usize {
-        self.buf.as_ref().expect("buf is Some until Drop").capacity()
+        self.buf
+            .as_ref()
+            .expect("buf is Some until Drop")
+            .capacity()
     }
 
     /// Stable pointer to the underlying allocation. Used in tests to
@@ -607,9 +613,7 @@ mod tests {
     fn pool_does_not_grow_past_capacity() {
         let pool = BufPool::with_capacity(2);
         // Three same-sized buffers in flight, then dropped in order.
-        let bufs: Vec<_> = (0..3)
-            .map(|_| PooledBuf::checkout(&pool, 1024))
-            .collect();
+        let bufs: Vec<_> = (0..3).map(|_| PooledBuf::checkout(&pool, 1024)).collect();
         assert_eq!(pool.free_count(), 0);
         drop(bufs);
         assert_eq!(pool.free_count(), 2, "third drop dropped to ground");

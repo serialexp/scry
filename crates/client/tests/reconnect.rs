@@ -7,6 +7,7 @@
 //! the *new* server-assigned session id into every batch (a stale id would draw
 //! `ERR_SESSION_MISMATCH` and a server-side disconnect).
 
+use scry_client::Client;
 use scry_proto::{
     build,
     constants::{ACK_ACCEPTED, PROTOCOL_VERSION_V0, SIGNAL_BIT_LOGS},
@@ -14,7 +15,6 @@ use scry_proto::{
     generated::FrameMsg,
     Frame,
 };
-use scry_client::Client;
 use tokio::{
     io::{AsyncWriteExt, BufReader, BufWriter},
     net::{TcpListener, TcpStream},
@@ -115,8 +115,15 @@ async fn reconnect_restamps_new_session_id() {
 
     // First batch goes over connection #1 and must carry session 111.
     let mut f1 = test_batch(1);
-    client.send_batch_stamped(&mut f1).await.expect("send batch 1");
-    assert_eq!(rx.recv().await.unwrap(), 111, "batch 1 stamped with session 111");
+    client
+        .send_batch_stamped(&mut f1)
+        .await
+        .expect("send batch 1");
+    assert_eq!(
+        rx.recv().await.unwrap(),
+        111,
+        "batch 1 stamped with session 111"
+    );
 
     // The server has now closed connection #1. Give the client's reader task a
     // moment to observe EOF and drop its ack channel, then confirm the next
@@ -132,8 +139,15 @@ async fn reconnect_restamps_new_session_id() {
     // be stamped with it — NOT the stale 111.
     client.reconnect().await.expect("reconnect");
     assert_eq!(client.session_id(), 222, "reconnect adopts new session id");
-    client.send_batch_stamped(&mut f2).await.expect("resend batch 2");
-    assert_eq!(rx.recv().await.unwrap(), 222, "resent batch stamped with session 222");
+    client
+        .send_batch_stamped(&mut f2)
+        .await
+        .expect("resend batch 2");
+    assert_eq!(
+        rx.recv().await.unwrap(),
+        222,
+        "resent batch stamped with session 222"
+    );
 
     server.await.unwrap();
 }

@@ -92,7 +92,11 @@ impl LeaseGuard for ValkeyLease {
         // Compare-and-DEL: only delete the key if it is still our token.
         let res: Result<i64, Error> = self
             .client
-            .eval(RELEASE_LUA, vec![self.key.clone()], vec![self.token.clone()])
+            .eval(
+                RELEASE_LUA,
+                vec![self.key.clone()],
+                vec![self.token.clone()],
+            )
             .await;
         if let Err(e) = res {
             tracing::warn!(key = %self.key, error = %e, "lease release DEL failed; will expire via TTL");
@@ -183,7 +187,11 @@ fn spawn_renew(
         loop {
             tick.tick().await;
             let renewed: Result<i64, Error> = client
-                .eval(RENEW_LUA, vec![key.clone()], vec![token.clone(), ttl_ms.to_string()])
+                .eval(
+                    RENEW_LUA,
+                    vec![key.clone()],
+                    vec![token.clone(), ttl_ms.to_string()],
+                )
                 .await;
             match renewed {
                 Ok(1) => continue,

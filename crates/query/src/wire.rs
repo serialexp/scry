@@ -104,7 +104,11 @@ impl QueryRequest {
             // Empty bytes = absent (same sentinel convention as `sql`).
             // Present is always exactly 16 bytes (the CLI parser enforces
             // it); the receiver treats any other length as absent.
-            trace_id: self.query.trace_id.map(|id| id.to_vec()).unwrap_or_default(),
+            trace_id: self
+                .query
+                .trace_id
+                .map(|id| id.to_vec())
+                .unwrap_or_default(),
             // Empty string = absent (same sentinel convention as `sql`).
             body_contains: self.query.body_contains.clone().unwrap_or_default(),
         }
@@ -112,11 +116,7 @@ impl QueryRequest {
 
     /// Decode from the binschema wire shape. Inverse of `to_wire`.
     pub fn from_wire(w: QueryRequestOutput) -> Self {
-        let matchers = w
-            .matchers
-            .into_iter()
-            .map(|m| (m.name, m.value))
-            .collect();
+        let matchers = w.matchers.into_iter().map(|m| (m.name, m.value)).collect();
         let ts_min = if w.ts_min_present != 0 {
             Some(w.ts_min)
         } else {

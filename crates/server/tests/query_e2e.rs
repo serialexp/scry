@@ -48,8 +48,8 @@ use scry_block::{
 };
 use scry_catalog::Catalog;
 use scry_objstore::BufPool;
-use scry_proto::framing::{read_frame, write_frame};
 use scry_proto::constants::Signal;
+use scry_proto::framing::{read_frame, write_frame};
 use scry_proto::streaming::{DecodedSpan, LogsAppender, MetricsAppender, TracesAppender};
 use scry_proto::{QueryFrame, QueryFrameMsg};
 use scry_query::{BloomCache, PostingsCache, Query, QueryRequest};
@@ -108,7 +108,9 @@ async fn run_query(addr: std::net::SocketAddr, req: QueryRequest) -> QueryResult
     let request_frame = QueryFrame {
         msg: QueryFrameMsg::QueryRequest(req.to_wire().into()),
     };
-    write_frame(&mut w, &request_frame).await.expect("write request");
+    write_frame(&mut w, &request_frame)
+        .await
+        .expect("write request");
     w.flush().await.expect("flush request");
 
     let mut decoder = StreamDecoder::new();
@@ -408,13 +410,7 @@ fn logs_labels(pairs: &[(&str, &str)]) -> Vec<(Vec<u8>, Vec<u8>)> {
 /// shape. The body deliberately varies per-entry (`row {i}`) so a
 /// later substring-filter test would have something to match; today
 /// the body is just data.
-fn entries_for(
-    b: &mut LogsBlockBuilder,
-    fp: u64,
-    ts_start: u64,
-    n: u64,
-    severity: u8,
-) {
+fn entries_for(b: &mut LogsBlockBuilder, fp: u64, ts_start: u64, n: u64, severity: u8) {
     for i in 0..n {
         let body = format!("row {i} fp={fp:#x}");
         b.append_entry(
@@ -728,7 +724,11 @@ async fn traces_round_trip() {
             .downcast_ref::<FixedSizeBinaryArray>()
             .expect("trace_id column is FixedSizeBinary");
         for i in 0..arr.len() {
-            assert_eq!(arr.value(i), &trace_a[..], "by-id row carries a non-A trace_id");
+            assert_eq!(
+                arr.value(i),
+                &trace_a[..],
+                "by-id row carries a non-A trace_id"
+            );
         }
     }
 

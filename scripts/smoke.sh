@@ -3,14 +3,14 @@
 #
 # Sends a known number of batches through the wire path, runs the
 # storage pipeline (WAL → block → object store → online catalog),
-# then bootstraps a fresh catalog from the bucket via scry-list and
+# then bootstraps a fresh catalog from the bucket via scry list and
 # asserts:
 #
 #   * the new catalog's total row count equals exactly the number of
 #     records the sink accepted,
 #   * at least one block landed in the bucket, and
 #   * (metrics/logs/both) the reconciled catalog *queries back* the same
-#     row count through scry-query — i.e. ingest → store → query is
+#     row count through scry get — i.e. ingest → store → query is
 #     loss-free. This last leg is the v0.4 exit criterion: the headline
 #     of the logs milestone is querying logs back, so the seal proves the
 #     full round-trip live, not just that bytes landed in the bucket.
@@ -46,7 +46,7 @@
 #                                        #  four + the --trace-id lookup.
 #
 # Records-per-batch and the connection-summary counter parsed from
-# scry-ingestd's log are signal-specific. The per-signal record
+# scry ingest's log are signal-specific. The per-signal record
 # definitions match the server.rs counters:
 #
 #   dummy    → records  = DummyRecord count        (256/batch)
@@ -205,7 +205,7 @@ fi
 
 # ── Build ───────────────────────────────────────────────────────────
 echo "[smoke] building release binaries..."
-cargo build --release -p scry-ingestd -p noise-spewer -p scry-list -p scry-query -p scry-compact -p scry-retention >&2
+cargo build --release -p scry -p noise-spewer >&2
 
 # ── Clean slate ─────────────────────────────────────────────────────
 rm -rf "$SMOKE_DIR"
@@ -219,13 +219,13 @@ AWS_REGION="$SCRY_OBJSTORE_REGION" \
         s3 rm "s3://$SCRY_OBJSTORE_BUCKET/" --recursive >/dev/null || true
 
 # ── Run the pipeline ────────────────────────────────────────────────
-# scry-ingestd runs under /usr/bin/time so we can capture peak RSS +
+# scry ingest runs under /usr/bin/time so we can capture peak RSS +
 # user/sys CPU across its whole lifetime, including the final flush.
 # Time does NOT forward SIGINT to its child, so we send the shutdown
-# signal directly to scry-ingestd via its PID (found with pgrep).
-echo "[smoke] starting scry-ingestd on $LISTEN (signal=$SIGNAL)..."
+# signal directly to scry ingest via its PID (found with pgrep).
+echo "[smoke] starting scry ingest on $LISTEN (signal=$SIGNAL)..."
 RUST_LOG="${RUST_LOG:-info}" "$TIME_BIN" -v -o "$SMOKE_DIR/sink.time" \
-    ./target/release/scry-ingestd \
+    ./target/release/scry ingest \
         --listen "$LISTEN" \
         --storage \
         --wal-dir "$SMOKE_DIR/wal" \
@@ -233,7 +233,7 @@ RUST_LOG="${RUST_LOG:-info}" "$TIME_BIN" -v -o "$SMOKE_DIR/sink.time" \
         "${INGEST_EXTRA_ARGS[@]+"${INGEST_EXTRA_ARGS[@]}"}" \
     > "$SMOKE_DIR/sink.log" 2>&1 &
 TIME_PID=$!
-# Find the actual scry-ingestd child of /usr/bin/time. Fork+exec is
+# Find the actual scry ingest child of /usr/bin/time. Fork+exec is
 # fast but not instantaneous; poll briefly.
 SINK_PID=""
 for _ in $(seq 1 50); do
@@ -242,7 +242,7 @@ for _ in $(seq 1 50); do
     sleep 0.05
 done
 if [[ -z "$SINK_PID" ]]; then
-    echo "[smoke] could not locate scry-ingestd under time(pid=$TIME_PID)" >&2
+    echo "[smoke] could not locate scry ingest under time(pid=$TIME_PID)" >&2
     kill -9 "$TIME_PID" 2>/dev/null || true
     exit 1
 fi
@@ -296,7 +296,7 @@ fi
     > "$SMOKE_DIR/spewer.log" 2>&1
 
 
-echo "[smoke] SIGINT scry-ingestd → graceful flush..."
+echo "[smoke] SIGINT scry ingest → graceful flush..."
 kill -INT "$SINK_PID"
 # Wait on the time wrapper, not on the sink directly — time exits
 # after the sink does, AND it's the process that writes sink.time.
@@ -307,12 +307,12 @@ trap - EXIT
 
 # ── Verify ──────────────────────────────────────────────────────────
 echo "[smoke] reconciling a fresh catalog from the bucket..."
-./target/release/scry-list \
+./target/release/scry list \
     --catalog "$SMOKE_DIR/recon.sqlite" \
     > "$SMOKE_DIR/scry-list.txt" 2>&1
 cat "$SMOKE_DIR/scry-list.txt"
 
-# Parse the trailer line produced by scry-list:
+# Parse the trailer line produced by scry list:
 #   # 1 block(s) in catalog (bucket=scry-dev)
 #   <uuid>  <date>  rows=... bytes=... ts=...  signal=dummy  writer=...
 #   # total rows=204800 bytes=9952617
@@ -473,7 +473,7 @@ fi
 
 # ── Query round-trip (v0.4 exit criterion) ──────────────────────────
 # Ingest + storage is only half the milestone; the headline of v0.4 is
-# *querying logs back*. Drive the reconciled catalog through scry-query
+# *querying logs back*. Drive the reconciled catalog through scry get
 # (implicit `SELECT * FROM <table>`, stream-drained) and assert the
 # scanned row count equals what the bucket holds for that signal —
 # proving the ingest → store → query round-trip is loss-free.
@@ -497,10 +497,10 @@ if [[ "$SIGNAL" != "dummy" ]]; then
     for pair in "${query_pairs[@]}"; do
         sig="${pair%%:*}"
         exp="${pair##*:}"
-        # scry-query prints its trailer ("# scan: <N> rows total | ...")
+        # scry get prints its trailer ("# scan: <N> rows total | ...")
         # on stderr; `|| true` keeps set -e from aborting before we get
         # to assert on the parsed count.
-        ./target/release/scry-query \
+        ./target/release/scry get \
             --catalog "$SMOKE_DIR/recon.sqlite" \
             --signal "$sig" \
             > "$SMOKE_DIR/query.$sig.txt" 2>&1 || true
@@ -508,7 +508,7 @@ if [[ "$SIGNAL" != "dummy" ]]; then
         echo "[smoke] $sig queried rows  : ${queried:-<none>} (expected $exp)"
         if [[ "${queried:-}" != "$exp" ]]; then
             echo "[smoke] FAIL: $sig query returned ${queried:-<none>} rows, expected $exp (ingest→store→query lost rows)"
-            echo "[smoke] scry-query output:"
+            echo "[smoke] scry get output:"
             cat "$SMOKE_DIR/query.$sig.txt"
             failed=1
         fi
@@ -525,7 +525,7 @@ fi
 # implies `--signal traces`, so we deliberately omit `--signal` here to
 # exercise that inference too.
 if [[ "$SIGNAL" == "traces" || "$SIGNAL" == "all" ]]; then
-    ./target/release/scry-query \
+    ./target/release/scry get \
         --catalog "$SMOKE_DIR/recon.sqlite" \
         --signal traces \
         --show \
@@ -549,7 +549,7 @@ if [[ "$SIGNAL" == "traces" || "$SIGNAL" == "all" ]]; then
         cat "$SMOKE_DIR/query.traceid-pick.txt"
         failed=1
     else
-        ./target/release/scry-query \
+        ./target/release/scry get \
             --catalog "$SMOKE_DIR/recon.sqlite" \
             --trace-id "$pick_tid" \
             > "$SMOKE_DIR/query.traceid.txt" 2>&1 || true
@@ -557,7 +557,7 @@ if [[ "$SIGNAL" == "traces" || "$SIGNAL" == "all" ]]; then
         echo "[smoke] trace-id lookup    : ${pick_tid:0:16}… → ${tid_rows:-<none>} spans (expected $pick_n)"
         if [[ "${tid_rows:-}" != "$pick_n" ]]; then
             echo "[smoke] FAIL: --trace-id returned ${tid_rows:-<none>} spans, expected $pick_n (pruning/predicate bug)"
-            echo "[smoke] scry-query output:"
+            echo "[smoke] scry get output:"
             cat "$SMOKE_DIR/query.traceid.txt"
             failed=1
         fi
@@ -581,7 +581,7 @@ if [[ "$SIGNAL" == "logs" || "$SIGNAL" == "both" || "$SIGNAL" == "all" ]]; then
     esac
 
     # (1a) bloom-accelerated grep path.
-    ./target/release/scry-query \
+    ./target/release/scry get \
         --catalog "$SMOKE_DIR/recon.sqlite" \
         --grep processed \
         > "$SMOKE_DIR/query.grep.txt" 2>&1 || true
@@ -589,7 +589,7 @@ if [[ "$SIGNAL" == "logs" || "$SIGNAL" == "both" || "$SIGNAL" == "all" ]]; then
 
     # (1b) un-accelerated LIKE scan over the same column (no --grep → no
     # body_contains → no bloom skip; pure DataFusion substring scan).
-    ./target/release/scry-query \
+    ./target/release/scry get \
         --catalog "$SMOKE_DIR/recon.sqlite" \
         --signal logs \
         --sql "SELECT * FROM logs WHERE body LIKE '%processed%'" \
@@ -610,7 +610,7 @@ if [[ "$SIGNAL" == "logs" || "$SIGNAL" == "both" || "$SIGNAL" == "all" ]]; then
     fi
 
     # (2) absent token → bloom prunes every block → zero rows.
-    ./target/release/scry-query \
+    ./target/release/scry get \
         --catalog "$SMOKE_DIR/recon.sqlite" \
         --grep "zzqq-no-such-token-xyz" \
         > "$SMOKE_DIR/query.grep-miss.txt" 2>&1 || true
@@ -630,7 +630,7 @@ if [[ "$SIGNAL" == "logs" || "$SIGNAL" == "both" || "$SIGNAL" == "all" ]]; then
     # LIKE scan. This is the equivalence that proves selective skipping is
     # loss-free, not just the all-match / no-match extremes. (rand8 is
     # alphanumeric, so it's safe to interpolate into LIKE and --grep.)
-    ./target/release/scry-query \
+    ./target/release/scry get \
         --catalog "$SMOKE_DIR/recon.sqlite" \
         --signal logs --show \
         --sql "SELECT body FROM logs LIMIT 1" \
@@ -650,12 +650,12 @@ if [[ "$SIGNAL" == "logs" || "$SIGNAL" == "both" || "$SIGNAL" == "all" ]]; then
         echo "[smoke] body-pick output:"; cat "$SMOKE_DIR/query.body-pick.txt"
         failed=1
     else
-        ./target/release/scry-query \
+        ./target/release/scry get \
             --catalog "$SMOKE_DIR/recon.sqlite" \
             --grep "$needle_tok" \
             > "$SMOKE_DIR/query.grep-sel.txt" 2>&1 || true
         sel_grep=$(awk '/^# scan:/ { print $3; exit }' "$SMOKE_DIR/query.grep-sel.txt")
-        ./target/release/scry-query \
+        ./target/release/scry get \
             --catalog "$SMOKE_DIR/recon.sqlite" \
             --signal logs \
             --sql "SELECT * FROM logs WHERE body LIKE '%${needle_tok}%'" \
@@ -713,7 +713,7 @@ if [[ "${COMPACT:-1}" == "1" ]] \
     # One pass over a dedicated catalog reconciled fresh from the bucket
     # by the tool itself. Merges the COMPACT_FANOUT smallest L0 logs
     # blocks into one L1 block, supersedes + deletes the inputs (grace 0).
-    ./target/release/scry-compact \
+    ./target/release/scry compact \
         --catalog "$SMOKE_DIR/compact.sqlite" \
         --signal logs \
         --fanout "$COMPACT_FANOUT" \
@@ -723,7 +723,7 @@ if [[ "${COMPACT:-1}" == "1" ]] \
 
     # Reconcile a *fresh* catalog from the post-compaction bucket so every
     # assertion below reads bucket truth, not the compactor's own catalog.
-    ./target/release/scry-list \
+    ./target/release/scry list \
         --catalog "$SMOKE_DIR/recon-post.sqlite" \
         > "$SMOKE_DIR/scry-list-post.txt" 2>&1
 
@@ -746,7 +746,7 @@ if [[ "${COMPACT:-1}" == "1" ]] \
 
     # (c) lossless + inputs reaped: a fresh reconcile still queries back the
     #     same logs row count.
-    ./target/release/scry-query \
+    ./target/release/scry get \
         --catalog "$SMOKE_DIR/recon-post.sqlite" \
         --signal logs \
         > "$SMOKE_DIR/query.logs-post.txt" 2>&1 || true
@@ -754,12 +754,12 @@ if [[ "${COMPACT:-1}" == "1" ]] \
     echo "[smoke] post-compaction logs rows  : ${post_rows:-<none>} (expected $compact_exp)"
     if [[ "${post_rows:-}" != "$compact_exp" ]]; then
         echo "[smoke] FAIL: post-compaction logs query returned ${post_rows:-<none>} rows, expected $compact_exp (merge lossy or inputs not reaped)"
-        echo "[smoke] scry-query output:"; cat "$SMOKE_DIR/query.logs-post.txt"
+        echo "[smoke] scry get output:"; cat "$SMOKE_DIR/query.logs-post.txt"
         failed=1
     fi
 
     # (d) the rebuilt body bloom still serves --grep over the merged block.
-    ./target/release/scry-query \
+    ./target/release/scry get \
         --catalog "$SMOKE_DIR/recon-post.sqlite" \
         --grep processed \
         > "$SMOKE_DIR/query.grep-post.txt" 2>&1 || true
@@ -783,7 +783,7 @@ if [[ "${RETAIN:-1}" == "1" ]] \
     echo "[smoke] ──── retention (v0.8) ────"
 
     # Baseline live counts from a fresh reconcile (post-compaction truth).
-    ./target/release/scry-list --catalog "$SMOKE_DIR/retain-base.sqlite" \
+    ./target/release/scry list --catalog "$SMOKE_DIR/retain-base.sqlite" \
         > "$SMOKE_DIR/scry-list-retain-base.txt" 2>&1
     base_logs=$(sqlite3 "$SMOKE_DIR/retain-base.sqlite" \
         "SELECT COUNT(*) FROM blocks WHERE signal='logs' AND superseded_by IS NULL AND deleted_at IS NULL;")
@@ -794,7 +794,7 @@ if [[ "${RETAIN:-1}" == "1" ]] \
     # (a) Dry-run, --ttl-logs 0s: every logs block is a candidate (ts_max is
     #     in the past), but WITHOUT --apply nothing is deleted. The reaper
     #     must report candidates yet leave the bucket untouched.
-    ./target/release/scry-retention \
+    ./target/release/scry retention \
         --catalog "$SMOKE_DIR/retain-dry.sqlite" \
         --ttl-logs 0s \
         > "$SMOKE_DIR/retain-dry.txt" 2>&1 || true
@@ -807,7 +807,7 @@ if [[ "${RETAIN:-1}" == "1" ]] \
         echo "[smoke] FAIL: dry-run deleted a block — must be inert without --apply"
         failed=1
     fi
-    ./target/release/scry-list --catalog "$SMOKE_DIR/retain-after-dry.sqlite" \
+    ./target/release/scry list --catalog "$SMOKE_DIR/retain-after-dry.sqlite" \
         > /dev/null 2>&1
     after_dry_logs=$(sqlite3 "$SMOKE_DIR/retain-after-dry.sqlite" \
         "SELECT COUNT(*) FROM blocks WHERE signal='logs' AND superseded_by IS NULL AND deleted_at IS NULL;")
@@ -819,11 +819,11 @@ if [[ "${RETAIN:-1}" == "1" ]] \
 
     # (b) Apply, --ttl-logs 0s: all logs blocks reaped; metrics (no TTL)
     #     untouched (signal-scoping, proven end-to-end via fresh reconcile).
-    ./target/release/scry-retention \
+    ./target/release/scry retention \
         --catalog "$SMOKE_DIR/retain-apply.sqlite" \
         --ttl-logs 0s --apply \
         > "$SMOKE_DIR/retain-apply.txt" 2>&1 || true
-    ./target/release/scry-list --catalog "$SMOKE_DIR/retain-after.sqlite" \
+    ./target/release/scry list --catalog "$SMOKE_DIR/retain-after.sqlite" \
         > "$SMOKE_DIR/scry-list-retain-after.txt" 2>&1
     after_logs=$(sqlite3 "$SMOKE_DIR/retain-after.sqlite" \
         "SELECT COUNT(*) FROM blocks WHERE signal='logs' AND superseded_by IS NULL AND deleted_at IS NULL;")

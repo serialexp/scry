@@ -147,8 +147,13 @@ async fn metrics_block_roundtrip() {
     let meta_path = ObjPath::from(format!("{prefix}.meta.json"));
 
     let main_bytes: Bytes = store.get(&main_path).await.unwrap().bytes().await.unwrap();
-    let postings_bytes: Bytes =
-        store.get(&postings_path).await.unwrap().bytes().await.unwrap();
+    let postings_bytes: Bytes = store
+        .get(&postings_path)
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
     let meta_bytes: Bytes = store.get(&meta_path).await.unwrap().bytes().await.unwrap();
 
     // ── Main parquet shape ────────────────────────────────────────

@@ -66,7 +66,11 @@ impl EvictOnNotFound {
     /// Whether anything has been evicted (without draining). Cheap predicate
     /// for the driver's "should I re-plan?" check.
     pub fn has_evictions(&self) -> bool {
-        !self.evicted.lock().expect("eviction set poisoned").is_empty()
+        !self
+            .evicted
+            .lock()
+            .expect("eviction set poisoned")
+            .is_empty()
     }
 
     /// If `result` is `NotFound`, parse the block UUID from `location` and
@@ -199,7 +203,10 @@ mod tests {
     async fn records_uuid_on_notfound_get() {
         let store = EvictOnNotFound::new(Arc::new(InMemory::new()));
         let uuid = Uuid::now_v7();
-        let missing = Path::from(format!("metrics/2026/05/31/{}/{uuid}.parquet", Uuid::now_v7()));
+        let missing = Path::from(format!(
+            "metrics/2026/05/31/{}/{uuid}.parquet",
+            Uuid::now_v7()
+        ));
 
         assert!(!store.has_evictions());
         let r = store.get_opts(&missing, GetOptions::default()).await;

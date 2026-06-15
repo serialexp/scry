@@ -1,13 +1,11 @@
-//! scry-queryd — long-running query daemon (binschema-over-TCP).
+//! `scry query` — long-running query daemon (binschema-over-TCP).
 //!
-//! The architectural counterpart to `scry-ingestd`: where `scry-ingestd`
-//! exposes `scry-server::Server` (ingest) as a process, this binary
-//! exposes `scry-server::QueryService` (query) over the same length-
-//! prefixed binschema framing pattern as ingest — `QueryFrame`s
-//! defined in `proto/query.schema.json`, one TCP connection per
-//! query. (Arrow Flight was the v0.3 step 2 transport; step 5
-//! replaced it with binschema to keep one wire vocabulary across
-//! ingest + query.) Same shape end-to-end:
+//! The architectural counterpart to `scry ingest`: where ingest exposes
+//! `scry-server::Server` (ingest) as a process, this exposes
+//! `scry-server::QueryService` (query) over the same length-prefixed
+//! binschema framing pattern as ingest — `QueryFrame`s defined in
+//! `proto/query.schema.json`, one TCP connection per query. Same shape
+//! end-to-end:
 //!
 //! 1. Parse flags + env (`SCRY_OBJSTORE_*` for store, `SCRY_OBJSTORE_POOL_*`
 //!    for buffer pool, `RUST_LOG` for tracing).
@@ -25,7 +23,7 @@
 //! Run (after `source docker/garage/.env`):
 //!
 //! ```bash
-//! scry-queryd \
+//! scry query \
 //!     --catalog ./online.sqlite \
 //!     --listen 127.0.0.1:4100 \
 //!     --pool-warmup-count 8
@@ -34,7 +32,7 @@
 //! Connect from the CLI:
 //!
 //! ```bash
-//! scry-query --remote 127.0.0.1:4100 \
+//! scry get --remote 127.0.0.1:4100 \
 //!     --matcher __name__=scry_http_requests_total
 //! ```
 
@@ -60,19 +58,11 @@ use uuid::Uuid;
 /// Block-event channels the convergence loops follow (every signal).
 const ALL_SIGNALS: [&str; 5] = ["dummy", "metrics", "logs", "traces", "profiles"];
 
-/// Swap glibc's malloc for mimalloc — same reasoning as `scry-query`
-/// (large response Vecs go via `mmap` under glibc which forces a fresh
-/// kernel page-zero on first write; mimalloc keeps these inside its
-/// own segments and reuses them across allocations within the
-/// process). For the daemon the win compounds: every query reuses the
-/// allocator's warmth.
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
+/// CLI arguments for the `scry query` subcommand (the query daemon).
 #[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
-struct Args {
-    /// Listen address for the Arrow Flight server.
+#[command(about = "Long-running query daemon (binschema QueryFrame wire over TCP)")]
+pub struct Args {
+    /// Listen address for the query wire server.
     #[arg(long, default_value = "127.0.0.1:4100")]
     listen: SocketAddr,
 
@@ -84,7 +74,7 @@ struct Args {
 
     // ── Buffer-pool knobs (override env / defaults) ──────────────
     //
-    // Identical semantics to scry-query's `--pool-*` flags. For the
+    // Identical semantics to `scry get`'s `--pool-*` flags. For the
     // daemon, set `--pool-warmup-count` high enough that the *first*
     // query against the daemon doesn't pay the page-fault tax for
     // the per-fetch response Vecs; subsequent queries reuse via the
@@ -166,16 +156,8 @@ struct Args {
     full_walk_interval: u64,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-    let args = Args::parse();
-
+/// Run the query daemon until ctrl-c.
+pub async fn run(args: Args) -> Result<()> {
     let cfg = ObjStoreConfig::from_env()
         .context("loading SCRY_OBJSTORE_* env (try `source docker/garage/.env`)")?;
 
@@ -210,8 +192,8 @@ async fn main() -> Result<()> {
     ));
 
     // Postings cache: env defaults, overridden by --postings-cache-bytes.
-    let mut cache_cfg = PostingsCacheConfig::from_env()
-        .context("parsing SCRY_POSTINGS_CACHE_BYTES env var")?;
+    let mut cache_cfg =
+        PostingsCacheConfig::from_env().context("parsing SCRY_POSTINGS_CACHE_BYTES env var")?;
     if let Some(v) = args.postings_cache_bytes {
         cache_cfg.budget_bytes = v;
     }
@@ -391,7 +373,10 @@ async fn run_consumer(url: String, catalog: Arc<Mutex<Catalog>>) {
                             }
                         }
                         Err(RecvError::Lagged(n)) => {
-                            warn!(skipped = n, "convergence consumer lagged; polling will backstop")
+                            warn!(
+                                skipped = n,
+                                "convergence consumer lagged; polling will backstop"
+                            )
                         }
                         Err(RecvError::Closed) => {
                             warn!("convergence subscription closed; reconnecting");

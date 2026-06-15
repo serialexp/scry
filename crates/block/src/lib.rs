@@ -203,7 +203,9 @@ impl BlockBuilderConfig {
     /// smaller (2026-05).
     pub fn main_writer_props(&self) -> Result<WriterProperties> {
         Ok(WriterProperties::builder()
-            .set_compression(Compression::ZSTD(ZstdLevel::try_new(self.compression_level)?))
+            .set_compression(Compression::ZSTD(ZstdLevel::try_new(
+                self.compression_level,
+            )?))
             .set_max_row_group_row_count(Some(self.row_group_size))
             .set_dictionary_enabled(false)
             .build())
@@ -219,7 +221,9 @@ impl BlockBuilderConfig {
     /// apply here; we keep parquet's default dictionary behaviour.
     pub fn postings_writer_props(&self) -> Result<WriterProperties> {
         Ok(WriterProperties::builder()
-            .set_compression(Compression::ZSTD(ZstdLevel::try_new(self.compression_level)?))
+            .set_compression(Compression::ZSTD(ZstdLevel::try_new(
+                self.compression_level,
+            )?))
             .set_max_row_group_row_count(Some(self.row_group_size))
             .build())
     }
@@ -238,8 +242,8 @@ pub fn block_path(
     kind: &str,
 ) -> String {
     let secs = (ts_min_unix_nano / 1_000_000_000) as i64;
-    let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0)
-        .unwrap_or_else(chrono::Utc::now);
+    let dt =
+        chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0).unwrap_or_else(chrono::Utc::now);
     format!(
         "{signal}/{}/{}/{}/{}/{}.{}",
         dt.format("%Y"),

@@ -1234,8 +1234,8 @@ metadata to load on every query) while bounding the write
 amplification cost.
 
 > **Implementation status (v0.8, D-036).** The shipped subset is
-> **single-instance** and runs as a **standalone tool** (`scry-compact`,
-> `--once` / `--watch`), not yet as an in-`scry-ingestd` background task.
+> **single-instance** and runs as a **standalone tool** (`scry compact`,
+> `--once` / `--watch`), not yet as an in-process background task (under `scry ingest`).
 > It implements the tiered levels, the size-tiered policy, and the
 > per-merge sequence below — with three deliberate simplifications:
 > (1) **no compaction lease.** There is one compactor, so the
@@ -1257,8 +1257,8 @@ amplification cost.
 > [Retention](#retention) status note below.
 
 > **Implementation status (v0.9, D-038/D-039).** Compaction (and
-> retention) are now **multi-instance**, running as in-`scry-ingestd`
-> background loops under `--mode full`. Two corrections to the v0.8 note
+> retention) are now **multi-instance**, running as in-process
+> background loops under `scry ingest --mode full`. Two corrections to the v0.8 note
 > above: (1) the lease is **no longer deferred** — it is a **Valkey**
 > lease (`SET NX PX` + Lua compare-and-set), not the object-store
 > `If-None-Match` lease, which **cannot** implement mutual exclusion on
@@ -1274,8 +1274,8 @@ amplification cost.
 > **grace=0** immediate input deletion (a stale peer's sequential re-merge
 > 404s at the input GET and aborts before committing). Convergence across
 > instances is three-tier (pub/sub → cursor poll → full walk); see
-> [Synchronisation](#synchronisation). The standalone `scry-compact` /
-> `scry-retention` CLIs still run **unfenced** as the single-instance
+> [Synchronisation](#synchronisation). The standalone `scry compact` /
+> `scry retention` CLIs still run **unfenced** as the single-instance
 > path. See `docs/decisions.md § D-038` and `§ D-039`.
 
 ### Tiered levels
@@ -1581,8 +1581,8 @@ prefix-delete. No partial-block resurrection logic. No
 "open the block and find old records" scan.
 
 > **Implementation status (v0.8, D-037).** Shipped as a **standalone
-> tool** (`scry-retention`, `--watch` / one-shot), not yet an
-> in-`scry-ingestd` background task, and **single-instance** (no
+> tool** (`scry retention`, `--watch` / one-shot), not yet an
+> in-process background task (under `scry ingest`), and **single-instance** (no
 > distributed lease — shared deferral with compaction). Two deliberate
 > choices on top of the sketch above: (1) **opt-in per signal, no
 > implicit deletion.** A signal is reaped only when a TTL is configured
@@ -1604,11 +1604,11 @@ prefix-delete. No partial-block resurrection logic. No
 > size/quota-based eviction (retention is purely age-based).
 
 > **Implementation status (v0.9, D-038/D-039).** Retention now runs as an
-> in-`scry-ingestd` background loop under `--mode full`, guarded by **one
+> in-process background loop under `scry ingest --mode full`, guarded by **one
 > global Valkey retention lease** (`scry/lease/retention`) — so exactly
 > one instance reaps at a time. The reap fences before `mark_deleted` and
 > again before the object delete; a lost lease aborts with inputs intact.
-> The standalone `scry-retention` CLI still runs **unfenced** as the
+> The standalone `scry retention` CLI still runs **unfenced** as the
 > single-instance path. The multi-instance lease is no longer deferred;
 > see `docs/decisions.md § D-038`.
 

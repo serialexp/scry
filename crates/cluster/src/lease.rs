@@ -88,7 +88,10 @@ pub struct LocalGuard {
 impl LocalGuard {
     fn relinquish(&self) {
         self.fence.0.store(false, Ordering::SeqCst);
-        self.held.lock().expect("held set poisoned").remove(&self.key);
+        self.held
+            .lock()
+            .expect("held set poisoned")
+            .remove(&self.key);
     }
 }
 
@@ -163,10 +166,17 @@ mod tests {
         let p = LocalLeaseProvider::new();
         {
             let _g = p.try_acquire("k", Duration::from_secs(1)).await.unwrap();
-            assert!(p.try_acquire("k", Duration::from_secs(1)).await.unwrap().is_none());
+            assert!(p
+                .try_acquire("k", Duration::from_secs(1))
+                .await
+                .unwrap()
+                .is_none());
         }
         assert!(
-            p.try_acquire("k", Duration::from_secs(1)).await.unwrap().is_some(),
+            p.try_acquire("k", Duration::from_secs(1))
+                .await
+                .unwrap()
+                .is_some(),
             "dropping the guard frees the key"
         );
     }

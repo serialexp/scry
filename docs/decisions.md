@@ -2195,3 +2195,65 @@ rows). Pod-label SD needs the k8s pod watch the smoke omits → proven by the
 `pod_matches` / `build_scrape_target` unit tests (same approach as D-047
 feature 2). Known gaps vs Prometheus/Alloy (deferred): Service/Endpoints SD,
 per-job TLS for pod-SD targets, mTLS client certs, hot config reload.
+
+## D-049: One `scry` multicall binary — the operator bins are subcommands
+
+**Date:** 2026-06-15
+**Status:** accepted
+
+scry has always been framed as an "opinionated **single-binary** replacement for
+the Grafana stack," but the workspace shipped nine separate operator binaries
+(`scry-ingestd`, `scry-queryd`, `scry-query`, `scry-list`, `scry-agent`,
+`scry-gateway`, `scry-webui`, `scry-compact`, `scry-retention`). D-049 makes the
+single-binary promise real: one `scry` binary dispatches every operator role via
+a clap subcommand.
+
+**Subcommand map (locked with Bart).**
+
+| subcommand      | former binary    | role |
+|-----------------|------------------|------|
+| `scry ingest`   | `scry-ingestd`   | ingest server daemon |
+| `scry query`    | `scry-queryd`    | query **daemon** (binschema wire on :4100) |
+| `scry get`      | `scry-query`     | one-shot query **CLI** |
+| `scry list`     | `scry-list`      | catalog inspector / reconciler |
+| `scry agent`    | `scry-agent`     | k8s log-collection + scrape agent |
+| `scry gateway`  | `scry-gateway`   | foreign-protocol fan-out hub |
+| `scry web`      | `scry-webui`     | browser query UI + relay |
+| `scry compact`  | `scry-compact`   | size-tiered compaction |
+| `scry retention`| `scry-retention` | per-signal TTL retention |
+
+The **`query` vs `get` split** resolves a naming collision: the daemon and the
+one-shot CLI both wanted "query." The daemon keeps `scry query` (it's the
+long-lived counterpart to `scry ingest`); the one-shot CLI becomes `scry get`
+(you *get* a result and exit). The website's two-role mental model — `scry
+ingest ×N`, `scry query ×N`, both scaling independently — drove the daemon
+keeping the `query` name.
+
+**Mechanics.** Each former-bin crate is now **library-only**: it exposes a
+`pub struct Args` (still deriving `clap::Parser`, so it embeds as a
+subcommand-variant payload) and a `pub async fn run(args: Args) ->
+anyhow::Result<()>` carrying the old `main` body minus the `Args::parse()` and
+the per-crate `tracing_subscriber` init. The new `crates/scry` bin owns the
+clap `Subcommand` enum, a **single** `tracing_subscriber` init, and the **single**
+process-global `#[global_allocator]` (mimalloc) — a binary may declare only one,
+so the per-daemon allocators all collapse here. Package names are unchanged
+(`scry-ingestd` is still the crate; it just no longer has a `[[bin]]`), so the
+dispatcher imports `scry_ingestd::{Args, run}` etc. **Hard replace** (Rule #8):
+no compat shims, no old binary names — the Dockerfile builds one `scry`, k8s
+manifests set `command: ["scry","<role>",…]`, smoke scripts invoke `scry
+<role>`, and the StatefulSet/Deployment were renamed `scry-ingest`/`scry-query`
+to match the site.
+
+**Dev harnesses stay separate.** `noise-spewer` (load generator) and
+`scry-gateway-probe` (gateway fixture builder) are NOT folded in — they're
+test-only and keep their own `[[bin]]` targets, built explicitly by the smoke
+scripts.
+
+**Status.** Implemented: `crates/scry/{Cargo.toml,src/main.rs}` (dispatcher);
+the nine role crates lib-ified (`Args` + `run`, `[[bin]]`→`[lib]`, mimalloc/
+tracing-subscriber deps dropped where they only served the bin); `Dockerfile`
+builds/copies one `scry`; `deploy/k8s/*` commands + resource names updated;
+`scripts/smoke*.sh` + `scripts/profile-query*.sh` rewritten to subcommand form;
+website hero one-shot example → `scry get`. The full smoke suite is the exit
+criterion — a green run proves subcommand dispatch is behaviour-identical to the
+old per-bin invocations.

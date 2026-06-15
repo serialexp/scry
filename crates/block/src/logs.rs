@@ -50,9 +50,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use arrow::array::{
-    ArrayRef, MapBuilder, StringArray, StringBuilder, UInt64Array, UInt8Array,
-};
+use arrow::array::{ArrayRef, MapBuilder, StringArray, StringBuilder, UInt64Array, UInt8Array};
 use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
@@ -306,10 +304,7 @@ impl LogsBlockBuilder {
     /// Body of [`BlockBuilder::finish_and_upload`]. Split out for
     /// the `mut self` rebinding ergonomic — see `dummy.rs` /
     /// `metrics.rs` for the same pattern.
-    async fn finish_and_upload_impl(
-        self,
-        store: &dyn ObjectStore,
-    ) -> Result<Option<BlockMeta>> {
+    async fn finish_and_upload_impl(self, store: &dyn ObjectStore) -> Result<Option<BlockMeta>> {
         if self.is_empty() {
             return Ok(None);
         }
@@ -373,11 +368,7 @@ impl LogsBlockBuilder {
         // attribute map. MapBuilder's defaults
         // ("entries"/"keys"/"values") match the schema field names
         // declared in `main_schema()` above.
-        let mut attr_builder = MapBuilder::new(
-            None,
-            StringBuilder::new(),
-            StringBuilder::new(),
-        );
+        let mut attr_builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
         for &i in order.iter() {
             for (k, v) in &self.attributes[i as usize] {
                 attr_builder.keys().append_value(k);
@@ -422,7 +413,8 @@ impl LogsBlockBuilder {
         {
             let mut w = ArrowWriter::try_new(&mut main_buf, main_schema, Some(props.clone()))
                 .context("ArrowWriter::try_new (logs main)")?;
-            w.write(&main_batch).context("ArrowWriter::write (logs main)")?;
+            w.write(&main_batch)
+                .context("ArrowWriter::write (logs main)")?;
             w.close().context("ArrowWriter::close (logs main)")?;
         }
         let main_bytes = Bytes::from(main_buf);
@@ -441,8 +433,7 @@ impl LogsBlockBuilder {
 
         // ── Sidecar JSON ───────────────────────────────────────────
         let block_uuid = Uuid::now_v7();
-        let all_fingerprints: Vec<u64> =
-            self.stream_dict.iter().map(|s| s.fingerprint).collect();
+        let all_fingerprints: Vec<u64> = self.stream_dict.iter().map(|s| s.fingerprint).collect();
         let meta = BlockMeta {
             uuid: block_uuid,
             signal: SIGNAL.to_string(),
@@ -467,9 +458,8 @@ impl LogsBlockBuilder {
             has_body_bloom: true,
             body_bloom_size_bytes: Some(bloom_size),
         };
-        let meta_bytes = Bytes::from(
-            serde_json::to_vec_pretty(&meta).context("serialising logs BlockMeta")?,
-        );
+        let meta_bytes =
+            Bytes::from(serde_json::to_vec_pretty(&meta).context("serialising logs BlockMeta")?);
 
         // ── Upload order: main → postings → meta ───────────────────
         //

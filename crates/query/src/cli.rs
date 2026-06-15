@@ -1,61 +1,35 @@
-//! scry-query — DataFusion-backed metrics querier CLI (v0.3).
+//! `scry get` — DataFusion-backed one-shot querier CLI (was the `scry-query` bin).
 //!
 //! Opens a SQLite catalog + the configured object store (same
-//! `SCRY_OBJSTORE_*` env vars as scry-ingestd + scry-list), pre-resolves
+//! `SCRY_OBJSTORE_*` env vars as `scry ingest` + `scry list`), pre-resolves
 //! AND'd label matchers via the postings sidecars, registers the
-//! result as a DataFusion `metrics` table, and either:
+//! result as a DataFusion table for the chosen signal, and either:
 //!
 //! * Runs `--sql` (if given) against the registered table, or
-//! * `SELECT * FROM metrics` for the v0.2-compatible "dump matching
-//!   samples" shape.
+//! * `SELECT * FROM <table>` for the "dump matching rows" shape.
 //!
 //! By default the CLI **drains** the result stream without printing
-//! rows — at v0.3 the binary's job is "did the scan work, what did
-//! it cost?", not "render a million UInt64s onto a terminal".
-//! Profile evidence (`flamegraphs/20260527T020354Z-selective-df-v2.svg`)
-//! showed 22.5% of wall in `pretty_format_batches`/`comfy_table` for
-//! the 1M-row dump case — pure throw-away formatting cost. Pass
-//! `--show` to opt into pretty-printing (small result sets only).
-//! The per-block scan trailer always prints on stderr.
-//!
-//! Per-block pruning trailer comes from the produced `ExecutionPlan`'s
-//! `MetricsSet`: rows pruned at the row-group level, files read,
-//! etc. Same architectural payoff signal the v0.2 CLI surfaced, just
-//! sourced from DataFusion's own counters.
+//! rows — the binary's job is "did the scan work, what did it cost?",
+//! not "render a million UInt64s onto a terminal". Pass `--show` to opt
+//! into pretty-printing (small result sets only). The per-block scan
+//! trailer always prints on stderr.
 //!
 //! Run (after `source docker/garage/.env`):
 //!
 //! ```bash
-//! scry-query \
+//! scry get \
 //!     --catalog ./online.sqlite \
 //!     --matcher __name__=scry_http_requests_total \
 //!     --matcher env=prod
 //!
-//! scry-query --catalog ./online.sqlite \
+//! scry get --catalog ./online.sqlite \
 //!     --matcher __name__=scry_http_requests_total \
 //!     --sql 'SELECT count(*) FROM metrics'
 //! ```
 
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
-
-/// Swap glibc's malloc for mimalloc.
-///
-/// The query hot path's biggest cost on the dump case was kernel
-/// page-fault servicing (~30% of wall on the v0.3 DWARF profile —
-/// `clear_page_erms` + `do_anonymous_page`). Root cause: every
-/// per-range `Vec<u8>` allocated for an HTTP body goes past glibc's
-/// ~128 KB `mmap` threshold, so each fetch is a fresh `mmap` → fresh
-/// kernel page-zeroing on first write → `munmap` on Drop. The next
-/// query repeats the whole dance.
-///
-/// mimalloc keeps large allocations inside its own segment heaps and
-/// reuses pages across allocations within the process, sidestepping
-/// the `mmap`/`munmap` churn entirely. Same allocator that
-/// `scry-ingestd` uses for the ingest hot path, applied here for the
-/// same reason.
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use arrow::util::pretty::pretty_format_batches;
@@ -68,6 +42,7 @@ use datafusion::physical_plan::{
     collect, display::DisplayableExecutionPlan, execute_stream, ExecutionPlan,
 };
 use futures::StreamExt;
+use object_store::ObjectStore;
 use scry_catalog::Catalog;
 use scry_objstore::{open_with_pool_config, BufPool, BufPoolConfig, ObjStoreConfig};
 use scry_proto::{
@@ -75,29 +50,29 @@ use scry_proto::{
     framing::{read_frame, write_frame},
     QueryFrame, QueryFrameMsg,
 };
-use scry_query::{
+use tokio::io::{BufReader as TokioBufReader, BufWriter as TokioBufWriter};
+use tokio::net::TcpStream;
+
+use crate::{
     logs::{register_logs_table, LOGS_TABLE_NAME},
     profiles::{register_profiles_table, PROFILES_TABLE_NAME},
     register_metrics_table,
     traces::{register_traces_table, TRACES_TABLE_NAME},
     EvictOnNotFound, Query, QueryRequest, METRICS_TABLE_NAME,
 };
-use std::sync::Arc;
-use object_store::ObjectStore;
-use tokio::io::{BufReader as TokioBufReader, BufWriter as TokioBufWriter};
-use tokio::net::TcpStream;
 
+/// CLI arguments for the `scry get` subcommand.
 #[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
-struct Args {
+#[command(about = "One-shot query against a catalog (local) or a running query daemon (--remote)")]
+pub struct Args {
     /// Path to the SQLite catalog file. Required for local mode;
     /// ignored when `--remote` is set (the daemon owns the catalog).
     #[arg(long, conflicts_with = "remote", required_unless_present = "remote")]
     catalog: Option<PathBuf>,
 
-    /// `host:port` of a running `scry-queryd`. When set, the query is
-    /// sent over Arrow Flight instead of evaluated locally. The
-    /// matcher/from/until/limit/sql flags get serialised into the
+    /// `host:port` of a running query daemon. When set, the query is
+    /// sent over the binschema query wire instead of evaluated locally.
+    /// The matcher/from/until/limit/sql flags get serialised into the
     /// request; pool flags are ignored (the daemon owns the pool).
     /// The local trailer collapses to "rows total (via remote)" — the
     /// per-block scan stats live in the daemon's logs.
@@ -166,9 +141,9 @@ struct Args {
     explain: bool,
 
     /// Pretty-print result rows to stdout via `comfy_table`. Off by
-    /// default — at v0.3 we care that the scan ran + what it cost,
-    /// not about painting a million rows onto a TTY. Suitable for
-    /// small result sets (an aggregate via `--sql`, or `--limit N`).
+    /// default — we care that the scan ran + what it cost, not about
+    /// painting a million rows onto a TTY. Suitable for small result
+    /// sets (an aggregate via `--sql`, or `--limit N`).
     #[arg(long)]
     show: bool,
 
@@ -275,16 +250,9 @@ fn parse_trace_id(raw: &str) -> Result<[u8; 16], String> {
     Ok(out)
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .init();
-    let args = Args::parse();
-
+/// Run a one-shot query: local (over a catalog + bucket) or `--remote`
+/// (over the query daemon's wire).
+pub async fn run(args: Args) -> Result<()> {
     // `--trace-id` is a traces-only operation. If the user passed it
     // without an explicit `--signal traces`, infer the signal; if they
     // explicitly asked for a *different* signal, that's a usage error.
@@ -366,7 +334,7 @@ async fn main() -> Result<()> {
     // The postings GETs + per-block fingerprint resolve happen inside
     // the register call; once it returns, the table is fully pre-
     // narrowed and `scan()` is pure CPU. We branch on the requested
-    // signal so `scry-query --signal logs ...` registers `logs`
+    // signal so `scry get --signal logs ...` registers `logs`
     // instead of `metrics`.
     // Wrap the store so a peer's deletion (another instance compacting or
     // reaping the same bucket) surfaces as an evict-and-re-plan rather than a
@@ -383,9 +351,7 @@ async fn main() -> Result<()> {
         loop {
             let ctx = SessionContext::new();
             let reg = match signal.0 {
-                Signal::Metrics => {
-                    register_metrics_table(&ctx, &catalog, store.clone(), &q).await
-                }
+                Signal::Metrics => register_metrics_table(&ctx, &catalog, store.clone(), &q).await,
                 Signal::Logs => register_logs_table(&ctx, &catalog, store.clone(), &q).await,
                 Signal::Traces => register_traces_table(&ctx, &catalog, store.clone(), &q).await,
                 Signal::Profiles => {
@@ -442,8 +408,7 @@ async fn main() -> Result<()> {
     //   * `--show`: collect everything, pretty-print via comfy_table.
     //     Suitable for small result sets (an aggregate, a `--limit N`).
     //     For 1M-row dumps this path is dominated by comfy_table
-    //     formatting (~22% of wall in the v0.3 profile); use `--sql`
-    //     with an aggregate or `--limit` instead.
+    //     formatting; use `--sql` with an aggregate or `--limit` instead.
     //   * default: stream-drain. The bytes still get read + filtered
     //     by ParquetSource and the MetricsSet still fills in, but we
     //     never materialise the rows past the batch boundary or
@@ -486,7 +451,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Send the query to a remote `scry-queryd` over the binschema query
+/// Send the query to a remote query daemon over the binschema query
 /// protocol, drain the resulting Arrow IPC stream into `RecordBatch`es,
 /// and print a degenerate trailer. The per-block scan stats and pool
 /// deltas live in the daemon's `scan_complete` log event — we don't
@@ -597,9 +562,7 @@ async fn run_remote(
             "# scan: {total_rows} {signal_name} rows total (server reported {server_total_rows}; mismatch!) via remote {host_port}"
         );
     } else {
-        eprintln!(
-            "# scan: {server_total_rows} {signal_name} rows total (via remote {host_port})"
-        );
+        eprintln!("# scan: {server_total_rows} {signal_name} rows total (via remote {host_port})");
     }
     Ok(())
 }
@@ -648,11 +611,7 @@ fn print_plan_metrics(plan: &dyn ExecutionPlan, total_rows: usize) {
             eprintln!(
                 "# scan: {} rows total | row groups {} matched / {} pruned by stats | \
                  files pruned: {} | bytes scanned: {}",
-                total_rows,
-                row_groups_matched,
-                row_groups_pruned,
-                files_pruned,
-                bytes_scanned,
+                total_rows, row_groups_matched, row_groups_pruned, files_pruned, bytes_scanned,
             );
         }
         None => {

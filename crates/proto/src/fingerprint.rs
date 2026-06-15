@@ -39,7 +39,10 @@ mod tests {
     use super::*;
 
     fn lp(k: &str, v: &str) -> LabelPair {
-        LabelPair { key: k.into(), value: v.into() }
+        LabelPair {
+            key: k.into(),
+            value: v.into(),
+        }
     }
 
     #[test]

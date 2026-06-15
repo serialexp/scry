@@ -230,10 +230,7 @@ impl MetricsBlockBuilder {
     /// Body of [`BlockBuilder::finish_and_upload`]. Split out for the
     /// `mut self` rebinding ergonomic — see `dummy.rs` for the same
     /// pattern.
-    async fn finish_and_upload_impl(
-        self,
-        store: &dyn ObjectStore,
-    ) -> Result<Option<BlockMeta>> {
+    async fn finish_and_upload_impl(self, store: &dyn ObjectStore) -> Result<Option<BlockMeta>> {
         if self.is_empty() {
             return Ok(None);
         }
@@ -303,12 +300,9 @@ impl MetricsBlockBuilder {
         rows.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
 
         let main_schema = Self::main_schema();
-        let fp_arr: ArrayRef =
-            Arc::new(UInt64Array::from_iter_values(rows.iter().map(|r| r.0)));
-        let ts_arr: ArrayRef =
-            Arc::new(UInt64Array::from_iter_values(rows.iter().map(|r| r.1)));
-        let val_arr: ArrayRef =
-            Arc::new(Float64Array::from_iter_values(rows.iter().map(|r| r.2)));
+        let fp_arr: ArrayRef = Arc::new(UInt64Array::from_iter_values(rows.iter().map(|r| r.0)));
+        let ts_arr: ArrayRef = Arc::new(UInt64Array::from_iter_values(rows.iter().map(|r| r.1)));
+        let val_arr: ArrayRef = Arc::new(Float64Array::from_iter_values(rows.iter().map(|r| r.2)));
         drop(rows);
 
         let main_batch = RecordBatch::try_new(main_schema.clone(), vec![fp_arr, ts_arr, val_arr])
@@ -319,7 +313,8 @@ impl MetricsBlockBuilder {
         {
             let mut w = ArrowWriter::try_new(&mut main_buf, main_schema, Some(props.clone()))
                 .context("ArrowWriter::try_new (metrics main)")?;
-            w.write(&main_batch).context("ArrowWriter::write (metrics main)")?;
+            w.write(&main_batch)
+                .context("ArrowWriter::write (metrics main)")?;
             w.close().context("ArrowWriter::close (metrics main)")?;
         }
         let main_bytes = Bytes::from(main_buf);
@@ -375,9 +370,8 @@ impl MetricsBlockBuilder {
             has_body_bloom: false,
             body_bloom_size_bytes: None,
         };
-        let meta_bytes = Bytes::from(
-            serde_json::to_vec_pretty(&meta).context("serialising metrics BlockMeta")?,
-        );
+        let meta_bytes =
+            Bytes::from(serde_json::to_vec_pretty(&meta).context("serialising metrics BlockMeta")?);
 
         // ── Upload order: main → postings → meta ───────────────────
         //

@@ -120,11 +120,7 @@ async fn handle_http<P: StatsProvider>(mut sock: TcpStream, provider: Arc<P>) ->
     let (method, path) = parse_request_line(&buf);
 
     let (status, content_type, body): (&str, &str, Cow<'static, str>) = match (method, path) {
-        (Some("GET"), Some("/")) => (
-            "200 OK",
-            "text/html; charset=utf-8",
-            provider.index_html(),
-        ),
+        (Some("GET"), Some("/")) => ("200 OK", "text/html; charset=utf-8", provider.index_html()),
         (Some("GET"), Some("/stats.json")) => (
             "200 OK",
             "application/json",
@@ -183,9 +179,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Current process resident set size in KiB, read from
@@ -520,7 +514,6 @@ impl ServerMetrics {
     }
 }
 
-
 impl StatsProvider for ServerMetrics {
     fn stats_json(&self) -> String {
         self.snapshot().to_string()
@@ -703,11 +696,9 @@ mod tests {
         let shutdown = Arc::new(Notify::new());
         let shutdown_wait = shutdown.clone();
         let handle = tokio::spawn(async move {
-            serve_stats(
-                addr.to_string(),
-                Arc::new(StubProvider),
-                async move { shutdown_wait.notified().await },
-            )
+            serve_stats(addr.to_string(), Arc::new(StubProvider), async move {
+                shutdown_wait.notified().await
+            })
             .await
             .unwrap();
         });
@@ -727,7 +718,10 @@ mod tests {
         assert_eq!(v["ok"], serde_json::json!(true));
 
         let missing = request(addr, "GET /nope HTTP/1.1").await;
-        assert!(missing.starts_with("HTTP/1.1 404 Not Found"), "404: {missing}");
+        assert!(
+            missing.starts_with("HTTP/1.1 404 Not Found"),
+            "404: {missing}"
+        );
 
         let method = request(addr, "POST / HTTP/1.1").await;
         assert!(
@@ -807,7 +801,10 @@ mod tests {
         assert_eq!(snap["blocks_uploaded"], serde_json::json!(1));
         assert_eq!(snap["bytes_uploaded"], serde_json::json!(1024));
         // 1024 bytes in 1.0 s → 1024 B/s.
-        assert_eq!(snap["effective_upload_bytes_per_sec"], serde_json::json!(1024.0));
+        assert_eq!(
+            snap["effective_upload_bytes_per_sec"],
+            serde_json::json!(1024.0)
+        );
         assert_eq!(snap["upload_stall_seconds_total"], serde_json::json!(0.5));
     }
 }

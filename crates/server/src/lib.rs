@@ -2,8 +2,8 @@
 //!
 //! Owns the wire-protocol lifecycle (listener, handshake, per-batch
 //! dispatch) and the per-signal generic [`Pipeline`] that turns
-//! accepted batches into durable parquet blocks. Callers (`scry-ingestd`
-//! today, the eventual single `scry` binary tomorrow) build one
+//! accepted batches into durable parquet blocks. Callers (the `scry ingest`
+//! subcommand of the single `scry` binary) build one
 //! [`Pipeline<B>`] per signal they want stored and hand them to
 //! [`Server`] — that way the same pipelines can be shared with future
 //! background uploaders or catalog-lookup code in a unified process.
@@ -20,7 +20,7 @@
 //! let server = Server::new(
 //!     ServerConfig {
 //!         listen_addr: "127.0.0.1:4000".into(),
-//!         writer_id: "scry-ingestd-1".into(),
+//!         writer_id: "scry-ingest-1".into(),
 //!         writer_uuid,
 //!     },
 //!     Some(dummy),

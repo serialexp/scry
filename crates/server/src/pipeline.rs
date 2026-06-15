@@ -597,7 +597,10 @@ impl<B: BlockBuilder> Pipeline<B> {
         // `None` while non-empty shouldn't happen (the ingest paths and
         // replay both stamp it), but treat it as "seal now" rather than
         // leaking the block forever.
-        let aged = self.block_started_at.map(|t| t.elapsed() >= max_age).unwrap_or(true);
+        let aged = self
+            .block_started_at
+            .map(|t| t.elapsed() >= max_age)
+            .unwrap_or(true);
         if !aged {
             return Ok(false);
         }
@@ -821,7 +824,11 @@ async fn run_upload<B: BlockBuilder>(
             // always re-derive a missing row. We don't want a
             // transient sqlite hiccup to fail the ingest path.
             if let Some(cat) = catalog.as_ref() {
-                match cat.lock().expect("catalog mutex poisoned").insert_block(&meta) {
+                match cat
+                    .lock()
+                    .expect("catalog mutex poisoned")
+                    .insert_block(&meta)
+                {
                     Ok(true) => {}
                     Ok(false) => {
                         tracing::debug!(block_uuid = %meta.uuid, "catalog row already present");
@@ -860,7 +867,10 @@ async fn run_upload<B: BlockBuilder>(
             // spawn_upload checks above, but possible if someone
             // called flush() under tight races. Leave the sealed WAL
             // segment in place; replay will pick it up next time.
-            warn!(signal = B::SIGNAL, "upload produced no block; WAL segment retained for replay");
+            warn!(
+                signal = B::SIGNAL,
+                "upload produced no block; WAL segment retained for replay"
+            );
         }
         Err(e) => {
             if let Some(s) = stats {
@@ -919,7 +929,10 @@ mod tests {
             decide_adaptive_level(false, Some(ADAPTIVE_LOAD_BUSY_PER_CORE - 0.01)),
             ADAPTIVE_DENSE_LEVEL
         );
-        assert_eq!(decide_adaptive_level(false, Some(0.0)), ADAPTIVE_DENSE_LEVEL);
+        assert_eq!(
+            decide_adaptive_level(false, Some(0.0)),
+            ADAPTIVE_DENSE_LEVEL
+        );
 
         // Slack + unreadable load → dense (safe default).
         assert_eq!(decide_adaptive_level(false, None), ADAPTIVE_DENSE_LEVEL);
@@ -960,12 +973,7 @@ mod tests {
 
     #[async_trait]
     impl ObjectStore for GateStore {
-        async fn put_opts(
-            &self,
-            l: &Path,
-            p: PutPayload,
-            o: PutOptions,
-        ) -> OsResult<PutResult> {
+        async fn put_opts(&self, l: &Path, p: PutPayload, o: PutOptions) -> OsResult<PutResult> {
             // Block until the test opens the gate. The permit is
             // released immediately; we only use it as a one-way valve.
             let _g = self.gate.acquire().await.expect("gate semaphore closed");
@@ -1046,7 +1054,10 @@ mod tests {
         let stats = Arc::new(UploadStats::default());
         let upload_sem = Arc::new(Semaphore::new(CAP));
         // every ingest closes a block
-        let cfg = BlockBuilderConfig { max_rows: 1, ..Default::default() };
+        let cfg = BlockBuilderConfig {
+            max_rows: 1,
+            ..Default::default()
+        };
 
         let pipeline = Pipeline::<DummyBlockBuilder>::open_with_config(
             tmp.path().to_path_buf(),
@@ -1115,7 +1126,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         // every committed batch closes a block
-        let cfg = BlockBuilderConfig { max_rows: 1, ..Default::default() };
+        let cfg = BlockBuilderConfig {
+            max_rows: 1,
+            ..Default::default()
+        };
 
         let mut pipeline = Pipeline::<DummyBlockBuilder>::open_with_config(
             tmp.path().to_path_buf(),
@@ -1161,7 +1175,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         // A high threshold so size-based sealing never fires in this test.
-        let cfg = BlockBuilderConfig { max_rows: 1_000_000, ..Default::default() };
+        let cfg = BlockBuilderConfig {
+            max_rows: 1_000_000,
+            ..Default::default()
+        };
 
         let mut pipeline = Pipeline::<DummyBlockBuilder>::open_with_config(
             tmp.path().to_path_buf(),
@@ -1176,7 +1193,10 @@ mod tests {
 
         // An empty builder is a no-op regardless of age.
         assert!(
-            !pipeline.flush_if_aged(std::time::Duration::ZERO).await.unwrap(),
+            !pipeline
+                .flush_if_aged(std::time::Duration::ZERO)
+                .await
+                .unwrap(),
             "empty builder never seals"
         );
 
@@ -1194,7 +1214,10 @@ mod tests {
 
         // max_age = 0 ⇒ aged ⇒ seal it even though it's tiny.
         assert!(
-            pipeline.flush_if_aged(std::time::Duration::ZERO).await.unwrap(),
+            pipeline
+                .flush_if_aged(std::time::Duration::ZERO)
+                .await
+                .unwrap(),
             "an aged non-empty block seals regardless of size"
         );
         pipeline.flush().await.unwrap();
@@ -1210,7 +1233,10 @@ mod tests {
         // After sealing, the builder is empty again — another aged flush
         // is a no-op (no duplicate block).
         assert!(
-            !pipeline.flush_if_aged(std::time::Duration::ZERO).await.unwrap(),
+            !pipeline
+                .flush_if_aged(std::time::Duration::ZERO)
+                .await
+                .unwrap(),
             "no block to seal after a flush"
         );
     }

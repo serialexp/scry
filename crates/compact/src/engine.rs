@@ -89,7 +89,15 @@ pub async fn compact_once(
 
     for plan in plans {
         let outcome = compact_partition(
-            &plan, store.clone(), catalog, bucket, writer_id, cfg, block_cfg, &fence, &sink,
+            &plan,
+            store.clone(),
+            catalog,
+            bucket,
+            writer_id,
+            cfg,
+            block_cfg,
+            &fence,
+            &sink,
         )
         .await
         .with_context(|| format!("compacting {} {} partition", plan.signal, plan.date))?;

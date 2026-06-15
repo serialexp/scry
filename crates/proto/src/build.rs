@@ -157,23 +157,37 @@ pub fn flow_control(
 }
 
 pub fn ping(nonce: u64) -> Frame {
-    Frame { msg: FrameMsg::Ping(PingInput { nonce }.into()) }
+    Frame {
+        msg: FrameMsg::Ping(PingInput { nonce }.into()),
+    }
 }
 
 pub fn pong(nonce: u64) -> Frame {
-    Frame { msg: FrameMsg::Pong(PongInput { nonce }.into()) }
+    Frame {
+        msg: FrameMsg::Pong(PongInput { nonce }.into()),
+    }
 }
 
 pub fn goodbye(reason_code: u16, message: &str) -> Frame {
     Frame {
         msg: FrameMsg::Goodbye(
-            GoodbyeInput { reason_code, message: message.into() }.into(),
+            GoodbyeInput {
+                reason_code,
+                message: message.into(),
+            }
+            .into(),
         ),
     }
 }
 
 pub fn error(code: u16, message: &str) -> Frame {
     Frame {
-        msg: FrameMsg::Error(ErrorInput { code, message: message.into() }.into()),
+        msg: FrameMsg::Error(
+            ErrorInput {
+                code,
+                message: message.into(),
+            }
+            .into(),
+        ),
     }
 }

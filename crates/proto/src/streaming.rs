@@ -226,11 +226,7 @@ pub fn decode_metrics_batch_into<A: MetricsAppender>(
 ///   writer requires valid UTF-8; `String::from_utf8_lossy` is
 ///   the conventional cheap coercion).
 pub trait LogsAppender {
-    fn observe_stream(
-        &mut self,
-        fingerprint: u64,
-        labels: Vec<(Vec<u8>, Vec<u8>)>,
-    );
+    fn observe_stream(&mut self, fingerprint: u64, labels: Vec<(Vec<u8>, Vec<u8>)>);
 
     fn append_entry(
         &mut self,
@@ -350,7 +346,9 @@ fn read_fixed<'p>(
     len: usize,
 ) -> Result<&'p [u8], BinSchemaError> {
     let start = dec.position();
-    let end = start.checked_add(len).ok_or(BinSchemaError::UnexpectedEof)?;
+    let end = start
+        .checked_add(len)
+        .ok_or(BinSchemaError::UnexpectedEof)?;
     if end > payload.len() {
         return Err(BinSchemaError::UnexpectedEof);
     }
@@ -767,25 +765,56 @@ mod tests {
                     fingerprint: 0xCAFE_BABE,
                     metric_type: 2, // gauge
                     labels: vec![
-                        LabelPair { key: "__name__".into(), value: "cpu_usage".into() },
-                        LabelPair { key: "host".into(),     value: "host-1".into() },
+                        LabelPair {
+                            key: "__name__".into(),
+                            value: "cpu_usage".into(),
+                        },
+                        LabelPair {
+                            key: "host".into(),
+                            value: "host-1".into(),
+                        },
                     ],
                 },
                 SeriesDictEntry {
                     fingerprint: 0xDEAD_BEEF,
                     metric_type: 1, // counter
                     labels: vec![
-                        LabelPair { key: "__name__".into(), value: "http_requests_total".into() },
-                        LabelPair { key: "service".into(),  value: "api".into() },
-                        LabelPair { key: "status".into(),   value: "200".into() },
+                        LabelPair {
+                            key: "__name__".into(),
+                            value: "http_requests_total".into(),
+                        },
+                        LabelPair {
+                            key: "service".into(),
+                            value: "api".into(),
+                        },
+                        LabelPair {
+                            key: "status".into(),
+                            value: "200".into(),
+                        },
                     ],
                 },
             ],
             samples: vec![
-                MetricSample { fingerprint: 0xCAFE_BABE, ts_unix_nano: 1_000, value:  3.25 },
-                MetricSample { fingerprint: 0xCAFE_BABE, ts_unix_nano: 2_000, value:  6.5  },
-                MetricSample { fingerprint: 0xDEAD_BEEF, ts_unix_nano: 1_500, value: 42.0  },
-                MetricSample { fingerprint: 0xDEAD_BEEF, ts_unix_nano: 2_500, value: 43.0  },
+                MetricSample {
+                    fingerprint: 0xCAFE_BABE,
+                    ts_unix_nano: 1_000,
+                    value: 3.25,
+                },
+                MetricSample {
+                    fingerprint: 0xCAFE_BABE,
+                    ts_unix_nano: 2_000,
+                    value: 6.5,
+                },
+                MetricSample {
+                    fingerprint: 0xDEAD_BEEF,
+                    ts_unix_nano: 1_500,
+                    value: 42.0,
+                },
+                MetricSample {
+                    fingerprint: 0xDEAD_BEEF,
+                    ts_unix_nano: 2_500,
+                    value: 43.0,
+                },
             ],
         };
         let payload = batch.encode().expect("encode");
@@ -814,7 +843,10 @@ mod tests {
 
     #[test]
     fn metrics_streaming_handles_empty_batch() {
-        let batch = MetricsBatch { series: vec![], samples: vec![] };
+        let batch = MetricsBatch {
+            series: vec![],
+            samples: vec![],
+        };
         let payload = batch.encode().expect("encode");
         let mut collected = MetricsCollected::default();
         let (n_series, n_samples) =
@@ -844,11 +876,7 @@ mod tests {
     }
 
     impl LogsAppender for LogsCollected {
-        fn observe_stream(
-            &mut self,
-            fingerprint: u64,
-            labels: Vec<(Vec<u8>, Vec<u8>)>,
-        ) {
+        fn observe_stream(&mut self, fingerprint: u64, labels: Vec<(Vec<u8>, Vec<u8>)>) {
             self.streams.push((fingerprint, labels));
         }
         fn append_entry(
@@ -871,8 +899,14 @@ mod tests {
                 LogStream {
                     fingerprint: 0x1111_2222,
                     labels: vec![
-                        LabelPair { key: "service".into(), value: "api".into() },
-                        LabelPair { key: "env".into(),     value: "prod".into() },
+                        LabelPair {
+                            key: "service".into(),
+                            value: "api".into(),
+                        },
+                        LabelPair {
+                            key: "env".into(),
+                            value: "prod".into(),
+                        },
                     ],
                     entries: vec![
                         LogEntry {
@@ -880,25 +914,33 @@ mod tests {
                             severity: 9,
                             body: "GET /healthz 200".into(),
                             attributes: vec![
-                                LabelPair { key: "status".into(),   value: "200".into() },
-                                LabelPair { key: "trace_id".into(), value: "abc123".into() },
+                                LabelPair {
+                                    key: "status".into(),
+                                    value: "200".into(),
+                                },
+                                LabelPair {
+                                    key: "trace_id".into(),
+                                    value: "abc123".into(),
+                                },
                             ],
                         },
                         LogEntry {
                             ts_unix_nano: 2_000,
                             severity: 17,
                             body: "POST /pay 500 (db timeout)".into(),
-                            attributes: vec![
-                                LabelPair { key: "status".into(), value: "500".into() },
-                            ],
+                            attributes: vec![LabelPair {
+                                key: "status".into(),
+                                value: "500".into(),
+                            }],
                         },
                     ],
                 },
                 LogStream {
                     fingerprint: 0x3333_4444,
-                    labels: vec![
-                        LabelPair { key: "service".into(), value: "worker".into() },
-                    ],
+                    labels: vec![LabelPair {
+                        key: "service".into(),
+                        value: "worker".into(),
+                    }],
                     entries: vec![LogEntry {
                         // Zero-length body + zero attributes — the edge case
                         // the dummy test guards for its own format.
@@ -964,7 +1006,10 @@ mod tests {
         let batch = LogsBatch {
             streams: vec![LogStream {
                 fingerprint: 1,
-                labels: vec![LabelPair { key: "k".into(), value: "v".into() }],
+                labels: vec![LabelPair {
+                    key: "k".into(),
+                    value: "v".into(),
+                }],
                 entries: vec![LogEntry {
                     ts_unix_nano: 1,
                     severity: 9,
@@ -988,11 +1033,22 @@ mod tests {
             series: vec![SeriesDictEntry {
                 fingerprint: 1,
                 metric_type: 2,
-                labels: vec![LabelPair { key: "k".into(), value: "v".into() }],
+                labels: vec![LabelPair {
+                    key: "k".into(),
+                    value: "v".into(),
+                }],
             }],
             samples: vec![
-                MetricSample { fingerprint: 1, ts_unix_nano: 1, value: 1.0 },
-                MetricSample { fingerprint: 1, ts_unix_nano: 2, value: 2.0 },
+                MetricSample {
+                    fingerprint: 1,
+                    ts_unix_nano: 1,
+                    value: 1.0,
+                },
+                MetricSample {
+                    fingerprint: 1,
+                    ts_unix_nano: 2,
+                    value: 2.0,
+                },
             ],
         };
         let mut payload = batch.encode().expect("encode");
@@ -1065,17 +1121,32 @@ mod tests {
             resources: vec![
                 ResourceEntry {
                     labels: vec![
-                        LabelPair { key: "service.name".into(), value: "api".into() },
-                        LabelPair { key: "host".into(), value: "host-1".into() },
+                        LabelPair {
+                            key: "service.name".into(),
+                            value: "api".into(),
+                        },
+                        LabelPair {
+                            key: "host".into(),
+                            value: "host-1".into(),
+                        },
                     ],
                 },
                 ResourceEntry {
-                    labels: vec![LabelPair { key: "service.name".into(), value: "worker".into() }],
+                    labels: vec![LabelPair {
+                        key: "service.name".into(),
+                        value: "worker".into(),
+                    }],
                 },
             ],
             scopes: vec![
-                ScopeEntry { name: "scry.spewer".into(), version: "0.1.0".into() },
-                ScopeEntry { name: "tokio".into(), version: "1.0".into() },
+                ScopeEntry {
+                    name: "scry.spewer".into(),
+                    version: "0.1.0".into(),
+                },
+                ScopeEntry {
+                    name: "tokio".into(),
+                    version: "1.0".into(),
+                },
             ],
             spans: vec![
                 Span {
@@ -1091,13 +1162,22 @@ mod tests {
                     status_code: 1,
                     status_message: "ok".into(),
                     attributes: vec![
-                        LabelPair { key: "http.method".into(), value: "GET".into() },
-                        LabelPair { key: "http.status".into(), value: "200".into() },
+                        LabelPair {
+                            key: "http.method".into(),
+                            value: "GET".into(),
+                        },
+                        LabelPair {
+                            key: "http.status".into(),
+                            value: "200".into(),
+                        },
                     ],
                     events: vec![SpanEvent {
                         ts_unix_nano: 1_500,
                         name: "checkpoint".into(),
-                        attributes: vec![LabelPair { key: "k".into(), value: "v".into() }],
+                        attributes: vec![LabelPair {
+                            key: "k".into(),
+                            value: "v".into(),
+                        }],
                     }],
                     links: vec![SpanLink {
                         trace_id: (16..32u8).collect(),
@@ -1122,8 +1202,19 @@ mod tests {
                     attributes: vec![],
                     events: vec![],
                     links: vec![
-                        SpanLink { trace_id: (32..48u8).collect(), span_id: (0..8u8).collect(), attributes: vec![] },
-                        SpanLink { trace_id: (48..64u8).collect(), span_id: (8..16u8).collect(), attributes: vec![LabelPair { key: "rel".into(), value: "follows".into() }] },
+                        SpanLink {
+                            trace_id: (32..48u8).collect(),
+                            span_id: (0..8u8).collect(),
+                            attributes: vec![],
+                        },
+                        SpanLink {
+                            trace_id: (48..64u8).collect(),
+                            span_id: (8..16u8).collect(),
+                            attributes: vec![LabelPair {
+                                key: "rel".into(),
+                                value: "follows".into(),
+                            }],
+                        },
                     ],
                 },
             ],
@@ -1143,7 +1234,10 @@ mod tests {
         for (got, want) in collected.spans.iter().zip(batch.spans.iter()) {
             assert_eq!(&got.trace_id, &want.trace_id);
             assert_eq!(&got.span_id, &want.span_id);
-            assert_eq!(got.parent_span_id.as_deref(), want.parent_span_id.as_deref());
+            assert_eq!(
+                got.parent_span_id.as_deref(),
+                want.parent_span_id.as_deref()
+            );
             assert_eq!(&got.name, want.name.as_bytes());
             assert_eq!(got.kind, want.kind);
             assert_eq!(got.start_unix_nano, want.start_unix_nano);
@@ -1193,7 +1287,11 @@ mod tests {
 
     #[test]
     fn traces_streaming_handles_empty_batch() {
-        let batch = TracesBatch { resources: vec![], scopes: vec![], spans: vec![] };
+        let batch = TracesBatch {
+            resources: vec![],
+            scopes: vec![],
+            spans: vec![],
+        };
         let payload = batch.encode().expect("encode");
         let mut collected = TracesCollected::default();
         let n = decode_traces_batch_into(&payload, &mut collected).expect("decode");
@@ -1233,7 +1331,8 @@ mod tests {
             format: u8,
             data: Vec<u8>,
         ) {
-            self.blobs.push((ts_unix_nano, duration_nano, labels, format, data));
+            self.blobs
+                .push((ts_unix_nano, duration_nano, labels, format, data));
         }
     }
 
@@ -1244,8 +1343,14 @@ mod tests {
                     ts_unix_nano: 42,
                     duration_nano: 10_000_000_000,
                     labels: vec![
-                        LabelPair { key: "service".into(), value: "api".into() },
-                        LabelPair { key: "profile.type".into(), value: "cpu".into() },
+                        LabelPair {
+                            key: "service".into(),
+                            value: "api".into(),
+                        },
+                        LabelPair {
+                            key: "profile.type".into(),
+                            value: "cpu".into(),
+                        },
                     ],
                     format: 1,
                     data: (0..255u16).map(|b| b as u8).collect(),

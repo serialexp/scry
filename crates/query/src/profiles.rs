@@ -156,14 +156,12 @@ impl TableProvider for ProfilesTable {
 
             if let Some(min) = self.ts_min {
                 block_filters.push(
-                    col("ts_unix_nano")
-                        .gt_eq(Expr::Literal(ScalarValue::UInt64(Some(min)), None)),
+                    col("ts_unix_nano").gt_eq(Expr::Literal(ScalarValue::UInt64(Some(min)), None)),
                 );
             }
             if let Some(max) = self.ts_max {
                 block_filters.push(
-                    col("ts_unix_nano")
-                        .lt_eq(Expr::Literal(ScalarValue::UInt64(Some(max)), None)),
+                    col("ts_unix_nano").lt_eq(Expr::Literal(ScalarValue::UInt64(Some(max)), None)),
                 );
             }
 
@@ -189,8 +187,7 @@ impl TableProvider for ProfilesTable {
             // No overlapping blocks. Emit a single empty
             // `DataSourceExec` so `SELECT count(*) FROM profiles`
             // returns 0 cleanly. Mirrors metrics/logs/traces behaviour.
-            let source =
-                Arc::new(ParquetSource::new(self.schema()).with_pushdown_filters(true));
+            let source = Arc::new(ParquetSource::new(self.schema()).with_pushdown_filters(true));
             let builder = FileScanConfigBuilder::new(self.object_store_url.clone(), source)
                 .with_projection_indices(projection.cloned())?
                 .with_limit(limit);

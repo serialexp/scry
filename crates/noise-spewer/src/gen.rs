@@ -5,19 +5,19 @@
 //! exercise realistic paths.
 
 use binschema_runtime::BinSchemaError;
-use rand::Rng;
 use rand::distributions::{Alphanumeric, Distribution};
+use rand::Rng;
 use rand_distr::Normal;
 use scry_proto::{
-    LabelPair, build,
-    constants::{COMPRESSION_ZSTD, Signal},
+    build,
+    constants::{Signal, COMPRESSION_ZSTD},
     fingerprint::fingerprint,
     generated::{
         DummyBatch, DummyRecord, LogEntry, LogStream, LogsBatch, MetricSample, MetricsBatch,
         ProfileBlob, ProfilesBatch, ResourceEntry, ScopeEntry, SeriesDictEntry, Span, SpanEvent,
         SpanLink, TracesBatch,
     },
-    Frame,
+    Frame, LabelPair,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -26,11 +26,11 @@ const ZSTD_LEVEL: i32 = 3;
 pub fn make_batch<R: Rng>(rng: &mut R, signal: Signal, session_id: u64, batch_id: u64) -> Frame {
     let now_ns = unix_nanos_now();
     let (record_count, payload_uncompressed, ts_min, ts_max) = match signal {
-        Signal::Metrics  => render_metrics(rng, now_ns),
-        Signal::Logs     => render_logs(rng, now_ns),
-        Signal::Traces   => render_traces(rng, now_ns),
+        Signal::Metrics => render_metrics(rng, now_ns),
+        Signal::Logs => render_logs(rng, now_ns),
+        Signal::Traces => render_traces(rng, now_ns),
         Signal::Profiles => render_profiles(rng, now_ns),
-        Signal::Dummy    => render_dummy(rng, now_ns),
+        Signal::Dummy => render_dummy(rng, now_ns),
     };
 
     let payload = zstd::encode_all(payload_uncompressed.as_slice(), ZSTD_LEVEL)
@@ -64,10 +64,22 @@ fn labels_for<R: Rng>(rng: &mut R, base_name: &str) -> Vec<LabelPair> {
     let host_idx: u32 = rng.gen_range(1..=8);
     let env = ["prod", "stage", "dev"][rng.gen_range(0..3)];
     vec![
-        LabelPair { key: "__name__".into(), value: base_name.into() },
-        LabelPair { key: "host".into(),     value: format!("host-{host_idx}") },
-        LabelPair { key: "env".into(),      value: env.into() },
-        LabelPair { key: "region".into(),   value: "eu-central".into() },
+        LabelPair {
+            key: "__name__".into(),
+            value: base_name.into(),
+        },
+        LabelPair {
+            key: "host".into(),
+            value: format!("host-{host_idx}"),
+        },
+        LabelPair {
+            key: "env".into(),
+            value: env.into(),
+        },
+        LabelPair {
+            key: "region".into(),
+            value: "eu-central".into(),
+        },
     ]
 }
 
@@ -107,8 +119,7 @@ fn render_metrics<R: Rng>(rng: &mut R, now_ns: u64) -> (u32, Vec<u8>, u64, u64) 
         let mut value: f64 = rng.gen_range(0.0..1000.0);
         for i in 0..samples_per_series {
             // 50 samples spaced 100 ms apart, ending "now".
-            let ts = now_ns
-                - ((samples_per_series - 1 - i) as u64) * 100 * 1_000_000;
+            let ts = now_ns - ((samples_per_series - 1 - i) as u64) * 100 * 1_000_000;
             value += dist.sample(rng);
             samples.push(MetricSample {
                 fingerprint: s.fingerprint,
@@ -137,9 +148,18 @@ fn render_logs<R: Rng>(rng: &mut R, now_ns: u64) -> (u32, Vec<u8>, u64, u64) {
 
     for svc in services {
         let labels = vec![
-            LabelPair { key: "service".into(),  value: svc.into() },
-            LabelPair { key: "host".into(),     value: format!("host-{}", rng.gen_range(1..=4)) },
-            LabelPair { key: "env".into(),      value: "prod".into() },
+            LabelPair {
+                key: "service".into(),
+                value: svc.into(),
+            },
+            LabelPair {
+                key: "host".into(),
+                value: format!("host-{}", rng.gen_range(1..=4)),
+            },
+            LabelPair {
+                key: "env".into(),
+                value: "prod".into(),
+            },
         ];
         let mut entries = Vec::with_capacity(20);
         for i in 0..20 {
@@ -184,22 +204,56 @@ fn render_logs<R: Rng>(rng: &mut R, now_ns: u64) -> (u32, Vec<u8>, u64, u64) {
 fn render_traces<R: Rng>(rng: &mut R, now_ns: u64) -> (u32, Vec<u8>, u64, u64) {
     // 5 traces, 4 spans each = 20 spans.
     let resources = vec![
-        ResourceEntry { labels: vec![
-            LabelPair { key: "service.name".into(),           value: "api".into() },
-            LabelPair { key: "service.namespace".into(),      value: "shop".into() },
-            LabelPair { key: "deployment.environment".into(), value: "prod".into() },
-            LabelPair { key: "host".into(),                   value: "host-1".into() },
-        ]},
-        ResourceEntry { labels: vec![
-            LabelPair { key: "service.name".into(),           value: "worker".into() },
-            LabelPair { key: "service.namespace".into(),      value: "shop".into() },
-            LabelPair { key: "deployment.environment".into(), value: "staging".into() },
-            LabelPair { key: "host".into(),                   value: "host-2".into() },
-        ]},
+        ResourceEntry {
+            labels: vec![
+                LabelPair {
+                    key: "service.name".into(),
+                    value: "api".into(),
+                },
+                LabelPair {
+                    key: "service.namespace".into(),
+                    value: "shop".into(),
+                },
+                LabelPair {
+                    key: "deployment.environment".into(),
+                    value: "prod".into(),
+                },
+                LabelPair {
+                    key: "host".into(),
+                    value: "host-1".into(),
+                },
+            ],
+        },
+        ResourceEntry {
+            labels: vec![
+                LabelPair {
+                    key: "service.name".into(),
+                    value: "worker".into(),
+                },
+                LabelPair {
+                    key: "service.namespace".into(),
+                    value: "shop".into(),
+                },
+                LabelPair {
+                    key: "deployment.environment".into(),
+                    value: "staging".into(),
+                },
+                LabelPair {
+                    key: "host".into(),
+                    value: "host-2".into(),
+                },
+            ],
+        },
     ];
     let scopes = vec![
-        ScopeEntry { name: "scry.spewer".into(),     version: "0.1.0".into() },
-        ScopeEntry { name: "scry.spewer.tokio".into(), version: "1.0".into() },
+        ScopeEntry {
+            name: "scry.spewer".into(),
+            version: "0.1.0".into(),
+        },
+        ScopeEntry {
+            name: "scry.spewer.tokio".into(),
+            version: "1.0".into(),
+        },
     ];
 
     let mut spans: Vec<Span> = Vec::with_capacity(20);
@@ -212,8 +266,16 @@ fn render_traces<R: Rng>(rng: &mut R, now_ns: u64) -> (u32, Vec<u8>, u64, u64) {
         let trace_start = now_ns - rng.gen_range(0..10_000_000_000u64);
 
         for span_idx in 0..4 {
-            let span_id: [u8; 8] = if span_idx == 0 { root_span_id } else { rng.gen() };
-            let parent = if span_idx == 0 { None } else { Some(root_span_id.to_vec()) };
+            let span_id: [u8; 8] = if span_idx == 0 {
+                root_span_id
+            } else {
+                rng.gen()
+            };
+            let parent = if span_idx == 0 {
+                None
+            } else {
+                Some(root_span_id.to_vec())
+            };
             let dur_ns: u64 = rng.gen_range(100_000..50_000_000);
             let start = trace_start + (span_idx as u64) * 1_000_000;
             let end = start + dur_ns;
@@ -260,7 +322,11 @@ fn render_traces<R: Rng>(rng: &mut R, now_ns: u64) -> (u32, Vec<u8>, u64, u64) {
     }
 
     let total = spans.len() as u32;
-    let payload = TracesBatch { resources, scopes, spans };
+    let payload = TracesBatch {
+        resources,
+        scopes,
+        spans,
+    };
     let bytes = encode(&payload, |b, e| b.encode_into(e));
     (total, bytes, ts_min, ts_max)
 }
@@ -277,14 +343,22 @@ fn render_profiles<R: Rng>(rng: &mut R, now_ns: u64) -> (u32, Vec<u8>, u64, u64)
         ts_unix_nano: now_ns,
         duration_nano: rng.gen_range(1_000_000_000..30_000_000_000), // 1-30 s
         labels: vec![
-            LabelPair { key: "service".into(),      value: "noise-spewer".into() },
-            LabelPair { key: "profile.type".into(), value: ["cpu", "heap", "goroutine"][rng.gen_range(0..3)].into() },
+            LabelPair {
+                key: "service".into(),
+                value: "noise-spewer".into(),
+            },
+            LabelPair {
+                key: "profile.type".into(),
+                value: ["cpu", "heap", "goroutine"][rng.gen_range(0..3)].into(),
+            },
         ],
         format: 1, // pprof_gz (placeholder; it's actually random bytes for the spewer)
         data,
     };
 
-    let payload = ProfilesBatch { samples: vec![blob] };
+    let payload = ProfilesBatch {
+        samples: vec![blob],
+    };
     let bytes = encode(&payload, |b, e| b.encode_into(e));
     (1, bytes, now_ns, now_ns)
 }
@@ -321,10 +395,7 @@ fn render_dummy<R: Rng>(rng: &mut R, now_ns: u64) -> (u32, Vec<u8>, u64, u64) {
 
 fn encode<T, F>(value: &T, encode_into: F) -> Vec<u8>
 where
-    F: Fn(
-        &T,
-        &mut binschema_runtime::BitStreamEncoder,
-    ) -> Result<(), BinSchemaError>,
+    F: Fn(&T, &mut binschema_runtime::BitStreamEncoder) -> Result<(), BinSchemaError>,
 {
     let mut encoder =
         binschema_runtime::BitStreamEncoder::new(binschema_runtime::BitOrder::MsbFirst);

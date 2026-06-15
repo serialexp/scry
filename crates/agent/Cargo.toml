@@ -6,9 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 description = "scry log-collection agent: discovers pods via the Kubernetes API, tails CRI container logs, and ships them over the native binschema wire to a scry ingest server."
 
-[[bin]]
-name = "scry-agent"
-path = "src/main.rs"
+[lib]
+name = "scry_agent"
+path = "src/lib.rs"
 
 [dependencies]
 anyhow            = { workspace = true }
@@ -17,7 +17,6 @@ clap              = { workspace = true, features = ["env"] }
 futures           = { workspace = true }
 k8s-openapi       = { workspace = true }
 kube              = { workspace = true }
-mimalloc          = { workspace = true }
 regex             = { workspace = true }
 reqwest           = { workspace = true }
 scry-client       = { workspace = true }

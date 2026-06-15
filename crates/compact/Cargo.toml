@@ -9,10 +9,6 @@ description = "v0.8 size-tiered compaction: merge many small blocks into fewer l
 name = "scry_compact"
 path = "src/lib.rs"
 
-[[bin]]
-name = "scry-compact"
-path = "src/main.rs"
-
 [dependencies]
 anyhow             = { workspace = true }
 arrow              = { workspace = true }
@@ -28,7 +24,6 @@ scry-objstore      = { workspace = true }
 serde_json         = { workspace = true }
 tokio              = { workspace = true }
 tracing            = { workspace = true }
-tracing-subscriber = { workspace = true }
 url                = { workspace = true }
 uuid               = { workspace = true }
 

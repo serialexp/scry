@@ -112,10 +112,7 @@ impl BufPoolConfig {
             DEFAULT_POOL_WARMUP_SIZE / (1024 * 1024),
         )?;
         Ok(Self {
-            initial_capacity: parse(
-                "SCRY_OBJSTORE_POOL_INITIAL_CAPACITY",
-                DEFAULT_POOL_CAPACITY,
-            )?,
+            initial_capacity: parse("SCRY_OBJSTORE_POOL_INITIAL_CAPACITY", DEFAULT_POOL_CAPACITY)?,
             max_capacity: parse("SCRY_OBJSTORE_POOL_MAX_CAPACITY", DEFAULT_POOL_MAX_CAPACITY)?,
             warmup_count: parse("SCRY_OBJSTORE_POOL_WARMUP_COUNT", 0)?,
             warmup_size: warmup_size_mib * 1024 * 1024,
@@ -182,4 +179,3 @@ pub fn open_with_pool_config(
     let pooled = PooledStore::with_pool(Arc::new(s3), pool.clone());
     Ok((Arc::new(pooled), pool))
 }
-

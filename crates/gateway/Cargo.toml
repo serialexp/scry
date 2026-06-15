@@ -8,10 +8,6 @@ repository.workspace = true
 description = "scry foreign-protocol push gateway: terminates OTLP/HTTP trace push and legacy Pyroscope profile ingest, translates each request into a binschema batch, and forwards it to a scry ingest server as just another wire client."
 
 [[bin]]
-name = "scry-gateway"
-path = "src/main.rs"
-
-[[bin]]
 name = "scry-gateway-probe"
 path = "src/bin/probe.rs"
 
@@ -25,7 +21,6 @@ binschema-runtime   = { workspace = true }
 bytes               = { workspace = true }
 chrono              = { workspace = true }
 clap                = { workspace = true }
-mimalloc            = { workspace = true }
 opentelemetry-proto = { workspace = true }
 prost               = { workspace = true }
 reqwest             = { workspace = true }
@@ -36,7 +31,6 @@ serde_json          = { workspace = true }
 snap                = { workspace = true }
 tokio               = { workspace = true }
 tracing             = { workspace = true }
-tracing-subscriber  = { workspace = true }
 uuid                = { workspace = true }
 zstd                = { workspace = true }
 

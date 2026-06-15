@@ -128,7 +128,11 @@ impl Client {
         let hello_ack = match read_frame::<Frame, _>(&mut rd).await?.msg {
             FrameMsg::HelloAck(a) => a,
             FrameMsg::Error(e) => {
-                bail!("server rejected handshake: code={} msg={:?}", e.code, e.message)
+                bail!(
+                    "server rejected handshake: code={} msg={:?}",
+                    e.code,
+                    e.message
+                )
             }
             other => bail!("expected HelloAck, got {other:?}"),
         };
@@ -145,7 +149,13 @@ impl Client {
         let (ack_tx, ack_rx) = mpsc::channel::<()>(1024);
         let reader = tokio::spawn(reader_loop(rd, ack_tx));
 
-        Ok(Established { wr, ack_rx, max_inflight, session_id, reader })
+        Ok(Established {
+            wr,
+            ack_rx,
+            max_inflight,
+            session_id,
+            reader,
+        })
     }
 
     /// Re-establish the session against the (possibly restarted) server,

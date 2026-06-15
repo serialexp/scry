@@ -9,10 +9,6 @@ description = "v0.8 per-signal TTL retention: reap blocks whose data is entirely
 name = "scry_retention"
 path = "src/lib.rs"
 
-[[bin]]
-name = "scry-retention"
-path = "src/main.rs"
-
 [dependencies]
 anyhow             = { workspace = true }
 clap               = { workspace = true }
@@ -22,7 +18,6 @@ scry-catalog       = { workspace = true }
 scry-objstore      = { workspace = true }
 tokio              = { workspace = true }
 tracing            = { workspace = true }
-tracing-subscriber = { workspace = true }
 uuid               = { workspace = true }
 
 [dev-dependencies]

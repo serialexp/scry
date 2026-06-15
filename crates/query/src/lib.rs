@@ -40,14 +40,15 @@
 
 pub mod bloom_cache;
 pub mod body_bloom;
+pub mod cli;
 pub mod evict;
 pub mod logs;
 pub mod postings;
 pub mod postings_cache;
 pub mod profiles;
+mod table;
 pub mod traces;
 pub mod wire;
-mod table;
 
 use std::sync::Arc;
 
@@ -58,40 +59,39 @@ use object_store::ObjectStore;
 use scry_catalog::{Catalog, CatalogEntry};
 use serde::{Deserialize, Serialize};
 
-pub use evict::EvictOnNotFound;
-pub use postings::resolve_fingerprints;
-pub use wire::QueryRequest;
-pub use postings_cache::{
-    PostingsCache, PostingsCacheConfig, PostingsCacheStats, PostingsIndex,
-    DEFAULT_BUDGET_BYTES as DEFAULT_POSTINGS_CACHE_BYTES,
-};
 pub use bloom_cache::{
     BloomCache, BloomCacheConfig, BloomCacheStats,
     DEFAULT_BUDGET_BYTES as DEFAULT_BLOOM_CACHE_BYTES,
 };
+pub use evict::EvictOnNotFound;
+pub use postings::resolve_fingerprints;
+pub use postings_cache::{
+    PostingsCache, PostingsCacheConfig, PostingsCacheStats, PostingsIndex,
+    DEFAULT_BUDGET_BYTES as DEFAULT_POSTINGS_CACHE_BYTES,
+};
 pub use table::{time_overlaps, BlockEntry, MetricsTable};
+pub use wire::QueryRequest;
 // Logs symmetry: same convenience re-exports the metrics path has, so
 // CLI/server callers can `use scry_query::{register_logs_table, ...}`
 // without reaching into the submodule. Names are signal-prefixed
 // because the metrics symbols above already claim the bare names.
 pub use logs::{
-    build_logs_table_from_candidates, list_logs_candidates, logs_query,
-    register_logs_table, register_logs_table_from_candidates, LogsBlockEntry, LogsTable,
-    LOGS_TABLE_NAME,
+    build_logs_table_from_candidates, list_logs_candidates, logs_query, register_logs_table,
+    register_logs_table_from_candidates, LogsBlockEntry, LogsTable, LOGS_TABLE_NAME,
 };
 // Traces + profiles query verticals (v0.5 / v0.6). Same signal-prefixed
 // convenience re-exports as logs — these two have no postings sidecar,
 // so their `build_*` helpers skip the postings resolve entirely and the
 // catalog narrow + per-block scan is the whole story.
-pub use traces::{
-    build_traces_table_from_candidates, list_traces_candidates, register_traces_table,
-    register_traces_table_from_candidates, traces_query, TracesBlockEntry, TracesTable,
-    TRACES_TABLE_NAME,
-};
 pub use profiles::{
     build_profiles_table_from_candidates, list_profiles_candidates, profiles_query,
     register_profiles_table, register_profiles_table_from_candidates, ProfilesBlockEntry,
     ProfilesTable, PROFILES_TABLE_NAME,
+};
+pub use traces::{
+    build_traces_table_from_candidates, list_traces_candidates, register_traces_table,
+    register_traces_table_from_candidates, traces_query, TracesBlockEntry, TracesTable,
+    TRACES_TABLE_NAME,
 };
 
 /// AND of equality matchers + optional time-range bounds. Shared
@@ -168,10 +168,7 @@ pub async fn build_metrics_table(
 /// and the query's time bounds. Pure compute over the connection +
 /// returns owned data, so callers wrapping the catalog in a mutex
 /// can drop the guard before doing any async work.
-pub fn list_metrics_candidates(
-    catalog: &Catalog,
-    q: &Query,
-) -> Result<Vec<CatalogEntry>> {
+pub fn list_metrics_candidates(catalog: &Catalog, q: &Query) -> Result<Vec<CatalogEntry>> {
     Ok(catalog
         .list_blocks()
         .context("listing blocks from catalog")?

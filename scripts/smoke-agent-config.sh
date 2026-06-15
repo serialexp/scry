@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# scry-agent config-pipeline exit criterion — end-to-end.
+# scry agent config-pipeline exit criterion — end-to-end.
 #
 # Proves the agent's TOML config-pipeline features land queryable logs +
-# metrics in the bucket, against a real scry-ingestd + Garage:
+# metrics in the bucket, against a real scry ingest + Garage:
 #
 #   CRI log tree ─┐
-#                  ├→ scry-agent (--config agent.toml) → scry-ingestd (--storage)
+#                  ├→ scry agent (--config agent.toml) → scry ingest (--storage)
 #   stub /metrics ─┘
-#                  → bucket → scry-list reconcile → scry-query
+#                  → bucket → scry list reconcile → scry get
 #
 # A Python stub serves a fixed exposition body with 1 gauge explicitly
 # carrying container_name (exercising metric label_map). A single CRI log
@@ -60,7 +60,7 @@ done
 
 # ── Build ───────────────────────────────────────────────────────────
 echo "[agent-config] building release binaries..."
-cargo build --release -p scry-ingestd -p scry-list -p scry-query -p scry-agent >&2
+cargo build --release -p scry >&2
 
 # ── Clean slate ─────────────────────────────────────────────────────
 rm -rf "$SMOKE_DIR"; mkdir -p "$SMOKE_DIR"
@@ -116,9 +116,9 @@ with socketserver.TCPServer(('127.0.0.1', port), H) as s:
 PY
 STUB_PID=$!
 
-# ── scry-ingestd (storage) ──────────────────────────────────────────
-echo "[agent-config] starting scry-ingestd on $LISTEN..."
-RUST_LOG="${RUST_LOG:-info}" ./target/release/scry-ingestd \
+# ── scry ingest (storage) ──────────────────────────────────────────
+echo "[agent-config] starting scry ingest on $LISTEN..."
+RUST_LOG="${RUST_LOG:-info}" ./target/release/scry ingest \
     --listen "$LISTEN" \
     --storage \
     --wal-dir "$SMOKE_DIR/wal" \
@@ -138,12 +138,12 @@ for _ in $(seq 1 50); do
     sleep 0.1
 done
 
-# ── scry-agent: one scrape + one log file ───────────────────────────
+# ── scry agent: one scrape + one log file ───────────────────────────
 # --no-discovery: pure static-target path + CRI file scan, no Kubernetes.
 # --from-start: replay the CRI log file from byte 0.
 # --scrape-interval 600s: only the immediate first tick fires in this run.
-echo "[agent-config] running scry-agent against stub + log tree..."
-RUST_LOG="${RUST_LOG:-info}" ./target/release/scry-agent \
+echo "[agent-config] running scry agent against stub + log tree..."
+RUST_LOG="${RUST_LOG:-info}" ./target/release/scry agent \
     --server-addr "$LISTEN" \
     --no-discovery \
     --from-start \
@@ -157,19 +157,19 @@ AGENT_PID=$!
 
 # Give it time to connect + scrape + read logs + flush, then graceful stop.
 sleep 4
-echo "[agent-config] SIGINT scry-agent → drain + flush..."
+echo "[agent-config] SIGINT scry agent → drain + flush..."
 kill -INT "$AGENT_PID"
 wait "$AGENT_PID" 2>/dev/null || true
 
 # Stop the ingest server so its final block flush completes, then reconcile.
-echo "[agent-config] SIGINT scry-ingestd → final block flush..."
+echo "[agent-config] SIGINT scry ingest → final block flush..."
 kill -INT "$INGEST_PID"
 wait "$INGEST_PID" 2>/dev/null || true
 trap 'kill -9 "$STUB_PID" 2>/dev/null || true' EXIT
 
 # ── Verify ──────────────────────────────────────────────────────────
 echo "[agent-config] reconciling a fresh catalog from the bucket..."
-./target/release/scry-list --catalog "$SMOKE_DIR/recon.sqlite" \
+./target/release/scry list --catalog "$SMOKE_DIR/recon.sqlite" \
     > "$SMOKE_DIR/scry-list.txt" 2>&1
 cat "$SMOKE_DIR/scry-list.txt"
 
@@ -183,14 +183,14 @@ metrics_blocks=$(sqlite3 "$SMOKE_DIR/recon.sqlite" \
 echo "[agent-config] ──── logs assertions ────"
 
 # 1. Default query → at least 1 log row (our line landed).
-./target/release/scry-query \
+./target/release/scry get \
     --catalog "$SMOKE_DIR/recon.sqlite" \
     --signal logs \
     > "$SMOKE_DIR/query.logs.default.txt" 2>&1 || true
 logs_default=$(awk '/^# scan:/ { print $3; exit }' "$SMOKE_DIR/query.logs.default.txt")
 
 # 2. Static label → postings.
-./target/release/scry-query \
+./target/release/scry get \
     --catalog "$SMOKE_DIR/recon.sqlite" \
     --signal logs \
     --matcher cluster=gothab-smoke \
@@ -198,7 +198,7 @@ logs_default=$(awk '/^# scan:/ { print $3; exit }' "$SMOKE_DIR/query.logs.defaul
 logs_static=$(awk '/^# scan:/ { print $3; exit }' "$SMOKE_DIR/query.logs.static.txt")
 
 # 3. JSON label (level=warn) → postings.
-./target/release/scry-query \
+./target/release/scry get \
     --catalog "$SMOKE_DIR/recon.sqlite" \
     --signal logs \
     --matcher level=warn \
@@ -206,7 +206,7 @@ logs_static=$(awk '/^# scan:/ { print $3; exit }' "$SMOKE_DIR/query.logs.static.
 logs_level=$(awk '/^# scan:/ { print $3; exit }' "$SMOKE_DIR/query.logs.level.txt")
 
 # 4. message_field replaced body (raw JSON gone; "hello" is the body).
-./target/release/scry-query \
+./target/release/scry get \
     --catalog "$SMOKE_DIR/recon.sqlite" \
     --signal logs \
     --show \
@@ -214,7 +214,7 @@ logs_level=$(awk '/^# scan:/ { print $3; exit }' "$SMOKE_DIR/query.logs.level.tx
     > "$SMOKE_DIR/query.logs.body.txt" 2>&1 || true
 
 # 5. json.metadata → attributes Map (request_id=r1 present).
-./target/release/scry-query \
+./target/release/scry get \
     --catalog "$SMOKE_DIR/recon.sqlite" \
     --signal logs \
     --show \
@@ -225,7 +225,7 @@ logs_level=$(awk '/^# scan:/ { print $3; exit }' "$SMOKE_DIR/query.logs.level.tx
 echo "[agent-config] ──── metrics assertions ────"
 
 # 6. Relabel applied: container=c1 matches.
-./target/release/scry-query \
+./target/release/scry get \
     --catalog "$SMOKE_DIR/recon.sqlite" \
     --signal metrics \
     --matcher container=c1 \
@@ -233,7 +233,7 @@ echo "[agent-config] ──── metrics assertions ────"
 metrics_relabel=$(awk '/^# scan:/ { print $3; exit }' "$SMOKE_DIR/query.metrics.relabel.txt")
 
 # 7. Old key container_name=c1 matches 0 (relabel removed it).
-./target/release/scry-query \
+./target/release/scry get \
     --catalog "$SMOKE_DIR/recon.sqlite" \
     --signal metrics \
     --matcher container_name=c1 \
@@ -241,7 +241,7 @@ metrics_relabel=$(awk '/^# scan:/ { print $3; exit }' "$SMOKE_DIR/query.metrics.
 metrics_oldkey=$(awk '/^# scan:/ { print $3; exit }' "$SMOKE_DIR/query.metrics.oldkey.txt")
 
 # 8. Static label on metrics.
-./target/release/scry-query \
+./target/release/scry get \
     --catalog "$SMOKE_DIR/recon.sqlite" \
     --signal metrics \
     --matcher cluster=gothab-smoke \
@@ -249,7 +249,7 @@ metrics_oldkey=$(awk '/^# scan:/ { print $3; exit }' "$SMOKE_DIR/query.metrics.o
 metrics_static=$(awk '/^# scan:/ { print $3; exit }' "$SMOKE_DIR/query.metrics.static.txt")
 
 # 9. Static label rides on synthesized up series.
-./target/release/scry-query \
+./target/release/scry get \
     --catalog "$SMOKE_DIR/recon.sqlite" \
     --signal metrics \
     --matcher __name__=up \

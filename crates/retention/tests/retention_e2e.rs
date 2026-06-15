@@ -196,7 +196,10 @@ async fn logs_retention_dry_run_then_apply() {
         .unwrap();
     assert!(dry.dry_run);
     assert_eq!(dry.reaped, 1, "only the aged logs block is a candidate");
-    assert_eq!(dry.by_signal.get("logs").copied(), Some((1, m_old.byte_size)));
+    assert_eq!(
+        dry.by_signal.get("logs").copied(),
+        Some((1, m_old.byte_size))
+    );
     assert_eq!(
         catalog.list_blocks().unwrap().len(),
         3,
@@ -282,9 +285,17 @@ async fn retention_aborts_under_a_lost_lease_leaving_blocks_intact() {
     assert_eq!(expired.len(), 1, "block is a reaping candidate");
 
     // But the lease is lost → retain_planned must abort and touch nothing.
-    let aborted = retain_planned(&expired, store.clone(), &catalog, &cfg, NOW, &LostFence, &NoopSink)
-        .await
-        .unwrap();
+    let aborted = retain_planned(
+        &expired,
+        store.clone(),
+        &catalog,
+        &cfg,
+        NOW,
+        &LostFence,
+        &NoopSink,
+    )
+    .await
+    .unwrap();
     assert!(aborted, "a lost lease aborts the pass");
 
     // Block survives: row present, objects present.

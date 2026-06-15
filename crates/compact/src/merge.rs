@@ -287,7 +287,13 @@ pub async fn merge_blocks(
         let bytes = Bytes::from(bloom.to_bytes());
         let size = bytes.len() as u64;
         puts.push((
-            ObjPath::from(block_path(signal, ts_min, writer_id, block_uuid, "body.bloom")),
+            ObjPath::from(block_path(
+                signal,
+                ts_min,
+                writer_id,
+                block_uuid,
+                "body.bloom",
+            )),
             bytes,
         ));
         (true, Some(size))
@@ -338,7 +344,8 @@ pub async fn merge_blocks(
         has_body_bloom,
         body_bloom_size_bytes,
     };
-    let meta_bytes = Bytes::from(serde_json::to_vec_pretty(&meta).context("serialise merged meta")?);
+    let meta_bytes =
+        Bytes::from(serde_json::to_vec_pretty(&meta).context("serialise merged meta")?);
 
     // Upload the data objects first (main → [postings] → [bloom]). These
     // carry no "block exists" signal on their own — reconcile keys on
@@ -366,7 +373,13 @@ pub async fn merge_blocks(
     }
 
     // Commit: meta.json last (durability invariant — the "block exists" signal).
-    let meta_path = ObjPath::from(block_path(signal, ts_min, writer_id, block_uuid, "meta.json"));
+    let meta_path = ObjPath::from(block_path(
+        signal,
+        ts_min,
+        writer_id,
+        block_uuid,
+        "meta.json",
+    ));
     store
         .put(&meta_path, meta_bytes.into())
         .await
@@ -402,4 +415,3 @@ async fn fetch_meta(store: &Arc<dyn ObjectStore>, meta: &BlockMeta) -> Result<Bl
         .context("read input meta.json body")?;
     serde_json::from_slice(&bytes).context("parse input meta.json")
 }
-
