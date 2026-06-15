@@ -1,0 +1,21 @@
+{
+  "name": "scry-website",
+  "version": "0.12.0",
+  "description": "Marketing site for scry — a single-binary observability stack. Static SolidJS SPA, no backend.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "solid-js": "^1.9.3"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2",
+    "vite": "^6.0.7",
+    "vite-plugin-solid": "^2.11.0"
+  }
+}

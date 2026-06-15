@@ -1,0 +1,215 @@
+/* ─────────────────────────────────────────────────────────────────────────
+   scry marketing site — design tokens + base + shared utilities
+
+   Theme: dark-minimal with tasteful motion. Near-black canvas, restrained
+   teal→violet accent, generous whitespace, soft glows, scroll-reveal.
+   ───────────────────────────────────────────────────────────────────────── */
+
+:root {
+  /* Surfaces */
+  --bg: #07080c;
+  --bg-elev: #0c0e15;
+  --surface: rgba(255, 255, 255, 0.025);
+  --surface-2: rgba(255, 255, 255, 0.04);
+  --border: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.14);
+
+  /* Text */
+  --text: #eef1f7;
+  --text-dim: #aab2c2;
+  --text-faint: #6b7587;
+
+  /* Accent */
+  --teal: #3ce8c6;
+  --violet: #8b6cf0;
+  --accent-grad: linear-gradient(120deg, #3ce8c6 0%, #6ad7d0 38%, #8b6cf0 100%);
+  --accent-glow: rgba(60, 232, 198, 0.35);
+  --violet-glow: rgba(139, 108, 240, 0.32);
+
+  /* Type */
+  --font-sans: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+  /* Layout */
+  --maxw: 1140px;
+  --radius: 16px;
+  --radius-sm: 10px;
+
+  /* Motion */
+  --ease: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 17px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  overflow-x: hidden;
+}
+
+h1,
+h2,
+h3 {
+  margin: 0;
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+  font-weight: 800;
+}
+
+p {
+  margin: 0;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+::selection {
+  background: rgba(60, 232, 198, 0.25);
+  color: #fff;
+}
+
+/* ── Shared layout ──────────────────────────────────────────────────────── */
+
+.container {
+  width: 100%;
+  max-width: var(--maxw);
+  margin-inline: auto;
+  padding-inline: 24px;
+}
+
+.section {
+  position: relative;
+  padding-block: clamp(72px, 12vw, 140px);
+}
+
+.eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--teal);
+}
+
+.eyebrow::before {
+  content: "";
+  width: 22px;
+  height: 1px;
+  background: var(--teal);
+  opacity: 0.6;
+}
+
+.section-title {
+  font-size: clamp(30px, 4.6vw, 50px);
+  margin-top: 18px;
+  max-width: 16ch;
+}
+
+.section-lead {
+  margin-top: 20px;
+  max-width: 60ch;
+  color: var(--text-dim);
+  font-size: clamp(16px, 2vw, 19px);
+}
+
+.grad-text {
+  background: var(--accent-grad);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+/* ── Buttons ────────────────────────────────────────────────────────────── */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  padding: 13px 22px;
+  border-radius: var(--radius-sm);
+  font-weight: 600;
+  font-size: 15px;
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition:
+    transform 0.2s var(--ease),
+    box-shadow 0.3s var(--ease),
+    background 0.3s var(--ease),
+    border-color 0.3s var(--ease);
+  will-change: transform;
+}
+
+.btn-primary {
+  color: #05201b;
+  background: var(--accent-grad);
+  box-shadow: 0 8px 30px -10px var(--accent-glow);
+}
+
+.btn-primary:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 14px 42px -10px var(--accent-glow);
+}
+
+.btn-ghost {
+  color: var(--text);
+  background: var(--surface);
+  border-color: var(--border-strong);
+}
+
+.btn-ghost:hover {
+  transform: translateY(-2px);
+  background: var(--surface-2);
+  border-color: var(--teal);
+}
+
+/* ── Scroll reveal ──────────────────────────────────────────────────────── */
+
+.reveal {
+  opacity: 0;
+  transform: translateY(26px);
+  transition:
+    opacity 0.7s var(--ease),
+    transform 0.7s var(--ease);
+}
+
+.reveal.is-visible {
+  opacity: 1;
+  transform: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  .reveal {
+    opacity: 1;
+    transform: none;
+    transition: none;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}

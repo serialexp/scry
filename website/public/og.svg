@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" fill="none">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1200" y2="630" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#07080c" />
+      <stop offset="1" stop-color="#0d1018" />
+    </linearGradient>
+    <linearGradient id="g" x1="120" y1="120" x2="520" y2="520" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#3ce8c6" />
+      <stop offset="1" stop-color="#8b6cf0" />
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop stop-color="#3ce8c6" stop-opacity="0.22" />
+      <stop offset="1" stop-color="#3ce8c6" stop-opacity="0" />
+    </radialGradient>
+  </defs>
+  <rect width="1200" height="630" fill="url(#bg)" />
+  <circle cx="930" cy="315" r="360" fill="url(#glow)" />
+  <g transform="translate(96 232)">
+    <circle cx="68" cy="68" r="58" stroke="url(#g)" stroke-width="10" />
+    <circle cx="68" cy="68" r="22" fill="url(#g)" />
+    <path d="M68 -2v22M68 116v22M-2 68h22M116 68h22" stroke="url(#g)" stroke-width="10" stroke-linecap="round" />
+  </g>
+  <text x="270" y="290" font-family="Inter, sans-serif" font-size="104" font-weight="800" fill="#f4f6fb">scry</text>
+  <text x="274" y="362" font-family="Inter, sans-serif" font-size="40" font-weight="600" fill="#9aa3b2">one binary. every signal.</text>
+  <text x="274" y="430" font-family="JetBrains Mono, monospace" font-size="27" fill="#5f6b7e">metrics · logs · traces · profiles → parquet in S3</text>
+</svg>

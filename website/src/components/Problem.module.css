@@ -1,0 +1,196 @@
+.head {
+  max-width: 760px;
+  margin-bottom: 56px;
+}
+
+/* ── Two deployment topologies, side by side ────────────────────────────── */
+
+.diagrams {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: clamp(16px, 3vw, 28px);
+  align-items: start;
+}
+
+.diagram {
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  padding: clamp(20px, 2.4vw, 28px);
+  height: 100%;
+}
+
+.before {
+  background: linear-gradient(180deg, rgba(255, 95, 87, 0.045), transparent 55%);
+}
+
+.after {
+  background: linear-gradient(180deg, rgba(60, 232, 198, 0.06), transparent 55%);
+  border-color: rgba(60, 232, 198, 0.22);
+  box-shadow: 0 24px 70px -40px var(--accent-glow);
+}
+
+.cardHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 24px;
+}
+
+.label {
+  font-weight: 700;
+  font-size: 17px;
+  letter-spacing: -0.01em;
+}
+
+.pill {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 4px 10px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+.pillBad {
+  color: #ff8a82;
+  background: rgba(255, 95, 87, 0.12);
+}
+
+.pillGood {
+  color: #05201b;
+  background: var(--accent-grad);
+}
+
+/* ── Tier flow ──────────────────────────────────────────────────────────── */
+
+.flow {
+  display: flex;
+  flex-direction: column;
+}
+
+.tier {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 9px;
+}
+
+/* Connector line between consecutive tiers. */
+.tier:not(:first-child) {
+  margin-top: 26px;
+}
+.tier:not(:first-child)::before {
+  content: "";
+  position: absolute;
+  top: -20px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 1.5px;
+  height: 15px;
+  background: var(--border-strong);
+}
+
+.tierLabel {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.nodes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: center;
+}
+
+.node {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.2;
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.nodeBad {
+  border-color: rgba(255, 95, 87, 0.22);
+  background: rgba(255, 95, 87, 0.05);
+  color: #e6b0ab;
+}
+
+.nodeGood {
+  border-color: rgba(60, 232, 198, 0.24);
+  background: rgba(60, 232, 198, 0.06);
+  color: #b6ebda;
+}
+
+.nodeCoord {
+  border-color: rgba(139, 108, 240, 0.4);
+  background: rgba(139, 108, 240, 0.1);
+  color: #c8b9fb;
+}
+
+.nodeStore {
+  border-color: var(--border-strong);
+  background: var(--surface-2);
+  color: var(--text);
+  font-weight: 600;
+}
+
+.nodeViz {
+  border-color: var(--border);
+  background: transparent;
+  color: var(--text-faint);
+}
+
+/* ── The four exploded Grafana clusters ─────────────────────────────────── */
+
+.dbGrid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  width: 100%;
+}
+
+.dbCol {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.dbTitle {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  text-align: center;
+  color: var(--text);
+  padding-bottom: 6px;
+  margin-bottom: 2px;
+  border-bottom: 1px solid var(--border);
+}
+
+.dbCol .node {
+  font-size: 10.5px;
+  padding: 4px 6px;
+  text-align: center;
+  white-space: normal;
+}
+
+@media (max-width: 920px) {
+  .diagrams {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 460px) {
+  .dbGrid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}

@@ -1,0 +1,121 @@
+.hero {
+  position: relative;
+  padding-top: clamp(64px, 10vw, 110px);
+  padding-bottom: clamp(36px, 5vw, 64px);
+}
+
+.inner {
+  display: grid;
+  grid-template-columns: 1.05fr 0.95fr;
+  gap: clamp(32px, 5vw, 72px);
+  align-items: center;
+}
+
+.badge {
+  margin-bottom: 4px;
+}
+
+.title {
+  font-size: clamp(54px, 9vw, 96px);
+  line-height: 0.96;
+  margin-top: 22px;
+}
+
+.lead {
+  margin-top: 26px;
+  max-width: 52ch;
+  color: var(--text-dim);
+  font-size: clamp(16px, 2.1vw, 20px);
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  margin-top: 34px;
+}
+
+/* ── Terminal card ──────────────────────────────────────────────────────── */
+
+.visual {
+  position: relative;
+}
+
+.term {
+  position: relative;
+  border-radius: var(--radius);
+  background: linear-gradient(180deg, rgba(18, 21, 30, 0.92), rgba(10, 12, 18, 0.92));
+  border: 1px solid var(--border-strong);
+  box-shadow:
+    0 30px 80px -30px rgba(0, 0, 0, 0.8),
+    0 0 0 1px rgba(60, 232, 198, 0.04),
+    0 0 60px -20px var(--accent-glow);
+  overflow: hidden;
+  backdrop-filter: blur(6px);
+}
+
+.termBar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 13px 16px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.dot {
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  opacity: 0.9;
+}
+
+.termTitle {
+  margin-left: 10px;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  color: var(--text-faint);
+}
+
+.termBody {
+  margin: 0;
+  padding: 20px 22px 24px;
+  font-family: var(--font-mono);
+  font-size: 13.5px;
+  line-height: 1.85;
+  color: var(--text);
+  overflow-x: auto;
+  white-space: pre;
+}
+
+.prompt {
+  color: var(--teal);
+  font-weight: 600;
+}
+.cmt {
+  color: var(--text-faint);
+  font-style: italic;
+}
+.ok {
+  color: var(--teal);
+  font-weight: 700;
+}
+.dim {
+  color: var(--text-faint);
+}
+
+@media (max-width: 920px) {
+  .inner {
+    grid-template-columns: 1fr;
+  }
+  /* Headline leads on narrow viewports; the terminal follows it. */
+  .copy {
+    order: -1;
+  }
+}
+
+@media (max-width: 520px) {
+  .termBody {
+    font-size: 12px;
+  }
+}

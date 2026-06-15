@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <defs>
+    <linearGradient id="g" x1="8" y1="8" x2="56" y2="56" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#3ce8c6" />
+      <stop offset="1" stop-color="#8b6cf0" />
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="14" fill="#0a0c12" />
+  <!-- scrying lens / orb -->
+  <circle cx="32" cy="32" r="17" stroke="url(#g)" stroke-width="3.5" />
+  <circle cx="32" cy="32" r="6.5" fill="url(#g)" />
+  <!-- four signal ticks: metrics, logs, traces, profiles -->
+  <path d="M32 6v7M32 51v7M6 32h7M51 32h7" stroke="url(#g)" stroke-width="3.5" stroke-linecap="round" />
+</svg>
