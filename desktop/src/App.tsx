@@ -9,7 +9,9 @@
 import { Show, onMount, type Component } from "solid-js";
 
 import QueryForm from "./components/QueryForm";
+import LabelBrowser from "./components/LabelBrowser";
 import ResultsTable from "./components/ResultsTable";
+import VolumePanel from "./components/VolumePanel";
 import LoginForm from "./components/LoginForm";
 import {
   state,
@@ -49,6 +51,7 @@ const App: Component = () => {
           <div class="app-body">
             <aside class="sidebar">
               <QueryForm />
+              <LabelBrowser />
             </aside>
             <main class="main">
               <Show when={state.status === "error" && state.error}>
@@ -56,6 +59,7 @@ const App: Component = () => {
                   {state.error}
                 </div>
               </Show>
+              <VolumePanel />
               <ResultsTable />
             </main>
           </div>

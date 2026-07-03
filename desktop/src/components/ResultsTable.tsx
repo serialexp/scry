@@ -19,6 +19,7 @@ import {
   singleTraceId,
 } from "../traces";
 import { state, resultTable, resultKind } from "../store";
+import { severity } from "../severity";
 import TracesView, { type TraceData } from "./TracesView";
 import FramesView, { type FramesData } from "./FramesView";
 
@@ -89,17 +90,6 @@ function shortKey(k: string): string {
   const slash = s.lastIndexOf("/");
   if (slash >= 0) s = s.slice(slash + 1);
   return s;
-}
-
-/** OTEL severity number → display label + CSS class. */
-function severity(sev: number): { label: string; cls: string } {
-  if (sev >= 21) return { label: "FATAL", cls: "sev-fatal" };
-  if (sev >= 17) return { label: "ERROR", cls: "sev-error" };
-  if (sev >= 13) return { label: "WARN", cls: "sev-warn" };
-  if (sev >= 9) return { label: "INFO", cls: "sev-info" };
-  if (sev >= 5) return { label: "DEBUG", cls: "sev-debug" };
-  if (sev >= 1) return { label: "TRACE", cls: "sev-trace" };
-  return { label: "—", cls: "sev-none" };
 }
 
 // ── component ──────────────────────────────────────────────────────────

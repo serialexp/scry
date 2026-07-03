@@ -9,6 +9,14 @@ description = "Long-running query daemon speaking the binschema QueryFrame wire 
 name = "scry_queryd"
 path = "src/lib.rs"
 
+# Dev/ops harness: a minimal client that speaks the QueryFrame wire so
+# scripts (and humans) can drive a running `scry query` daemon without the
+# TS desktop app. Mirrors `scry-gateway-probe`. Used by scripts/smoke.sh to
+# assert the queryd result cache serves an identical replay as `cache=hit`.
+[[bin]]
+name = "scry-query-probe"
+path = "src/bin/probe.rs"
+
 [dependencies]
 anyhow             = { workspace = true }
 clap               = { workspace = true }
@@ -16,6 +24,7 @@ datafusion         = { workspace = true }
 scry-catalog       = { workspace = true }
 scry-cluster       = { workspace = true }
 scry-objstore      = { workspace = true }
+scry-proto         = { workspace = true }
 scry-query         = { workspace = true }
 scry-server        = { workspace = true }
 scry-valkey        = { workspace = true }

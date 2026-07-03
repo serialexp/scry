@@ -56,19 +56,22 @@ use scry_proto::{
         Signal, QUERY_ERR_BAD_REQUEST, QUERY_ERR_INTERNAL, QUERY_ERR_PLAN, QUERY_ERR_RESOURCES,
         QUERY_ERR_SQL_PARSE,
     },
-    framing::{read_frame, write_frame},
-    BatchMsgInput, EndOfStreamInput, QueryFrame, QueryFrameMsg, SchemaMsgInput, StreamErrorInput,
+    framing::{read_frame, write_frame, Framed, MAX_FRAME_BYTES},
+    BatchMsgInput, EndOfStreamInput, LabelNamesRequestOutput, LabelNamesResponseInput,
+    LabelValuesRequestOutput, LabelValuesResponseInput, QueryFrame, QueryFrameMsg, SchemaMsgInput,
+    StreamErrorInput,
 };
 use scry_query::{
-    list_metrics_candidates,
+    collect_label_names, collect_label_values, hash128, list_metrics_candidates,
     logs::{list_logs_candidates, register_logs_table_from_candidates, LOGS_TABLE_NAME},
+    meta_query,
     profiles::{
         list_profiles_candidates, register_profiles_table_from_candidates, PROFILES_TABLE_NAME,
     },
     register_metrics_table_from_candidates,
     traces::{list_traces_candidates, register_traces_table_from_candidates, TRACES_TABLE_NAME},
-    BloomCache, BloomCacheStats, EvictOnNotFound, PostingsCache, PostingsCacheStats, QueryRequest,
-    METRICS_TABLE_NAME,
+    BloomCache, BloomCacheStats, EvictOnNotFound, PostingsCache, PostingsCacheStats, Query,
+    QueryRequest, QueryResultCache, QueryResultCacheStats, METRICS_TABLE_NAME,
 };
 use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
@@ -82,6 +85,7 @@ use uuid::Uuid;
 struct CacheStarts {
     postings: PostingsCacheStats,
     bloom: BloomCacheStats,
+    result: QueryResultCacheStats,
 }
 
 /// Long-lived query service. One instance per daemon process. All
@@ -118,6 +122,19 @@ pub struct QueryService {
     /// at scan_complete time without downcasting from
     /// `Arc<dyn MemoryPool>`. Pure observability handle.
     memory_pool: Arc<GreedyMemoryPool>,
+    /// Whole-response cache, keyed by the normalized request ⊕ the
+    /// candidate block-UUID set (see [`data_query_cache_key`]). Turns a
+    /// repeated data query — the shape a dashboard re-polling the same
+    /// panel produces — into a single `write_all` of the cached frame
+    /// bytes, with no DataFusion or object-store work. A budget of `0`
+    /// disables it. Only the QueryRequest (data) path consults it;
+    /// metadata answers are already served from the catalog label cache.
+    result_cache: Arc<QueryResultCache>,
+    /// Per-entry cap: a response is buffered for caching only while its
+    /// framed bytes stay under this. Larger responses (big log dumps)
+    /// stream normally but are never cached — keeps the cache to the
+    /// small aggregation/metadata results dashboards re-poll.
+    result_cache_entry_bytes: usize,
     /// Monotonic per-process counter, used only when the client
     /// didn't supply `request_id`. A `u64` is plenty — the daemon
     /// would have to serve 18 quintillion requests to wrap.
@@ -134,6 +151,8 @@ impl QueryService {
         bloom_cache: Arc<BloomCache>,
         runtime_env: Arc<RuntimeEnv>,
         memory_pool: Arc<GreedyMemoryPool>,
+        result_cache: Arc<QueryResultCache>,
+        result_cache_entry_bytes: usize,
     ) -> Self {
         Self {
             catalog,
@@ -143,6 +162,8 @@ impl QueryService {
             bloom_cache,
             runtime_env,
             memory_pool,
+            result_cache,
+            result_cache_entry_bytes,
             next_request_id: AtomicU64::new(0),
         }
     }
@@ -168,6 +189,12 @@ impl QueryService {
     /// configured budget at startup.
     pub fn memory_pool(&self) -> &Arc<GreedyMemoryPool> {
         &self.memory_pool
+    }
+
+    /// Borrow the result cache — exposed so the binary can log its
+    /// budget at startup and so callers can inspect stats.
+    pub fn result_cache(&self) -> &Arc<QueryResultCache> {
+        &self.result_cache
     }
 
     /// Bind a TCP listener on `listen_addr`, accept connections, and
@@ -236,13 +263,26 @@ impl QueryService {
         };
         let wire_req = match req_frame.msg {
             QueryFrameMsg::QueryRequest(q) => q,
+            // Metadata (discoverability) requests are self-contained: one
+            // request → one response frame → close. They share the connection
+            // handshake but not the query pipeline (no Arrow stream). See D-050.
+            QueryFrameMsg::LabelNamesRequest(m) => {
+                return self.handle_label_names(m, &mut wr, peer).await;
+            }
+            QueryFrameMsg::LabelValuesRequest(m) => {
+                return self.handle_label_values(m, &mut wr, peer).await;
+            }
             other => {
                 let name = match other {
                     QueryFrameMsg::SchemaMsg(_) => "SchemaMsg",
                     QueryFrameMsg::BatchMsg(_) => "BatchMsg",
                     QueryFrameMsg::EndOfStream(_) => "EndOfStream",
+                    QueryFrameMsg::LabelNamesResponse(_) => "LabelNamesResponse",
+                    QueryFrameMsg::LabelValuesResponse(_) => "LabelValuesResponse",
                     QueryFrameMsg::StreamError(_) => "StreamError",
-                    QueryFrameMsg::QueryRequest(_) => unreachable!(),
+                    QueryFrameMsg::QueryRequest(_)
+                    | QueryFrameMsg::LabelNamesRequest(_)
+                    | QueryFrameMsg::LabelValuesRequest(_) => unreachable!(),
                 };
                 let _ = emit_stream_error(
                     &mut wr,
@@ -331,49 +371,54 @@ impl QueryService {
     /// against `store` (a peer deleted a block we still list). For metrics/logs
     /// the 404 surfaces here (postings GET); traces/profiles resolve no sidecar
     /// at plan time so theirs only appears mid-scan (handled in `run_query`).
+    /// List the candidate blocks for a query from the catalog — one
+    /// indexed SELECT under the mutex, dropped before any async work.
+    /// Hoisted out of [`plan_and_execute`] so [`run_query`] can list
+    /// candidates once, fold them into the result-cache key, and reuse
+    /// the same `Vec` for planning on a miss.
+    fn list_candidates(
+        &self,
+        signal: Signal,
+        query: &Query,
+    ) -> std::result::Result<Vec<CatalogEntry>, (u16, String)> {
+        let guard = self
+            .catalog
+            .lock()
+            .map_err(|e| (QUERY_ERR_INTERNAL, format!("catalog mutex poisoned: {e}")))?;
+        match signal {
+            Signal::Metrics => list_metrics_candidates(&guard, query).map_err(|e| {
+                (
+                    QUERY_ERR_INTERNAL,
+                    format!("list_metrics_candidates: {e:#}"),
+                )
+            }),
+            Signal::Logs => list_logs_candidates(&guard, query)
+                .map_err(|e| (QUERY_ERR_INTERNAL, format!("list_logs_candidates: {e:#}"))),
+            Signal::Traces => list_traces_candidates(&guard, query)
+                .map_err(|e| (QUERY_ERR_INTERNAL, format!("list_traces_candidates: {e:#}"))),
+            Signal::Profiles => list_profiles_candidates(&guard, query).map_err(|e| {
+                (
+                    QUERY_ERR_INTERNAL,
+                    format!("list_profiles_candidates: {e:#}"),
+                )
+            }),
+            other => Err((
+                QUERY_ERR_INTERNAL,
+                format!("BUG: unsupported signal {other:?} reached run_query"),
+            )),
+        }
+    }
+
     async fn plan_and_execute(
         &self,
         signal: Signal,
         req: &QueryRequest,
         store: Arc<dyn ObjectStore>,
+        candidates: Vec<CatalogEntry>,
     ) -> std::result::Result<(SendableRecordBatchStream, Arc<dyn ExecutionPlan>), (u16, String)>
     {
         let ctx =
             SessionContext::new_with_config_rt(SessionConfig::new(), self.runtime_env.clone());
-
-        // ── Catalog lookup (sync) ────────────────────────────────────
-        // Lock only to list candidates into an owned Vec; the guard drops
-        // before any .await (MutexGuard isn't Send across await anyway).
-        let candidates: Vec<CatalogEntry> = {
-            let guard = self
-                .catalog
-                .lock()
-                .map_err(|e| (QUERY_ERR_INTERNAL, format!("catalog mutex poisoned: {e}")))?;
-            match signal {
-                Signal::Metrics => list_metrics_candidates(&guard, &req.query).map_err(|e| {
-                    (
-                        QUERY_ERR_INTERNAL,
-                        format!("list_metrics_candidates: {e:#}"),
-                    )
-                })?,
-                Signal::Logs => list_logs_candidates(&guard, &req.query)
-                    .map_err(|e| (QUERY_ERR_INTERNAL, format!("list_logs_candidates: {e:#}")))?,
-                Signal::Traces => list_traces_candidates(&guard, &req.query)
-                    .map_err(|e| (QUERY_ERR_INTERNAL, format!("list_traces_candidates: {e:#}")))?,
-                Signal::Profiles => list_profiles_candidates(&guard, &req.query).map_err(|e| {
-                    (
-                        QUERY_ERR_INTERNAL,
-                        format!("list_profiles_candidates: {e:#}"),
-                    )
-                })?,
-                other => {
-                    return Err((
-                        QUERY_ERR_INTERNAL,
-                        format!("BUG: unsupported signal {other:?} reached run_query"),
-                    ))
-                }
-            }
-        };
 
         // ── Register the signal's table (sidecar GETs happen here) ────
         let register_result = match signal {
@@ -478,6 +523,153 @@ impl QueryService {
         }
     }
 
+    // ── Label metadata (discoverability) ─────────────────────────────────
+    // A materialized view over the authoritative postings sidecars, cached in
+    // the catalog and warmed lazily. Answers "what can I match on?" without a
+    // data scan. See D-050 and `scry_catalog`'s `block_labels*` tables.
+
+    /// `LabelNamesRequest` → one `LabelNamesResponse`.
+    async fn handle_label_names<W>(
+        &self,
+        m: LabelNamesRequestOutput,
+        wr: &mut BufWriter<W>,
+        peer: SocketAddr,
+    ) -> Result<()>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        let Some(signal) = self.resolve_meta_signal(m.signal, wr).await? else {
+            return Ok(());
+        };
+        let q = meta_query(
+            (m.ts_min_present != 0).then_some(m.ts_min),
+            (m.ts_max_present != 0).then_some(m.ts_max),
+        );
+        let names = match self.collect_label_names(signal, &q).await {
+            Ok(n) => n,
+            Err((code, msg)) => {
+                warn!(%peer, signal = signal_name(signal), code, %msg, "label-names request failed");
+                let _ = emit_stream_error(wr, code, msg).await;
+                let _ = wr.flush().await;
+                return Ok(());
+            }
+        };
+        let frame = QueryFrame {
+            msg: QueryFrameMsg::LabelNamesResponse(LabelNamesResponseInput { names }.into()),
+        };
+        if let Err(e) = write_frame(wr, &frame).await {
+            warn!(%peer, error = %e, "writing LabelNamesResponse");
+        }
+        let _ = wr.flush().await;
+        Ok(())
+    }
+
+    /// `LabelValuesRequest` → one `LabelValuesResponse`.
+    async fn handle_label_values<W>(
+        &self,
+        m: LabelValuesRequestOutput,
+        wr: &mut BufWriter<W>,
+        peer: SocketAddr,
+    ) -> Result<()>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        let Some(signal) = self.resolve_meta_signal(m.signal, wr).await? else {
+            return Ok(());
+        };
+        let q = meta_query(
+            (m.ts_min_present != 0).then_some(m.ts_min),
+            (m.ts_max_present != 0).then_some(m.ts_max),
+        );
+        let values = match self.collect_label_values(signal, &m.label_name, &q).await {
+            Ok(v) => v,
+            Err((code, msg)) => {
+                warn!(%peer, signal = signal_name(signal), code, %msg, "label-values request failed");
+                let _ = emit_stream_error(wr, code, msg).await;
+                let _ = wr.flush().await;
+                return Ok(());
+            }
+        };
+        let frame = QueryFrame {
+            msg: QueryFrameMsg::LabelValuesResponse(LabelValuesResponseInput { values }.into()),
+        };
+        if let Err(e) = write_frame(wr, &frame).await {
+            warn!(%peer, error = %e, "writing LabelValuesResponse");
+        }
+        let _ = wr.flush().await;
+        Ok(())
+    }
+
+    /// Resolve a metadata request's signal byte, emitting a `StreamError` +
+    /// flushing on an invalid byte. `Ok(None)` means the error was already sent
+    /// and the caller should return.
+    async fn resolve_meta_signal<W>(
+        &self,
+        byte: u8,
+        wr: &mut BufWriter<W>,
+    ) -> Result<Option<Signal>>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        match Signal::from_u8(byte) {
+            Some(s @ (Signal::Metrics | Signal::Logs | Signal::Traces | Signal::Profiles)) => {
+                Ok(Some(s))
+            }
+            _ => {
+                let _ = emit_stream_error(
+                    wr,
+                    QUERY_ERR_BAD_REQUEST,
+                    format!(
+                        "signal byte {byte} has no label metadata \
+                         (expected 1=metrics, 2=logs, 3=traces, 4=profiles)"
+                    ),
+                )
+                .await;
+                let _ = wr.flush().await;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Distinct, sorted label names for a signal + time window. Thin wrapper
+    /// over the shared [`scry_query::collect_label_names`] so the daemon and the
+    /// `scry get` CLI answer identically.
+    async fn collect_label_names(
+        &self,
+        signal: Signal,
+        q: &Query,
+    ) -> std::result::Result<Vec<String>, (u16, String)> {
+        collect_label_names(
+            &self.catalog,
+            self.store.clone(),
+            self.postings_cache.as_ref(),
+            self.runtime_env.clone(),
+            signal,
+            q,
+        )
+        .await
+    }
+
+    /// Distinct, sorted values for one label name over a signal + time window.
+    /// Thin wrapper over the shared [`scry_query::collect_label_values`].
+    async fn collect_label_values(
+        &self,
+        signal: Signal,
+        name: &str,
+        q: &Query,
+    ) -> std::result::Result<Vec<String>, (u16, String)> {
+        collect_label_values(
+            &self.catalog,
+            self.store.clone(),
+            self.postings_cache.as_ref(),
+            self.runtime_env.clone(),
+            signal,
+            name,
+            q,
+        )
+        .await
+    }
+
     /// The actual query execution. Split out from `handle_connection`
     /// so the request decode + span setup is one orderly block, and
     /// this fn can return early via `?` on framing errors without
@@ -492,38 +684,89 @@ impl QueryService {
         W: tokio::io::AsyncWrite + Unpin,
     {
         let pool_start = self.pool.stats();
-        // Bundle both cache start-snapshots under one name so every
+        // Bundle the three cache start-snapshots under one name so every
         // `emit_scan_complete` call site stays unchanged (they pass
-        // `cache_start` by name); only the type and the two reads here move.
+        // `cache_start` by name); only the type and the reads here move.
         let cache_start = CacheStarts {
             postings: self.postings_cache.stats(),
             bloom: self.bloom_cache.stats(),
+            result: self.result_cache.stats(),
         };
         let t0 = Instant::now();
         // Pre-allocate row counter so we can pass it to emit_scan_complete
         // on every exit path (success + each error path).
         let mut rows_total: u64 = 0;
 
-        // ── Plan + execute, with one transparent re-plan on a peer's
-        //    deletion ─────────────────────────────────────────────────
+        // ── Result-cache lookup + plan/execute, with one transparent
+        //    re-plan on a peer's deletion ───────────────────────────────
         //
-        // A peer (compaction reaping a superseded input, retention reaping an
-        // expired block) can hard-delete a block this instance still has a
-        // catalog row for — convergence just hasn't caught up. We wrap the
-        // store in `EvictOnNotFound`: a `NotFound` during the planning reads
-        // (the postings-sidecar GETs for metrics/logs) records the dead
-        // block's UUID. If planning fails with anything recorded, we delete
-        // those stale rows and re-plan **once** — fully transparent, the
-        // client never saw a byte. (Traces/profiles resolve no sidecar at plan
-        // time, so their 404 only surfaces mid-scan, below: we can't re-plan
-        // once the schema is on the wire, so we evict to heal the next query
-        // and return a clean StreamError.)
+        // Each iteration: (1) list candidate blocks (one indexed catalog
+        // SELECT), (2) build the result-cache key from the normalized request
+        // ⊕ that candidate set and short-circuit on a hit — the 2 ms path,
+        // no SessionContext / scan / object store, (3) on a miss plan+execute.
+        //
+        // The re-plan handles a peer (compaction reaping a superseded input,
+        // retention reaping an expired block) hard-deleting a block this
+        // instance still lists — convergence just hasn't caught up. We wrap
+        // the store in `EvictOnNotFound`: a `NotFound` during the planning
+        // reads records the dead block's UUID; we delete those stale rows and
+        // loop **once** — re-listing candidates (a different set → a different
+        // cache key) — fully transparent, the client never saw a byte.
+        // (Traces/profiles resolve no sidecar at plan time, so their 404 only
+        // surfaces mid-scan, below.)
         let evict = Arc::new(EvictOnNotFound::new(self.store.clone()));
         let store: Arc<dyn ObjectStore> = evict.clone();
         let mut replanned = false;
-        let (mut stream, physical) = loop {
-            match self.plan_and_execute(signal, &req, store.clone()).await {
-                Ok(v) => break v,
+        let (mut stream, physical, cache_key) = loop {
+            // (1) Candidate blocks for this request.
+            let candidates = match self.list_candidates(signal, &req.query) {
+                Ok(c) => c,
+                Err((code, msg)) => {
+                    let _ = emit_stream_error(&mut wr, code, msg).await;
+                    let _ = wr.flush().await;
+                    self.emit_scan_complete(
+                        signal,
+                        None,
+                        rows_total,
+                        pool_start,
+                        cache_start,
+                        "miss",
+                        t0.elapsed(),
+                    );
+                    return Ok(());
+                }
+            };
+
+            // (2) Cache key + hit short-circuit. The cached value is the exact
+            // concatenation of the SchemaMsg + BatchMsg… + EndOfStream frames,
+            // so a hit is a single write_all.
+            let key = data_query_cache_key(signal, &req, &candidates);
+            if let Some(bytes) = self.result_cache.get(key) {
+                if let Err(e) = wr.write_all(&bytes).await {
+                    warn!(error = %e, "client disconnected while writing cached response");
+                }
+                let _ = wr.flush().await;
+                // total_rows is not recomputed on a hit (the count rides inside
+                // the cached EndOfStream frame the client parses); `cache=hit`
+                // marks the fast path in telemetry.
+                self.emit_scan_complete(
+                    signal,
+                    None,
+                    rows_total,
+                    pool_start,
+                    cache_start,
+                    "hit",
+                    t0.elapsed(),
+                );
+                return Ok(());
+            }
+
+            // (3) Miss → plan + execute against the candidate set.
+            match self
+                .plan_and_execute(signal, &req, store.clone(), candidates)
+                .await
+            {
+                Ok((stream, physical)) => break (stream, physical, key),
                 Err((code, msg)) => {
                     let evicted = evict.take_evicted();
                     if !replanned && !evicted.is_empty() {
@@ -544,6 +787,7 @@ impl QueryService {
                         rows_total,
                         pool_start,
                         cache_start,
+                        "miss",
                         t0.elapsed(),
                     );
                     return Ok(());
@@ -551,6 +795,15 @@ impl QueryService {
             }
         };
         let schema = stream.schema();
+
+        // Buffer the response for the cache while it streams (dropped past the
+        // per-entry cap → response still streams, just isn't cached). Skipped
+        // entirely when the cache is disabled.
+        let mut tee = if self.result_cache.enabled() {
+            ResponseTee::new(self.result_cache_entry_bytes)
+        } else {
+            ResponseTee::disabled()
+        };
 
         let data_gen = IpcDataGenerator::default();
         let mut dict_tracker = DictionaryTracker::new(false);
@@ -574,6 +827,7 @@ impl QueryService {
                 rows_total,
                 pool_start,
                 cache_start,
+                "miss",
                 t0.elapsed(),
             );
             return Ok(());
@@ -586,7 +840,7 @@ impl QueryService {
                 .into(),
             ),
         };
-        if let Err(e) = write_frame(&mut wr, &schema_frame).await {
+        if let Err(e) = write_and_tee(&mut wr, &schema_frame, &mut tee).await {
             warn!(error = %e, "client disconnected while writing SchemaMsg");
             self.emit_scan_complete(
                 signal,
@@ -594,6 +848,7 @@ impl QueryService {
                 rows_total,
                 pool_start,
                 cache_start,
+                "miss",
                 t0.elapsed(),
             );
             return Ok(());
@@ -633,6 +888,7 @@ impl QueryService {
                         rows_total,
                         pool_start,
                         cache_start,
+                        "miss",
                         t0.elapsed(),
                     );
                     return Ok(());
@@ -661,6 +917,7 @@ impl QueryService {
                             rows_total,
                             pool_start,
                             cache_start,
+                            "miss",
                             t0.elapsed(),
                         );
                         return Ok(());
@@ -668,7 +925,7 @@ impl QueryService {
                 };
 
             for d in dict_batches {
-                if let Err(e) = write_one_batch(&mut wr, d, &options).await {
+                if let Err(e) = write_one_batch(&mut wr, d, &options, &mut tee).await {
                     warn!(error = %e, "client disconnected while writing BatchMsg (dict)");
                     self.emit_scan_complete(
                         signal,
@@ -676,12 +933,13 @@ impl QueryService {
                         rows_total,
                         pool_start,
                         cache_start,
+                        "miss",
                         t0.elapsed(),
                     );
                     return Ok(());
                 }
             }
-            if let Err(e) = write_one_batch(&mut wr, batch_enc, &options).await {
+            if let Err(e) = write_one_batch(&mut wr, batch_enc, &options, &mut tee).await {
                 warn!(error = %e, "client disconnected while writing BatchMsg");
                 self.emit_scan_complete(
                     signal,
@@ -689,6 +947,7 @@ impl QueryService {
                     rows_total,
                     pool_start,
                     cache_start,
+                    "miss",
                     t0.elapsed(),
                 );
                 return Ok(());
@@ -706,10 +965,17 @@ impl QueryService {
                 .into(),
             ),
         };
-        if let Err(e) = write_frame(&mut wr, &end_frame).await {
+        if let Err(e) = write_and_tee(&mut wr, &end_frame, &mut tee).await {
             warn!(error = %e, "client disconnected while writing EndOfStream");
         }
         let _ = wr.flush().await;
+
+        // Admit the full, cleanly-completed response to the result cache. `tee`
+        // is `None` if the response outgrew the per-entry cap (large log dump)
+        // or the cache is disabled — in either case this is a no-op.
+        if let Some(bytes) = tee.take() {
+            self.result_cache.insert(cache_key, bytes.into());
+        }
 
         self.emit_scan_complete(
             signal,
@@ -717,6 +983,7 @@ impl QueryService {
             rows_total,
             pool_start,
             cache_start,
+            "miss",
             t0.elapsed(),
         );
         Ok(())
@@ -732,6 +999,7 @@ impl QueryService {
         rows_total: u64,
         pool_start: PoolStats,
         cache_start: CacheStarts,
+        cache_status: &'static str,
         wall: Duration,
     ) {
         let pool_end = self.pool.stats();
@@ -740,6 +1008,8 @@ impl QueryService {
         let cache_delta = cache_end.delta(cache_start.postings);
         let bloom_end = self.bloom_cache.stats();
         let bloom_delta = bloom_end.delta(cache_start.bloom);
+        let result_end = self.result_cache.stats();
+        let result_delta = result_end.delta(cache_start.result);
         let metrics = plan.and_then(collect_leaf_metrics);
 
         let (row_groups_pruned, row_groups_matched, files_pruned, bytes_scanned) = match metrics {
@@ -755,6 +1025,7 @@ impl QueryService {
 
         info!(
             signal = signal_name(signal),
+            cache = cache_status,
             total_rows = rows_total,
             row_groups_matched,
             row_groups_pruned,
@@ -777,6 +1048,12 @@ impl QueryService {
             bloom_cache_fetch_errors_delta = bloom_delta.fetch_errors,
             bloom_cache_entries = bloom_end.entries,
             bloom_cache_bytes_in = bloom_end.bytes_in,
+            result_cache_hits_delta = result_delta.hits,
+            result_cache_misses_delta = result_delta.misses,
+            result_cache_inserts_delta = result_delta.inserts,
+            result_cache_evictions_delta = result_delta.evictions,
+            result_cache_entries = result_end.entries,
+            result_cache_bytes_in = result_end.bytes_in,
             query_memory_reserved_bytes_end = memory_reserved_bytes_end,
             pool_in_flight = pool_end.in_flight,
             wall_ms = wall.as_millis() as u64,
@@ -801,13 +1078,15 @@ fn signal_name(s: Signal) -> &'static str {
     }
 }
 
-/// Frame one IPC-encoded message as a [`QueryFrameMsg::BatchMsg`].
+/// Frame one IPC-encoded message as a [`QueryFrameMsg::BatchMsg`], writing it to
+/// the socket and teeing its exact wire bytes into the result-cache buffer.
 /// Encapsulated so the dictionary / record-batch arms in
-/// [`QueryService::run_query`] don't repeat the same five lines.
+/// [`QueryService::run_query`] don't repeat the same lines.
 async fn write_one_batch<W>(
     wr: &mut BufWriter<W>,
     enc: arrow_ipc::writer::EncodedData,
     options: &IpcWriteOptions,
+    tee: &mut ResponseTee,
 ) -> Result<()>
 where
     W: tokio::io::AsyncWrite + Unpin,
@@ -817,10 +1096,154 @@ where
     let frame = QueryFrame {
         msg: QueryFrameMsg::BatchMsg(BatchMsgInput { ipc_bytes: bytes }.into()),
     };
-    write_frame(wr, &frame)
+    write_and_tee(wr, &frame, tee).await
+}
+
+/// Accumulates the exact response bytes for the result cache while they're also
+/// streamed to the socket. Once the buffer would exceed `cap` it's dropped and
+/// stays `None` — the response streams on but won't be cached (keeps large log
+/// dumps out of the cache). [`ResponseTee::disabled`] skips buffering entirely
+/// when the cache is off.
+struct ResponseTee {
+    buf: Option<Vec<u8>>,
+    cap: usize,
+}
+
+impl ResponseTee {
+    fn new(cap: usize) -> Self {
+        Self {
+            buf: Some(Vec::new()),
+            cap,
+        }
+    }
+
+    fn disabled() -> Self {
+        Self { buf: None, cap: 0 }
+    }
+
+    /// Append `bytes` unless the buffer is already dropped or would exceed the
+    /// cap (in which case it's dropped, permanently, for this response).
+    fn push(&mut self, bytes: &[u8]) {
+        if let Some(b) = self.buf.as_mut() {
+            if b.len().saturating_add(bytes.len()) > self.cap {
+                self.buf = None;
+            } else {
+                b.extend_from_slice(bytes);
+            }
+        }
+    }
+
+    /// The buffered response, or `None` if it was dropped / disabled.
+    fn take(self) -> Option<Vec<u8>> {
+        self.buf
+    }
+}
+
+/// Encode a `QueryFrame` to its exact on-wire bytes: `[u32 BE payload-len]
+/// [payload]` — byte-identical to what [`write_frame`] emits, so a tee'd copy
+/// replays perfectly on a cache hit.
+fn frame_to_wire(frame: &QueryFrame) -> Result<Vec<u8>> {
+    let payload = Framed::encode(frame).map_err(|e| anyhow::anyhow!("frame encode: {e}"))?;
+    if payload.len() > MAX_FRAME_BYTES {
+        return Err(anyhow::anyhow!(
+            "frame {} exceeds max {}",
+            payload.len(),
+            MAX_FRAME_BYTES
+        ));
+    }
+    let mut out = Vec::with_capacity(4 + payload.len());
+    out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    out.extend_from_slice(&payload);
+    Ok(out)
+}
+
+/// Write one frame to the socket and tee its bytes for caching.
+async fn write_and_tee<W>(
+    wr: &mut BufWriter<W>,
+    frame: &QueryFrame,
+    tee: &mut ResponseTee,
+) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let wire = frame_to_wire(frame)?;
+    wr.write_all(&wire)
         .await
-        .map_err(|e| anyhow::anyhow!("write_frame: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("write_all: {e}"))?;
+    tee.push(&wire);
     Ok(())
+}
+
+/// Build the result-cache key for a data query: a 128-bit content hash over the
+/// normalized request **plus** the candidate block-UUID set. Folding the
+/// candidate set in is what makes invalidation free — any ingest / compaction /
+/// retention that changes which blocks a range touches changes the candidate
+/// set, hence the key, hence it's a miss; a closed past range keeps a stable
+/// set and stays cached. `request_id` is deliberately excluded (per-call
+/// correlation id, not part of the result identity).
+fn data_query_cache_key(signal: Signal, req: &QueryRequest, candidates: &[CatalogEntry]) -> u128 {
+    fn push_str(buf: &mut Vec<u8>, s: &str) {
+        buf.extend_from_slice(&(s.len() as u32).to_be_bytes());
+        buf.extend_from_slice(s.as_bytes());
+    }
+    fn push_opt_u64(buf: &mut Vec<u8>, v: Option<u64>) {
+        match v {
+            Some(x) => {
+                buf.push(1);
+                buf.extend_from_slice(&x.to_be_bytes());
+            }
+            None => buf.push(0),
+        }
+    }
+
+    let mut buf: Vec<u8> = Vec::new();
+    buf.push(0x01); // kind discriminator: data query (vs future metadata keys)
+    buf.push(signal as u8);
+
+    // Matchers, canonically sorted so ordering doesn't perturb the key.
+    let mut matchers: Vec<&(String, String)> = req.query.matchers.iter().collect();
+    matchers.sort();
+    buf.extend_from_slice(&(matchers.len() as u32).to_be_bytes());
+    for (k, v) in matchers {
+        push_str(&mut buf, k);
+        push_str(&mut buf, v);
+    }
+
+    push_opt_u64(&mut buf, req.query.ts_min);
+    push_opt_u64(&mut buf, req.query.ts_max);
+
+    match req.sql.as_deref() {
+        Some(s) => {
+            buf.push(1);
+            push_str(&mut buf, s);
+        }
+        None => buf.push(0),
+    }
+    push_opt_u64(&mut buf, req.limit.map(|l| l as u64));
+    match &req.query.trace_id {
+        Some(t) => {
+            buf.push(1);
+            buf.extend_from_slice(t);
+        }
+        None => buf.push(0),
+    }
+    match req.query.body_contains.as_deref() {
+        Some(s) => {
+            buf.push(1);
+            push_str(&mut buf, s);
+        }
+        None => buf.push(0),
+    }
+
+    // Candidate block UUIDs, sorted — the invalidation-carrying component.
+    let mut uuids: Vec<Uuid> = candidates.iter().map(|c| c.meta.uuid).collect();
+    uuids.sort();
+    buf.extend_from_slice(&(uuids.len() as u32).to_be_bytes());
+    for u in uuids {
+        buf.extend_from_slice(u.as_bytes());
+    }
+
+    hash128(&buf)
 }
 
 /// Build + transmit one [`QueryFrameMsg::StreamError`] frame. Errors

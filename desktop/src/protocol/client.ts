@@ -17,6 +17,10 @@ import {
   type QueryFrameInput,
   type QueryRequestInput,
   type QueryRequestOutput,
+  type LabelNamesRequestInput,
+  type LabelValuesRequestInput,
+  type LabelNamesResponseOutput,
+  type LabelValuesResponseOutput,
   type SchemaMsgOutput,
   type BatchMsgOutput,
   type EndOfStreamOutput,
@@ -42,6 +46,8 @@ type TaggedFrame =
   | { type: "SchemaMsg"; value: SchemaMsgOutput }
   | { type: "BatchMsg"; value: BatchMsgOutput }
   | { type: "EndOfStream"; value: EndOfStreamOutput }
+  | { type: "LabelNamesResponse"; value: LabelNamesResponseOutput }
+  | { type: "LabelValuesResponse"; value: LabelValuesResponseOutput }
   | { type: "StreamError"; value: StreamErrorOutput };
 
 /** High-level, ergonomic query description (the UI's vocabulary). */
@@ -184,4 +190,76 @@ export async function runQuery(
     totalRows,
     elapsedMs: performance.now() - started,
   };
+}
+
+// ── Label metadata (discoverability) ─────────────────────────────────
+//
+// One request → one terminal response frame → close, over the same
+// `Transport` the data query uses (so scry-webui's dumb byte-pipe relays
+// it unchanged). Answers "what can I match on?" from the daemon's label
+// cache; see the query schema's LabelNames/LabelValues variants and D-050.
+
+/** Signal + optional time window scoping a metadata request. */
+export interface MetaScope {
+  signal: number;
+  tsMin?: bigint;
+  tsMax?: bigint;
+}
+
+function decodeMetaResponse(responseBytes: Uint8Array): TaggedFrame {
+  for (const body of deframe(responseBytes)) {
+    const decoded = new QueryFrameDecoder(body).decode();
+    return (decoded as unknown as { msg: TaggedFrame }).msg;
+  }
+  throw new Error("metadata stream ended with no frame (server closed early?)");
+}
+
+/** Fetch the distinct, sorted label names matchable for `scope`. */
+export async function fetchLabelNames(
+  transport: Transport,
+  addr: string,
+  scope: MetaScope,
+): Promise<string[]> {
+  const value: LabelNamesRequestInput = {
+    signal: scope.signal,
+    ts_min_present: scope.tsMin !== undefined ? 1 : 0,
+    ts_min: scope.tsMin ?? 0n,
+    ts_max_present: scope.tsMax !== undefined ? 1 : 0,
+    ts_max: scope.tsMax ?? 0n,
+  };
+  const frameInput = {
+    msg: { type: "LabelNamesRequest", value },
+  } as unknown as QueryFrameInput;
+  const requestFrame = frame(new QueryFrameEncoder().encode(frameInput));
+  const responseBytes = await transport.query(addr, requestFrame);
+  const msg = decodeMetaResponse(responseBytes);
+  if (msg.type === "StreamError") throw new QueryError(msg.value.code, msg.value.message);
+  if (msg.type === "LabelNamesResponse") return msg.value.names;
+  throw new Error(`expected LabelNamesResponse, got ${msg.type}`);
+}
+
+/** Fetch the distinct, sorted values `name` takes for `scope`. */
+export async function fetchLabelValues(
+  transport: Transport,
+  addr: string,
+  scope: MetaScope,
+  name: string,
+): Promise<string[]> {
+  const value: LabelValuesRequestInput = {
+    signal: scope.signal,
+    label_name: name,
+    ts_min_present: scope.tsMin !== undefined ? 1 : 0,
+    ts_min: scope.tsMin ?? 0n,
+    ts_max_present: scope.tsMax !== undefined ? 1 : 0,
+    ts_max: scope.tsMax ?? 0n,
+  };
+  const frameInput = {
+    msg: { type: "LabelValuesRequest", value },
+  } as unknown as QueryFrameInput;
+  const requestFrame = frame(new QueryFrameEncoder().encode(frameInput));
+  const responseBytes = await transport.query(addr, requestFrame);
+  const msg = decodeMetaResponse(responseBytes);
+  if (msg.type === "StreamError") throw new QueryError(msg.value.code, msg.value.message);
+  if (msg.type === "LabelValuesResponse") return msg.value.values;
+  throw new Error(`expected LabelValuesResponse, got ${msg.type}`);
 }

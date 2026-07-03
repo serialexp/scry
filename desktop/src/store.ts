@@ -15,7 +15,21 @@ import { Signal, type SignalName } from "./protocol/constants";
 import type { Transport } from "./protocol/transport";
 import { UnauthorizedError } from "./protocol/transport-http";
 import { isTauri } from "./env";
-import { runQuery, QueryError, type QuerySpec } from "./protocol/client";
+import {
+  runQuery,
+  QueryError,
+  fetchLabelNames,
+  fetchLabelValues,
+  type QuerySpec,
+  type MetaScope,
+} from "./protocol/client";
+import { severity, severityRank } from "./severity";
+import {
+  chooseStepMs,
+  stepIntervalSql,
+  type VolumeData,
+  type VolumeSeries,
+} from "./volume";
 
 export interface MatcherRow {
   name: string;
@@ -181,6 +195,20 @@ export function setMatcher(index: number, field: keyof MatcherRow, value: string
   setState("matchers", index, field, value);
 }
 
+/** Add (or fill) a `name=value` matcher from the label browser. Reuses the
+ *  first fully-blank row if there is one, else appends; a no-op if the exact
+ *  pair is already present. */
+export function applyLabelMatcher(name: string, value: string): void {
+  const rows = state.matchers;
+  if (rows.some((m) => m.name === name && m.value === value)) return;
+  const blank = rows.findIndex((m) => m.name.trim() === "" && m.value.trim() === "");
+  if (blank >= 0) {
+    setState("matchers", blank, { name, value });
+  } else {
+    setState("matchers", (m) => [...m, { name, value }]);
+  }
+}
+
 // ── Run ──────────────────────────────────────────────────────────────
 
 // Pick the transport for the current shell, lazily and once. The Tauri adapter
@@ -290,6 +318,176 @@ async function runSpec(spec: QuerySpec, kind: "default" | "frames"): Promise<voi
   }
 }
 
+// ── Label discoverability (D-050) ────────────────────────────────────
+//
+// "What can I match on?" answered from the daemon's label cache over the
+// same transport as queries. Names load for the current signal + time
+// window; values load lazily per name. Both caches reset when the scope
+// (signal / time / target) changes, guarded by a monotonic sequence so a
+// stale in-flight response can't clobber a newer scope.
+
+export type LabelStatus = "idle" | "loading" | "ready" | "error";
+
+const [labelNames, setLabelNames] = createSignal<string[]>([]);
+const [labelStatus, setLabelStatus] = createSignal<LabelStatus>("idle");
+const [labelValues, setLabelValues] = createSignal<Record<string, string[]>>({});
+export { labelNames, labelStatus, labelValues };
+
+/** Signals with a postings/promoted-column label surface. Profiles carry
+ *  their labels inside the opaque pprof blob, so metadata is empty there. */
+function signalHasLabels(sig: SignalName): boolean {
+  return sig === "Metrics" || sig === "Logs" || sig === "Traces";
+}
+
+let metaKey = "";
+let metaSeq = 0;
+
+function currentMetaScope(): MetaScope {
+  let tsMin: bigint | undefined;
+  let tsMax: bigint | undefined;
+  // Metadata is best-effort: an in-progress (invalid) time entry just means
+  // "unbounded on that side" rather than an error.
+  try {
+    tsMin = parseBigIntOpt(state.tsMin);
+  } catch {
+    tsMin = undefined;
+  }
+  try {
+    tsMax = parseBigIntOpt(state.tsMax);
+  } catch {
+    tsMax = undefined;
+  }
+  return { signal: Signal[state.signal], tsMin, tsMax };
+}
+
+function metaDest(): string {
+  return inBrowser ? state.target.trim() : state.addr.trim();
+}
+
+function scopeKey(scope: MetaScope, dest: string): string {
+  return `${dest}|${scope.signal}|${scope.tsMin ?? ""}|${scope.tsMax ?? ""}`;
+}
+
+/** Load the label names for the current signal + time window, resetting the
+ *  per-name value cache. No-ops when the scope key is unchanged (unless
+ *  `force`). Browser mode needs a session + a chosen target first. */
+export async function refreshLabels(force = false): Promise<void> {
+  if (!signalHasLabels(state.signal)) {
+    metaKey = "";
+    setLabelNames([]);
+    setLabelValues({});
+    setLabelStatus("idle");
+    return;
+  }
+  const scope = currentMetaScope();
+  const dest = metaDest();
+  if (inBrowser && (!authed() || dest === "")) return;
+
+  const key = scopeKey(scope, dest);
+  if (!force && key === metaKey) return;
+  metaKey = key;
+  const seq = ++metaSeq;
+  setLabelValues({});
+  setLabelStatus("loading");
+  try {
+    const transport = await getTransport();
+    const names = await fetchLabelNames(transport, dest, scope);
+    if (seq !== metaSeq) return; // superseded by a newer scope
+    setLabelNames(names);
+    setLabelStatus("ready");
+  } catch {
+    if (seq !== metaSeq) return;
+    setLabelNames([]);
+    setLabelStatus("error");
+  }
+}
+
+/** Lazily fetch the distinct values for one label `name` under the current
+ *  scope, caching them. No-op if already cached or the name is blank. */
+export async function ensureLabelValues(name: string): Promise<void> {
+  const n = name.trim();
+  if (n === "" || !signalHasLabels(state.signal)) return;
+  if (labelValues()[n] !== undefined) return;
+  const scope = currentMetaScope();
+  const dest = metaDest();
+  if (inBrowser && (!authed() || dest === "")) return;
+  const keyAtStart = metaKey || scopeKey(scope, dest);
+  try {
+    const transport = await getTransport();
+    const values = await fetchLabelValues(transport, dest, scope, n);
+    if ((metaKey || keyAtStart) !== keyAtStart) return; // scope changed under us
+    setLabelValues((prev) => ({ ...prev, [n]: values }));
+  } catch {
+    // Leave uncached so a later interaction can retry.
+  }
+}
+
+// ── Per-value counts for label drill-down (Part C) ───────────────────
+//
+// When a label name is expanded in the browser, show how many entries each
+// value accounts for *under the current matchers + range* — the Explore
+// drill-down. Logs-only: it reads the synthesized `labels` map column
+// (`labels['key']`), which metrics results don't carry yet. Counts reset
+// whenever the query is (re)run, so they always reflect the active filters.
+
+const [labelValueCounts, setLabelValueCounts] = createSignal<
+  Record<string, Record<string, number>>
+>({});
+export { labelValueCounts };
+
+/** Escape a label key for safe interpolation into `labels['…']`. */
+function sqlStrLit(s: string): string {
+  return s.replace(/'/g, "''");
+}
+
+/** Fetch per-value entry counts for one label `name` under the current
+ *  matchers + range (logs only), caching them until the next query run. */
+export async function ensureLabelValueCounts(name: string): Promise<void> {
+  const n = name.trim();
+  if (n === "" || state.signal !== "Logs") return;
+  if (labelValueCounts()[n] !== undefined) return;
+
+  let tsMin: bigint | undefined;
+  let tsMax: bigint | undefined;
+  let matchers: { name: string; value: string }[];
+  try {
+    tsMin = parseBigIntOpt(state.tsMin);
+    tsMax = parseBigIntOpt(state.tsMax);
+    matchers = state.matchers
+      .map((m) => ({ name: m.name.trim(), value: m.value }))
+      .filter((m) => m.name !== "");
+  } catch {
+    return;
+  }
+  const dest = metaDest();
+  if (inBrowser && (!authed() || dest === "")) return;
+
+  const sql =
+    `SELECT labels['${sqlStrLit(n)}'] AS v, count(*) AS c ` +
+    `FROM logs GROUP BY v ORDER BY c DESC`;
+  try {
+    const transport = await getTransport();
+    const res = await runQuery(transport, dest, {
+      signal: Signal.Logs,
+      matchers,
+      tsMin,
+      tsMax,
+      sql,
+      requestId: "webui-label-counts",
+    });
+    const counts: Record<string, number> = {};
+    for (const r of res.table.toArray()) {
+      const o = (r?.toJSON?.() ?? {}) as Record<string, unknown>;
+      const v = o.v;
+      if (v === null || v === undefined) continue; // entries lacking the label
+      counts[String(v)] = Number(o.c ?? 0);
+    }
+    setLabelValueCounts((prev) => ({ ...prev, [n]: counts }));
+  } catch {
+    // Leave uncached so a later expansion can retry.
+  }
+}
+
 export async function runCurrentQuery(): Promise<void> {
   let spec: QuerySpec;
   try {
@@ -298,7 +496,160 @@ export async function runCurrentQuery(): Promise<void> {
     setState({ status: "error", error: e instanceof Error ? e.message : String(e) });
     return;
   }
+  // Counts are matcher-dependent; invalidate so an expanded name re-fetches
+  // against the new filter set.
+  setLabelValueCounts({});
   await runSpec(spec, "default");
+  // For logs, refresh the volume histogram alongside the table using the same
+  // matchers + range. Fire-and-forget: the graph is auxiliary, so a volume
+  // failure must never fail the main query. It's cache-backed on the queryd,
+  // so a repeated range is ~free.
+  if (state.signal === "Logs") void runLogVolume();
+  else clearVolume();
+}
+
+/** The Explore drill-down loop: add a `name=value` matcher, then re-run the
+ *  table + volume so the whole view refilters to the selected slice. */
+export async function drillLabelValue(name: string, value: string): Promise<void> {
+  applyLabelMatcher(name, value);
+  await runCurrentQuery();
+}
+
+// ── Logs volume histogram (Part B) ───────────────────────────────────
+//
+// A count-over-time of log entries split by severity, over the current
+// matchers + range. Rides the query wire via a `date_bin` aggregation (no
+// protocol change); the result lives in its own signal so the table view is
+// untouched. Logs-only — metrics results carry no label/severity column yet.
+
+export type VolumeStatus = "idle" | "loading" | "ready" | "empty" | "error";
+
+const [volumeData, setVolumeData] = createSignal<VolumeData | null>(null);
+const [volumeStatus, setVolumeStatus] = createSignal<VolumeStatus>("idle");
+export { volumeData, volumeStatus };
+
+/** Monotonic guard so a slow volume response can't clobber a newer one. */
+let volumeSeq = 0;
+
+function clearVolume(): void {
+  volumeSeq++;
+  setVolumeData(null);
+  setVolumeStatus("idle");
+}
+
+/** Run the log-volume aggregation for the current form (matchers + range) and
+ *  decode it into the `volumeData` signal. Requires an explicit [ts_min,
+ *  ts_max] range (like Grafana Explore) so the bucket step is well-defined and
+ *  the range is a closed, cacheable window. */
+export async function runLogVolume(): Promise<void> {
+  if (state.signal !== "Logs") {
+    clearVolume();
+    return;
+  }
+
+  let tsMin: bigint | undefined;
+  let tsMax: bigint | undefined;
+  let matchers: { name: string; value: string }[];
+  try {
+    tsMin = parseBigIntOpt(state.tsMin);
+    tsMax = parseBigIntOpt(state.tsMax);
+    matchers = state.matchers
+      .map((m) => ({ name: m.name.trim(), value: m.value }))
+      .filter((m) => m.name !== "");
+  } catch {
+    setVolumeStatus("error");
+    setVolumeData(null);
+    return;
+  }
+
+  // Need a bounded range to pick a bucket width. Without one, skip quietly —
+  // the panel prompts the user to choose a range.
+  if (tsMin === undefined || tsMax === undefined || tsMax <= tsMin) {
+    clearVolume();
+    setVolumeStatus("empty");
+    return;
+  }
+
+  const spanMs = Number((tsMax - tsMin) / 1_000_000n);
+  const stepMs = chooseStepMs(spanMs);
+  const sql =
+    `SELECT CAST(date_bin(${stepIntervalSql(stepMs)}, ` +
+    `to_timestamp_nanos(ts_unix_nano)) AS BIGINT) AS bucket_ns, ` +
+    `severity, count(*) AS n FROM logs GROUP BY bucket_ns, severity ORDER BY bucket_ns`;
+
+  const seq = ++volumeSeq;
+  setVolumeStatus("loading");
+  try {
+    const transport = await getTransport();
+    const dest = inBrowser ? state.target.trim() : state.addr.trim();
+    const res = await runQuery(transport, dest, {
+      signal: Signal.Logs,
+      matchers,
+      tsMin,
+      tsMax,
+      sql,
+      requestId: "webui-log-volume",
+    });
+    if (seq !== volumeSeq) return; // superseded by a newer request
+    const decoded = decodeVolume(res.table, stepMs);
+    setVolumeData(decoded);
+    setVolumeStatus(decoded.buckets.length === 0 ? "empty" : "ready");
+  } catch (e) {
+    if (seq !== volumeSeq) return;
+    if (e instanceof UnauthorizedError) {
+      setAuthed(false);
+      clearVolume();
+      return;
+    }
+    setVolumeData(null);
+    setVolumeStatus("error");
+  }
+}
+
+/** Decode the `{bucket_ns, severity, n}` aggregate into stacked severity bands
+ *  over a shared, gap-filled bucket axis. */
+function decodeVolume(table: Table, stepMs: number): VolumeData {
+  const rows = table.toArray();
+  // bucket-ms → (sevClass → count)
+  const byBucket = new Map<number, Map<string, number>>();
+  const classMeta = new Map<string, { label: string; cls: string; sev: number }>();
+  let total = 0;
+
+  for (const r of rows) {
+    const o = (r?.toJSON?.() ?? {}) as Record<string, unknown>;
+    const bucketNs = BigInt((o.bucket_ns ?? 0) as bigint | number | string);
+    const bucketMs = Number(bucketNs / 1_000_000n);
+    const sevNum = Number(o.severity ?? 0);
+    const n = Number(o.n ?? 0);
+    const info = severity(sevNum);
+    total += n;
+
+    let bucket = byBucket.get(bucketMs);
+    if (!bucket) {
+      bucket = new Map();
+      byBucket.set(bucketMs, bucket);
+    }
+    bucket.set(info.label, (bucket.get(info.label) ?? 0) + n);
+    if (!classMeta.has(info.label)) {
+      classMeta.set(info.label, {
+        label: info.label,
+        cls: info.cls,
+        sev: severityRank(info.label),
+      });
+    }
+  }
+
+  const buckets = Array.from(byBucket.keys()).sort((a, b) => a - b);
+  // Least→most severe so the stack order is stable (severe on top).
+  const classes = Array.from(classMeta.values()).sort((a, b) => a.sev - b.sev);
+  const series: VolumeSeries[] = classes.map((c) => ({
+    label: c.label,
+    cls: c.cls,
+    sev: c.sev,
+    counts: buckets.map((b) => byBucket.get(b)?.get(c.label) ?? 0),
+  }));
+
+  return { buckets, series, total, stepMs };
 }
 
 /** Max frames the overview aggregate returns. Slowest-first, so the cap keeps

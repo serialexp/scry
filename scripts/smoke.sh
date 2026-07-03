@@ -205,7 +205,9 @@ fi
 
 # ── Build ───────────────────────────────────────────────────────────
 echo "[smoke] building release binaries..."
-cargo build --release -p scry -p noise-spewer >&2
+# scry-query-probe (a bin in scry-queryd) drives the running `scry query`
+# daemon for the query-result-cache leg; the daemon itself is `scry query`.
+cargo build --release -p scry -p noise-spewer -p scry-queryd --bin scry --bin noise-spewer --bin scry-query-probe >&2
 
 # ── Clean slate ─────────────────────────────────────────────────────
 rm -rf "$SMOKE_DIR"
@@ -515,6 +517,52 @@ if [[ "$SIGNAL" != "dummy" ]]; then
     done
 fi
 
+# ── Label discoverability (D-050) ───────────────────────────────────
+# Metadata frames answer "what can I match on?" without a data scan: the
+# catalog label cache, warmed lazily from the postings sidecars. Assert
+# `scry get --list-label-names` surfaces the label keys the spewer
+# emitted, and `--label-values <k>` returns the expected value set for a
+# deterministic key. Metrics + logs only — traces expose their promoted
+# columns (covered by unit/e2e tests) and profiles expose nothing.
+meta_signals=()
+case "$SIGNAL" in
+    metrics)  meta_signals=("metrics") ;;
+    logs)     meta_signals=("logs") ;;
+    both|all) meta_signals=("metrics" "logs") ;;
+esac
+for sig in "${meta_signals[@]}"; do
+    case "$sig" in
+        metrics) want_names="__name__ env host region"; vkey="region"; want_vals="eu-central" ;;
+        logs)    want_names="env host service";          vkey="env";    want_vals="prod" ;;
+    esac
+    ./target/release/scry get \
+        --catalog "$SMOKE_DIR/recon.sqlite" \
+        --signal "$sig" \
+        --list-label-names \
+        > "$SMOKE_DIR/labelnames.$sig.txt" 2> "$SMOKE_DIR/labelnames.$sig.err" || true
+    names=$(paste -sd, "$SMOKE_DIR/labelnames.$sig.txt" 2>/dev/null || true)
+    echo "[smoke] $sig label names   : ${names:-<none>}"
+    for k in $want_names; do
+        if ! grep -qxF "$k" "$SMOKE_DIR/labelnames.$sig.txt"; then
+            echo "[smoke] FAIL: $sig label names missing '$k' (got: ${names:-<none>})"
+            cat "$SMOKE_DIR/labelnames.$sig.err"
+            failed=1
+        fi
+    done
+    ./target/release/scry get \
+        --catalog "$SMOKE_DIR/recon.sqlite" \
+        --signal "$sig" \
+        --label-values "$vkey" \
+        > "$SMOKE_DIR/labelvals.$sig.txt" 2> "$SMOKE_DIR/labelvals.$sig.err" || true
+    got_vals=$(paste -sd, "$SMOKE_DIR/labelvals.$sig.txt" 2>/dev/null || true)
+    echo "[smoke] $sig $vkey values   : ${got_vals:-<none>} (expected $want_vals)"
+    if [[ "$(cat "$SMOKE_DIR/labelvals.$sig.txt")" != "$want_vals" ]]; then
+        echo "[smoke] FAIL: $sig label-values $vkey = '${got_vals:-<none>}', expected '$want_vals'"
+        cat "$SMOKE_DIR/labelvals.$sig.err"
+        failed=1
+    fi
+done
+
 # ── Trace-by-id lookup (v0.5) ────────────────────────────────────────
 # The headline traces operation is "give me one trace." Prove the
 # `--trace-id` flag prunes to exactly that trace's spans and nothing
@@ -673,6 +721,107 @@ if [[ "$SIGNAL" == "logs" || "$SIGNAL" == "both" || "$SIGNAL" == "all" ]]; then
             failed=1
         fi
     fi
+fi
+
+# ── Query-result cache (queryd) ──────────────────────────────────────
+# The `scry query` daemon caches the exact framed response bytes of a data
+# query keyed by the normalized request ⊕ the candidate block-UUID set, so a
+# repeated dashboard-style query over a closed past range is served from
+# memory with no scan. Prove it end-to-end against a real daemon + bucket:
+#
+#   (a) a `date_bin` log-volume query (count-over-time split by severity —
+#       the query that backs the UI's volume histogram) returns ≥1 bucket
+#       row, confirming the aggregation runs server-side; and
+#   (b) issuing the *same* query twice logs `cache=miss` then `cache=hit`
+#       (with result_cache_hits_delta=1) — the daemon served the replay from
+#       the result cache. Because nothing writes to the bucket between the two
+#       runs, the candidate set is identical, so the key matches and it hits.
+#
+# Runs against the stable reconciled catalog, before compaction mutates the
+# bucket. A dedicated daemon (its own catalog copy) means its log holds
+# exactly the two scan_complete lines this probe produces. Set QCACHE=0 to
+# skip. Logs-bearing signals only (they're guaranteed to have rows here).
+if [[ "${QCACHE:-1}" == "1" ]] \
+   && { [[ "$SIGNAL" == "logs" || "$SIGNAL" == "both" || "$SIGNAL" == "all" ]]; }; then
+    echo "[smoke] ──── query-result cache (queryd) ────"
+    QUERYD_LISTEN="${QUERYD_LISTEN:-127.0.0.1:4101}"
+    QUERYD_LOG="$SMOKE_DIR/queryd.log"
+    # A private catalog copy so this daemon owns its own file (avoids any
+    # rusqlite WAL contention with the reconcile/query legs above).
+    cp "$SMOKE_DIR/recon.sqlite" "$SMOKE_DIR/queryd.sqlite"
+
+    # NO_COLOR so the tracing fmt layer doesn't wrap fields in ANSI escapes
+    # (it emits color unconditionally, even to a file); we still strip ANSI
+    # defensively when parsing below.
+    NO_COLOR=1 ./target/release/scry query \
+        --listen "$QUERYD_LISTEN" \
+        --catalog "$SMOKE_DIR/queryd.sqlite" \
+        > "$QUERYD_LOG" 2>&1 &
+    QUERYD_PID=$!
+    # Ensure the daemon is reaped even if a later assertion aborts the script.
+    trap 'kill -9 "$QUERYD_PID" 2>/dev/null || true' EXIT
+
+    # Wait for the listener (bounded).
+    qd_ready=0
+    for _ in $(seq 1 50); do
+        if (echo > "/dev/tcp/${QUERYD_LISTEN%:*}/${QUERYD_LISTEN#*:}") 2>/dev/null; then
+            qd_ready=1; break
+        fi
+        sleep 0.1
+    done
+    if [[ "$qd_ready" != "1" ]]; then
+        echo "[smoke] FAIL: query daemon never came up on $QUERYD_LISTEN"
+        cat "$QUERYD_LOG"
+        failed=1
+    else
+        # The volume histogram query: buckets × severity counts over the range.
+        VOL_SQL="SELECT date_bin(INTERVAL '1 hour', to_timestamp_nanos(ts_unix_nano)) AS bucket, severity, count(*) AS n FROM logs GROUP BY bucket, severity ORDER BY bucket"
+
+        vol1=$(./target/release/scry-query-probe \
+            --addr "$QUERYD_LISTEN" --signal logs \
+            --sql "$VOL_SQL" --request-id smoke-vol-1 2>"$SMOKE_DIR/probe1.err" || true)
+        vol2=$(./target/release/scry-query-probe \
+            --addr "$QUERYD_LISTEN" --signal logs \
+            --sql "$VOL_SQL" --request-id smoke-vol-2 2>"$SMOKE_DIR/probe2.err" || true)
+
+        echo "[smoke] volume query rows  : run1=${vol1:-<none>} run2=${vol2:-<none>} (bucket×severity groups)"
+        if [[ -z "${vol1:-}" || "${vol1:-0}" -lt 1 ]]; then
+            echo "[smoke] FAIL: volume date_bin query returned ${vol1:-<none>} rows, expected ≥1"
+            cat "$SMOKE_DIR/probe1.err" "$QUERYD_LOG"
+            failed=1
+        fi
+        if [[ "${vol1:-}" != "${vol2:-X}" ]]; then
+            echo "[smoke] FAIL: cached replay returned ${vol2:-<none>} rows, expected ${vol1:-<none>} (cache changed the result)"
+            failed=1
+        fi
+
+        # Give the daemon a beat to flush both scan_complete lines.
+        sleep 0.3
+        # Strip any ANSI escapes, then read the two scan_complete lines'
+        # `cache="…"` verdicts in emit order. The value is quoted because
+        # it's a string tracing field.
+        qd_plain=$(sed 's/\x1b\[[0-9;]*m//g' "$QUERYD_LOG")
+        mapfile -t cache_verdicts < <(printf '%s\n' "$qd_plain" | grep -o 'cache="[a-z]*"' | sed 's/cache="\([a-z]*\)"/\1/')
+        echo "[smoke] cache verdicts      : ${cache_verdicts[*]:-<none>} (expected: miss hit)"
+        if [[ "${#cache_verdicts[@]}" -lt 2 ]]; then
+            echo "[smoke] FAIL: expected 2 scan_complete cache verdicts, got ${#cache_verdicts[@]}"
+            printf '%s\n' "$qd_plain" | grep scan_complete || true
+            failed=1
+        elif [[ "${cache_verdicts[0]}" != "miss" || "${cache_verdicts[1]}" != "hit" ]]; then
+            echo "[smoke] FAIL: cache verdicts were '${cache_verdicts[0]} ${cache_verdicts[1]}', expected 'miss hit'"
+            printf '%s\n' "$qd_plain" | grep scan_complete || true
+            failed=1
+        fi
+        # Corroborate with the hit-delta counter on the hit line.
+        if ! printf '%s\n' "$qd_plain" | grep 'cache="hit"' | grep -q 'result_cache_hits_delta=1'; then
+            echo "[smoke] FAIL: the cache=hit scan_complete did not carry result_cache_hits_delta=1"
+            printf '%s\n' "$qd_plain" | grep 'cache="hit"' || true
+            failed=1
+        fi
+    fi
+
+    kill -9 "$QUERYD_PID" 2>/dev/null || true
+    trap - EXIT
 fi
 
 # ── Compaction (v0.8) ────────────────────────────────────────────────

@@ -63,6 +63,15 @@ echo "== building frontend bundle (desktop/dist) =="
 ( cd desktop && bun run build ) >"$TMP/fe-build.log" 2>&1 \
   || { cat "$TMP/fe-build.log"; fail "frontend build failed"; }
 
+# Guard against frontend-version drift: `bun run build` stamps the displayed
+# version from the workspace Cargo.toml (scripts/stamp-version.mjs), so the built
+# bundle must contain that exact version. Catches a broken/removed stamp step.
+WS_VERSION=$(sed -n '/^\[workspace.package\]/,/^\[/{s/^version *= *"\([^"]*\)".*/\1/p}' Cargo.toml | head -1)
+[ -n "$WS_VERSION" ] || fail "could not read [workspace.package].version from Cargo.toml"
+grep -rqF "$WS_VERSION" desktop/dist/assets \
+  || fail "built bundle does not contain workspace version $WS_VERSION (stamp step broken?)"
+ok "bundle carries workspace version $WS_VERSION"
+
 echo "== building release scry web (embeds the bundle) =="
 cargo build --release -p scry >"$TMP/cargo.log" 2>&1 \
   || { cat "$TMP/cargo.log"; fail "scry-webui build failed"; }

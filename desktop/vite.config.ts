@@ -5,12 +5,13 @@ import { defineConfig } from "vite";
 import solid from "vite-plugin-solid";
 
 // Single source of truth for the displayed app version: src-tauri/tauri.conf.json,
-// which scripts/stamp-version.mjs rewrites from the git tag during a release
-// build. We bake it into the bundle as the compile-time constant
-// `__APP_VERSION__` so BOTH shells show the same number: the Tauri desktop
-// bundle (CI stamps tauri.conf.json first) and the browser bundle embedded by
-// scry-webui (reads the committed value at `bun run build`). No runtime Tauri
-// API is involved, so it works in the browser, which has none.
+// which `scripts/stamp-version.mjs` rewrites from the workspace Cargo.toml
+// `[workspace.package].version` — that script runs first in the `build` npm
+// script (`bun ../scripts/stamp-version.mjs && vite build`), so the number here
+// can never drift from the crate version. We bake it into the bundle as the
+// compile-time constant `__APP_VERSION__` so BOTH shells show the same number:
+// the Tauri desktop bundle and the browser bundle embedded by scry-webui. No
+// runtime Tauri API is involved, so it works in the browser, which has none.
 const tauriConf = JSON.parse(
   readFileSync(
     fileURLToPath(new URL("./src-tauri/tauri.conf.json", import.meta.url)),

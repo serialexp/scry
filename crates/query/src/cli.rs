@@ -135,6 +135,23 @@ pub struct Args {
     #[arg(long = "grep")]
     grep: Option<String>,
 
+    /// Discoverability: instead of running a query, list the distinct label
+    /// **names** matchable for the chosen signal (+ optional `--from`/`--until`
+    /// window), one per line, sorted. Metrics/logs enumerate their postings
+    /// (warming the catalog label cache); traces list their promoted resource
+    /// columns; profiles list nothing. Local mode only. See D-050.
+    #[arg(
+        long,
+        conflicts_with_all = ["remote", "sql", "label_values"],
+    )]
+    list_label_names: bool,
+
+    /// Discoverability: instead of running a query, list the distinct
+    /// **values** the given label name takes for the chosen signal (+ optional
+    /// window), one per line, sorted. Local mode only. See D-050.
+    #[arg(long = "label-values", value_name = "NAME", conflicts_with_all = ["remote", "sql"])]
+    label_values: Option<String>,
+
     /// Print the produced physical plan to stderr after execution.
     /// Useful for verifying pushdown / pruning behaviour.
     #[arg(long)]
@@ -329,6 +346,16 @@ pub async fn run(args: Args) -> Result<()> {
     let catalog = Catalog::open(catalog_path, &cfg.bucket)
         .with_context(|| format!("opening catalog at {}", catalog_path.display()))?;
 
+    // ── Label-metadata (discoverability) short-circuit ────────────
+    //
+    // `--list-label-names` / `--label-values NAME` answer "what can I match
+    // on?" from the same shared core the query daemon uses (postings →
+    // catalog label cache), then print one item per line and exit. No table
+    // registration, no scan.
+    if args.list_label_names || args.label_values.is_some() {
+        return run_metadata(&args, signal.0, &q, catalog, store, pool).await;
+    }
+
     // ── Register the chosen signal's table on a fresh ctx ─────────
     //
     // The postings GETs + per-block fingerprint resolve happen inside
@@ -451,6 +478,58 @@ pub async fn run(args: Args) -> Result<()> {
     Ok(())
 }
 
+/// Local label-metadata mode: answer `--list-label-names` /
+/// `--label-values NAME` from the shared discoverability core
+/// ([`crate::metadata`]) and print one item per line on stdout, sorted. This
+/// is the CLI counterpart to the query daemon's `LabelNamesRequest` /
+/// `LabelValuesRequest` wire handlers — same code path, so the two agree.
+async fn run_metadata(
+    args: &Args,
+    signal: Signal,
+    q: &Query,
+    catalog: Catalog,
+    store: Arc<dyn ObjectStore>,
+    pool: BufPool,
+) -> Result<()> {
+    // The shared core takes `&Mutex<Catalog>` (the daemon holds one; Catalog is
+    // !Sync). A cheap wrapper unifies the two callers.
+    let catalog = std::sync::Mutex::new(catalog);
+    let postings = crate::PostingsCache::with_budget_bytes(crate::DEFAULT_POSTINGS_CACHE_BYTES);
+    let runtime_env = Arc::new(datafusion::execution::runtime_env::RuntimeEnv::default());
+
+    let items = if let Some(name) = args.label_values.as_deref() {
+        crate::metadata::collect_label_values(
+            &catalog,
+            store,
+            &postings,
+            runtime_env,
+            signal,
+            name,
+            q,
+        )
+        .await
+    } else {
+        crate::metadata::collect_label_names(&catalog, store, &postings, runtime_env, signal, q)
+            .await
+    };
+
+    let items = items.map_err(|(code, msg)| {
+        anyhow::anyhow!("{} (code={:#06x}): {msg}", query_err_name(code), code)
+    })?;
+
+    let stdout = std::io::stdout();
+    let mut out = BufWriter::new(stdout.lock());
+    for item in &items {
+        writeln!(out, "{item}")?;
+    }
+    out.flush()?;
+
+    eprintln!();
+    eprintln!("# metadata: {} item(s)", items.len());
+    print_pool_stats(&pool);
+    Ok(())
+}
+
 /// Send the query to a remote query daemon over the binschema query
 /// protocol, drain the resulting Arrow IPC stream into `RecordBatch`es,
 /// and print a degenerate trailer. The per-block scan stats and pool
@@ -549,8 +628,15 @@ async fn run_remote(
                     err.message,
                 );
             }
-            QueryFrameMsg::QueryRequest(_) => {
-                anyhow::bail!("server sent QueryRequest as response (protocol violation)");
+            QueryFrameMsg::QueryRequest(_)
+            | QueryFrameMsg::LabelNamesRequest(_)
+            | QueryFrameMsg::LabelValuesRequest(_) => {
+                anyhow::bail!("server sent a request frame as response (protocol violation)");
+            }
+            QueryFrameMsg::LabelNamesResponse(_) | QueryFrameMsg::LabelValuesResponse(_) => {
+                anyhow::bail!(
+                    "server sent a label-metadata response to a data query (protocol violation)"
+                );
             }
         }
     };

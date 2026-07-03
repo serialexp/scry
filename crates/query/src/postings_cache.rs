@@ -177,6 +177,22 @@ impl PostingsIndex {
         self.entries.get(name)?.get(value)
     }
 
+    /// Every distinct label **name** present in this block's postings.
+    /// Borrowed — the caller decides whether to own. Order is arbitrary
+    /// (HashMap iteration); metadata callers sort the union across blocks.
+    pub fn label_names(&self) -> Vec<&str> {
+        self.entries.keys().map(String::as_str).collect()
+    }
+
+    /// Every distinct **value** carried by label `name` in this block, or
+    /// an empty vec if the name is absent. Borrowed; order arbitrary.
+    pub fn label_values(&self, name: &str) -> Vec<&str> {
+        match self.entries.get(name) {
+            Some(inner) => inner.keys().map(String::as_str).collect(),
+            None => Vec::new(),
+        }
+    }
+
     /// Invert this `(name → value → fingerprints)` index into a
     /// per-fingerprint label set, merging the result into `acc`.
     ///
@@ -532,6 +548,40 @@ mod tests {
         assert_eq!(*got, vec![1, 2, 3]);
         assert!(idx.lookup("env", "stage").is_none());
         assert!(idx.lookup("missing", "x").is_none());
+    }
+
+    /// Build a `PostingsIndex` from a list of `(name, value, fps)` triples,
+    /// grouping values under the same name — so enumeration has something to
+    /// dedupe/collect across.
+    fn multi_index(triples: &[(&str, &str, &[u64])]) -> PostingsIndex {
+        let mut outer: HashMap<String, HashMap<String, Arc<Vec<u64>>>> = HashMap::new();
+        for (name, value, fps) in triples {
+            outer
+                .entry(name.to_string())
+                .or_default()
+                .insert(value.to_string(), fp_list(fps));
+        }
+        PostingsIndex::new(outer)
+    }
+
+    #[tokio::test]
+    async fn enumerate_names_and_values() {
+        let idx = multi_index(&[
+            ("env", "prod", &[1]),
+            ("env", "stage", &[2]),
+            ("service", "api", &[1, 2]),
+        ]);
+
+        let mut names = idx.label_names();
+        names.sort_unstable();
+        assert_eq!(names, vec!["env", "service"]);
+
+        let mut env_vals = idx.label_values("env");
+        env_vals.sort_unstable();
+        assert_eq!(env_vals, vec!["prod", "stage"]);
+
+        assert_eq!(idx.label_values("service"), vec!["api"]);
+        assert!(idx.label_values("missing").is_empty());
     }
 
     #[tokio::test]

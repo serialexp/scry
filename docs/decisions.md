@@ -1501,6 +1501,98 @@ tiers but never leases (no destructive work). The `writer_uuid` is persisted to
 `<wal_dir>/writer_id` so a restart reuses its prefix rather than bloating the
 per-`(signal, writer, date)` poll fan-out with a fresh UUID each restart.
 
+## D-051: Grafana-Explore log volume + label drill-down, on a server-side result cache
+
+**Date:** 2026-07-03
+**Status:** accepted
+
+The query UI became discoverable in D-050 (you can see *what* labels exist) but
+stayed tabular: you never saw **how much** a slice weighs or **how it trends**,
+and every repeat of the same range re-scanned parquet from scratch. D-051 adds
+Grafana Explore's two signature moves — a **log-volume histogram** (count over
+time, split by severity) and a **label drill-down** (per-value counts, click to
+refilter the graph) — and the thing that makes a dashboard cheap: a **server-side
+query result cache** so identical/replayed requests return from memory in ms.
+
+**The cache lives in the queryd, not the client (Bart's explicit call).** A
+browser dashboard "just keeps making requests but gets results in 2 ms instead of
+2 s." So the cache is in `crates/server/src/query_service.rs`, shared by every
+client of a daemon, memory-bounded with a sensible default.
+
+**Correctness comes from the key, not from invalidation.** The cache key is
+`hash128(kind, signal, sorted matchers, ts_min, ts_max, sql, limit, trace_id,
+body_contains) ⊕ hash128(sorted candidate block UUIDs)`. The second half folds in
+**which blocks the range actually touches** — listed anyway, cheaply, at the top
+of every plan. Any ingest / compaction / retention that changes that set changes
+the key, so a stale entry is simply never looked up again (it ages out of the
+LRU); a **closed past range** has a stable candidate set and hits. There is no
+block-event wiring, no explicit invalidation, and no TTL required for
+correctness. `request_id` is deliberately excluded from the key so two clients
+issuing the same logical query share the entry. This is the same
+"derived-data-keyed-by-immutable-blocks" discipline as D-050's label cache.
+
+**Streaming is preserved by a capped tee.** On a miss the existing
+plan/execute/stream path runs unchanged, but each framed byte slice is also
+pushed into a `ResponseTee` (a `Vec<u8>` with a per-entry byte cap, default
+8 MiB). If the response outgrows the cap the buffer is dropped and the entry is
+never cached — so a giant raw-log dump still streams row-by-row and only small
+aggregation/metadata results (the dashboard case) are retained. On a clean
+`EndOfStream` the intact buffer is inserted verbatim; a **hit** is then just
+`write_all(&bytes)` — no `SessionContext`, no scan. Metadata responses
+(`LabelNames`/`LabelValues`) ride the same cache (a distinct `kind` byte), since
+drill-down fires them repeatedly.
+
+**Cache type mirrors `PostingsCache`.** `crates/query/src/result_cache.rs` is a
+`Mutex<Lru>` byte-weighted by entry size, with atomic `hits/misses/inserts/
+evictions/bytes_in` and a `delta()` so the numbers fold straight into the
+existing `scan_complete` telemetry next to the postings/bloom gauges — every scan
+now logs `cache = "hit"|"miss"` plus the cache deltas. Config mirrors
+`--postings-cache-bytes`: `--query-cache-bytes` (default 256 MiB; `0` disables)
+and `--query-cache-entry-bytes` (default 8 MiB), constructed in
+`crates/scry-queryd/src/lib.rs` and logged at startup. A "percent of RAM" knob was
+floated but deferred — the existing budget flags are all absolute, and there's no
+total-memory source wired in yet.
+
+**Live "now" ranges are made cacheable client-side.** A naive "last 15m" sends a
+fresh `ts_max = now` every refresh → a new key every time → never hits. So quick
+ranges **snap** `ts_max` down to the histogram's bucket step (`ts_min = ts_max −
+span`), so repeated refreshes within one step reuse the exact bounds and hit.
+`snapQuickRangeNs` (`desktop/src/volume.ts`) is pure and unit-tested for both the
+snap and the intra-bucket stability.
+
+**Volume + drill-down need no wire change — they ride `QueryRequest.sql`.** The
+logs table is registered with the request's matchers/time regardless of `sql`, so
+a `SELECT CAST(date_bin(INTERVAL '<step>', to_timestamp_nanos(ts_unix_nano)) AS
+BIGINT) AS bucket_ns, severity, count(*) … GROUP BY bucket_ns, severity` respects
+the current filter for free. `severity` is a real `UInt8` column (no map access);
+the `CAST(... AS BIGINT)` keeps nanos as a JS-friendly `Int64`. The step is chosen
+from a fixed ladder (1 s … 1 d) targeting ~120 buckets (`chooseStepMs`). The panel
+is uPlot (`desktop/src/components/VolumePanel.tsx`): stacked-by-severity bars via
+the cumulative-sum + reverse-paint recipe, colored by the shared `severity`
+palette, with drag-to-zoom that sets `[ts_min, ts_max]` and re-runs the table +
+volume together (the Explore brush loop). **Logs only** in v1 — metrics results
+carry no label/severity column yet.
+
+**Drill-down counts reuse the same SQL path.** Expanding a label in the
+`LabelBrowser` fires one grouped count — `SELECT labels['<key>'] AS v, count(*) AS
+c FROM logs GROUP BY v ORDER BY c DESC` — under the current matchers/range;
+DataFusion 53 bracket map access (`labels['key']`) returns a scalar (verified;
+`map_extract` returns a list and is avoided). Counts render as a chip suffix
+(biggest first, `k`/`M` formatted); clicking a value adds the matcher and re-runs
+the query + volume so the graph refilters to the slice. All of these queries are
+small and cache-backed, so the drill-down loop is cheap.
+
+**Deferred:** metrics/traces/profiles label-in-results and their volume graphs
+(metrics needs a fingerprint→label join in the scan path — a real engine change);
+IndexedDB client persistence and the percent-of-RAM knob; saved/pinned queries.
+
+**Status.** Backend cache + flags + tee wired; `result_cache` unit tests and a
+`logs_round_trip` replay-hits-cache assertion in `query_e2e`; `scripts/smoke.sh`
+gains a `scry-query-probe`-driven leg (`QCACHE=1`, logs) asserting a `date_bin`
+volume query returns stable bucket rows and a second identical request logs
+`cache="hit"` with `result_cache_hits_delta=1`. Frontend volume/severity/snap
+helpers unit-tested; `MULTI=1` still green (each instance caches its own).
+
 ## Deferred / open
 
 These are not decisions yet; they're flagged for "we'll decide when the
@@ -2257,3 +2349,87 @@ builds/copies one `scry`; `deploy/k8s/*` commands + resource names updated;
 website hero one-shot example → `scry get`. The full smoke suite is the exit
 criterion — a green run proves subcommand dispatch is behaviour-identical to the
 old per-bin invocations.
+
+## D-050: Label discoverability — metadata frames over a catalog label cache
+
+**Date:** 2026-07-02
+**Status:** accepted
+
+The query UI let you type a matcher `name=value` but never showed you what you
+*could* match on. You learned matchable labels only by running a query and
+eyeballing columns — and for **metrics** even that failed (results carry
+`fingerprint/ts/value`, never the labels). D-050 adds a first-class "what can I
+match on?" capability, surfaced in the UI as both inline autocomplete on the
+matcher fields and a browsable Labels panel.
+
+**The label truth already exists — it just wasn't queryable.** Every
+metrics/logs block ships a **postings sidecar** (`label_name, label_value,
+fingerprints`); the in-memory `PostingsIndex` holds `name → value →
+fingerprints`. That is the authoritative label surface. Enumerating every
+block's postings on each metadata request would defeat the point, so the answer
+is a **materialized view, not a new source of truth.**
+
+**Cache = catalog tables, warmed lazily, reaped on block lifecycle.** Two new
+catalog tables keyed by block UUID: `block_labels(block_uuid, label_name,
+label_value)` and `block_labels_warmed(block_uuid)` (a block with zero labels is
+still marked warmed so it isn't refetched forever). A metadata request lists the
+candidate blocks for the signal + time window (the same `list_*_candidates` path
+a data query uses), fetches the postings of any not-yet-warmed block through the
+shared `PostingsCache`, enumerates the pairs, and upserts them. The answer is
+then a `SELECT DISTINCT … WHERE block_uuid IN (…)` union, sorted. **Expiry is
+free:** `delete_blocks` already runs when a block is compacted away or reaped by
+retention, and it now also deletes that block's cache rows. The cache can never
+outlive its source data because it is keyed by, and reaped with, the block.
+
+**Multi-instance is a non-issue precisely because it's derived data.** Under
+v0.9 each instance's catalog converges independently. Each instance therefore
+warms its *own* label cache off the same immutable blocks; a cold instance is
+only slower on the first hit, never wrong. No cross-instance coordination, no
+Valkey involvement — the metadata path is deliberately Valkey-agnostic like the
+rest of the query engine.
+
+**Locking discipline.** `Catalog` is `!Sync` (rusqlite `RefCell`); the daemon
+wraps it in a `Mutex`. The warm path is three phases so the guard is never held
+across an `.await`: (1) lock → list candidates + read warmed set; (2) drop lock
+→ async postings fetches; (3) re-lock → upsert. A block whose postings fetch
+fails (a peer deleted it mid-flight) is skipped *without* being marked warmed,
+so a later request retries it.
+
+**Per-signal fidelity.** Metrics + logs get full-fidelity discovery from
+postings. **Traces** carry no postings — names are the static promoted-column
+set (`service.name`, `service.namespace`, `deployment.environment`) and values
+come from a `SELECT DISTINCT arrow_cast(col,'Utf8')` over the candidate trace
+blocks. **Profiles** carry their labels inside the opaque pprof blob, so
+metadata is empty (the form directs you to SQL). Trace-attribute discovery
+beyond the three promoted columns, and profile labels, are deferred.
+
+**Wire shape.** Four new `QueryFrame` variants (`proto/query.schema.json`):
+`LabelNamesRequest` (0x02) / `LabelValuesRequest` (0x03) carry the signal + an
+optional `[ts_min, ts_max]` window (same `*_present` companion convention as
+`QueryRequest`, per the binschema-optional caveat); `LabelNamesResponse` (0x20)
+/ `LabelValuesResponse` (0x21) each carry one sorted, deduplicated string list
+and are terminal (one request → one response → close). scry-webui stays a **dumb
+byte-pipe** — the metadata frame rides the exact same relay as a query, so
+D-040/D-046 are preserved and the browser sends only an opaque target id.
+
+**One implementation, two callers.** The warm/enumerate/DISTINCT core lives in
+`crates/query/src/metadata.rs` (`collect_label_names` / `collect_label_values`,
+both taking `&Mutex<Catalog>`). The `scry query` daemon's wire handlers and the
+`scry get --list-label-names` / `--label-values <name>` CLI mode are thin
+wrappers over it, so the daemon and the one-shot CLI can never disagree about
+what a signal exposes. The CLI mode also gives `scripts/smoke.sh` a clean
+assertion path: the metrics/logs legs assert the spewer's label keys appear and
+a deterministic key's values match.
+
+**Frontend.** `fetchLabelNames`/`fetchLabelValues` (`desktop/src/protocol/
+client.ts`) build the frames and ride the existing `Transport`. The store
+(`desktop/src/store.ts`) caches names per scope (signal/time/target) and values
+lazily per name, resetting on scope change under a monotonic sequence guard so a
+stale in-flight response can't clobber a newer scope. The matcher inputs
+autocomplete via native `<datalist>`; the new `LabelBrowser` panel lists
+keys → values and click-adds a matcher.
+
+**Status.** Implemented across proto/catalog/query/server/CLI/frontend; sealed
+by the `query_e2e` metadata test and the `SIGNAL=metrics|logs|both` smoke legs.
+Deferred: an age/size cap on the cache (block-lifecycle reaping is the only
+expiry today), regex/non-promoted trace-attribute discovery, and profile labels.

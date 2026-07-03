@@ -142,8 +142,8 @@ async fn run_query(addr: std::net::SocketAddr, req: QueryRequest) -> QueryResult
                     err.code, err.message
                 );
             }
-            QueryFrameMsg::QueryRequest(_) => {
-                panic!("server sent QueryRequest as response (protocol violation)");
+            other => {
+                panic!("server sent unexpected frame as data-query response: {other:?}");
             }
         }
     };
@@ -151,6 +151,69 @@ async fn run_query(addr: std::net::SocketAddr, req: QueryRequest) -> QueryResult
     QueryResult {
         batches,
         server_total_rows,
+    }
+}
+
+/// Send a `LabelNamesRequest` for `signal` (unbounded time window) and
+/// return the sorted names from the single terminal `LabelNamesResponse`.
+async fn fetch_label_names(addr: std::net::SocketAddr, signal: Signal) -> Vec<String> {
+    let sock = TcpStream::connect(addr).await.expect("connect");
+    let (r, w) = sock.into_split();
+    let mut r = TokioBufReader::new(r);
+    let mut w = TokioBufWriter::new(w);
+    let frame = QueryFrame {
+        msg: QueryFrameMsg::LabelNamesRequest(
+            scry_proto::LabelNamesRequestInput {
+                signal: signal as u8,
+                ts_min_present: 0,
+                ts_min: 0,
+                ts_max_present: 0,
+                ts_max: 0,
+            }
+            .into(),
+        ),
+    };
+    write_frame(&mut w, &frame).await.expect("write names req");
+    w.flush().await.expect("flush");
+    let resp: QueryFrame = read_frame(&mut r).await.expect("read names resp");
+    match resp.msg {
+        QueryFrameMsg::LabelNamesResponse(m) => m.names,
+        QueryFrameMsg::StreamError(err) => {
+            panic!("LabelNames StreamError {:#06x}: {}", err.code, err.message)
+        }
+        other => panic!("expected LabelNamesResponse, got {other:?}"),
+    }
+}
+
+/// Send a `LabelValuesRequest` for `signal`/`name` (unbounded window) and
+/// return the sorted values from the single terminal response.
+async fn fetch_label_values(addr: std::net::SocketAddr, signal: Signal, name: &str) -> Vec<String> {
+    let sock = TcpStream::connect(addr).await.expect("connect");
+    let (r, w) = sock.into_split();
+    let mut r = TokioBufReader::new(r);
+    let mut w = TokioBufWriter::new(w);
+    let frame = QueryFrame {
+        msg: QueryFrameMsg::LabelValuesRequest(
+            scry_proto::LabelValuesRequestInput {
+                signal: signal as u8,
+                label_name: name.to_string(),
+                ts_min_present: 0,
+                ts_min: 0,
+                ts_max_present: 0,
+                ts_max: 0,
+            }
+            .into(),
+        ),
+    };
+    write_frame(&mut w, &frame).await.expect("write values req");
+    w.flush().await.expect("flush");
+    let resp: QueryFrame = read_frame(&mut r).await.expect("read values resp");
+    match resp.msg {
+        QueryFrameMsg::LabelValuesResponse(m) => m.values,
+        QueryFrameMsg::StreamError(err) => {
+            panic!("LabelValues StreamError {:#06x}: {}", err.code, err.message)
+        }
+        other => panic!("expected LabelValuesResponse, got {other:?}"),
     }
 }
 
@@ -243,6 +306,13 @@ async fn query_round_trip() {
         bloom_cache.clone(),
         runtime_env,
         memory_pool,
+        // Result cache disabled here: this test asserts *postings*-cache
+        // warmth on an identical replay, which the result cache would
+        // otherwise short-circuit before postings are ever read. The
+        // result cache gets its own integration coverage in
+        // `logs_round_trip` below (plus unit tests + smoke.sh).
+        Arc::new(scry_query::QueryResultCache::with_budget_bytes(0)),
+        scry_query::DEFAULT_QUERY_CACHE_ENTRY_BYTES,
     ));
 
     // Pre-bind to capture the chosen port before spawning the serve
@@ -385,6 +455,33 @@ async fn query_round_trip() {
         delta.hits
     );
 
+    // ── Label metadata (discoverability) ───────────────────────────
+    //
+    // The two planted blocks carry labels `__name__` and `env` only.
+    // Names must union+dedupe+sort across both blocks; values for a name
+    // likewise. This exercises the postings→cache warm path end-to-end.
+    let names = fetch_label_names(listen_addr, Signal::Metrics).await;
+    assert_eq!(
+        names,
+        vec!["__name__".to_string(), "env".to_string()],
+        "label names should be the sorted union across both blocks"
+    );
+    let name_vals = fetch_label_values(listen_addr, Signal::Metrics, "__name__").await;
+    assert_eq!(
+        name_vals,
+        vec!["bar".to_string(), "baz".to_string(), "foo".to_string()],
+        "__name__ values are the sorted union (bar,baz,foo) across both blocks"
+    );
+    let env_vals = fetch_label_values(listen_addr, Signal::Metrics, "env").await;
+    assert_eq!(
+        env_vals,
+        vec!["prod".to_string(), "stage".to_string()],
+        "env values are the sorted union (prod,stage)"
+    );
+    // Unknown label ⇒ empty, not an error.
+    let missing = fetch_label_values(listen_addr, Signal::Metrics, "nope").await;
+    assert!(missing.is_empty(), "unknown label yields no values");
+
     // ── Clean shutdown ─────────────────────────────────────────────
     let _ = shutdown_tx.send(());
     serve_handle.await.expect("serve task join").unwrap();
@@ -477,6 +574,10 @@ async fn logs_round_trip() {
         bloom_cache.clone(),
         runtime_env,
         memory_pool,
+        Arc::new(scry_query::QueryResultCache::with_budget_bytes(
+            scry_query::DEFAULT_QUERY_CACHE_BYTES,
+        )),
+        scry_query::DEFAULT_QUERY_CACHE_ENTRY_BYTES,
     ));
 
     let bind = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
@@ -574,6 +675,49 @@ async fn logs_round_trip() {
     );
     assert_eq!(result_all.server_total_rows, 60);
 
+    // ── Result-cache warmth ────────────────────────────────────────
+    //
+    // The very first query above (`service=api`, 20 rows) populated the
+    // result cache. Replaying a request that's identical in every
+    // key-relevant field (signal + matchers + range + sql + limit; the
+    // per-call `request_id` is deliberately excluded from the key) must
+    // be served from the cache: a hit, no insert, and byte-identical
+    // rows. Because the candidate block-UUID set is folded into the key,
+    // this hit is provably for the same blocks — the whole invalidation
+    // story in one assertion.
+    let rc_before = service.result_cache().stats();
+    let req_replay = QueryRequest {
+        signal: Signal::Logs as u8,
+        query: Query {
+            matchers: vec![("service".into(), "api".into())],
+            ts_min: None,
+            ts_max: None,
+            trace_id: None,
+            body_contains: None,
+        },
+        sql: None,
+        limit: None,
+        request_id: Some("logs-matcher-replay".into()),
+    };
+    let result_replay = run_query(listen_addr, req_replay).await;
+    assert_eq!(
+        total_rows(&result_replay.batches),
+        20,
+        "cached replay returns the same 20 rows"
+    );
+    assert_eq!(result_replay.server_total_rows, 20);
+    let rc_delta = service.result_cache().stats().delta(rc_before);
+    assert_eq!(
+        rc_delta.hits, 1,
+        "identical replay must hit the result cache exactly once (got hits={})",
+        rc_delta.hits
+    );
+    assert_eq!(
+        rc_delta.inserts, 0,
+        "a cache hit must not re-insert (got inserts={})",
+        rc_delta.inserts
+    );
+
     // ── Clean shutdown ─────────────────────────────────────────────
     let _ = shutdown_tx.send(());
     serve_handle.await.expect("serve task join").unwrap();
@@ -663,6 +807,10 @@ async fn traces_round_trip() {
         bloom_cache.clone(),
         runtime_env,
         memory_pool,
+        Arc::new(scry_query::QueryResultCache::with_budget_bytes(
+            scry_query::DEFAULT_QUERY_CACHE_BYTES,
+        )),
+        scry_query::DEFAULT_QUERY_CACHE_ENTRY_BYTES,
     ));
 
     let bind = std::net::SocketAddr::from(([127, 0, 0, 1], 0));

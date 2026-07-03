@@ -22,6 +22,7 @@
 //! schema as nullables so v0.2+ doesn't need a migration. Indices
 //! match the architecture spec exactly.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -147,6 +148,27 @@ impl Catalog {
               date         TEXT NOT NULL,
               highest_uuid TEXT NOT NULL,
               PRIMARY KEY (signal, writer_id, date)
+            );
+
+            -- Label cache: a materialized view over the authoritative per-block
+            -- postings sidecars, warmed lazily by the metadata handler (D-050).
+            -- NOT a source of truth — every row is reconstructable by scanning
+            -- the block's postings. Keyed by block_uuid so it expires with the
+            -- block lifecycle (reaped in delete_blocks). `block_labels_warmed`
+            -- records that a block has been scanned even when it carries zero
+            -- labels, so a label-less block isn't rescanned on every request.
+            CREATE TABLE IF NOT EXISTS block_labels (
+              block_uuid  TEXT NOT NULL,
+              label_name  TEXT NOT NULL,
+              label_value TEXT NOT NULL,
+              PRIMARY KEY (block_uuid, label_name, label_value)
+            ) WITHOUT ROWID;
+
+            CREATE INDEX IF NOT EXISTS idx_block_labels_name
+              ON block_labels(label_name);
+
+            CREATE TABLE IF NOT EXISTS block_labels_warmed (
+              block_uuid TEXT PRIMARY KEY
             );
             "#,
             )
@@ -301,13 +323,108 @@ impl Catalog {
         let tx = self.conn.unchecked_transaction()?;
         {
             let mut stmt = tx.prepare_cached("DELETE FROM blocks WHERE uuid = ?1")?;
+            // Reap the derived label cache alongside the block row so it stays
+            // bounded to live blocks (the cache's expiry mechanism, D-050).
+            let mut lbl = tx.prepare_cached("DELETE FROM block_labels WHERE block_uuid = ?1")?;
+            let mut warm =
+                tx.prepare_cached("DELETE FROM block_labels_warmed WHERE block_uuid = ?1")?;
             for uuid in uuids {
-                stmt.execute(params![uuid.to_string()])
-                    .context("DELETE block row")?;
+                let id = uuid.to_string();
+                stmt.execute(params![id]).context("DELETE block row")?;
+                lbl.execute(params![id]).context("DELETE block_labels")?;
+                warm.execute(params![id])
+                    .context("DELETE block_labels_warmed")?;
             }
         }
         tx.commit().context("commit delete_blocks")?;
         Ok(())
+    }
+
+    /// Record a block's distinct `(label_name, label_value)` pairs into the
+    /// label cache and mark the block **warmed**. Idempotent (`INSERT OR
+    /// IGNORE`); safe with an empty slice — the warmed marker is still written
+    /// so a label-less block is not rescanned on every metadata request. One
+    /// transaction. The cache is a materialized view over postings (D-050); the
+    /// caller supplies pairs enumerated from the block's `PostingsIndex`.
+    pub fn upsert_block_labels(&self, uuid: Uuid, pairs: &[(String, String)]) -> Result<()> {
+        let id = uuid.to_string();
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            tx.prepare_cached("INSERT OR IGNORE INTO block_labels_warmed(block_uuid) VALUES (?1)")?
+                .execute(params![id])
+                .context("mark block warmed")?;
+            let mut ins = tx.prepare_cached(
+                "INSERT OR IGNORE INTO block_labels(block_uuid, label_name, label_value) \
+                 VALUES (?1, ?2, ?3)",
+            )?;
+            for (name, value) in pairs {
+                ins.execute(params![id, name, value])
+                    .context("insert block label")?;
+            }
+        }
+        tx.commit().context("commit upsert_block_labels")?;
+        Ok(())
+    }
+
+    /// The subset of `candidates` whose labels are already cached (warmed), so
+    /// the metadata handler only pays a postings scan for the cold remainder.
+    pub fn warmed_blocks(&self, candidates: &[Uuid]) -> Result<HashSet<Uuid>> {
+        let mut out = HashSet::new();
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT 1 FROM block_labels_warmed WHERE block_uuid = ?1")?;
+        for uuid in candidates {
+            if stmt.exists(params![uuid.to_string()])? {
+                out.insert(*uuid);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Distinct label **names** across the given (warmed) blocks, sorted.
+    /// Empty input → empty output.
+    pub fn distinct_label_names(&self, blocks: &[Uuid]) -> Result<Vec<String>> {
+        if blocks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = vec!["?"; blocks.len()].join(",");
+        let sql = format!(
+            "SELECT DISTINCT label_name FROM block_labels \
+             WHERE block_uuid IN ({placeholders}) ORDER BY label_name"
+        );
+        let ids: Vec<String> = blocks.iter().map(Uuid::to_string).collect();
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(ids.iter()), |r| {
+                r.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("distinct_label_names")?;
+        Ok(rows)
+    }
+
+    /// Distinct **values** for `name` across the given (warmed) blocks, sorted.
+    /// Empty input → empty output.
+    pub fn distinct_label_values(&self, name: &str, blocks: &[Uuid]) -> Result<Vec<String>> {
+        if blocks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = vec!["?"; blocks.len()].join(",");
+        let sql = format!(
+            "SELECT DISTINCT label_value FROM block_labels \
+             WHERE label_name = ? AND block_uuid IN ({placeholders}) ORDER BY label_value"
+        );
+        let mut binds: Vec<String> = Vec::with_capacity(blocks.len() + 1);
+        binds.push(name.to_string());
+        binds.extend(blocks.iter().map(Uuid::to_string));
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(binds.iter()), |r| {
+                r.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("distinct_label_values")?;
+        Ok(rows)
     }
 
     /// Soft-delete a set of blocks: stamp `deleted_at` with

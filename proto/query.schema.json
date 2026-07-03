@@ -19,11 +19,15 @@
           "type": "discriminated_union",
           "discriminator": { "peek": "uint8" },
           "variants": [
-            { "type": "QueryRequest",  "when": "value === 0x01" },
-            { "type": "SchemaMsg",     "when": "value === 0x10" },
-            { "type": "BatchMsg",      "when": "value === 0x11" },
-            { "type": "EndOfStream",   "when": "value === 0x1F" },
-            { "type": "StreamError",   "when": "value === 0xF0" }
+            { "type": "QueryRequest",       "when": "value === 0x01" },
+            { "type": "LabelNamesRequest",  "when": "value === 0x02" },
+            { "type": "LabelValuesRequest", "when": "value === 0x03" },
+            { "type": "SchemaMsg",          "when": "value === 0x10" },
+            { "type": "BatchMsg",           "when": "value === 0x11" },
+            { "type": "EndOfStream",        "when": "value === 0x1F" },
+            { "type": "LabelNamesResponse", "when": "value === 0x20" },
+            { "type": "LabelValuesResponse","when": "value === 0x21" },
+            { "type": "StreamError",        "when": "value === 0xF0" }
           ]
         }
       ]
@@ -52,6 +56,49 @@
       "sequence": [
         { "name": "name",  "type": "string", "kind": "length_prefixed", "length_type": "uint16", "encoding": "utf8" },
         { "name": "value", "type": "string", "kind": "length_prefixed", "length_type": "uint16", "encoding": "utf8" }
+      ]
+    },
+
+    "LabelNamesRequest": {
+      "description": "Client → server. Metadata request for label DISCOVERABILITY, not data: 'what label names can I match on for this signal in this time window?' Answered from the per-instance label cache (a materialized view over the authoritative postings sidecars, warmed lazily; see D-050), unioned across the candidate blocks that overlap [ts_min, ts_max]. The time bounds use the same `*_present: uint8` companion convention as QueryRequest (0 = absent → unbounded on that side). The server replies with exactly one LabelNamesResponse and closes, or a StreamError (QUERY_ERR_BAD_REQUEST if `signal` is 0 / unimplemented).",
+      "sequence": [
+        { "name": "tag",    "type": "uint8", "const": 2 },
+        { "name": "signal", "type": "uint8" },
+        { "name": "ts_min_present", "type": "uint8" },
+        { "name": "ts_min",         "type": "uint64" },
+        { "name": "ts_max_present", "type": "uint8" },
+        { "name": "ts_max",         "type": "uint64" }
+      ]
+    },
+
+    "LabelValuesRequest": {
+      "description": "Client → server. Metadata request: 'what values does label `label_name` take for this signal in this time window?' Same cache/union semantics and time-bound convention as LabelNamesRequest. The server replies with exactly one LabelValuesResponse and closes, or a StreamError.",
+      "sequence": [
+        { "name": "tag",        "type": "uint8", "const": 3 },
+        { "name": "signal",     "type": "uint8" },
+        { "name": "label_name", "type": "string", "kind": "length_prefixed", "length_type": "uint16", "encoding": "utf8" },
+        { "name": "ts_min_present", "type": "uint8" },
+        { "name": "ts_min",         "type": "uint64" },
+        { "name": "ts_max_present", "type": "uint8" },
+        { "name": "ts_max",         "type": "uint64" }
+      ]
+    },
+
+    "LabelNamesResponse": {
+      "description": "Server → client. The distinct, sorted label names for a LabelNamesRequest. One frame, terminal — the connection closes after it. `names` is deduplicated and lexicographically sorted across all candidate blocks.",
+      "sequence": [
+        { "name": "tag",   "type": "uint8", "const": 32 },
+        { "name": "names", "type": "array", "kind": "length_prefixed", "length_type": "uint32",
+          "items": { "type": "string", "kind": "length_prefixed", "length_type": "uint16", "encoding": "utf8" } }
+      ]
+    },
+
+    "LabelValuesResponse": {
+      "description": "Server → client. The distinct, sorted values for a LabelValuesRequest. One frame, terminal — the connection closes after it.",
+      "sequence": [
+        { "name": "tag",    "type": "uint8", "const": 33 },
+        { "name": "values", "type": "array", "kind": "length_prefixed", "length_type": "uint32",
+          "items": { "type": "string", "kind": "length_prefixed", "length_type": "uint16", "encoding": "utf8" } }
       ]
     },
 

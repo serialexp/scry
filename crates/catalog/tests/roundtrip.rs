@@ -256,6 +256,89 @@ async fn reconcile_walks_bucket_and_upserts_sidecars() {
     assert_eq!(again.failed, 1);
 }
 
+fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
+    items
+        .iter()
+        .map(|(n, v)| (n.to_string(), v.to_string()))
+        .collect()
+}
+
+#[test]
+fn label_cache_warm_enumerate_and_reap() {
+    let tmp = TempDir::new().unwrap();
+    let cat = Catalog::open(&tmp.path().join("cat.sqlite"), "scry-dev").unwrap();
+    let a = Uuid::now_v7();
+    let b = Uuid::now_v7();
+    let cold = Uuid::now_v7();
+
+    // Nothing warmed yet.
+    assert!(cat.warmed_blocks(&[a, b, cold]).unwrap().is_empty());
+
+    // Warm two blocks with overlapping + distinct labels.
+    cat.upsert_block_labels(a, &pairs(&[("service", "api"), ("env", "prod")]))
+        .unwrap();
+    cat.upsert_block_labels(b, &pairs(&[("service", "web"), ("env", "prod")]))
+        .unwrap();
+
+    let warmed = cat.warmed_blocks(&[a, b, cold]).unwrap();
+    assert!(warmed.contains(&a) && warmed.contains(&b) && !warmed.contains(&cold));
+
+    // Names: union across a+b, deduped + sorted.
+    assert_eq!(
+        cat.distinct_label_names(&[a, b]).unwrap(),
+        vec!["env".to_string(), "service".to_string()]
+    );
+    // Values scoped to blocks: querying only `a` sees only its service value.
+    assert_eq!(
+        cat.distinct_label_values("service", &[a]).unwrap(),
+        vec!["api"]
+    );
+    // Across both, deduped + sorted.
+    assert_eq!(
+        cat.distinct_label_values("service", &[a, b]).unwrap(),
+        vec!["api".to_string(), "web".to_string()]
+    );
+    assert_eq!(
+        cat.distinct_label_values("env", &[a, b]).unwrap(),
+        vec!["prod"]
+    );
+    // Empty candidate set → empty result (no panic on IN ()).
+    assert!(cat.distinct_label_names(&[]).unwrap().is_empty());
+
+    // Idempotent re-warm doesn't duplicate.
+    cat.upsert_block_labels(a, &pairs(&[("service", "api"), ("env", "prod")]))
+        .unwrap();
+    assert_eq!(
+        cat.distinct_label_values("service", &[a]).unwrap(),
+        vec!["api"]
+    );
+
+    // Deleting a block reaps its label rows + warmed marker.
+    cat.delete_blocks(&[a]).unwrap();
+    assert!(!cat.warmed_blocks(&[a]).unwrap().contains(&a));
+    assert_eq!(
+        cat.distinct_label_values("service", &[a]).unwrap(),
+        Vec::<String>::new()
+    );
+    // b is untouched.
+    assert_eq!(
+        cat.distinct_label_values("service", &[b]).unwrap(),
+        vec!["web"]
+    );
+}
+
+#[test]
+fn label_cache_warms_a_label_less_block() {
+    // A block with zero labels must still be recorded as warmed, so the
+    // metadata handler doesn't rescan its postings on every request.
+    let tmp = TempDir::new().unwrap();
+    let cat = Catalog::open(&tmp.path().join("cat.sqlite"), "scry-dev").unwrap();
+    let u = Uuid::now_v7();
+    cat.upsert_block_labels(u, &[]).unwrap();
+    assert!(cat.warmed_blocks(&[u]).unwrap().contains(&u));
+    assert!(cat.distinct_label_names(&[u]).unwrap().is_empty());
+}
+
 #[test]
 fn poll_cursor_absent_then_advances_monotonically() {
     let tmp = TempDir::new().unwrap();

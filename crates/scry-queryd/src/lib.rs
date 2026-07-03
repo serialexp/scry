@@ -49,7 +49,9 @@ use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use scry_catalog::Catalog;
 use scry_cluster::{apply_event, full_walk, poll_once};
 use scry_objstore::{open_with_pool_config, BufPoolConfig, ObjStoreConfig};
-use scry_query::{BloomCache, BloomCacheConfig, PostingsCache, PostingsCacheConfig};
+use scry_query::{
+    BloomCache, BloomCacheConfig, PostingsCache, PostingsCacheConfig, QueryResultCache,
+};
 use scry_server::QueryService;
 use scry_valkey::{parse_envelope, subscribe_blocks, ValkeyClient, VALKEY_URL_ENV};
 use tracing::{info, warn};
@@ -118,6 +120,25 @@ pub struct Args {
     /// bloom; correctness is unaffected, it's a pure accelerator).
     #[arg(long)]
     bloom_cache_bytes: Option<usize>,
+
+    /// Query-result cache byte budget (default 256 MiB; `0` disables).
+    /// Caches the exact framed response bytes of *data* queries keyed by
+    /// the normalized request ⊕ the candidate block-UUID set, so a
+    /// repeated dashboard-style query over a closed past range is served
+    /// from memory in ~ms with no scan. Folding the candidate set into
+    /// the key makes invalidation free: any ingest / compaction /
+    /// retention that changes which blocks a range touches changes the
+    /// key → automatic miss, so a hit is always for an identical block
+    /// set. Byte-weighted LRU eviction to this budget.
+    #[arg(long, default_value_t = scry_query::DEFAULT_QUERY_CACHE_BYTES)]
+    query_cache_bytes: usize,
+
+    /// Per-entry cap for the query-result cache (default 8 MiB). A
+    /// response whose framed bytes exceed this is streamed to the client
+    /// but never cached, so large log dumps don't evict the small
+    /// aggregation / metadata results the dashboard actually re-hits.
+    #[arg(long, default_value_t = scry_query::DEFAULT_QUERY_CACHE_ENTRY_BYTES)]
+    query_cache_entry_bytes: usize,
 
     /// Process-wide DataFusion memory budget, in MiB. Every per-
     /// request `SessionContext` shares the same `GreedyMemoryPool`
@@ -207,6 +228,10 @@ pub async fn run(args: Args) -> Result<()> {
     }
     let bloom_cache = Arc::new(BloomCache::new(bloom_cache_cfg));
 
+    // Query-result cache: byte-budgeted LRU over exact framed response
+    // bytes. `--query-cache-bytes 0` disables it entirely.
+    let result_cache = Arc::new(QueryResultCache::with_budget_bytes(args.query_cache_bytes));
+
     // ── Memory pool + shared RuntimeEnv ───────────────────────────
     //
     // The pool is constructed once and lives for the lifetime of the
@@ -245,6 +270,8 @@ pub async fn run(args: Args) -> Result<()> {
         bloom_cache.clone(),
         runtime_env.clone(),
         memory_pool.clone(),
+        result_cache.clone(),
+        args.query_cache_entry_bytes,
     ));
 
     info!(
@@ -255,6 +282,8 @@ pub async fn run(args: Args) -> Result<()> {
         pool_capacity               = pool.capacity(),
         postings_cache_budget_bytes = cache_cfg.budget_bytes,
         bloom_cache_budget_bytes    = bloom_cache_cfg.budget_bytes,
+        query_cache_budget_bytes    = result_cache.budget_bytes(),
+        query_cache_entry_bytes     = args.query_cache_entry_bytes,
         query_memory_budget_bytes   = memory_budget_bytes,
         "query daemon ready"
     );

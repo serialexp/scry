@@ -882,3 +882,137 @@ textarea {
     min-height: 60vh;
   }
 }
+
+/* ── Label browser (discoverability panel; D-050) ──────────────────── */
+.label-browser {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+
+.label-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.label-item {
+  display: flex;
+  flex-direction: column;
+}
+
+.label-key {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: none;
+  border: none;
+  color: var(--text);
+  cursor: pointer;
+  font-size: 13px;
+  font-family: inherit;
+  padding: 4px 2px;
+  text-align: left;
+  width: 100%;
+}
+
+.label-key:hover {
+  color: var(--accent);
+}
+
+.label-key .disclosure {
+  color: var(--muted);
+  font-size: 10px;
+  width: 10px;
+}
+
+.label-values {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 4px 0 8px 18px;
+}
+
+.value-chip {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.value-hint {
+  padding: 2px 0 6px 18px;
+}
+
+/* ── Log-volume histogram (Part B) ─────────────────────────────────── */
+.volume-panel {
+  margin: 0 0 10px;
+  padding: 8px 10px 6px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.volume-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 4px;
+}
+
+.volume-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.volume-meta {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.volume-plot {
+  width: 100%;
+}
+
+.volume-plot.hidden {
+  display: none;
+}
+
+.volume-empty {
+  padding: 18px 6px;
+  font-size: 12px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.volume-hint {
+  margin-top: 2px;
+  font-size: 10px;
+  color: var(--muted);
+  opacity: 0.8;
+}
+
+/* uPlot legend: compact + themed to the dark panel. */
+.volume-panel .u-legend {
+  font-size: 10px;
+  color: var(--muted);
+}
+.volume-panel .u-legend .u-marker {
+  width: 9px;
+  height: 9px;
+}
+
+/* Per-value entry-count suffix on drill-down chips. */
+.value-chip .value-count {
+  margin-left: 6px;
+  padding: 0 4px;
+  border-radius: 6px;
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.06);
+}

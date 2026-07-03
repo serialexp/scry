@@ -43,9 +43,11 @@ pub mod body_bloom;
 pub mod cli;
 pub mod evict;
 pub mod logs;
+pub mod metadata;
 pub mod postings;
 pub mod postings_cache;
 pub mod profiles;
+pub mod result_cache;
 mod table;
 pub mod traces;
 pub mod wire;
@@ -64,10 +66,15 @@ pub use bloom_cache::{
     DEFAULT_BUDGET_BYTES as DEFAULT_BLOOM_CACHE_BYTES,
 };
 pub use evict::EvictOnNotFound;
+pub use metadata::{collect_label_names, collect_label_values, meta_query, MetaError};
 pub use postings::resolve_fingerprints;
 pub use postings_cache::{
     PostingsCache, PostingsCacheConfig, PostingsCacheStats, PostingsIndex,
     DEFAULT_BUDGET_BYTES as DEFAULT_POSTINGS_CACHE_BYTES,
+};
+pub use result_cache::{
+    hash128, QueryResultCache, QueryResultCacheStats, DEFAULT_QUERY_CACHE_BYTES,
+    DEFAULT_QUERY_CACHE_ENTRY_BYTES,
 };
 pub use table::{time_overlaps, BlockEntry, MetricsTable};
 pub use wire::QueryRequest;
@@ -89,9 +96,9 @@ pub use profiles::{
     ProfilesTable, PROFILES_TABLE_NAME,
 };
 pub use traces::{
-    build_traces_table_from_candidates, list_traces_candidates, register_traces_table,
-    register_traces_table_from_candidates, traces_query, TracesBlockEntry, TracesTable,
-    TRACES_TABLE_NAME,
+    build_traces_table_from_candidates, list_traces_candidates, promoted_column_for,
+    register_traces_table, register_traces_table_from_candidates, traces_query, TracesBlockEntry,
+    TracesTable, TRACES_TABLE_NAME, TRACE_PROMOTED_LABELS,
 };
 
 /// AND of equality matchers + optional time-range bounds. Shared

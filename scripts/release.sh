@@ -77,10 +77,16 @@ PY
 # Refresh Cargo.lock for the new version (cheap, no network).
 cargo update --workspace --offline >/dev/null 2>&1 || cargo update --workspace >/dev/null 2>&1 || true
 
-echo "release: set workspace version -> ${VERSION}"
-git --no-pager diff -- "$ROOT_TOML" Cargo.lock | sed -n '1,40p'
+# Align the frontend version (tauri.conf.json + package.json) with the workspace
+# version, so the release commit carries the UI bump too and the committed tree
+# stays in lockstep (CI's build-time stamp is then always a no-op). Idempotent.
+FRONTEND_JSON=(desktop/src-tauri/tauri.conf.json desktop/package.json)
+bun scripts/stamp-version.mjs
 
-git add "$ROOT_TOML" Cargo.lock
+echo "release: set workspace version -> ${VERSION}"
+git --no-pager diff -- "$ROOT_TOML" Cargo.lock "${FRONTEND_JSON[@]}" | sed -n '1,60p'
+
+git add "$ROOT_TOML" Cargo.lock "${FRONTEND_JSON[@]}"
 git commit -m "chore(release): ${TAG}"
 git tag -a "$TAG" -m "$MSG"
 

@@ -12,43 +12,6 @@ import { crc32 } from "./crc32.js";
 import { evaluateExpression } from "./expression-evaluator.js";
 import { BinSchemaError, ErrorCode } from "./errors.js";
 
-function __bs_get<T>(expr: () => T): T | undefined {
-  try {
-    return expr();
-  } catch {
-    return undefined;
-  }
-}
-
-function __bs_numeric(value: any): any {
-  if (typeof value === "bigint") {
-    return value;
-  }
-  if (typeof value === "number" && Number.isInteger(value)) {
-    return BigInt(value);
-  }
-  return value;
-}
-
-function __bs_literal(value: number): number | bigint {
-  if (Number.isInteger(value)) {
-    return BigInt(value);
-  }
-  return value;
-}
-
-function __bs_checkCondition(expr: () => any): boolean {
-  try {
-    const result = expr();
-    if (typeof result === "bigint") {
-      return result !== 0n;
-    }
-    return !!result;
-  } catch {
-    return false;
-  }
-}
-
 /**
  * Top-level discriminated union of all query-protocol messages. Peek-discriminated on the message-type byte; each variant struct begins with a const-tagged uint8 that matches the discriminator. Client → server: Request (exactly one). Server → client: SchemaMsg (exactly one), then BatchMsg* , then EndOfStream OR StreamError (exactly one terminator).
  */
@@ -60,14 +23,18 @@ export interface QueryFrameInput {
    * @remarks
    *
    * Discriminator: peek uint8
-   * Variants: 5
+   * Variants: 9
    * - QueryRequest (when value === 0x01)
+   * - LabelNamesRequest (when value === 0x02)
+   * - LabelValuesRequest (when value === 0x03)
    * - SchemaMsg (when value === 0x10)
    * - BatchMsg (when value === 0x11)
    * - EndOfStream (when value === 0x1F)
+   * - LabelNamesResponse (when value === 0x20)
+   * - LabelValuesResponse (when value === 0x21)
    * - StreamError (when value === 0xF0)
    */
-  msg: QueryRequestInput | SchemaMsgInput | BatchMsgInput | EndOfStreamInput | StreamErrorInput;
+  msg: { type: 'QueryRequest'; value: QueryRequestInput } | { type: 'LabelNamesRequest'; value: LabelNamesRequestInput } | { type: 'LabelValuesRequest'; value: LabelValuesRequestInput } | { type: 'SchemaMsg'; value: SchemaMsgInput } | { type: 'BatchMsg'; value: BatchMsgInput } | { type: 'EndOfStream'; value: EndOfStreamInput } | { type: 'LabelNamesResponse'; value: LabelNamesResponseInput } | { type: 'LabelValuesResponse'; value: LabelValuesResponseInput } | { type: 'StreamError'; value: StreamErrorInput };
 }
 
 /**
@@ -81,14 +48,18 @@ export interface QueryFrameOutput {
    * @remarks
    *
    * Discriminator: peek uint8
-   * Variants: 5
+   * Variants: 9
    * - QueryRequest (when value === 0x01)
+   * - LabelNamesRequest (when value === 0x02)
+   * - LabelValuesRequest (when value === 0x03)
    * - SchemaMsg (when value === 0x10)
    * - BatchMsg (when value === 0x11)
    * - EndOfStream (when value === 0x1F)
+   * - LabelNamesResponse (when value === 0x20)
+   * - LabelValuesResponse (when value === 0x21)
    * - StreamError (when value === 0xF0)
    */
-  msg: QueryRequestOutput | SchemaMsgOutput | BatchMsgOutput | EndOfStreamOutput | StreamErrorOutput;
+  msg: { type: 'QueryRequest'; value: QueryRequestOutput } | { type: 'LabelNamesRequest'; value: LabelNamesRequestOutput } | { type: 'LabelValuesRequest'; value: LabelValuesRequestOutput } | { type: 'SchemaMsg'; value: SchemaMsgOutput } | { type: 'BatchMsg'; value: BatchMsgOutput } | { type: 'EndOfStream'; value: EndOfStreamOutput } | { type: 'LabelNamesResponse'; value: LabelNamesResponseOutput } | { type: 'LabelValuesResponse'; value: LabelValuesResponseOutput } | { type: 'StreamError'; value: StreamErrorOutput };
 }
 
 export type QueryFrame = QueryFrameOutput;
@@ -98,9 +69,13 @@ export type QueryFrame = QueryFrameOutput;
  */
 export const enum QueryFrameMsgVariant {
   QueryRequest = 'QueryRequest',
+  LabelNamesRequest = 'LabelNamesRequest',
+  LabelValuesRequest = 'LabelValuesRequest',
   SchemaMsg = 'SchemaMsg',
   BatchMsg = 'BatchMsg',
   EndOfStream = 'EndOfStream',
+  LabelNamesResponse = 'LabelNamesResponse',
+  LabelValuesResponse = 'LabelValuesResponse',
   StreamError = 'StreamError',
 }
 
@@ -122,6 +97,20 @@ export class QueryFrameEncoder extends BitStreamEncoder {
         this.writeUint8(byte);
       }
     }
+    else if (value.msg.type === 'LabelNamesRequest') {
+      const encoder_value = new LabelNamesRequestEncoder();
+      const encoded_value = encoder_value.encode(value.msg.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
+    }
+    else if (value.msg.type === 'LabelValuesRequest') {
+      const encoder_value = new LabelValuesRequestEncoder();
+      const encoded_value = encoder_value.encode(value.msg.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
+    }
     else if (value.msg.type === 'SchemaMsg') {
       const encoder_value = new SchemaMsgEncoder();
       const encoded_value = encoder_value.encode(value.msg.value);
@@ -138,6 +127,20 @@ export class QueryFrameEncoder extends BitStreamEncoder {
     }
     else if (value.msg.type === 'EndOfStream') {
       const encoder_value = new EndOfStreamEncoder();
+      const encoded_value = encoder_value.encode(value.msg.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
+    }
+    else if (value.msg.type === 'LabelNamesResponse') {
+      const encoder_value = new LabelNamesResponseEncoder();
+      const encoded_value = encoder_value.encode(value.msg.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
+    }
+    else if (value.msg.type === 'LabelValuesResponse') {
+      const encoder_value = new LabelValuesResponseEncoder();
       const encoded_value = encoder_value.encode(value.msg.value);
       for (const byte of encoded_value) {
         this.writeUint8(byte);
@@ -165,6 +168,14 @@ export class QueryFrameEncoder extends BitStreamEncoder {
       const _enc = new QueryRequestEncoder();
       size += _enc.calculateSize(value.msg.value);
     }
+    else if (value.msg.type === 'LabelNamesRequest') {
+      const _enc = new LabelNamesRequestEncoder();
+      size += _enc.calculateSize(value.msg.value);
+    }
+    else if (value.msg.type === 'LabelValuesRequest') {
+      const _enc = new LabelValuesRequestEncoder();
+      size += _enc.calculateSize(value.msg.value);
+    }
     else if (value.msg.type === 'SchemaMsg') {
       const _enc = new SchemaMsgEncoder();
       size += _enc.calculateSize(value.msg.value);
@@ -177,12 +188,20 @@ export class QueryFrameEncoder extends BitStreamEncoder {
       const _enc = new EndOfStreamEncoder();
       size += _enc.calculateSize(value.msg.value);
     }
+    else if (value.msg.type === 'LabelNamesResponse') {
+      const _enc = new LabelNamesResponseEncoder();
+      size += _enc.calculateSize(value.msg.value);
+    }
+    else if (value.msg.type === 'LabelValuesResponse') {
+      const _enc = new LabelValuesResponseEncoder();
+      size += _enc.calculateSize(value.msg.value);
+    }
     else if (value.msg.type === 'StreamError') {
       const _enc = new StreamErrorEncoder();
       size += _enc.calculateSize(value.msg.value);
     }
     else {
-      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown variant type for msg: ${value.msg.type}`);
+      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown variant type for msg: ${(value.msg as any).type}`);
     }
     return size;
   }
@@ -204,6 +223,18 @@ export class QueryFrameDecoder extends SeekableBitStreamDecoder {
       this.byteOffset += decoder.byteOffset;
       value.msg = { type: 'QueryRequest', value: decodedValue };
     }
+    else if (discriminator === 0x02) {
+      const decoder = new LabelNamesRequestDecoder(this.bytes.slice(this.byteOffset), value);
+      const decodedValue = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.msg = { type: 'LabelNamesRequest', value: decodedValue };
+    }
+    else if (discriminator === 0x03) {
+      const decoder = new LabelValuesRequestDecoder(this.bytes.slice(this.byteOffset), value);
+      const decodedValue = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.msg = { type: 'LabelValuesRequest', value: decodedValue };
+    }
     else if (discriminator === 0x10) {
       const decoder = new SchemaMsgDecoder(this.bytes.slice(this.byteOffset), value);
       const decodedValue = decoder.decode();
@@ -221,6 +252,18 @@ export class QueryFrameDecoder extends SeekableBitStreamDecoder {
       const decodedValue = decoder.decode();
       this.byteOffset += decoder.byteOffset;
       value.msg = { type: 'EndOfStream', value: decodedValue };
+    }
+    else if (discriminator === 0x20) {
+      const decoder = new LabelNamesResponseDecoder(this.bytes.slice(this.byteOffset), value);
+      const decodedValue = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.msg = { type: 'LabelNamesResponse', value: decodedValue };
+    }
+    else if (discriminator === 0x21) {
+      const decoder = new LabelValuesResponseDecoder(this.bytes.slice(this.byteOffset), value);
+      const decodedValue = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.msg = { type: 'LabelValuesResponse', value: decodedValue };
     }
     else if (discriminator === 0xF0) {
       const decoder = new StreamErrorDecoder(this.bytes.slice(this.byteOffset), value);
@@ -435,25 +478,21 @@ export class QueryRequestEncoder extends BitStreamEncoder {
    */
   calculateSize(value: QueryRequest): number {
     let size = 0;
-    size += 1; // tag (const)
-    size += 1; // signal
+    size += 2; // tag (const) + signal
     // matchers: array (kind: length_prefixed)
     for (const item of value.matchers) {
       const matchers_itemEncoder = new MatcherEncoder();
       size += matchers_itemEncoder.calculateSize(item);
     }
-    size += 1; // ts_min_present
-    size += 8; // ts_min
-    size += 1; // ts_max_present
-    size += 8; // ts_max
+    size += 20; // length prefix (uint16) + ts_min_present + ts_min + ts_max_present + ts_max
     // sql: string (utf8)
     size += new TextEncoder().encode(value.sql).length;
     size += 8; // limit
     // request_id: string (ascii)
     size += value.request_id.length;
-    // trace_id: custom type (bytes)
-    const trace_id_encoder = new bytesEncoder();
-    size += trace_id_encoder.calculateSize(value.trace_id);
+    // trace_id: bytes (kind: length_prefixed)
+    size += value.trace_id.length;
+    size += 2; // length prefix (uint16)
     // body_contains: string (utf8)
     size += new TextEncoder().encode(value.body_contains).length;
     return size;
@@ -629,6 +668,481 @@ export class MatcherDecoder extends SeekableBitStreamDecoder {
 }
 
 /**
+ * Client → server. Metadata request for label DISCOVERABILITY, not data: 'what label names can I match on for this signal in this time window?' Answered from the per-instance label cache (a materialized view over the authoritative postings sidecars, warmed lazily; see D-050), unioned across the candidate blocks that overlap [ts_min, ts_max]. The time bounds use the same `*_present: uint8` companion convention as QueryRequest (0 = absent → unbounded on that side). The server replies with exactly one LabelNamesResponse and closes, or a StreamError (QUERY_ERR_BAD_REQUEST if `signal` is 0 / unimplemented).
+ */
+export interface LabelNamesRequestInput {
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  signal: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  ts_min_present: number;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  ts_min: bigint;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  ts_max_present: number;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  ts_max: bigint;
+}
+
+/**
+ * Client → server. Metadata request for label DISCOVERABILITY, not data: 'what label names can I match on for this signal in this time window?' Answered from the per-instance label cache (a materialized view over the authoritative postings sidecars, warmed lazily; see D-050), unioned across the candidate blocks that overlap [ts_min, ts_max]. The time bounds use the same `*_present: uint8` companion convention as QueryRequest (0 = absent → unbounded on that side). The server replies with exactly one LabelNamesResponse and closes, or a StreamError (QUERY_ERR_BAD_REQUEST if `signal` is 0 / unimplemented).
+ */
+export interface LabelNamesRequestOutput {
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  tag: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  signal: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  ts_min_present: number;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  ts_min: bigint;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  ts_max_present: number;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  ts_max: bigint;
+}
+
+export type LabelNamesRequest = LabelNamesRequestOutput;
+
+export class LabelNamesRequestEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("msb_first");
+  }
+
+  encode(value: LabelNamesRequestInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint8(2);
+    this.writeUint8(value.signal);
+    this.writeUint8(value.ts_min_present);
+    this.writeUint64(value.ts_min, "big_endian");
+    this.writeUint8(value.ts_max_present);
+    this.writeUint64(value.ts_max, "big_endian");
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a LabelNamesRequest value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: LabelNamesRequest): number {
+    return 20; // tag (const) + signal + ts_min_present + ts_min + ts_max_present + ts_max
+  }
+}
+
+export class LabelNamesRequestDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "msb_first");
+  }
+
+  decode(): LabelNamesRequestOutput {
+    const value: any = {};
+
+    value.tag = this.readUint8();
+    value.signal = this.readUint8();
+    value.ts_min_present = this.readUint8();
+    value.ts_min = this.readUint64("big_endian");
+    value.ts_max_present = this.readUint8();
+    value.ts_max = this.readUint64("big_endian");
+    return value;
+  }
+}
+
+/**
+ * Client → server. Metadata request: 'what values does label `label_name` take for this signal in this time window?' Same cache/union semantics and time-bound convention as LabelNamesRequest. The server replies with exactly one LabelValuesResponse and closes, or a StreamError.
+ */
+export interface LabelValuesRequestInput {
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  signal: number;
+  /**
+   * String kind: length_prefixed
+   * Encoding: utf8
+   * Length prefix type: uint16
+   */
+  label_name: string;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  ts_min_present: number;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  ts_min: bigint;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  ts_max_present: number;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  ts_max: bigint;
+}
+
+/**
+ * Client → server. Metadata request: 'what values does label `label_name` take for this signal in this time window?' Same cache/union semantics and time-bound convention as LabelNamesRequest. The server replies with exactly one LabelValuesResponse and closes, or a StreamError.
+ */
+export interface LabelValuesRequestOutput {
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  tag: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  signal: number;
+  /**
+   * String kind: length_prefixed
+   * Encoding: utf8
+   * Length prefix type: uint16
+   */
+  label_name: string;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  ts_min_present: number;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  ts_min: bigint;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  ts_max_present: number;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  ts_max: bigint;
+}
+
+export type LabelValuesRequest = LabelValuesRequestOutput;
+
+export class LabelValuesRequestEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("msb_first");
+  }
+
+  encode(value: LabelValuesRequestInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint8(3);
+    this.writeUint8(value.signal);
+    const value_label_name_bytes = new TextEncoder().encode(value.label_name);
+    this.writeUint16(value_label_name_bytes.length, "big_endian");
+    for (const byte of value_label_name_bytes) {
+      this.writeUint8(byte);
+    }
+    this.writeUint8(value.ts_min_present);
+    this.writeUint64(value.ts_min, "big_endian");
+    this.writeUint8(value.ts_max_present);
+    this.writeUint64(value.ts_max, "big_endian");
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a LabelValuesRequest value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: LabelValuesRequest): number {
+    let size = 0;
+    size += 2; // tag (const) + signal
+    // label_name: string (utf8)
+    size += new TextEncoder().encode(value.label_name).length;
+    size += 18; // ts_min_present + ts_min + ts_max_present + ts_max
+    return size;
+  }
+}
+
+export class LabelValuesRequestDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "msb_first");
+  }
+
+  decode(): LabelValuesRequestOutput {
+    const value: any = {};
+
+    value.tag = this.readUint8();
+    value.signal = this.readUint8();
+    const label_name_length = this.readUint16("big_endian");
+    const label_name_bytes = this.readBytesSlice(label_name_length);
+    try {
+      value.label_name = new TextDecoder("utf-8", { fatal: true }).decode(label_name_bytes);
+    } catch (e) {
+      throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
+    }
+    value.ts_min_present = this.readUint8();
+    value.ts_min = this.readUint64("big_endian");
+    value.ts_max_present = this.readUint8();
+    value.ts_max = this.readUint64("big_endian");
+    return value;
+  }
+}
+
+/**
+ * Server → client. The distinct, sorted label names for a LabelNamesRequest. One frame, terminal — the connection closes after it. `names` is deduplicated and lexicographically sorted across all candidate blocks.
+ */
+export interface LabelNamesResponseInput {
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  names: string[];
+}
+
+/**
+ * Server → client. The distinct, sorted label names for a LabelNamesRequest. One frame, terminal — the connection closes after it. `names` is deduplicated and lexicographically sorted across all candidate blocks.
+ */
+export interface LabelNamesResponseOutput {
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  tag: number;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  names: string[];
+}
+
+export type LabelNamesResponse = LabelNamesResponseOutput;
+
+export class LabelNamesResponseEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("msb_first");
+  }
+
+  encode(value: LabelNamesResponseInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint8(32);
+    this.writeUint32(value.names.length, "big_endian");
+    for (let value_names__iter_index = 0; value_names__iter_index < value.names.length; value_names__iter_index++) {
+      const value_names__iter = value.names[value_names__iter_index];
+      const value_names__iter_bytes = new TextEncoder().encode(value_names__iter);
+      this.writeUint16(value_names__iter_bytes.length, "big_endian");
+      for (const byte of value_names__iter_bytes) {
+        this.writeUint8(byte);
+      }
+    }
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a LabelNamesResponse value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: LabelNamesResponse): number {
+    let size = 0;
+    size += 1; // tag (const)
+    // names: array (kind: length_prefixed)
+    for (const item of value.names) {
+      size += 0;
+    }
+    size += 4; // length prefix (uint32)
+    return size;
+  }
+}
+
+export class LabelNamesResponseDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "msb_first");
+  }
+
+  decode(): LabelNamesResponseOutput {
+    const value: any = {};
+
+    value.tag = this.readUint8();
+    value.names = [];
+    const names_length = this.readUint32("big_endian");
+    for (let i = 0; i < names_length; i++) {
+      let names__iter: any;
+      const names__iter_length = this.readUint16("big_endian");
+      const names__iter_bytes = this.readBytesSlice(names__iter_length);
+      try {
+        names__iter = new TextDecoder("utf-8", { fatal: true }).decode(names__iter_bytes);
+      } catch (e) {
+        throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
+      }
+      value.names.push(names__iter);
+    }
+    return value;
+  }
+}
+
+/**
+ * Server → client. The distinct, sorted values for a LabelValuesRequest. One frame, terminal — the connection closes after it.
+ */
+export interface LabelValuesResponseInput {
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  values: string[];
+}
+
+/**
+ * Server → client. The distinct, sorted values for a LabelValuesRequest. One frame, terminal — the connection closes after it.
+ */
+export interface LabelValuesResponseOutput {
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  tag: number;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  values: string[];
+}
+
+export type LabelValuesResponse = LabelValuesResponseOutput;
+
+export class LabelValuesResponseEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("msb_first");
+  }
+
+  encode(value: LabelValuesResponseInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint8(33);
+    this.writeUint32(value.values.length, "big_endian");
+    for (let value_values__iter_index = 0; value_values__iter_index < value.values.length; value_values__iter_index++) {
+      const value_values__iter = value.values[value_values__iter_index];
+      const value_values__iter_bytes = new TextEncoder().encode(value_values__iter);
+      this.writeUint16(value_values__iter_bytes.length, "big_endian");
+      for (const byte of value_values__iter_bytes) {
+        this.writeUint8(byte);
+      }
+    }
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a LabelValuesResponse value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: LabelValuesResponse): number {
+    let size = 0;
+    size += 1; // tag (const)
+    // values: array (kind: length_prefixed)
+    for (const item of value.values) {
+      size += 0;
+    }
+    size += 4; // length prefix (uint32)
+    return size;
+  }
+}
+
+export class LabelValuesResponseDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "msb_first");
+  }
+
+  decode(): LabelValuesResponseOutput {
+    const value: any = {};
+
+    value.tag = this.readUint8();
+    value.values = [];
+    const values_length = this.readUint32("big_endian");
+    for (let i = 0; i < values_length; i++) {
+      let values__iter: any;
+      const values__iter_length = this.readUint16("big_endian");
+      const values__iter_bytes = this.readBytesSlice(values__iter_length);
+      try {
+        values__iter = new TextDecoder("utf-8", { fatal: true }).decode(values__iter_bytes);
+      } catch (e) {
+        throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
+      }
+      value.values.push(values__iter);
+    }
+    return value;
+  }
+}
+
+/**
  * Server → client. The Arrow IPC schema message, exactly one per query, sent before any BatchMsg. `ipc_bytes` is the output of arrow::ipc::writer::write_message for the schema EncodedData — continuation marker, length prefix, flatbuf, padding, body, all included — so the client can feed it directly into an arrow::ipc::reader::StreamDecoder without reconstructing the IPC framing.
  */
 export interface SchemaMsgInput {
@@ -684,9 +1198,9 @@ export class SchemaMsgEncoder extends BitStreamEncoder {
   calculateSize(value: SchemaMsg): number {
     let size = 0;
     size += 1; // tag (const)
-    // ipc_bytes: custom type (bytes)
-    const ipc_bytes_encoder = new bytesEncoder();
-    size += ipc_bytes_encoder.calculateSize(value.ipc_bytes);
+    // ipc_bytes: bytes (kind: length_prefixed)
+    size += value.ipc_bytes.length;
+    size += 4; // length prefix (uint32)
     return size;
   }
 }
@@ -768,9 +1282,9 @@ export class BatchMsgEncoder extends BitStreamEncoder {
   calculateSize(value: BatchMsg): number {
     let size = 0;
     size += 1; // tag (const)
-    // ipc_bytes: custom type (bytes)
-    const ipc_bytes_encoder = new bytesEncoder();
-    size += ipc_bytes_encoder.calculateSize(value.ipc_bytes);
+    // ipc_bytes: bytes (kind: length_prefixed)
+    size += value.ipc_bytes.length;
+    size += 4; // length prefix (uint32)
     return size;
   }
 }
@@ -846,10 +1360,7 @@ export class EndOfStreamEncoder extends BitStreamEncoder {
    * Used for from_after_field computed lengths and buffer pre-allocation.
    */
   calculateSize(value: EndOfStream): number {
-    let size = 0;
-    size += 1; // tag (const)
-    size += 8; // total_rows
-    return size;
+    return 9; // tag (const) + total_rows
   }
 }
 
@@ -936,8 +1447,7 @@ export class StreamErrorEncoder extends BitStreamEncoder {
    */
   calculateSize(value: StreamError): number {
     let size = 0;
-    size += 1; // tag (const)
-    size += 2; // code
+    size += 3; // tag (const) + code
     // message: string (utf8)
     size += new TextEncoder().encode(value.message).length;
     return size;

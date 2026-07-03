@@ -4637,6 +4637,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "twox-hash 1.6.3",
  "url",
  "uuid",
 ]
@@ -4651,6 +4652,7 @@ dependencies = [
  "scry-catalog",
  "scry-cluster",
  "scry-objstore",
+ "scry-proto",
  "scry-query",
  "scry-server",
  "scry-valkey",

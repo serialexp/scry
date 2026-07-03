@@ -2,7 +2,7 @@
 //! limit, and (for traces) a by-id lookup. Reads/writes the shared store
 //! directly — no props.
 
-import { For, Show, type Component } from "solid-js";
+import { For, Show, createEffect, onMount, type Component } from "solid-js";
 
 import { SIGNAL_NAMES } from "../protocol/constants";
 import { isTauri } from "../env";
@@ -15,7 +15,13 @@ import {
   runCurrentQuery,
   runFramesOverview,
   targets,
+  labelNames,
+  labelValues,
+  refreshLabels,
+  ensureLabelValues,
+  runLogVolume,
 } from "../store";
+import { snapQuickRangeNs } from "../volume";
 
 const SIGNAL_HINTS: Record<string, string> = {
   Metrics: "Matchers preselect series via postings. SQL runs against the metrics table.",
@@ -34,16 +40,32 @@ const QUICK_RANGES: { label: string; ms: number }[] = [
   { label: "7d", ms: 7 * 24 * 60 * 60_000 },
 ];
 
-/** Set ts_min/ts_max to [now - span, now] in unix nanoseconds. */
+/** Set ts_min/ts_max to [now - span, now] in unix nanoseconds, snapping the
+ *  upper bound down to the range's bucket step. Snapping keeps repeated
+ *  refreshes within a bucket on identical bounds, so the queryd result cache
+ *  hits instead of re-scanning an ever-shifting "now". */
 function applyQuickRange(ms: number): void {
-  const nowNs = BigInt(Date.now()) * 1_000_000n;
-  const spanNs = BigInt(ms) * 1_000_000n;
-  setField("tsMin", String(nowNs - spanNs));
-  setField("tsMax", String(nowNs));
+  const { tsMinNs, tsMaxNs } = snapQuickRangeNs(Date.now(), ms);
+  setField("tsMin", String(tsMinNs));
+  setField("tsMax", String(tsMaxNs));
+  void refreshLabels();
+  // Refresh the volume histogram to the new range (logs-only; a no-op else).
+  if (state.signal === "Logs") void runLogVolume();
 }
 
 const QueryForm: Component = () => {
   const isRunning = () => state.status === "running";
+
+  // Warm the label cache whenever the scope changes: signal (tracked here),
+  // and — for the browser — the selected target once it's seeded after login.
+  // `refreshLabels` no-ops when the scope key is unchanged, so this is cheap.
+  createEffect(() => {
+    // Touch the reactive deps so the effect re-runs when they change.
+    void state.signal;
+    void state.target;
+    void refreshLabels();
+  });
+  onMount(() => void refreshLabels());
 
   return (
     <form
@@ -107,6 +129,12 @@ const QueryForm: Component = () => {
             + add
           </button>
         </div>
+        {/* Shared list of matchable label names for the current signal +
+            time window (see D-050). Each matcher name input autocompletes
+            against it; the value input against that name's known values. */}
+        <datalist id="label-names">
+          <For each={labelNames()}>{(n) => <option value={n} />}</For>
+        </datalist>
         <For each={state.matchers}>
           {(m, i) => (
             <div class="matcher-row">
@@ -115,8 +143,14 @@ const QueryForm: Component = () => {
                 class="matcher-name"
                 placeholder="name"
                 spellcheck={false}
+                list="label-names"
                 value={m.name}
-                onInput={(e) => setMatcher(i(), "name", e.currentTarget.value)}
+                onInput={(e) => {
+                  const v = e.currentTarget.value;
+                  setMatcher(i(), "name", v);
+                  void ensureLabelValues(v);
+                }}
+                onFocus={() => void refreshLabels()}
               />
               <span class="eq">=</span>
               <input
@@ -124,9 +158,16 @@ const QueryForm: Component = () => {
                 class="matcher-value"
                 placeholder="value"
                 spellcheck={false}
+                list={`label-values-${i()}`}
                 value={m.value}
                 onInput={(e) => setMatcher(i(), "value", e.currentTarget.value)}
+                onFocus={() => void ensureLabelValues(m.name)}
               />
+              <datalist id={`label-values-${i()}`}>
+                <For each={labelValues()[m.name.trim()] ?? []}>
+                  {(v) => <option value={v} />}
+                </For>
+              </datalist>
               <button
                 type="button"
                 class="icon-btn"
@@ -196,6 +237,7 @@ const QueryForm: Component = () => {
             spellcheck={false}
             value={state.tsMin}
             onInput={(e) => setField("tsMin", e.currentTarget.value)}
+            onChange={() => void refreshLabels()}
             placeholder="(none)"
           />
         </div>
@@ -208,6 +250,7 @@ const QueryForm: Component = () => {
             spellcheck={false}
             value={state.tsMax}
             onInput={(e) => setField("tsMax", e.currentTarget.value)}
+            onChange={() => void refreshLabels()}
             placeholder="(none)"
           />
         </div>

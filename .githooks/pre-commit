@@ -33,15 +33,32 @@ if [ ${#present[@]} -eq 0 ]; then
   exit 0
 fi
 
+# Exclude the generated protocol bindings. binschema (scripts/gen-proto.sh)
+# emits them verbatim and they are declared `#[rustfmt::skip]` at their `mod`
+# site, so `cargo fmt` intentionally never formats them — they are committed
+# exactly as generated. `rustfmt --check` on the file directly can't see that
+# module-level attribute, so it would demand a formatting the tree can't
+# produce (`cargo fmt` is a no-op on them). Skip them; everything hand-written
+# stays gated. Pattern matches crates/proto/src/generated.rs and generated_*.rs.
+GENERATED_RE='(^|/)crates/proto/src/generated[^/]*\.rs$'
+check=()
+for f in "${present[@]}"; do
+  [[ "$f" =~ $GENERATED_RE ]] && continue
+  check+=("$f")
+done
+if [ ${#check[@]} -eq 0 ]; then
+  exit 0
+fi
+
 if ! command -v rustfmt >/dev/null 2>&1; then
   echo "pre-commit: rustfmt not found on PATH — install it with: rustup component add rustfmt" >&2
   exit 1
 fi
 
 # --check exits non-zero and prints a diff if any file would be reformatted.
-if ! rustfmt --edition 2021 --check "${present[@]}" >/dev/null 2>&1; then
+if ! rustfmt --edition 2021 --check "${check[@]}" >/dev/null 2>&1; then
   echo "pre-commit: the following staged file(s) are not rustfmt-clean:" >&2
-  for f in "${present[@]}"; do
+  for f in "${check[@]}"; do
     if ! rustfmt --edition 2021 --check "$f" >/dev/null 2>&1; then
       echo "  - $f" >&2
     fi

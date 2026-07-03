@@ -69,11 +69,22 @@ fn traces_schema() -> SchemaRef {
     TracesBlockBuilder::main_schema()
 }
 
+/// The promoted resource attributes a traces query can match on as labels —
+/// the canonical matcher keys the metadata (discoverability) path advertises
+/// for the traces signal. Traces carry no postings sidecar, so this is the
+/// authoritative "matchable label names" list; [`promoted_column_for`] maps
+/// each to its Utf8 column for value enumeration.
+pub const TRACE_PROMOTED_LABELS: &[&str] = &[
+    "service.name",
+    "service.namespace",
+    "deployment.environment",
+];
+
 /// Map a matcher key to the promoted Utf8 column it filters, or `None`
 /// if the key isn't a promoted resource attribute (in which case the
 /// caller rejects it and points the user at `--sql`). Keys mirror
 /// `crates/block/src/traces.rs`'s `PROMOTED_*_KEYS`.
-fn promoted_column_for(key: &str) -> Option<&'static str> {
+pub fn promoted_column_for(key: &str) -> Option<&'static str> {
     match key {
         "service.name" => Some("service_name"),
         "service.namespace" => Some("service_namespace"),

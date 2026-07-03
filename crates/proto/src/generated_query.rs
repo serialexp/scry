@@ -10,9 +10,13 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, PartialEq)]
 pub enum QueryFrameMsg {
     QueryRequest(QueryRequestOutput),
+    LabelNamesRequest(LabelNamesRequestOutput),
+    LabelValuesRequest(LabelValuesRequestOutput),
     SchemaMsg(SchemaMsgOutput),
     BatchMsg(BatchMsgOutput),
     EndOfStream(EndOfStreamOutput),
+    LabelNamesResponse(LabelNamesResponseOutput),
+    LabelValuesResponse(LabelValuesResponseOutput),
     StreamError(StreamErrorOutput),
 }
 
@@ -57,6 +61,27 @@ impl QueryFrameMsg {
                     encoder.write_uint8(b);
                 }
             }
+            QueryFrameMsg::LabelNamesRequest(v) => {
+                encoder.write_uint8(2);
+                encoder.write_uint8(v.signal);
+                encoder.write_uint8(v.ts_min_present);
+                encoder.write_uint64(v.ts_min, Endianness::BigEndian);
+                encoder.write_uint8(v.ts_max_present);
+                encoder.write_uint64(v.ts_max, Endianness::BigEndian);
+            }
+            QueryFrameMsg::LabelValuesRequest(v) => {
+                encoder.write_uint8(3);
+                encoder.write_uint8(v.signal);
+                encoder.write_uint16(v.label_name.len() as u16, Endianness::BigEndian);
+                let string_bytes: &[u8] = v.label_name.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint8(v.ts_min_present);
+                encoder.write_uint64(v.ts_min, Endianness::BigEndian);
+                encoder.write_uint8(v.ts_max_present);
+                encoder.write_uint64(v.ts_max, Endianness::BigEndian);
+            }
             QueryFrameMsg::SchemaMsg(v) => {
                 encoder.write_uint8(16);
                 encoder.write_uint32(v.ipc_bytes.len() as u32, Endianness::BigEndian);
@@ -75,6 +100,26 @@ impl QueryFrameMsg {
                 encoder.write_uint8(31);
                 encoder.write_uint64(v.total_rows, Endianness::BigEndian);
             }
+            QueryFrameMsg::LabelNamesResponse(v) => {
+                encoder.write_uint8(32);
+                encoder.write_uint32(v.names.len() as u32, Endianness::BigEndian);
+                for item in &v.names {
+                    encoder.write_uint16(item.len() as u16, Endianness::BigEndian);
+                    for b in item.as_bytes() {
+                        encoder.write_uint8(*b);
+                    }
+                }
+            }
+            QueryFrameMsg::LabelValuesResponse(v) => {
+                encoder.write_uint8(33);
+                encoder.write_uint32(v.values.len() as u32, Endianness::BigEndian);
+                for item in &v.values {
+                    encoder.write_uint16(item.len() as u16, Endianness::BigEndian);
+                    for b in item.as_bytes() {
+                        encoder.write_uint8(*b);
+                    }
+                }
+            }
             QueryFrameMsg::StreamError(v) => {
                 encoder.write_uint8(240);
                 encoder.write_uint16(v.code, Endianness::BigEndian);
@@ -91,9 +136,13 @@ impl QueryFrameMsg {
     pub fn type_name(&self) -> &'static str {
         match self {
             QueryFrameMsg::QueryRequest(_) => "QueryRequest",
+            QueryFrameMsg::LabelNamesRequest(_) => "LabelNamesRequest",
+            QueryFrameMsg::LabelValuesRequest(_) => "LabelValuesRequest",
             QueryFrameMsg::SchemaMsg(_) => "SchemaMsg",
             QueryFrameMsg::BatchMsg(_) => "BatchMsg",
             QueryFrameMsg::EndOfStream(_) => "EndOfStream",
+            QueryFrameMsg::LabelNamesResponse(_) => "LabelNamesResponse",
+            QueryFrameMsg::LabelValuesResponse(_) => "LabelValuesResponse",
             QueryFrameMsg::StreamError(_) => "StreamError",
         }
     }
@@ -110,6 +159,14 @@ impl QueryFrameMsg {
             return Ok(QueryFrameMsg::QueryRequest(v));
         }
         decoder.seek(start_pos)?;
+        if let Ok(v) = LabelNamesRequestOutput::decode_with_decoder(decoder) {
+            return Ok(QueryFrameMsg::LabelNamesRequest(v));
+        }
+        decoder.seek(start_pos)?;
+        if let Ok(v) = LabelValuesRequestOutput::decode_with_decoder(decoder) {
+            return Ok(QueryFrameMsg::LabelValuesRequest(v));
+        }
+        decoder.seek(start_pos)?;
         if let Ok(v) = SchemaMsgOutput::decode_with_decoder(decoder) {
             return Ok(QueryFrameMsg::SchemaMsg(v));
         }
@@ -120,6 +177,14 @@ impl QueryFrameMsg {
         decoder.seek(start_pos)?;
         if let Ok(v) = EndOfStreamOutput::decode_with_decoder(decoder) {
             return Ok(QueryFrameMsg::EndOfStream(v));
+        }
+        decoder.seek(start_pos)?;
+        if let Ok(v) = LabelNamesResponseOutput::decode_with_decoder(decoder) {
+            return Ok(QueryFrameMsg::LabelNamesResponse(v));
+        }
+        decoder.seek(start_pos)?;
+        if let Ok(v) = LabelValuesResponseOutput::decode_with_decoder(decoder) {
+            return Ok(QueryFrameMsg::LabelValuesResponse(v));
         }
         decoder.seek(start_pos)?;
         if let Ok(v) = StreamErrorOutput::decode_with_decoder(decoder) {
@@ -376,6 +441,381 @@ impl Matcher {
             name,
             value,
         })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LabelNamesRequestInput {
+    pub signal: u8,
+    pub ts_min_present: u8,
+    pub ts_min: u64,
+    pub ts_max_present: u8,
+    pub ts_max: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LabelNamesRequestOutput {
+    pub tag: u8,
+    pub signal: u8,
+    pub ts_min_present: u8,
+    pub ts_min: u64,
+    pub ts_max_present: u8,
+    pub ts_max: u64,
+}
+
+pub type LabelNamesRequest = LabelNamesRequestOutput;
+
+impl LabelNamesRequestInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(2);
+        encoder.write_byte(self.signal);
+        encoder.write_byte(self.ts_min_present);
+        encoder.write_u64_be(self.ts_min);
+        encoder.write_byte(self.ts_max_present);
+        encoder.write_u64_be(self.ts_max);
+        Ok(())
+    }
+
+}
+
+impl LabelNamesRequestOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let tag = decoder.read_byte()?;
+        if tag != 2u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 2, got {}", tag)));
+        }
+        let signal = decoder.read_byte()?;
+        let ts_min_present = decoder.read_byte()?;
+        let ts_min = decoder.read_u64_be()?;
+        let ts_max_present = decoder.read_byte()?;
+        let ts_max = decoder.read_u64_be()?;
+        Ok(Self {
+            tag,
+            signal,
+            ts_min_present,
+            ts_min,
+            ts_max_present,
+            ts_max,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        LabelNamesRequestInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        LabelNamesRequestInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<LabelNamesRequestOutput> for LabelNamesRequestInput {
+    fn from(o: LabelNamesRequestOutput) -> Self {
+        Self {
+            signal: o.signal,
+            ts_min_present: o.ts_min_present,
+            ts_min: o.ts_min,
+            ts_max_present: o.ts_max_present,
+            ts_max: o.ts_max,
+        }
+    }
+}
+
+impl From<LabelNamesRequestInput> for LabelNamesRequestOutput {
+    fn from(i: LabelNamesRequestInput) -> Self {
+        Self {
+            tag: 2u8,
+            signal: i.signal,
+            ts_min_present: i.ts_min_present,
+            ts_min: i.ts_min,
+            ts_max_present: i.ts_max_present,
+            ts_max: i.ts_max,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LabelValuesRequestInput {
+    pub signal: u8,
+    pub label_name: std::string::String,
+    pub ts_min_present: u8,
+    pub ts_min: u64,
+    pub ts_max_present: u8,
+    pub ts_max: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LabelValuesRequestOutput {
+    pub tag: u8,
+    pub signal: u8,
+    pub label_name: std::string::String,
+    pub ts_min_present: u8,
+    pub ts_min: u64,
+    pub ts_max_present: u8,
+    pub ts_max: u64,
+}
+
+pub type LabelValuesRequest = LabelValuesRequestOutput;
+
+impl LabelValuesRequestInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(3);
+        encoder.write_byte(self.signal);
+        encoder.write_u16_be(self.label_name.len() as u16);
+        let string_bytes: &[u8] = self.label_name.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_byte(self.ts_min_present);
+        encoder.write_u64_be(self.ts_min);
+        encoder.write_byte(self.ts_max_present);
+        encoder.write_u64_be(self.ts_max);
+        Ok(())
+    }
+
+}
+
+impl LabelValuesRequestOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let tag = decoder.read_byte()?;
+        if tag != 3u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 3, got {}", tag)));
+        }
+        let signal = decoder.read_byte()?;
+        let length = decoder.read_u16_be()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let label_name = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let ts_min_present = decoder.read_byte()?;
+        let ts_min = decoder.read_u64_be()?;
+        let ts_max_present = decoder.read_byte()?;
+        let ts_max = decoder.read_u64_be()?;
+        Ok(Self {
+            tag,
+            signal,
+            label_name,
+            ts_min_present,
+            ts_min,
+            ts_max_present,
+            ts_max,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        LabelValuesRequestInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        LabelValuesRequestInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<LabelValuesRequestOutput> for LabelValuesRequestInput {
+    fn from(o: LabelValuesRequestOutput) -> Self {
+        Self {
+            signal: o.signal,
+            label_name: o.label_name,
+            ts_min_present: o.ts_min_present,
+            ts_min: o.ts_min,
+            ts_max_present: o.ts_max_present,
+            ts_max: o.ts_max,
+        }
+    }
+}
+
+impl From<LabelValuesRequestInput> for LabelValuesRequestOutput {
+    fn from(i: LabelValuesRequestInput) -> Self {
+        Self {
+            tag: 3u8,
+            signal: i.signal,
+            label_name: i.label_name,
+            ts_min_present: i.ts_min_present,
+            ts_min: i.ts_min,
+            ts_max_present: i.ts_max_present,
+            ts_max: i.ts_max,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LabelNamesResponseInput {
+    pub names: Vec<std::string::String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LabelNamesResponseOutput {
+    pub tag: u8,
+    pub names: Vec<std::string::String>,
+}
+
+pub type LabelNamesResponse = LabelNamesResponseOutput;
+
+impl LabelNamesResponseInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(32);
+        encoder.write_u32_be(self.names.len() as u32);
+        for item in &self.names {
+            encoder.write_u16_be(item.len() as u16);
+            for b in item.as_bytes() {
+                encoder.write_byte(*b);
+            }
+        }
+        Ok(())
+    }
+
+}
+
+impl LabelNamesResponseOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let tag = decoder.read_byte()?;
+        if tag != 32u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 32, got {}", tag)));
+        }
+        let length = decoder.read_u32_be()? as usize;
+        let mut names = Vec::with_capacity(length);
+        for _ in 0..length {
+            let str_len = decoder.read_u16_be()? as usize;
+            let str_bytes = decoder.read_bytes_vec(str_len)?;
+            let item = std::string::String::from_utf8(str_bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+            names.push(item);
+        }
+        Ok(Self {
+            tag,
+            names,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        LabelNamesResponseInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        LabelNamesResponseInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<LabelNamesResponseOutput> for LabelNamesResponseInput {
+    fn from(o: LabelNamesResponseOutput) -> Self {
+        Self {
+            names: o.names,
+        }
+    }
+}
+
+impl From<LabelNamesResponseInput> for LabelNamesResponseOutput {
+    fn from(i: LabelNamesResponseInput) -> Self {
+        Self {
+            tag: 32u8,
+            names: i.names,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LabelValuesResponseInput {
+    pub values: Vec<std::string::String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LabelValuesResponseOutput {
+    pub tag: u8,
+    pub values: Vec<std::string::String>,
+}
+
+pub type LabelValuesResponse = LabelValuesResponseOutput;
+
+impl LabelValuesResponseInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(33);
+        encoder.write_u32_be(self.values.len() as u32);
+        for item in &self.values {
+            encoder.write_u16_be(item.len() as u16);
+            for b in item.as_bytes() {
+                encoder.write_byte(*b);
+            }
+        }
+        Ok(())
+    }
+
+}
+
+impl LabelValuesResponseOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let tag = decoder.read_byte()?;
+        if tag != 33u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 33, got {}", tag)));
+        }
+        let length = decoder.read_u32_be()? as usize;
+        let mut values = Vec::with_capacity(length);
+        for _ in 0..length {
+            let str_len = decoder.read_u16_be()? as usize;
+            let str_bytes = decoder.read_bytes_vec(str_len)?;
+            let item = std::string::String::from_utf8(str_bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+            values.push(item);
+        }
+        Ok(Self {
+            tag,
+            values,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        LabelValuesResponseInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        LabelValuesResponseInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<LabelValuesResponseOutput> for LabelValuesResponseInput {
+    fn from(o: LabelValuesResponseOutput) -> Self {
+        Self {
+            values: o.values,
+        }
+    }
+}
+
+impl From<LabelValuesResponseInput> for LabelValuesResponseOutput {
+    fn from(i: LabelValuesResponseInput) -> Self {
+        Self {
+            tag: 33u8,
+            values: i.values,
+        }
     }
 }
 
