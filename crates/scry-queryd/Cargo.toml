@@ -19,14 +19,17 @@ path = "src/bin/probe.rs"
 
 [dependencies]
 anyhow             = { workspace = true }
+async-trait        = { workspace = true }
 clap               = { workspace = true }
 datafusion         = { workspace = true }
 scry-catalog       = { workspace = true }
 scry-cluster       = { workspace = true }
+scry-match         = { workspace = true }
 scry-objstore      = { workspace = true }
 scry-proto         = { workspace = true }
 scry-query         = { workspace = true }
 scry-server        = { workspace = true }
+scry-tail          = { workspace = true }
 scry-valkey        = { workspace = true }
 tokio              = { workspace = true }
 tracing            = { workspace = true }

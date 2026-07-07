@@ -33,6 +33,12 @@ use rusqlite::{params, Connection, OptionalExtension};
 use scry_block::BlockMeta;
 use uuid::Uuid;
 
+pub mod snapshot;
+pub use snapshot::{
+    restore_snapshot, save_snapshot, RestoreOutcome, SaveReport, CATALOG_SCHEMA_VERSION,
+    SNAPSHOT_KEY,
+};
+
 /// A catalog row, joining the block sidecar with the per-instance
 /// bookkeeping fields (`bucket`, `date`, `level`). Returned by
 /// [`Catalog::list_blocks`] and [`Catalog::get_block`].
@@ -126,7 +132,14 @@ impl Catalog {
               schema_version      INTEGER NOT NULL,
               fingerprint         BLOB,
               superseded_by       TEXT REFERENCES blocks(uuid),
-              deleted_at          INTEGER
+              deleted_at          INTEGER,
+              -- D-054 dedup watermark: highest WAL segment this block
+              -- durably contains, and the ingest shard that wrote it. NULL
+              -- for pre-D-054 / compacted blocks (round-trips the sidecar
+              -- losslessly; the authoritative high-water lives in
+              -- wal_watermarks below).
+              wal_seg_max         INTEGER,
+              wal_shard           INTEGER
             );
 
             CREATE INDEX IF NOT EXISTS idx_blocks_query
@@ -148,6 +161,24 @@ impl Catalog {
               date         TEXT NOT NULL,
               highest_uuid TEXT NOT NULL,
               PRIMARY KEY (signal, writer_id, date)
+            );
+
+            -- Persistent, monotonic per-WAL-instance segment high-water
+            -- (D-054). Keyed by the WAL instance `(writer_id, signal,
+            -- shard)`; `seg_max` is the greatest WAL segment durably
+            -- committed to a block for that instance. Advanced atomically
+            -- with `insert_block` (and by convergence `apply_event` for
+            -- peers' blocks), never decremented by supersede/delete, so it
+            -- survives compaction (which drops per-block watermarks). The
+            -- merged history+live query keeps a live record tagged
+            -- `(writer, shard, seg)` iff `seg > seg_max` — the exact seam
+            -- between "already in a block" and "still only in flight".
+            CREATE TABLE IF NOT EXISTS wal_watermarks (
+              writer_id TEXT NOT NULL,
+              signal    TEXT NOT NULL,
+              shard     INTEGER NOT NULL,
+              seg_max   INTEGER NOT NULL,
+              PRIMARY KEY (writer_id, signal, shard)
             );
 
             -- Label cache: a materialized view over the authoritative per-block
@@ -173,6 +204,12 @@ impl Catalog {
             "#,
             )
             .context("initialising catalog schema")?;
+        // Stamp the catalog schema version so a snapshot restored by a
+        // different binary can be version-checked before use (D-055). Bump
+        // `CATALOG_SCHEMA_VERSION` whenever the DDL above changes.
+        self.conn
+            .pragma_update(None, "user_version", snapshot::CATALOG_SCHEMA_VERSION)
+            .context("stamping PRAGMA user_version")?;
         Ok(())
     }
 
@@ -185,8 +222,18 @@ impl Catalog {
     /// was already present.
     pub fn insert_block(&self, meta: &BlockMeta) -> Result<bool> {
         let date = format_date(meta.ts_min_unix_nano);
-        let rows = self
+        // Insert the block row and advance the WAL high-water in one
+        // transaction (D-054): the block becoming queryable and the
+        // watermark that dedups it against still-in-flight live records must
+        // be atomic, or a crash between the two writes would leave a block
+        // visible whose records the live path can't recognise as durable →
+        // a double across the seam. `unchecked_transaction` gives us a tx
+        // over the shared `&self` connection.
+        let tx = self
             .conn
+            .unchecked_transaction()
+            .context("begin insert_block transaction")?;
+        let rows = tx
             .execute(
                 r#"
             INSERT OR IGNORE INTO blocks (
@@ -194,13 +241,15 @@ impl Catalog {
               ts_min, ts_max, row_count, byte_size,
               postings_size_bytes, has_postings,
               body_bloom_size_bytes, has_body_bloom,
-              schema_version, fingerprint, superseded_by, deleted_at
+              schema_version, fingerprint, superseded_by, deleted_at,
+              wal_seg_max, wal_shard
             ) VALUES (
               ?1, ?2, ?3, ?4, ?5, ?16,
               ?6, ?7, ?8, ?9,
               ?10, ?11,
               ?12, ?13,
-              ?14, ?15, NULL, NULL
+              ?14, ?15, NULL, NULL,
+              ?17, ?18
             )
             "#,
                 params![
@@ -223,10 +272,56 @@ impl Catalog {
                     meta.schema_version as i64,
                     meta.label_fingerprint_bloom.as_deref(),
                     meta.level as i64,
+                    meta.wal_seg_max.map(|v| v as i64),
+                    meta.wal_shard.map(|v| v as i64),
                 ],
             )
             .context("INSERT OR IGNORE block")?;
+        // Advance the high-water unconditionally when the block carries a
+        // watermark — even if the block row was already present (rows==0),
+        // because the UPSERT is monotonic-max, so re-advancing is a no-op
+        // that also self-heals a watermark table lagging behind blocks.
+        if let (Some(seg), Some(shard)) = (meta.wal_seg_max, meta.wal_shard) {
+            advance_watermark_in(&tx, &meta.writer_id.to_string(), &meta.signal, shard, seg)?;
+        }
+        tx.commit().context("commit insert_block transaction")?;
         Ok(rows > 0)
+    }
+
+    /// Advance the durable WAL segment high-water for the instance
+    /// `(writer_id, signal, shard)` to `seg_max`, but **only if greater**
+    /// than the stored value — a monotonic high-water (mirrors
+    /// [`advance_cursor`]). This is the value the merged history+live query
+    /// dedups against (D-054): a live record tagged `(writer, shard, seg)`
+    /// is kept iff `seg > seg_max`. Called from `insert_block` (local
+    /// writes) and convergence `apply_event` (peers' blocks) so a
+    /// query-only catalog carries every instance's high-water.
+    pub fn advance_watermark(
+        &self,
+        writer_id: Uuid,
+        signal: &str,
+        shard: u32,
+        seg_max: u64,
+    ) -> Result<()> {
+        advance_watermark_in(&self.conn, &writer_id.to_string(), signal, shard, seg_max)
+    }
+
+    /// Read the durable WAL segment high-water for `(writer_id, signal,
+    /// shard)`. `None` when no block for that instance has been seen — the
+    /// dedup treats it as `0` (covers nothing, so every live record is
+    /// kept).
+    pub fn get_watermark(&self, writer_id: Uuid, signal: &str, shard: u32) -> Result<Option<u64>> {
+        let v: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT seg_max FROM wal_watermarks \
+                 WHERE writer_id = ?1 AND signal = ?2 AND shard = ?3",
+                params![writer_id.to_string(), signal, shard as i64],
+                |r| r.get(0),
+            )
+            .optional()
+            .context("SELECT wal_watermark")?;
+        Ok(v.map(|v| v as u64))
     }
 
     /// List every **live** block — not deleted and not superseded by a
@@ -243,7 +338,8 @@ impl Catalog {
                    ts_min, ts_max, row_count, byte_size,
                    schema_version, fingerprint,
                    has_postings, postings_size_bytes,
-                   has_body_bloom, body_bloom_size_bytes
+                   has_body_bloom, body_bloom_size_bytes,
+                   wal_seg_max, wal_shard
             FROM blocks
             WHERE deleted_at IS NULL AND superseded_by IS NULL
             ORDER BY date, ts_min, uuid
@@ -265,7 +361,8 @@ impl Catalog {
                    ts_min, ts_max, row_count, byte_size,
                    schema_version, fingerprint,
                    has_postings, postings_size_bytes,
-                   has_body_bloom, body_bloom_size_bytes
+                   has_body_bloom, body_bloom_size_bytes,
+                   wal_seg_max, wal_shard
             FROM blocks
             WHERE uuid = ?1
             "#,
@@ -541,6 +638,11 @@ impl Catalog {
                 }
             };
             let path_str = obj.location.as_ref();
+            // The `_catalog/` prefix is reserved for catalog snapshots (D-055),
+            // never a block sidecar — skip it before any suffix check.
+            if path_str.starts_with("_catalog/") {
+                continue;
+            }
             if !path_str.ends_with(".meta.json") {
                 continue;
             }
@@ -643,6 +745,32 @@ fn format_date(ts_unix_nano: u64) -> String {
         .to_string()
 }
 
+/// Monotonic-max UPSERT into `wal_watermarks`, shared by the `&self`
+/// [`Catalog::advance_watermark`] and the transactional `insert_block`
+/// path. Generic over anything that derefs to a `Connection` (a
+/// `Connection` or a `Transaction`) so both callers reuse one statement.
+/// The `DO UPDATE` is gated on `excluded.seg_max > wal_watermarks.seg_max`,
+/// so an out-of-order (older) observation can never roll the high-water
+/// backward — exactly the `advance_cursor` idiom.
+fn advance_watermark_in(
+    conn: &Connection,
+    writer_id: &str,
+    signal: &str,
+    shard: u32,
+    seg_max: u64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO wal_watermarks (writer_id, signal, shard, seg_max) \
+         VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT(writer_id, signal, shard) DO UPDATE SET \
+           seg_max = excluded.seg_max \
+         WHERE excluded.seg_max > wal_watermarks.seg_max",
+        params![writer_id, signal, shard as i64, seg_max as i64],
+    )
+    .context("UPSERT wal_watermark")?;
+    Ok(())
+}
+
 fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<CatalogEntry> {
     let uuid_str: String = row.get(0)?;
     let bucket: String = row.get(1)?;
@@ -660,6 +788,8 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<CatalogEntry> {
     let postings_size_bytes: Option<i64> = row.get(13)?;
     let has_body_bloom_raw: i64 = row.get(14)?;
     let body_bloom_size_bytes: Option<i64> = row.get(15)?;
+    let wal_seg_max: Option<i64> = row.get(16)?;
+    let wal_shard: Option<i64> = row.get(17)?;
 
     let uuid = Uuid::parse_str(&uuid_str).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
@@ -697,6 +827,8 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<CatalogEntry> {
             all_fingerprints: None,
             has_body_bloom: has_body_bloom_raw != 0,
             body_bloom_size_bytes: body_bloom_size_bytes.map(|v| v as u64),
+            wal_seg_max: wal_seg_max.map(|v| v as u64),
+            wal_shard: wal_shard.map(|v| v as u32),
         },
         bucket,
         date,

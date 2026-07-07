@@ -2433,3 +2433,361 @@ keys → values and click-adds a matcher.
 by the `query_e2e` metadata test and the `SIGNAL=metrics|logs|both` smoke legs.
 Deferred: an age/size cap on the cache (block-lifecycle reaping is the only
 expiry today), regex/non-promoted trace-attribute discovery, and profile labels.
+
+## D-052: `scry tail` — a separate, best-effort live-tail surface (never merged with history)
+
+**Date:** 2026-07-03
+**Status:** accepted
+
+Stored records only become queryable after a block seals (`--block-max-age-secs`,
+default 60s → visible in ~60–90s). That lag is fine for the query engine's
+correctness contract but makes "what is happening *right now*?" hard. `scry tail`
+adds live visibility **without touching that contract**: it is a distinct surface,
+not a query mode.
+
+**Why not fold live data into query results.** Every earlier design we sketched
+(replay the WAL tail into a query, stream ingesters → queriers and union with S3)
+died on the same rock: the moment live data must *merge* with stored data, you owe
+deduplication — a record can be both in a writer's in-memory buffer and in a block
+it already uploaded. Dedup here is not row-identity (blocks are UUID-addressed, not
+content-addressed) but a per-writer **segment watermark**, and it needs a
+restart-safe WAL sequence and a `wal_seg_max` in block meta that today's format
+doesn't carry. A **pure live tail has no correctness contract at all** — it is
+explicitly lossy, unordered across servers, and "roughly now" — so it never
+touches S3, never merges, and has nothing to dedup. That is the entire reason it's
+easy to reason about, and the reason we built *only* this and deferred the merged
+"history + gap + live in one pane" view.
+
+**Subscription-as-a-stream: the request socket IS the delivery socket.** A tail
+client opens a normal native-wire connection, does the Hello handshake, and sends
+one `Subscribe { signal, matchers[] }` frame. The server then sprays matching
+`TailRecord` frames back down that same connection until the client hangs up
+(socket EOF = unsubscribe) or sends `Goodbye`. No reverse dial, no callback
+endpoint, no lease/TTL, and **no Valkey on the data path** — Bart's explicit
+steer ("an extra pointless hop"). Two new `Frame.msg` variants (`Subscribe`=0x50,
+`TailRecord`=0x51) in `proto/ingest.schema.json`; `ERR_BAD_MATCHER`=8 for an
+unparseable matcher spec.
+
+**Zero cost when nobody is tailing.** A process-local `SubscriptionRegistry`
+(`crates/server/src/tail.rs`) holds an `AtomicUsize` subscriber count. The logs
+ingest path reads it **once per batch** (one relaxed load); `== 0` → the exact
+pre-tail decode path, byte-for-byte. Only with ≥1 subscriber does a batch decode
+through `TappingLogsAppender`, a `LogsAppender` decorator that snapshots the
+subscriber handles **once per batch** (a single read-lock, not per entry),
+attaches stream labels by fingerprint, evaluates each subscriber's `LabelFilter`
+per entry, and forwards matches. Storage is authoritative and untouched — the tap
+only *reads* records as they flow into the scratch builder, so the sealed block is
+identical to the untapped path. The idle overhead is one relaxed atomic load **per
+batch** (~60 records), not per record; the perf sentinel
+(`SIGNAL=logs scripts/smoke.sh`) reads **3.08 CPU-µs/record** with the tap present
+but no subscriber — within noise of the pre-tail baseline, as expected.
+
+**Delivery is `try_send` — drops, never blocks.** Each subscriber owns a bounded
+channel (4096). The tap `try_send`s; a full/closed channel bumps a drop counter and
+moves on. A slow tail client can never backpressure ingest — losing records under
+load is the contract, not a bug.
+
+**Matcher reuse.** The agent's Prometheus-style keep-matcher grammar (D-043 —
+`key=value|!=|=~|!~`, whole-string-anchored regex, AND semantics) was the right
+language for "which streams do I want?", so it was lifted verbatim out of
+`crates/agent/src/filter.rs` into a shared `scry-match` crate (`LabelFilter` /
+`Matcher` / `MatchOp`) that both the agent and the tap depend on. Kept out of
+`scry-proto` so `regex` doesn't leak into every proto dependent.
+
+**The tap also works without storage.** The forward path lives in *both* the
+storage-backed and the count-only logs branches, so a storage-less
+`scry ingest --listen` still serves `scry tail`. This is what lets
+`scripts/smoke-tail.sh` be **self-contained — no Garage, no Valkey**: it stands up
+a bare ingester, a filtered tail (`service="api"`) and an unfiltered tail, spews
+`--signals logs`, and asserts the filtered tail sees only `service=api` while the
+unfiltered tail sees all three services (and that records only arrive for a
+subscription that was live when they were sent).
+
+**Client (`scry tail`, crate `crates/tail`).** One TCP connection per `--ingest`
+(repeatable); trailing positional args are the matchers. Records fan into one
+`mpsc` and print to **stdout** — `<rfc3339 ts> <LEVEL> {labels} body` — while every
+diagnostic goes to **stderr** via `eprintln!`, deliberately *not* `tracing` (the
+shared `scry` subscriber routes tracing to stdout, which would interleave logs with
+the record stream). Ctrl-C aborts the tasks, closing the sockets → the server sees
+EOF and deregisters.
+
+**Scope.** v1 is **logs only** (Bart's actual complaint) and **static
+`--ingest` discovery**. Deferred: metrics tail (a structurally identical
+`MetricsAppender` tap), Valkey instance-registry auto-discovery, a queryd
+front-door fan-in, and the merged history+live view (the `wal_seg_max` +
+restart-safe WAL seq + segment-granular dedup milestone). Live tail is a genuine
+side-surface — Bart uses live logs "a single hand per year" — so the design bias
+throughout was *minimize the blast radius on the ingest hot path and the block
+format*, not maximize completeness.
+
+## D-053: queryd live-tail front-door + Valkey ingester registry
+
+**Date:** 2026-07-03
+**Status:** accepted
+
+D-052 shipped `scry tail --ingest host:port` — the client dials each ingester by
+address. That is the right *debug* primitive but the wrong *blessed* path: an
+operator shouldn't have to know (or enumerate) the live ingester set, and in a
+multi-instance deployment that set changes as instances come and go. D-053 makes
+the query daemon the **front door**: `scry tail --queryd Q:PORT` talks to queryd,
+which discovers the live ingesters itself and fans their records back. **Both
+paths stay** (Bart's call): `--queryd` is primary/documented; `--ingest` remains
+for Valkey-free direct debugging.
+
+**queryd is a transparent relay — the frames are reused, not re-specified.** The
+relay speaks the *identical* D-052 tail sub-protocol on both sides: downstream to
+the CLI (Hello → HelloAck → Subscribe → `TailRecord`…) and upstream, where it acts
+as a tail *client* to each ingester via the shared `scry_tail::dial_subscribe`
+primitive (lifted out of the CLI's `tail_one`). No query-schema (`QueryFrame`)
+involvement at all — a `TailRecordOutput` read off an upstream is re-emitted
+verbatim with `build::tail_record` downstream.
+
+**A separate `--tail-listen` port, not the query port.** queryd's query wire
+(`QueryFrame`) and the tail sub-protocol (`Frame`) are different binschema unions
+whose first-byte tags collide (both begin at 0x01), so they cannot be
+discriminated on one socket. The relay therefore binds its own listener; unset ⇒
+no front-door. This keeps the query path byte-for-byte unchanged.
+
+**The ingester registry — the first instance-address use of Valkey.** Nothing
+stored an instance's *network address* in Valkey before (the lease and pub/sub
+are content/coordination, not topology). `scry-valkey::registry` adds one: an
+ingester with `--valkey-url` set `SET`s `scry/tail/ingesters/<writer_uuid> =
+<advertised addr>` with a `PX` TTL, renewed every `ttl/3` (reusing the lease
+idiom — **server-side expiry, no client clocks**; a crashed instance's key
+vanishes within one TTL). Discovery is one **read-only Lua `eval`** that `SCAN`s
+the prefix and `GET`s each value — SCAN-in-Lua is allowed because it mutates
+nothing. `Drop`/`deregister` best-effort compare-and-`DEL`s (keyed on the
+instance's own addr, like the lease release) so a clean shutdown frees the key
+immediately rather than waiting out the TTL. No new `fred` features.
+
+**No Valkey ⇒ refuse, loudly.** Without a registry there is nothing to discover.
+A `--tail-listen` queryd with no Valkey completes the handshake, reads the
+`Subscribe`, then replies `Error(ERR_TAIL_UNAVAILABLE=9)` and closes — an explicit
+refusal the client renders, not a silent empty stream that looks like "no logs
+match." (`--ingest` direct tailing never hits this; only the relay refuses.)
+
+**Advertise-address resolution — auto-detect where safe, else demand an explicit
+IP.** An ingester must advertise an address a *peer* can dial, so `--listen
+0.0.0.0` is not directly usable. Resolution (only when Valkey is present — a
+no-Valkey ingester never registers, so `--listen 0.0.0.0` stays fine and
+backwards-compatible), in order: (1) `--tail-advertise-addr` / `$SCRY_TAIL_ADVERTISE_ADDR`
+wins; (2) else a **concrete** `--listen` IP is advertised verbatim (zero-config
+bare-metal); (3) else a wildcard bind + `NODE_IP` (the k8s downward-API env
+already used by D-048) → `<NODE_IP>:<port>` (zero-config k8s); (4) else a **hard
+error at startup** — "cannot determine tail advertise address for a wildcard
+`--listen`; set `--tail-advertise-addr` or `NODE_IP`, or bind a concrete IP." No
+local-interface enumeration (fragile / wrong on multi-homed hosts, per Bart) —
+the common cases are covered and the rest is an explicit ask.
+
+**Live rediscovery.** While a tail streams, the relay reconciles its upstream set
+every `--tail-rediscover-interval` (default 5s): dial newly-appeared ingesters,
+drop those whose key vanished (or whose upstream task ended — a restarted
+ingester is re-dialed), keep the rest. A per-client bounded `mpsc` fans all
+upstreams into one downstream writer; client EOF/`Goodbye`/write-error tears down
+every upstream (each socket close deregisters that subscription at its ingester).
+
+**Sealed by `scripts/smoke-tail-queryd.sh`** (needs only a dev Valkey — the
+ingesters run storage-less and the relay never touches the object store, so no
+Garage): two registering ingesters + a `--tail-listen` queryd + `scry tail
+--queryd`. It proves **fan-in** by spewing to A only (count rises) then B only
+(count rises again — the delta can only be B, since A is idle, so both were
+discovered and dialed), the **filter** (`service="api"` excludes worker/scheduler,
+every line well-formed), and the **refuse path** (a Valkey-less `--tail-listen`
+queryd rejects the subscription with `code=9` and streams nothing).
+
+**Deferred (unchanged from D-052):** metrics tail via the relay (logs-only, as
+v1), merged history+live, per-tenant/ACL on the relay, and re-subscribing an
+upstream that flaps within one TTL (best-effort).
+
+## D-054: merged history+live query view, with per-writer WAL-segment dedup
+
+D-052/D-053 gave us `scry tail` — a pure best-effort *side-surface*: live-only,
+lossy, never merged with stored history, so it needs no deduplication. D-054 is
+the piece that was deliberately deferred there — **"request the last minute": one
+coherent recent view that unions the stored parquet blocks (history) with the
+still-in-flight records at the ingesters (live), deduplicated across the seam.**
+`scry query --live` (and `scry-query-probe --live`); **logs only** for v1.
+
+**The hazard.** A query is a separate process from the ingesters, so it samples
+the catalog (blocks) and the ingesters' in-flight state at slightly different
+instants. Across a block-commit boundary that yields either a **gap** (a record
+already drained from the builder but its block not yet visible to the query) or a
+**double** (a record visible in both the freshly-committed block *and* the still-
+un-drained builder). Because blocks are UUID-addressed, not content-addressed,
+you cannot dedup by row identity. You dedup by a **per-writer WAL-segment
+watermark**.
+
+**The dedup invariant (the one idea the whole design rests on).** The unit of
+dedup is a **WAL instance** = `(writer_id, signal, shard)`. Each signal ingests
+across `INGEST_SHARDS = 8` independent WAL sequences per instance (all sharing one
+`writer_uuid`), so segment numbers are only comparable *within* one
+`(writer, signal, shard)`. Let `H(writer, signal, shard)` be that instance's
+**durable segment high-water** — the highest WAL segment fully committed to a
+block. A live record `r` tagged `(writer, shard, seg)` is included **iff its
+segment is above the high-water**. Blocks cover segments `≤ H`; the retained ring
+covers a recent suffix including `seg > H`. Coverage is disjoint at the watermark
+⇒ no gap, no double.
+
+**`H` is a persistent, monotonic high-water in the catalog — not recomputed from
+live blocks.** Two realities force this: (1) **sharding** — the key must include
+`shard`, or a bare `writer_id` key mixes 8 incomparable sequences; (2)
+**compaction** groups by `(signal, date, level)` *across writers*, so a merged L1
+block can't carry a single writer's scalar watermark, and recomputing
+`max(wal_seg_max)` over live blocks would **regress** the moment a watermark-
+bearing L0 block is merged away. So a `wal_watermarks(writer_id, signal, shard →
+seg_max)` table is advanced *atomically with `insert_block`* (monotonic-max
+UPSERT; never decremented by supersede/delete). A block becomes queryable and `H`
+advances in the same transaction, so a live record is dropped exactly when its
+block is visible. Merged blocks carry `wal_seg_max = None` harmlessly — the L0
+blocks they merged already advanced `H`. Peers' blocks arriving over pub/sub
+advance `H` in `apply_event`'s `Created` arm too, so a query-only queryd's catalog
+carries every writer-shard's high-water.
+
+**Absent-watermark is `None`, not `0` (the segment-0 gap).** WAL segments are
+**0-based** (`Wal::open` starts a fresh instance at seq 0). So "no block yet for
+this `(writer, shard)`" cannot be represented as `H = 0` — that would claim
+segment 0 is durable and silently drop a fresh ingester's first-segment records
+from the live view *before its first flush* (a gap, defeating the whole purpose).
+The dedup selector is therefore `Option`-aware: `get_watermark → None` ⇒ **nothing
+durable ⇒ keep every live record**; `Some(h)` ⇒ drop `seg ≤ h`. `Some(0)` (first
+block sealed segment 0) legitimately covers segment 0; `None` must not.
+`live_record_is_durable(seg, wm)` is a pure, unit-tested helper
+(`crates/server/src/query_service.rs`) exactly so this boundary can't silently
+regress.
+
+**Components.**
+- **Watermark plumbing** (all signals, cheap, signal-agnostic): `BlockMeta`
+  gains `wal_seg_max: Option<u64>` + `wal_shard: Option<u32>` (both
+  `serde(default)`); `BlockBuilder::{set_wal_seg_max,set_wal_shard}`; the
+  `Pipeline` stamps them in `spawn_upload` right after it `rotate()`s the WAL
+  (the sealed segment id) and before `finish_and_upload`, so both land in the
+  `meta.json`. `insert_block` writes the two columns *and* `advance_watermark` in
+  one transaction; `reconcile_from_bucket` advances from every meta seen.
+- **Retained recent-window ring** (the live source, logs only): `LiveRing`
+  (`crates/server/src/live_ring.rs`) — a bounded, per-writer, always-on deque of
+  `LiveLogRecord { wal_shard, wal_seg, ts, severity, labels, body, attributes }`,
+  evicting by age (`--live-window-secs`, default 90) **and** a hard byte cap
+  (`--live-window-max-bytes`, default 128 MiB). The segment is only known *after*
+  commit, so a `RetainingLogsAppender` `LogsAppender` decorator (sibling of the
+  D-052 `TappingLogsAppender`, nesting inside it when both are active) collects
+  the batch's entries during phase-1 decode; `ingest_decoded` now **returns the
+  `SegmentId`** it appended to, and phase 2 stamps that seg + the connection's
+  shard onto the collected records and pushes them into the ring. Storage path
+  unchanged; always-on but bounded, independent of whether anyone is querying.
+- **Ingester live-query endpoint** (reuses the ingest `--listen` port + the
+  D-053 Valkey registry): two new frames on the ingest union — `LiveQuery`
+  (**0x52**: signal + matchers + optional ts range + optional `body_contains`)
+  and `LiveBatch` (**0x53**: `writer_uuid` once + records each carrying
+  `wal_shard` + `wal_seg` + ts/severity/labels/body/attributes). The server
+  snapshots the ring, applies the predicate (`scry_match::LabelFilter`, substring,
+  ts range), and replies with one `LiveBatch`. An ingester that advertises for
+  tail advertises for live-query too (same addr/port) — no new registry, no new
+  advertise flag.
+- **Query daemon merge + dedup** (`scry query`): on `live && logs`, plan blocks
+  as usual (EvictOnNotFound one-replan preserved), then — **no Valkey ⇒ reply
+  `QUERY_ERR_LIVE_UNAVAILABLE` (0x0005) and close** (refuse, not silently degrade)
+  — discover ingesters via Valkey, fan out `LiveQuery` with a short deadline
+  (dead/slow ingester skipped + logged), dedup survivors with
+  `live_record_is_durable`, build a logs `RecordBatch` schema-identical to the
+  block-backed table, register it as a `MemTable` (`logs_live`), and expose a
+  `CREATE VIEW logs AS SELECT * FROM __logs_blocks UNION ALL SELECT * FROM
+  logs_live` so both the default `SELECT * FROM logs` **and** any user SQL
+  referencing `logs` transparently span the seam. `scry-server` stays Valkey-
+  agnostic — it takes a `&dyn LiveDiscovery` (mirroring the engines' `&dyn
+  Fence`); `scry query` injects the Valkey-backed impl over the D-053 registry.
+  Live queries bypass the result cache entirely (results are time-varying).
+
+**Sealed by `scripts/smoke-live.sh`** (needs Garage + a dev Valkey): one storage
++ Valkey ingester (short `--block-max-age-secs`, long `--live-window-secs`) and a
+Valkey-backed query daemon *sharing the ingester's SQLite catalog* (so the
+watermark advanced by `insert_block` is immediately visible to the dedup via the
+SQLite WAL — no convergence needed, intervals set huge). With `N` ≡ total logs
+ingested, it asserts: **(a) live half** — before any flush, `probe --live` sees
+all `N` in-flight rows while blocks-only sees `< N` (the segment-0 gap the
+`unwrap_or(0)` bug used to drop); **(b) history half** — after the flush, blocks-
+only sees exactly `N`; **(c) dedup exact** — after the flush the ring *still*
+holds all `N` (window ≫ elapsed) yet `probe --live` sees exactly `N`, not `~2N`
+(the watermark dropped the now-durable ring copies — no double across the seam);
+**(d) refuse** — `probe --live` against a Valkey-less daemon is refused with
+`0x0005` and streams nothing, while a plain query against it still works.
+
+**Deferred:** metrics/traces/profiles merged view (logs-only v1); `scry get`
+local one-shot live-merge (daemon-only, mirroring D-053's front-door); per-
+tenant/ACL on the live endpoint; partial-block rewrite at the TTL boundary
+(unrelated); making the live endpoint a streaming subscription (bounded request/
+response snapshot for v1). Cross-ref D-052/D-053 (the tail surface this reuses).
+
+## D-055: catalog snapshot bootstrap — fast query-daemon cold start
+
+**The problem.** A `scry query` daemon keeps its catalog on an ephemeral
+`emptyDir` (the catalog is derived state, fully rebuildable from the bucket — no
+PVC). But rebuilding it means `Catalog::reconcile_from_bucket`, which issues **one
+network GET per `*.meta.json` for every block in the bucket, unconditionally** —
+the `insert_block` dedup only saves the SQLite write, not the round-trip. So cold
+boot costs O(total blocks) GETs, every restart, and "takes ages" once the bucket
+is large.
+
+**The fix (stateless, no PVC).** A writer with an authoritative catalog
+periodically uploads it as **one object** — `_catalog/snapshot.sqlite` — and a
+cold consumer **restores that one object on boot** (a single GET), then lets its
+existing incremental cursor-poll fill the small delta since the snapshot. The
+`emptyDir`/rebuildable property is kept; only the *bootstrap mechanism* changes.
+
+**Why one SQLite object.** The snapshot is produced with `VACUUM INTO` on a
+**separate read-only connection** to the live catalog (a consistent, defragmented
+copy taken through a read transaction — safe against the concurrent
+writers/readers on the shared connection, and never touches the shared `Mutex`).
+It's uploaded as a single object, so a reader always sees a whole, valid catalog —
+a torn read is impossible. No JSON sidecar (that would reintroduce a two-object
+consistency window); the schema version rides *inside* the db.
+
+**Producer needs no lease.** Uploading a snapshot is **non-destructive** — it
+overwrites one key, last-writer-wins, and every copy is a valid full catalog. So
+unlike compaction/retention (D-036/D-037, single-winner for *correctness*),
+snapshot production is safe on every instance and is deliberately **not** hooked
+into the lease-guarded maintenance loop (which pauses without a Valkey lease). It
+runs as an independent `--catalog-snapshot-interval` background task in `scry
+ingest` (default 300s, `0` disables; requires `--storage --catalog`). In the
+single-instance home deployment that's exactly one uploader; multi-instance just
+means N redundant uploads (a bandwidth cost, noted as a future lease-gate
+optimization).
+
+**Cross-version safety — the load-bearing subtlety.** `Catalog::init_schema` has
+**no `ALTER` migrations** (`CREATE TABLE IF NOT EXISTS` only). That is safe today
+*only because* the catalog is always created fresh by the current binary — an
+assumption snapshots break (a snapshot written by binary vX, restored by vY). So
+the catalog schema version travels in the db as `PRAGMA user_version`
+(`CATALOG_SCHEMA_VERSION`, stamped on every open); `restore_snapshot` reads it and
+**refuses a snapshot whose version doesn't match**, and the caller falls back to a
+full reconcile. Bump `CATALOG_SCHEMA_VERSION` whenever the DDL changes. (A real
+`ALTER`-migration framework is deferred — until then, a version bump costs one
+cold reconcile, then the next snapshot is written at the new version.)
+
+**Reserved prefix.** `_catalog/` is reserved for snapshots and explicitly skipped
+by every block walk (`reconcile_from_bucket`, the cluster `poll_once`/`full_walk`)
+so a snapshot object is never mis-parsed as a block sidecar.
+
+**Consumer.** `scry query`, before opening the catalog, if the local file is
+absent, calls `restore_snapshot`; `Restored{blocks}` logs and serves immediately,
+while `NoSnapshot` / `VersionMismatch` / any error fall through to an empty catalog
+exactly as before (the daemon's own poll + full-walk loops — spawned
+unconditionally, Valkey or not — repopulate it). `--no-snapshot-restore` forces a
+cold catalog. Manifests updated: the ingest statefulset adds
+`--catalog-snapshot-interval=300s`; the queryd deployment **drops** the
+`catalog-seed` init container and the `catalog-reconcile` sidecar (restore-on-boot
++ the daemon's built-in convergence replace both), keeping the `emptyDir`.
+
+**Sealed by `scripts/smoke-catalog-snapshot.sh`** (Garage only — no Valkey): one
+storage ingester with a 3s snapshot interval; asserts **(a)**
+`_catalog/snapshot.sqlite` appears once the catalog is populated; **(b)** a cold
+`scry query` (catalog absent, full-walk disabled) logs "restored catalog from
+bucket snapshot" and a probe returns the ingester's `N` rows immediately (restore,
+not reconcile); **(c)** after a second spew, the daemon's poll loop lifts the
+count to `N+M` (snapshot + delta, no double-count); **(d)** a fresh reconcile over
+the bucket counts exactly the block sidecars (the `_catalog/` object is never a
+block) with no parse failures.
+
+**Deferred:** a real `ALTER TABLE` migration framework (v1: version mismatch ⇒ one
+full reconcile); lease-gating snapshot production to cut redundant multi-instance
+uploads; snapshot history/GC and compression; folding restore into `scry get` /
+one-shot query paths. No wire-protocol change — object-layout + boot-path only.

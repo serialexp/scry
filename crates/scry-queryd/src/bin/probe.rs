@@ -67,6 +67,13 @@ struct Args {
     /// Caller-supplied request id echoed in the daemon's per-query logs.
     #[arg(long)]
     request_id: Option<String>,
+
+    /// Merged history+live view (D-054): union the stored blocks with the
+    /// still-in-flight records at the ingesters, deduped across the block
+    /// commit seam. Logs only; needs the daemon to have Valkey (else the
+    /// daemon refuses with `QUERY_ERR_LIVE_UNAVAILABLE`).
+    #[arg(long)]
+    live: bool,
 }
 
 fn parse_signal(s: &str) -> Result<u8> {
@@ -108,6 +115,7 @@ async fn main() -> Result<()> {
         sql: args.sql,
         limit: args.limit,
         request_id: args.request_id,
+        live: args.live,
     };
 
     let sock = TcpStream::connect(args.addr)

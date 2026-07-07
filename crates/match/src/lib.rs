@@ -1,10 +1,15 @@
-//! Node-side keep-only label allow-list.
+//! Prometheus-style label matchers, shared across scry.
 //!
-//! On a busy node the agent would otherwise ship every container log stream it
-//! finds. A [`LabelFilter`] lets an operator restrict what leaves the node: a
-//! stream is forwarded only if its label set satisfies **all** configured
-//! matchers (logical AND). With no matchers the filter keeps everything, so the
-//! feature is fully opt-in and the default behavior is unchanged.
+//! A [`LabelFilter`] is a set of matchers ANDed together: a label set passes
+//! only if it satisfies **every** matcher (logical AND). An empty filter keeps
+//! everything, so any feature built on it is fully opt-in.
+//!
+//! Two consumers today:
+//!
+//! - the agent's node-side keep allow-list (`--keep`, D-043) — a container log
+//!   stream is shipped only if its labels satisfy the filter;
+//! - the ingest server's live-tail subscription (`scry tail`, D-050) — a
+//!   record is forwarded to a subscriber only if its labels satisfy the filter.
 //!
 //! Matchers follow scry's Prometheus-style convention, extended with regex:
 //!
@@ -13,11 +18,9 @@
 //! - `key=~regex` — label matches the (whole-string-anchored) regex
 //! - `key!~regex` — label does not match the regex
 //!
-//! Matches run against the *stream* labels the agent builds in
-//! [`crate::stream::stream_labels`]: the core `namespace` / `pod` / `container`
-//! / `node`, plus Kubernetes pod labels exposed as `k8s_<key>`. A label the
-//! stream does not carry is treated as the empty string, so `key=~".+"` means
-//! "the label is present and non-empty".
+//! Matches run against a label set represented as [`scry_proto::LabelPair`]s. A
+//! label the set does not carry is treated as the empty string, so `key=~".+"`
+//! means "the label is present and non-empty".
 
 use anyhow::{bail, Context, Result};
 use regex::Regex;
@@ -80,8 +83,8 @@ impl Matcher {
         })
     }
 
-    /// Evaluate this matcher against a stream's labels. A missing label is
-    /// treated as the empty string.
+    /// Evaluate this matcher against a label set. A missing label is treated as
+    /// the empty string.
     fn matches(&self, labels: &[LabelPair]) -> bool {
         let actual = labels
             .iter()
@@ -105,7 +108,8 @@ pub struct LabelFilter {
 
 impl LabelFilter {
     /// Build a filter from a list of matcher specs (e.g. the repeated `--keep`
-    /// flag values). An empty list yields a keep-everything filter.
+    /// flag values, or a tail subscription's matchers). An empty list yields a
+    /// keep-everything filter.
     pub fn parse(specs: &[String]) -> Result<Self> {
         let matchers = specs
             .iter()
@@ -124,8 +128,8 @@ impl LabelFilter {
         self.matchers.len()
     }
 
-    /// Whether a stream with these labels should be forwarded. A stream is kept
-    /// only if it satisfies **every** matcher; an empty filter keeps all.
+    /// Whether a label set should be kept. A set is kept only if it satisfies
+    /// **every** matcher; an empty filter keeps all.
     pub fn keeps(&self, labels: &[LabelPair]) -> bool {
         self.matchers.iter().all(|m| m.matches(labels))
     }

@@ -4404,6 +4404,7 @@ dependencies = [
  "scry-query",
  "scry-queryd",
  "scry-retention",
+ "scry-tail",
  "scry-webui",
  "tokio",
  "tracing-subscriber",
@@ -4419,9 +4420,9 @@ dependencies = [
  "futures",
  "k8s-openapi",
  "kube",
- "regex",
  "reqwest",
  "scry-client",
+ "scry-match",
  "scry-proto",
  "serde",
  "serde_json",
@@ -4590,6 +4591,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "scry-match"
+version = "0.13.0"
+dependencies = [
+ "anyhow",
+ "regex",
+ "scry-proto",
+]
+
+[[package]]
 name = "scry-objstore"
 version = "0.13.0"
 dependencies = [
@@ -4647,14 +4657,17 @@ name = "scry-queryd"
 version = "0.13.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
  "datafusion",
  "scry-catalog",
  "scry-cluster",
+ "scry-match",
  "scry-objstore",
  "scry-proto",
  "scry-query",
  "scry-server",
+ "scry-tail",
  "scry-valkey",
  "tokio",
  "tracing",
@@ -4697,6 +4710,7 @@ dependencies = [
  "object_store",
  "scry-block",
  "scry-catalog",
+ "scry-match",
  "scry-objstore",
  "scry-proto",
  "scry-query",
@@ -4707,6 +4721,19 @@ dependencies = [
  "tracing",
  "uuid",
  "zstd",
+]
+
+[[package]]
+name = "scry-tail"
+version = "0.13.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "scry-match",
+ "scry-proto",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

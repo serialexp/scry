@@ -108,7 +108,12 @@ where
     let mut out = Vec::new();
     while let Some(item) = stream.next().await {
         let meta = item.context("listing bucket objects")?;
-        if meta.location.as_ref().ends_with(".meta.json") {
+        let loc = meta.location.as_ref();
+        // `_catalog/` is reserved for catalog snapshots (D-055), not blocks.
+        if loc.starts_with("_catalog/") {
+            continue;
+        }
+        if loc.ends_with(".meta.json") {
             out.push(meta.location);
         }
     }
@@ -128,7 +133,12 @@ where
     let mut out = Vec::new();
     while let Some(item) = stream.next().await {
         let meta = item.context("listing bucket objects (offset)")?;
-        if meta.location.as_ref().ends_with(".meta.json") {
+        let loc = meta.location.as_ref();
+        // `_catalog/` is reserved for catalog snapshots (D-055), not blocks.
+        if loc.starts_with("_catalog/") {
+            continue;
+        }
+        if loc.ends_with(".meta.json") {
             out.push(meta.location);
         }
     }

@@ -27,6 +27,10 @@
             { "type": "Ping",        "when": "value === 0x30" },
             { "type": "Pong",        "when": "value === 0x31" },
             { "type": "Goodbye",     "when": "value === 0x40" },
+            { "type": "Subscribe",   "when": "value === 0x50" },
+            { "type": "TailRecord",  "when": "value === 0x51" },
+            { "type": "LiveQuery",   "when": "value === 0x52" },
+            { "type": "LiveBatch",   "when": "value === 0x53" },
             { "type": "Error",       "when": "value === 0xF0" }
           ]
         }
@@ -133,6 +137,69 @@
         { "name": "tag", "type": "uint8", "const": 240 },
         { "name": "code", "type": "uint16" },
         { "name": "message", "type": "string", "kind": "length_prefixed", "length_type": "uint16", "encoding": "utf8" }
+      ]
+    },
+
+    "Subscribe": {
+      "description": "Live-tail subscription request (scry tail, D-050). After the Hello handshake a tail client sends this to switch the connection into server-push mode: the server sprays matching TailRecord frames back down the same connection until the client closes it. Best-effort — records may be dropped under load; there is no ack and no durability.",
+      "sequence": [
+        { "name": "tag", "type": "uint8", "const": 80 },
+        { "name": "signal", "type": "uint8" },
+        { "name": "matchers", "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "MatcherSpec" } }
+      ]
+    },
+
+    "MatcherSpec": {
+      "description": "One Prometheus-style label matcher spec string (key=value | key!=value | key=~regex | key!~regex), parsed server-side by scry-match. ANDed with the others in a Subscribe.",
+      "sequence": [
+        { "name": "spec", "type": "string", "kind": "length_prefixed", "length_type": "uint16", "encoding": "utf8" }
+      ]
+    },
+
+    "TailRecord": {
+      "description": "Server-to-client push of one record matching a live-tail Subscribe. Currently only logs (signal = Logs): carries the stream labels, entry timestamp/severity/body, and per-entry attributes. Fire-and-forget; the client never acks.",
+      "sequence": [
+        { "name": "tag", "type": "uint8", "const": 81 },
+        { "name": "signal", "type": "uint8" },
+        { "name": "ts_unix_nano", "type": "uint64" },
+        { "name": "severity", "type": "uint8" },
+        { "name": "labels", "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "LabelPair" } },
+        { "name": "body", "type": "string", "kind": "length_prefixed", "length_type": "uint32", "encoding": "utf8" },
+        { "name": "attributes", "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "LabelPair" } }
+      ]
+    },
+
+    "LiveQuery": {
+      "description": "Merged-query live snapshot request (D-054). The query daemon sends this to each discovered ingester on its ingest port after the Hello handshake: 'return your retained recent records for `signal` matching these predicates.' The ingester replies with exactly one LiveBatch, then the connection is done. Logs only in v1. ts_min_unix_nano = 0 means no lower bound; ts_max_unix_nano = 0 means no upper bound; body_contains empty means no substring filter. matchers are ANDed (scry-match).",
+      "sequence": [
+        { "name": "tag", "type": "uint8", "const": 82 },
+        { "name": "signal", "type": "uint8" },
+        { "name": "matchers", "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "MatcherSpec" } },
+        { "name": "ts_min_unix_nano", "type": "uint64" },
+        { "name": "ts_max_unix_nano", "type": "uint64" },
+        { "name": "body_contains", "type": "string", "kind": "length_prefixed", "length_type": "uint32", "encoding": "utf8" }
+      ]
+    },
+
+    "LiveBatch": {
+      "description": "An ingester's reply to a LiveQuery (D-054): its retained recent records matching the request, each tagged with the WAL (shard, segment) the merged query dedups against. `writer_uuid` identifies this ingester's WAL instance (combined with signal + each record's shard). Exactly one LiveBatch is sent per LiveQuery, then the connection closes.",
+      "sequence": [
+        { "name": "tag", "type": "uint8", "const": 83 },
+        { "name": "writer_uuid", "type": "bytes", "kind": "fixed", "length": 16 },
+        { "name": "records", "type": "array", "kind": "length_prefixed", "length_type": "uint32", "items": { "type": "LiveRecord" } }
+      ]
+    },
+
+    "LiveRecord": {
+      "description": "One retained log record in a LiveBatch. `wal_shard`/`wal_seg` are the dedup tag: the merged query keeps this record iff `wal_seg > H(writer_uuid, signal, wal_shard)`, the catalog's durable per-WAL-instance segment high-water. Everything else mirrors a stored logs row (ts/severity/labels/body/attributes).",
+      "sequence": [
+        { "name": "wal_shard", "type": "uint32" },
+        { "name": "wal_seg", "type": "uint64" },
+        { "name": "ts_unix_nano", "type": "uint64" },
+        { "name": "severity", "type": "uint8" },
+        { "name": "labels", "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "LabelPair" } },
+        { "name": "body", "type": "string", "kind": "length_prefixed", "length_type": "uint32", "encoding": "utf8" },
+        { "name": "attributes", "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "LabelPair" } }
       ]
     },
 

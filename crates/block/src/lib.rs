@@ -120,6 +120,24 @@ pub trait BlockBuilder: Send + 'static {
     /// compression policy in `scry-server` (`--compression auto`).
     fn set_compression_level(&mut self, level: i32);
 
+    /// Stamp the highest WAL segment this block durably contains, read
+    /// into the `BlockMeta` at `finish_and_upload` time. The pipeline
+    /// calls this at block-close from the `SegmentId` it just sealed
+    /// (`rotate()` return), right beside `set_compression_level` — same
+    /// close-time-override idiom. The per-writer dedup watermark for the
+    /// merged history+live query (D-054). Default no-op so a builder that
+    /// never needs a watermark (or a signal that never live-tails) can
+    /// ignore it.
+    fn set_wal_seg_max(&mut self, _seg: u64) {}
+
+    /// Stamp the ingest shard index whose WAL wrote this block, read into
+    /// the `BlockMeta` at `finish_and_upload` time. Paired with
+    /// `set_wal_seg_max`: the `(writer_id, signal, wal_shard)` triple is the
+    /// WAL instance whose segments `wal_seg_max` counts, and the catalog
+    /// `wal_watermarks` high-water is keyed on it (D-054). The pipeline
+    /// passes its own `shard_index` here at block-close. Default no-op.
+    fn set_wal_shard(&mut self, _shard: u32) {}
+
     /// Consume the builder, encode to parquet (+ any sidecars), upload
     /// to object storage, and return a `BlockMeta` ready for catalog
     /// insertion. Returns `Ok(None)` if the builder turned out to be
@@ -172,6 +190,21 @@ pub struct BlockBuilderConfig {
     /// the sidecar near ~2% of body bytes. False positives only cost a
     /// wasted scan; there are never false negatives.
     pub bloom_target_fpr: f64,
+
+    /// Highest WAL segment this block durably contains, stamped into the
+    /// `BlockMeta` at encode time. Set by the pipeline at block-close via
+    /// [`BlockBuilder::set_wal_seg_max`] from the `SegmentId` it just
+    /// sealed — the same close-time-override idiom as `compression_level`.
+    /// `None` until set (and for blocks that never carry a watermark, e.g.
+    /// compaction output). The merged history+live query's per-writer
+    /// dedup watermark (D-054).
+    pub wal_seg_max: Option<u64>,
+
+    /// Ingest shard index whose WAL wrote this block, stamped into the
+    /// `BlockMeta` at encode time via [`BlockBuilder::set_wal_shard`].
+    /// Paired with `wal_seg_max` to identify the WAL instance the watermark
+    /// counts within (D-054). `None` until set (and for compaction output).
+    pub wal_shard: Option<u32>,
 }
 
 impl Default for BlockBuilderConfig {
@@ -183,6 +216,8 @@ impl Default for BlockBuilderConfig {
             compression_level: 3,            // dense by default
             bloom_ngram: 3,                  // trigrams
             bloom_target_fpr: 0.01,          // 1%
+            wal_seg_max: None,               // stamped at block-close
+            wal_shard: None,                 // stamped at block-close
         }
     }
 }

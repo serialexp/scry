@@ -165,6 +165,8 @@ mod tests {
             trace_id: Vec::new(),
             // Empty = absent (logs-only full-text substring).
             body_contains: String::new(),
+            // 0 = blocks-only (no merged history+live view).
+            live: 0,
         };
         let frame = QueryFrame {
             msg: QueryFrameMsg::QueryRequest(req.clone().into()),

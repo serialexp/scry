@@ -27,6 +27,7 @@ scry-gateway       = { workspace = true }
 scry-webui         = { workspace = true }
 scry-compact       = { workspace = true }
 scry-retention     = { workspace = true }
+scry-tail          = { workspace = true }
 
 [lints]
 workspace = true

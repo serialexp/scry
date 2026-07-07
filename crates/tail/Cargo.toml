@@ -1,0 +1,23 @@
+[package]
+name        = "scry-tail"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "scry live-tail client: subscribes to one or more ingest servers and streams matching log records to the terminal in real time (best-effort, never merged with stored history)."
+
+[lib]
+name = "scry_tail"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow     = { workspace = true }
+chrono     = { workspace = true }
+clap       = { workspace = true, features = ["env"] }
+scry-match = { workspace = true }
+scry-proto = { workspace = true }
+tokio      = { workspace = true }
+uuid       = { workspace = true }
+
+[lints]
+workspace = true

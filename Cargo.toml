@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/binschema-runtime",
     "crates/proto",
+    "crates/match",
     "crates/objstore",
     "crates/wal",
     "crates/block",
@@ -21,6 +22,7 @@ members = [
     "crates/cluster",
     "crates/valkey",
     "crates/scry-webui",
+    "crates/tail",
     "crates/scry",
 ]
 # The desktop query app (Tauri + SolidJS) is its own crate with a heavy,
@@ -57,6 +59,7 @@ aws-sigv4              = { version = "1", default-features = false, features = [
 
 binschema-runtime = { path = "crates/binschema-runtime" }
 scry-proto        = { path = "crates/proto" }
+scry-match        = { path = "crates/match" }
 scry-objstore     = { path = "crates/objstore" }
 scry-wal          = { path = "crates/wal" }
 scry-block        = { path = "crates/block" }
@@ -74,6 +77,7 @@ scry-list         = { path = "crates/scry-list" }
 scry-agent        = { path = "crates/agent" }
 scry-gateway      = { path = "crates/gateway" }
 scry-webui        = { path = "crates/scry-webui" }
+scry-tail          = { path = "crates/tail" }
 
 anyhow    = "1"
 arrow     = "58"

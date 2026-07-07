@@ -236,6 +236,12 @@ pub struct Pipeline<B: BlockBuilder> {
     /// builder is non-empty. Set on the empty→non-empty transition in the
     /// ingest paths (and after WAL replay), cleared in `spawn_upload`.
     block_started_at: Option<Instant>,
+    /// This pipeline's ingest shard index (`0..INGEST_SHARDS`), stamped
+    /// into every block's `wal_shard` meta at upload so the D-054 dedup can
+    /// key its WAL high-water on `(writer_id, signal, shard)`. Set by
+    /// [`ShardedPipeline`] from its construction loop; `0` for a standalone
+    /// [`Pipeline`] (the sole shard).
+    shard_index: u32,
 }
 
 impl<B: BlockBuilder> Pipeline<B> {
@@ -318,7 +324,31 @@ impl<B: BlockBuilder> Pipeline<B> {
             adaptive_compression: false,
             event_sink: None,
             block_started_at,
+            shard_index: 0,
         })
+    }
+
+    /// Set this pipeline's ingest shard index, stamped into every block's
+    /// `wal_shard` meta (D-054). Builder-style so `open`/`open_with_config`
+    /// keep their signatures; [`ShardedPipeline`] calls it per shard, and a
+    /// standalone pipeline keeps the `0` default.
+    pub fn with_shard_index(mut self, shard: u32) -> Self {
+        self.shard_index = shard;
+        self
+    }
+
+    /// This pipeline's ingest shard index. The logs decode path reads it in
+    /// phase 2 to stamp the WAL segment tag's shard onto the live ring
+    /// records before pushing them (D-054).
+    pub fn shard_index(&self) -> u32 {
+        self.shard_index
+    }
+
+    /// This pipeline's writer UUID — the WAL-instance discriminator that,
+    /// with signal + shard, keys the dedup high-water. Read by the live ring
+    /// feed / live-query endpoint.
+    pub fn writer_uuid(&self) -> Uuid {
+        self.writer_uuid
     }
 
     /// Attach live upload gauges for the stats endpoint. Builder-style
@@ -401,19 +431,29 @@ impl<B: BlockBuilder> Pipeline<B> {
     /// on any error so the connection's next batch decodes into a clean
     /// buffer. (A successful merge already leaves `scratch` empty.)
     ///
-    /// The record count for the ack comes from the decode the caller
-    /// already performed, so this returns `()` rather than a count.
-    pub async fn ingest_decoded(&mut self, payload: &[u8], scratch: &mut B) -> Result<()> {
+    /// Returns the [`SegmentId`] the batch's frame was appended to — the
+    /// per-shard WAL segment tag the D-054 live path stamps onto the ring
+    /// records it collected during decode, so the merged history+live query
+    /// can dedup them against the catalog high-water (`kept iff seg > H`).
+    /// The record count for the ack comes from the decode the caller already
+    /// performed, so this returns the segment rather than a count.
+    pub async fn ingest_decoded(&mut self, payload: &[u8], scratch: &mut B) -> Result<SegmentId> {
         // Order matters: WAL first, builder second — same invariant as
         // `ingest`. If the WAL append fails we never merge the scratch
         // records into the shared builder; the agent sees the BatchAck
         // failure and retries, and the caller resets the scratch.
-        self.wal
-            .lock()
-            .await
-            .append(payload)
-            .await
-            .context("WAL append")?;
+        //
+        // Capture the segment the frame lands in *before* the append: an
+        // append that tips the segment past its cap rotates internally
+        // *after* writing the frame, so the frame is in the pre-append
+        // current segment, not `current_segment()` afterwards. Same lock
+        // acquisition so no other holder can rotate between the two.
+        let seg = {
+            let mut wal = self.wal.lock().await;
+            let seg = wal.current_segment();
+            wal.append(payload).await.context("WAL append")?;
+            seg
+        };
 
         self.builder.merge(scratch);
         self.mark_block_started();
@@ -424,7 +464,7 @@ impl<B: BlockBuilder> Pipeline<B> {
         // Reap any finished upload tasks so the JoinSet doesn't grow
         // unbounded. Non-blocking.
         self.reap_finished();
-        Ok(())
+        Ok(seg)
     }
 
     pub async fn ingest(&mut self, payload: &[u8]) -> Result<u64> {
@@ -531,6 +571,15 @@ impl<B: BlockBuilder> Pipeline<B> {
         if self.adaptive_compression {
             old_builder.set_compression_level(self.adaptive_level());
         }
+
+        // D-054 dedup watermark: the block we're about to encode durably
+        // contains every record up to and including the segment `rotate()`
+        // just sealed, for this shard's WAL. Stamp both into the meta so the
+        // catalog can advance `H(writer, signal, shard)` on insert — the
+        // exact seam the merged history+live query dedups against. Same
+        // close-time-override idiom as `set_compression_level`.
+        old_builder.set_wal_seg_max(sealed.0);
+        old_builder.set_wal_shard(self.shard_index);
 
         let store = self.store.clone();
         let wal = self.wal.clone();
@@ -733,7 +782,8 @@ impl<B: BlockBuilder> ShardedPipeline<B> {
             .await
             .with_context(|| format!("opening {} shard {k}", B::SIGNAL))?
             .with_upload_sem(upload_sem.clone())
-            .with_adaptive_compression(adaptive_compression);
+            .with_adaptive_compression(adaptive_compression)
+            .with_shard_index(k as u32);
             if let Some(s) = upload_stats.as_ref() {
                 pipe = pipe.with_upload_stats(s.clone());
             }

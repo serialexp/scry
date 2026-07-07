@@ -22,9 +22,11 @@
 pub mod client;
 pub mod lease;
 pub mod pubsub;
+pub mod registry;
 pub mod sink;
 
 pub use client::{ValkeyClient, VALKEY_URL_ENV};
 pub use lease::{ValkeyLease, ValkeyLeaseProvider};
 pub use pubsub::{channel_for, parse_envelope, publish_envelope, subscribe_blocks};
+pub use registry::{discover_tail_endpoints, TailRegistration, TAIL_REGISTRY_PREFIX};
 pub use sink::ValkeySink;

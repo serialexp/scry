@@ -4,11 +4,12 @@
 # Clients connect with `scry get --remote <addr>:4100`.
 #
 # Single replica. The daemon keeps its own SQLite catalog (NOT shared with the
-# ingest server's WAL volume): an init container seeds it from the bucket once,
-# then a `scry list --interval` sidecar reconciles it on a loop. The daemon opens
-# the same file and SQLite's WAL makes the sidecar's cross-process writes
-# visible to its per-query catalog lookups. The catalog is fully rebuildable
-# from the bucket, so it lives on an emptyDir — no PVC needed.
+# ingest server's WAL volume) on an emptyDir. On a cold boot it restores the
+# catalog from the bucket snapshot the ingester uploads (D-055) in one GET —
+# `_catalog/snapshot.sqlite` — instead of walking every block sidecar, then its
+# own built-in poll + full-walk convergence loops keep it fresh (no seed init
+# container or reconcile sidecar needed). The catalog is fully rebuildable from
+# the bucket, so the emptyDir stays — no PVC.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -34,23 +35,6 @@ spec:
         runAsUser: 65532
         runAsGroup: 65532
         fsGroup: 65532
-      initContainers:
-        # Seed the catalog from the bucket once before the daemon starts, so the
-        # first query has a populated catalog to plan against.
-        - name: catalog-seed
-          image: serialexp/scry:latest
-          imagePullPolicy: IfNotPresent
-          command:
-            - scry
-            - list
-            - --catalog
-            - /catalog/catalog.sqlite
-          envFrom:
-            - secretRef:
-                name: scry-objstore
-          volumeMounts:
-            - name: catalog
-              mountPath: /catalog
       containers:
         - name: query
           image: serialexp/scry:latest
@@ -84,28 +68,6 @@ spec:
               # Headroom over the daemon's default 1024 MiB DataFusion budget
               # (streaming operators aren't accounted, so true RSS runs higher).
               memory: "1536Mi"
-          volumeMounts:
-            - name: catalog
-              mountPath: /catalog
-        - name: catalog-reconcile
-          image: serialexp/scry:latest
-          imagePullPolicy: IfNotPresent
-          command:
-            - scry
-            - list
-            - --catalog
-            - /catalog/catalog.sqlite
-            - --interval
-            - "60"
-          envFrom:
-            - secretRef:
-                name: scry-objstore
-          resources:
-            requests:
-              cpu: "25m"
-              memory: "64Mi"
-            limits:
-              memory: "256Mi"
           volumeMounts:
             - name: catalog
               mountPath: /catalog

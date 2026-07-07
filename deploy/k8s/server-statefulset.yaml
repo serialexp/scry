@@ -43,6 +43,10 @@ spec:
             - --wal-dir=/wal
             - --catalog=/wal/catalog.sqlite
             - --writer-id=scry-ingest-0
+            # Upload the online catalog to the bucket (_catalog/snapshot.sqlite)
+            # every 5 min so a cold `scry query` restores it in one GET instead
+            # of walking every block sidecar (D-055). Non-destructive, no lease.
+            - --catalog-snapshot-interval=300s
           envFrom:
             - secretRef:
                 name: scry-objstore

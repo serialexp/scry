@@ -225,6 +225,14 @@ impl BlockBuilder for LogsBlockBuilder {
         self.cfg.compression_level = level;
     }
 
+    fn set_wal_seg_max(&mut self, seg: u64) {
+        self.cfg.wal_seg_max = Some(seg);
+    }
+
+    fn set_wal_shard(&mut self, shard: u32) {
+        self.cfg.wal_shard = Some(shard);
+    }
+
     fn finish_and_upload(
         self,
         store: &dyn ObjectStore,
@@ -457,6 +465,8 @@ impl LogsBlockBuilder {
             all_fingerprints: Some(all_fingerprints),
             has_body_bloom: true,
             body_bloom_size_bytes: Some(bloom_size),
+            wal_seg_max: self.cfg.wal_seg_max,
+            wal_shard: self.cfg.wal_shard,
         };
         let meta_bytes =
             Bytes::from(serde_json::to_vec_pretty(&meta).context("serialising logs BlockMeta")?);

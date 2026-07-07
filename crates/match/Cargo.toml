@@ -1,0 +1,19 @@
+[package]
+name        = "scry-match"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Prometheus-style label matchers (key=value | key!=value | key=~regex | key!~regex) shared across scry: the agent's node-side keep allow-list and the ingest server's live-tail subscription filter."
+
+[lib]
+name = "scry_match"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow     = { workspace = true }
+regex      = { workspace = true }
+scry-proto = { workspace = true }
+
+[lints]
+workspace = true

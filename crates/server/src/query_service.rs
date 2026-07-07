@@ -53,8 +53,8 @@ use scry_catalog::CatalogEntry;
 use scry_objstore::{BufPool, PoolStats};
 use scry_proto::{
     constants::{
-        Signal, QUERY_ERR_BAD_REQUEST, QUERY_ERR_INTERNAL, QUERY_ERR_PLAN, QUERY_ERR_RESOURCES,
-        QUERY_ERR_SQL_PARSE,
+        Signal, QUERY_ERR_BAD_REQUEST, QUERY_ERR_INTERNAL, QUERY_ERR_LIVE_UNAVAILABLE,
+        QUERY_ERR_PLAN, QUERY_ERR_RESOURCES, QUERY_ERR_SQL_PARSE,
     },
     framing::{read_frame, write_frame, Framed, MAX_FRAME_BYTES},
     BatchMsgInput, EndOfStreamInput, LabelNamesRequestOutput, LabelNamesResponseInput,
@@ -63,7 +63,10 @@ use scry_proto::{
 };
 use scry_query::{
     collect_label_names, collect_label_values, hash128, list_metrics_candidates,
-    logs::{list_logs_candidates, register_logs_table_from_candidates, LOGS_TABLE_NAME},
+    logs::{
+        build_logs_table_from_candidates, list_logs_candidates, register_live_logs_table,
+        register_logs_table_from_candidates, LiveLogRow, LOGS_LIVE_TABLE_NAME, LOGS_TABLE_NAME,
+    },
     meta_query,
     profiles::{
         list_profiles_candidates, register_profiles_table_from_candidates, PROFILES_TABLE_NAME,
@@ -73,10 +76,17 @@ use scry_query::{
     BloomCache, BloomCacheStats, EvictOnNotFound, PostingsCache, PostingsCacheStats, Query,
     QueryRequest, QueryResultCache, QueryResultCacheStats, METRICS_TABLE_NAME,
 };
+
+use crate::live_merge::{fetch_live_from_ingester, LiveDiscovery};
 use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, info_span, warn, Instrument, Span};
 use uuid::Uuid;
+
+/// Per-ingester deadline for the live fan-in (D-054). A slow/dead ingester
+/// is skipped after this so one straggler can't stall the merged query; the
+/// stored (block) half always returns regardless.
+const LIVE_FETCH_DEADLINE: Duration = Duration::from_secs(2);
 
 /// Per-query start snapshots of the two sidecar caches, bundled so the
 /// many `emit_scan_complete` call sites can pass one `cache_start` value
@@ -139,6 +149,11 @@ pub struct QueryService {
     /// didn't supply `request_id`. A `u64` is plenty — the daemon
     /// would have to serve 18 quintillion requests to wrap.
     next_request_id: AtomicU64,
+    /// Discovery of live ingester endpoints for the merged history+live
+    /// query (D-054). `None` when the daemon has no Valkey — a `live`
+    /// logs query is then refused with `QUERY_ERR_LIVE_UNAVAILABLE`
+    /// rather than silently degraded to blocks-only (decision 3).
+    live_discovery: Option<Arc<dyn LiveDiscovery>>,
 }
 
 impl QueryService {
@@ -165,7 +180,17 @@ impl QueryService {
             result_cache,
             result_cache_entry_bytes,
             next_request_id: AtomicU64::new(0),
+            live_discovery: None,
         }
+    }
+
+    /// Attach a live-ingester discovery source (D-054). Enables the merged
+    /// history+live logs query; without it a `live` query is refused with
+    /// `QUERY_ERR_LIVE_UNAVAILABLE`. Builder-style — call before wrapping the
+    /// service in an `Arc`.
+    pub fn with_live_discovery(mut self, discovery: Option<Arc<dyn LiveDiscovery>>) -> Self {
+        self.live_discovery = discovery;
+        self
     }
 
     /// Borrow the postings cache — exposed so the binary can log
@@ -409,12 +434,165 @@ impl QueryService {
         }
     }
 
+    /// Register the merged history+live logs surface (D-054) into `ctx`: the
+    /// block-backed table under a private name, the fanned-in live rows as an
+    /// in-memory table, and a `logs` view = their `UNION ALL`. After this the
+    /// rest of [`plan_and_execute`] proceeds unchanged — `logs` resolves to the
+    /// union for both the default `SELECT *` and any caller SQL.
+    async fn register_logs_merged(
+        &self,
+        ctx: &SessionContext,
+        candidates: Vec<CatalogEntry>,
+        store: Arc<dyn ObjectStore>,
+        live_rows: &[LiveLogRow],
+        query: &Query,
+    ) -> Result<()> {
+        // Blocks under a private name so `logs` is free for the union view.
+        let table = build_logs_table_from_candidates(
+            candidates,
+            store.clone(),
+            Some(self.postings_cache.as_ref()),
+            Some(self.bloom_cache.as_ref()),
+            query,
+        )
+        .await?;
+        // `object_store_url().as_ref()` resolves to `&url::Url` from
+        // `register_object_store`'s signature — no need to name the `url`
+        // crate (not a direct dep here).
+        let store_url = table.object_store_url().clone();
+        ctx.runtime_env()
+            .register_object_store(store_url.as_ref(), store);
+        ctx.register_table("__logs_blocks", Arc::new(table))
+            .map_err(|e| anyhow::anyhow!("register __logs_blocks: {e}"))?;
+
+        // Live (in-flight, already watermark-deduped) rows as `logs_live`.
+        register_live_logs_table(ctx, live_rows)?;
+
+        // Expose `logs` as the union of both. `logs_live` is schema-identical
+        // to `__logs_blocks`, so UNION ALL is well-typed.
+        ctx.sql(&format!(
+            "CREATE VIEW {LOGS_TABLE_NAME} AS \
+             SELECT * FROM __logs_blocks UNION ALL SELECT * FROM {LOGS_LIVE_TABLE_NAME}"
+        ))
+        .await
+        .map_err(|e| anyhow::anyhow!("create logs union view: {e}"))?;
+        Ok(())
+    }
+
+    /// Fan in the live half of a merged logs query (D-054): discover the
+    /// ingesters, ask each for its retained recent records matching the
+    /// predicate, and dedup them against the catalog's durable WAL high-water
+    /// so a record already in a block is dropped. Returns the survivors as
+    /// [`LiveLogRow`]s ready to register as `logs_live`.
+    ///
+    /// `discovery` is the caller-verified `Some` source. A dead/slow ingester
+    /// is skipped (logged), not fatal; only a discovery failure (Valkey down)
+    /// surfaces as `QUERY_ERR_LIVE_UNAVAILABLE`.
+    async fn fetch_live_logs(
+        &self,
+        discovery: &Arc<dyn LiveDiscovery>,
+        req: &QueryRequest,
+    ) -> std::result::Result<Vec<LiveLogRow>, (u16, String)> {
+        // Discovery failure = the live half can't be served → refuse.
+        let endpoints = discovery.discover().await.map_err(|e| {
+            (
+                QUERY_ERR_LIVE_UNAVAILABLE,
+                format!("live ingester discovery failed: {e:#}"),
+            )
+        })?;
+
+        // Turn the request's equality matchers into scry-match spec strings
+        // (`key="value"`), the same grammar the ingester's ring filter parses.
+        let matchers: Vec<String> = req
+            .query
+            .matchers
+            .iter()
+            .map(|(k, v)| format!("{k}=\"{v}\""))
+            .collect();
+        let ts_min = req.query.ts_min.unwrap_or(0);
+        let ts_max = req.query.ts_max.unwrap_or(0);
+        let body_contains = req.query.body_contains.clone().unwrap_or_default();
+        let signal = Signal::Logs as u8;
+
+        // Fan out to every ingester, best-effort with a short per-peer deadline.
+        let mut batches: Vec<scry_proto::generated::LiveBatchOutput> = Vec::new();
+        for addr in &endpoints {
+            let fut =
+                fetch_live_from_ingester(addr, signal, &matchers, ts_min, ts_max, &body_contains);
+            match tokio::time::timeout(LIVE_FETCH_DEADLINE, fut).await {
+                Ok(Ok(batch)) => batches.push(batch),
+                Ok(Err(e)) => {
+                    warn!(%addr, error = %format!("{e:#}"), "live fetch from ingester failed; skipping")
+                }
+                Err(_) => warn!(%addr, "live fetch from ingester timed out; skipping"),
+            }
+        }
+
+        // Dedup each record against the durable WAL high-water for its
+        // (writer, "logs", shard). Keep iff `wal_seg > H` (absent ⇒ 0). Cache
+        // the watermark per (writer, shard) so we lock the catalog once per
+        // distinct WAL instance, not once per record.
+        // Watermark per WAL instance: `None` = no block yet for this
+        // (writer, shard) ⇒ *nothing* is durable, so every live record is
+        // kept (segment 0 included — WAL segments are 0-based, so an
+        // `unwrap_or(0)` here would wrongly treat the first segment as
+        // already-durable and drop it before the first flush). `Some(h)` =
+        // segments `≤ h` are durable in a block.
+        let mut wm_cache: std::collections::HashMap<(Uuid, u32), Option<u64>> =
+            std::collections::HashMap::new();
+        let mut rows: Vec<LiveLogRow> = Vec::new();
+        for batch in batches {
+            let writer = match Uuid::from_slice(&batch.writer_uuid) {
+                Ok(u) => u,
+                Err(e) => {
+                    warn!(error = %e, "live batch had a malformed writer_uuid; skipping");
+                    continue;
+                }
+            };
+            for r in batch.records {
+                let key = (writer, r.wal_shard);
+                let hw = match wm_cache.get(&key) {
+                    Some(&h) => h,
+                    None => {
+                        let h = {
+                            let guard = self.catalog.lock().map_err(|e| {
+                                (QUERY_ERR_INTERNAL, format!("catalog mutex poisoned: {e}"))
+                            })?;
+                            guard
+                                .get_watermark(writer, "logs", r.wal_shard)
+                                .map_err(|e| {
+                                    (QUERY_ERR_INTERNAL, format!("get_watermark: {e:#}"))
+                                })?
+                        };
+                        wm_cache.insert(key, h);
+                        h
+                    }
+                };
+                // Records at or below the high-water are already durable in a
+                // block — drop them here so they aren't double-counted. An
+                // absent watermark covers nothing, so nothing is dropped.
+                if live_record_is_durable(r.wal_seg, hw) {
+                    continue;
+                }
+                rows.push(LiveLogRow {
+                    ts_unix_nano: r.ts_unix_nano,
+                    severity: r.severity,
+                    body: r.body,
+                    labels: r.labels.into_iter().map(|p| (p.key, p.value)).collect(),
+                    attributes: r.attributes.into_iter().map(|p| (p.key, p.value)).collect(),
+                });
+            }
+        }
+        Ok(rows)
+    }
+
     async fn plan_and_execute(
         &self,
         signal: Signal,
         req: &QueryRequest,
         store: Arc<dyn ObjectStore>,
         candidates: Vec<CatalogEntry>,
+        live_rows: Option<Vec<LiveLogRow>>,
     ) -> std::result::Result<(SendableRecordBatchStream, Arc<dyn ExecutionPlan>), (u16, String)>
     {
         let ctx =
@@ -432,17 +610,28 @@ impl QueryService {
                 )
                 .await
             }
-            Signal::Logs => {
-                register_logs_table_from_candidates(
-                    &ctx,
-                    candidates,
-                    store.clone(),
-                    Some(self.postings_cache.as_ref()),
-                    Some(self.bloom_cache.as_ref()),
-                    &req.query,
-                )
-                .await
-            }
+            Signal::Logs => match live_rows {
+                // Merged history+live view (D-054): register the block-backed
+                // logs table under a private name, the fanned-in live rows as
+                // an in-memory table, and expose `logs` as their UNION ALL —
+                // so both the default `SELECT * FROM logs` and any caller SQL
+                // referencing `logs` transparently span the block-commit seam.
+                Some(rows) => {
+                    self.register_logs_merged(&ctx, candidates, store.clone(), &rows, &req.query)
+                        .await
+                }
+                None => {
+                    register_logs_table_from_candidates(
+                        &ctx,
+                        candidates,
+                        store.clone(),
+                        Some(self.postings_cache.as_ref()),
+                        Some(self.bloom_cache.as_ref()),
+                        &req.query,
+                    )
+                    .await
+                }
+            },
             Signal::Traces => {
                 register_traces_table_from_candidates(
                     &ctx,
@@ -697,6 +886,57 @@ impl QueryService {
         // on every exit path (success + each error path).
         let mut rows_total: u64 = 0;
 
+        // ── Live fan-in (D-054) ──────────────────────────────────────────
+        //
+        // For a `live` logs query, fan in the ingesters' retained recent
+        // records and dedup them against the catalog watermark *once*, up
+        // front — the live half is independent of the block candidate set,
+        // so it survives the transparent re-plan below unchanged. No Valkey
+        // discovery ⇒ refuse (decision 3); non-logs `live` is ignored.
+        let live_rows: Option<Vec<LiveLogRow>> = if req.live && signal == Signal::Logs {
+            match self.live_discovery.clone() {
+                Some(disco) => match self.fetch_live_logs(&disco, &req).await {
+                    Ok(rows) => Some(rows),
+                    Err((code, msg)) => {
+                        let _ = emit_stream_error(&mut wr, code, msg).await;
+                        let _ = wr.flush().await;
+                        self.emit_scan_complete(
+                            signal,
+                            None,
+                            rows_total,
+                            pool_start,
+                            cache_start,
+                            "miss",
+                            t0.elapsed(),
+                        );
+                        return Ok(());
+                    }
+                },
+                None => {
+                    let _ = emit_stream_error(
+                        &mut wr,
+                        QUERY_ERR_LIVE_UNAVAILABLE,
+                        "live query requires Valkey ingester discovery; this server has none"
+                            .to_string(),
+                    )
+                    .await;
+                    let _ = wr.flush().await;
+                    self.emit_scan_complete(
+                        signal,
+                        None,
+                        rows_total,
+                        pool_start,
+                        cache_start,
+                        "miss",
+                        t0.elapsed(),
+                    );
+                    return Ok(());
+                }
+            }
+        } else {
+            None
+        };
+
         // ── Result-cache lookup + plan/execute, with one transparent
         //    re-plan on a peer's deletion ───────────────────────────────
         //
@@ -739,31 +979,35 @@ impl QueryService {
 
             // (2) Cache key + hit short-circuit. The cached value is the exact
             // concatenation of the SchemaMsg + BatchMsg… + EndOfStream frames,
-            // so a hit is a single write_all.
+            // so a hit is a single write_all. A `live` query is time-varying
+            // (fresh in-flight records every instant), so it never consults or
+            // populates the result cache.
             let key = data_query_cache_key(signal, &req, &candidates);
-            if let Some(bytes) = self.result_cache.get(key) {
-                if let Err(e) = wr.write_all(&bytes).await {
-                    warn!(error = %e, "client disconnected while writing cached response");
+            if !req.live {
+                if let Some(bytes) = self.result_cache.get(key) {
+                    if let Err(e) = wr.write_all(&bytes).await {
+                        warn!(error = %e, "client disconnected while writing cached response");
+                    }
+                    let _ = wr.flush().await;
+                    // total_rows is not recomputed on a hit (the count rides inside
+                    // the cached EndOfStream frame the client parses); `cache=hit`
+                    // marks the fast path in telemetry.
+                    self.emit_scan_complete(
+                        signal,
+                        None,
+                        rows_total,
+                        pool_start,
+                        cache_start,
+                        "hit",
+                        t0.elapsed(),
+                    );
+                    return Ok(());
                 }
-                let _ = wr.flush().await;
-                // total_rows is not recomputed on a hit (the count rides inside
-                // the cached EndOfStream frame the client parses); `cache=hit`
-                // marks the fast path in telemetry.
-                self.emit_scan_complete(
-                    signal,
-                    None,
-                    rows_total,
-                    pool_start,
-                    cache_start,
-                    "hit",
-                    t0.elapsed(),
-                );
-                return Ok(());
             }
 
             // (3) Miss → plan + execute against the candidate set.
             match self
-                .plan_and_execute(signal, &req, store.clone(), candidates)
+                .plan_and_execute(signal, &req, store.clone(), candidates, live_rows.clone())
                 .await
             {
                 Ok((stream, physical)) => break (stream, physical, key),
@@ -798,8 +1042,9 @@ impl QueryService {
 
         // Buffer the response for the cache while it streams (dropped past the
         // per-entry cap → response still streams, just isn't cached). Skipped
-        // entirely when the cache is disabled.
-        let mut tee = if self.result_cache.enabled() {
+        // entirely when the cache is disabled or the query is `live` (whose
+        // result is time-varying and must never be cached).
+        let mut tee = if self.result_cache.enabled() && !req.live {
             ResponseTee::new(self.result_cache_entry_bytes)
         } else {
             ResponseTee::disabled()
@@ -1337,4 +1582,52 @@ fn summarise_metrics(metrics: &MetricsSet) -> (usize, usize, usize, usize) {
         files_pruned,
         bytes_scanned,
     )
+}
+
+/// The merged history+live dedup selector (D-054). A live record tagged with
+/// `wal_seg` is *durable* — already committed to a block and therefore must be
+/// dropped from the live half to avoid a double across the block-commit seam —
+/// iff a watermark exists for its WAL instance and its segment is at or below
+/// it. An absent watermark (`None`) means no block has ever sealed for that
+/// `(writer, shard)`, so nothing is durable yet and every live record is kept.
+///
+/// WAL segments are 0-based, so this must be `Option`-aware: `Some(0)` (the
+/// first block sealed segment 0) legitimately covers segment 0, whereas `None`
+/// (no block) must *not* — collapsing the two via `unwrap_or(0)` would drop a
+/// fresh ingester's first-segment records before its first flush.
+#[inline]
+fn live_record_is_durable(wal_seg: u64, watermark: Option<u64>) -> bool {
+    matches!(watermark, Some(h) if wal_seg <= h)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::live_record_is_durable;
+
+    #[test]
+    fn absent_watermark_keeps_everything_including_segment_zero() {
+        // No block yet for this (writer, shard): nothing is durable, so even
+        // segment 0 stays live. This is the case `unwrap_or(0)` got wrong.
+        assert!(!live_record_is_durable(0, None));
+        assert!(!live_record_is_durable(7, None));
+    }
+
+    #[test]
+    fn watermark_zero_covers_only_segment_zero() {
+        // First block sealed segment 0 ⇒ H = Some(0). Segment 0 is durable;
+        // segment 1+ (appended after the post-flush rotation) is still live.
+        assert!(live_record_is_durable(0, Some(0)));
+        assert!(!live_record_is_durable(1, Some(0)));
+    }
+
+    #[test]
+    fn straddle_splits_exactly_at_the_watermark() {
+        // A block that spanned segments up to 5 (size-based mid-block WAL
+        // rotation) advances H to 5. Live records ≤ 5 are durable; > 5 live.
+        for seg in 0..=5 {
+            assert!(live_record_is_durable(seg, Some(5)), "seg {seg} ≤ 5");
+        }
+        assert!(!live_record_is_durable(6, Some(5)));
+        assert!(!live_record_is_durable(u64::MAX, Some(5)));
+    }
 }

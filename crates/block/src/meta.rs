@@ -96,4 +96,34 @@ pub struct BlockMeta {
     /// the full-text index overhead without opening the sidecar.
     #[serde(default)]
     pub body_bloom_size_bytes: Option<u64>,
+
+    /// Highest WAL segment sequence number this block durably contains,
+    /// for the WAL instance `(writer_id, signal, wal_shard)`. Set at
+    /// upload time from the `SegmentId` the pipeline just sealed (the
+    /// block covers *all* records in that instance's segments
+    /// `<= wal_seg_max`). Together with `wal_shard` this feeds the catalog
+    /// `wal_watermarks` high-water table that the merged history+live query
+    /// uses to deduplicate across the block-commit seam (D-054): on
+    /// `insert_block`/reconcile the catalog advances
+    /// `H(writer, signal, shard) = max(H, wal_seg_max)` monotonically, and
+    /// a live in-flight record tagged `(writer, shard, seg)` is kept iff
+    /// `seg > H`. `None` for pre-D-054 sidecars **and** for compacted
+    /// blocks — a merged block groups inputs across `(signal, date, level)`
+    /// spanning multiple writers/shards, so it can't carry a single
+    /// instance's scalar watermark; its L0 inputs already advanced `H` when
+    /// first inserted, so `None` is harmless. `#[serde(default)]` keeps old
+    /// sidecars deserialising. Treated as "advances nothing" when absent.
+    #[serde(default)]
+    pub wal_seg_max: Option<u64>,
+
+    /// The ingest shard index (`0..INGEST_SHARDS`) whose WAL wrote this
+    /// block. With `writer_id` + `signal` this identifies the WAL instance
+    /// that `wal_seg_max` counts segments within — segment numbers are only
+    /// comparable *inside* one `(writer, signal, shard)` because every
+    /// signal runs `INGEST_SHARDS` independent WAL sequences per instance,
+    /// all sharing one `writer_id`. `None` for pre-D-054 sidecars and for
+    /// compacted blocks (see `wal_seg_max`); `#[serde(default)]` keeps old
+    /// sidecars deserialising.
+    #[serde(default)]
+    pub wal_shard: Option<u32>,
 }

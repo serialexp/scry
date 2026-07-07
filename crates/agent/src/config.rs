@@ -33,8 +33,8 @@ use serde::Deserialize;
 
 use scry_proto::LabelPair;
 
-use crate::filter::LabelFilter;
 use crate::scrape::TlsProfile;
+use scry_match::LabelFilter;
 
 // ── File shape (serde) ──────────────────────────────────────────────────────
 

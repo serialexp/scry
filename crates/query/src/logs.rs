@@ -32,7 +32,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use datafusion::arrow::array::{
-    Array, ArrayRef, MapBuilder, MapFieldNames, StringBuilder, UInt64Array,
+    Array, ArrayRef, MapBuilder, MapFieldNames, StringBuilder, UInt64Array, UInt64Builder,
+    UInt8Builder,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -41,6 +42,7 @@ use datafusion::common::{DFSchema, DataFusionError, Result as DfResult, ScalarVa
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::memory::DataSourceExec;
 use datafusion::datasource::physical_plan::{FileScanConfigBuilder, ParquetSource};
+use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::TaskContext;
@@ -818,6 +820,103 @@ pub async fn logs_query(
     ctx.table(LOGS_TABLE_NAME)
         .await
         .with_context(|| format!("looking up table {LOGS_TABLE_NAME}"))
+}
+
+// ── Live merge (D-054): in-memory logs rows fanned in from ingesters ──
+
+/// Table name the live (in-flight) logs rows are registered under for the
+/// merged history+live view (D-054). The query unions `logs` (blocks) with
+/// `logs_live` (this MemTable) so a single scan spans the block-commit seam.
+pub const LOGS_LIVE_TABLE_NAME: &str = "logs_live";
+
+/// One live log record fanned in from an ingester's retained ring for the
+/// merged query, already deduplicated against the block watermark. Mirrors
+/// the columns the block-backed logs *table* exposes so a batch of these
+/// unions cleanly with the stored side.
+#[derive(Debug, Clone)]
+pub struct LiveLogRow {
+    pub ts_unix_nano: u64,
+    pub severity: u8,
+    pub body: String,
+    /// Stream-level labels → the synthesised `labels` column.
+    pub labels: Vec<(String, String)>,
+    /// Per-entry attributes → the `attributes` map column.
+    pub attributes: Vec<(String, String)>,
+}
+
+/// The logs *table* schema (physical logs columns + synthesised `labels`),
+/// exposed so the live-merge path can build a schema-identical `MemTable`.
+pub fn logs_table_schema_public() -> SchemaRef {
+    logs_table_schema()
+}
+
+/// Build a `RecordBatch` matching [`logs_table_schema_public`] from live
+/// rows. `stream_fingerprint` is recomputed from each row's labels with the
+/// same [`scry_proto::fingerprint::fingerprint`] the ingest side uses, so a
+/// live row and its eventual stored twin carry the identical fingerprint.
+pub fn build_live_logs_batch(rows: &[LiveLogRow]) -> DfResult<RecordBatch> {
+    let schema = logs_table_schema();
+    let mut fp = UInt64Builder::with_capacity(rows.len());
+    let mut ts = UInt64Builder::with_capacity(rows.len());
+    let mut sev = UInt8Builder::with_capacity(rows.len());
+    let mut body = StringBuilder::new();
+    let mut attrs = MapBuilder::new(
+        Some(labels_map_field_names()),
+        StringBuilder::new(),
+        StringBuilder::new(),
+    );
+    let mut labels = MapBuilder::new(
+        Some(labels_map_field_names()),
+        StringBuilder::new(),
+        StringBuilder::new(),
+    );
+    for r in rows {
+        let pairs: Vec<scry_proto::LabelPair> = r
+            .labels
+            .iter()
+            .map(|(k, v)| scry_proto::LabelPair {
+                key: k.clone(),
+                value: v.clone(),
+            })
+            .collect();
+        fp.append_value(scry_proto::fingerprint::fingerprint(&pairs));
+        ts.append_value(r.ts_unix_nano);
+        sev.append_value(r.severity);
+        body.append_value(&r.body);
+        for (k, v) in &r.attributes {
+            attrs.keys().append_value(k);
+            attrs.values().append_value(v);
+        }
+        attrs.append(true)?;
+        for (k, v) in &r.labels {
+            labels.keys().append_value(k);
+            labels.values().append_value(v);
+        }
+        labels.append(true)?;
+    }
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(fp.finish()),
+        Arc::new(ts.finish()),
+        Arc::new(sev.finish()),
+        Arc::new(body.finish()),
+        Arc::new(attrs.finish()),
+        Arc::new(labels.finish()),
+    ];
+    RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)
+}
+
+/// Register `rows` as an in-memory `logs_live` table in `ctx`, schema-identical
+/// to the block-backed `logs` table. Registering an empty batch is fine — the
+/// union then simply contributes no live rows.
+pub fn register_live_logs_table(ctx: &SessionContext, rows: &[LiveLogRow]) -> Result<()> {
+    let schema = logs_table_schema();
+    let batch = build_live_logs_batch(rows)
+        .map_err(|e| anyhow::anyhow!("building live logs batch: {e}"))?;
+    let table = MemTable::try_new(schema, vec![vec![batch]])
+        .map_err(|e| anyhow::anyhow!("creating logs_live MemTable: {e}"))?;
+    ctx.register_table(LOGS_LIVE_TABLE_NAME, Arc::new(table))
+        .map_err(|e| anyhow::anyhow!("register logs_live table: {e}"))?;
+    Ok(())
 }
 
 // ── tiny helper: shared time_overlaps lives in table.rs ───────────

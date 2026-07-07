@@ -25,7 +25,6 @@ use uuid::Uuid;
 mod config;
 mod cri;
 mod discovery;
-mod filter;
 mod promparse;
 mod scrape;
 mod stream;
@@ -576,7 +575,7 @@ async fn ingest(
 fn ingest_metrics(
     pending: &mut MetricsPending,
     result: scrape::ScrapeResult,
-    keep_filter: &filter::LabelFilter,
+    keep_filter: &scry_match::LabelFilter,
     keep_cache: &mut HashMap<u64, bool>,
     dropped: &mut u64,
 ) {

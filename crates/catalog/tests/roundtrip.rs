@@ -29,7 +29,66 @@ fn meta(uuid: Uuid, writer: Uuid, ts_min: u64, rows: u64) -> BlockMeta {
         all_fingerprints: None,
         has_body_bloom: false,
         body_bloom_size_bytes: None,
+        wal_seg_max: None,
+        wal_shard: None,
     }
+}
+
+/// D-054: inserting a block advances the persistent WAL high-water
+/// atomically, monotonically, and per-`(writer, signal, shard)`; and the
+/// `wal_seg_max`/`wal_shard` columns round-trip through `list_blocks`.
+#[test]
+fn wal_watermark_advances_monotonically_per_instance() {
+    let tmp = TempDir::new().unwrap();
+    let cat = Catalog::open(&tmp.path().join("cat.sqlite"), "scry-dev").unwrap();
+    let writer = Uuid::now_v7();
+    let ts = 1_700_000_000_000_000_000;
+
+    let with_wm = |seg: u64, shard: u32| {
+        let mut m = meta(Uuid::now_v7(), writer, ts, 10);
+        m.signal = "logs".into();
+        m.wal_seg_max = Some(seg);
+        m.wal_shard = Some(shard);
+        m
+    };
+
+    // No blocks yet → absent (treated as 0 by the dedup).
+    assert_eq!(cat.get_watermark(writer, "logs", 0).unwrap(), None);
+
+    // First block on shard 0 at seg 5 sets the high-water.
+    cat.insert_block(&with_wm(5, 0)).unwrap();
+    assert_eq!(cat.get_watermark(writer, "logs", 0).unwrap(), Some(5));
+
+    // A later (higher) segment advances it.
+    cat.insert_block(&with_wm(9, 0)).unwrap();
+    assert_eq!(cat.get_watermark(writer, "logs", 0).unwrap(), Some(9));
+
+    // An out-of-order (lower) segment must NOT roll it back.
+    cat.insert_block(&with_wm(7, 0)).unwrap();
+    assert_eq!(cat.get_watermark(writer, "logs", 0).unwrap(), Some(9));
+
+    // A different shard is an independent instance.
+    assert_eq!(cat.get_watermark(writer, "logs", 3).unwrap(), None);
+    cat.insert_block(&with_wm(2, 3)).unwrap();
+    assert_eq!(cat.get_watermark(writer, "logs", 3).unwrap(), Some(2));
+    assert_eq!(cat.get_watermark(writer, "logs", 0).unwrap(), Some(9));
+
+    // A different signal is independent too.
+    assert_eq!(cat.get_watermark(writer, "metrics", 0).unwrap(), None);
+
+    // The columns round-trip through the catalog.
+    let rows = cat.list_blocks().unwrap();
+    let one = rows
+        .iter()
+        .find(|r| r.meta.wal_seg_max == Some(5) && r.meta.wal_shard == Some(0))
+        .expect("seg=5 shard=0 block present with watermark columns");
+    assert_eq!(one.meta.wal_shard, Some(0));
+
+    // Direct advance_watermark is also monotonic (used by convergence).
+    cat.advance_watermark(writer, "logs", 0, 4).unwrap();
+    assert_eq!(cat.get_watermark(writer, "logs", 0).unwrap(), Some(9));
+    cat.advance_watermark(writer, "logs", 0, 42).unwrap();
+    assert_eq!(cat.get_watermark(writer, "logs", 0).unwrap(), Some(42));
 }
 
 #[test]

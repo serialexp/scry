@@ -21,8 +21,8 @@ use fred::prelude::ClientLike;
 use scry_block::{BlockEvent, BlockEventSink, Envelope};
 use scry_cluster::{LeaseGuard, LeaseProvider};
 use scry_valkey::{
-    channel_for, parse_envelope, publish_envelope, subscribe_blocks, ValkeyClient,
-    ValkeyLeaseProvider, ValkeySink,
+    channel_for, discover_tail_endpoints, parse_envelope, publish_envelope, subscribe_blocks,
+    TailRegistration, ValkeyClient, ValkeyLeaseProvider, ValkeySink,
 };
 use uuid::Uuid;
 
@@ -189,4 +189,77 @@ async fn sink_publishes_emitted_events() {
     drop(sink);
     let _ = task.await;
     let _ = sub.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a real Valkey (scripts/dev-valkey-up.sh)"]
+async fn tail_registration_is_discoverable_and_deregisters() {
+    let c = client().await;
+
+    // Two instances register distinct advertised addresses (the addr embeds a
+    // UUID so a shared registry prefix can't collide across concurrent runs).
+    let uuid_a = Uuid::now_v7();
+    let uuid_b = Uuid::now_v7();
+    let addr_a = format!("10.0.0.1:{}", &uuid_a.simple().to_string()[..8]);
+    let addr_b = format!("10.0.0.2:{}", &uuid_b.simple().to_string()[..8]);
+
+    let reg_a = TailRegistration::spawn(
+        c.inner().clone(),
+        uuid_a,
+        addr_a.clone(),
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("register A");
+    let reg_b = TailRegistration::spawn(
+        c.inner().clone(),
+        uuid_b,
+        addr_b.clone(),
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("register B");
+
+    // Discovery sees both (subset — a shared Valkey may host other entries).
+    let found = discover_tail_endpoints(c.inner()).await.expect("discover");
+    assert!(found.contains(&addr_a), "A discoverable: {found:?}");
+    assert!(found.contains(&addr_b), "B discoverable: {found:?}");
+
+    // Deregister A promptly; B remains.
+    reg_a.deregister().await;
+    let found = discover_tail_endpoints(c.inner()).await.expect("discover");
+    assert!(
+        !found.contains(&addr_a),
+        "A gone after deregister: {found:?}"
+    );
+    assert!(found.contains(&addr_b), "B still present: {found:?}");
+
+    reg_b.deregister().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a real Valkey (scripts/dev-valkey-up.sh)"]
+async fn tail_registration_renews_past_its_ttl() {
+    let c = client().await;
+    let uuid = Uuid::now_v7();
+    let addr = format!("10.0.0.9:{}", &uuid.simple().to_string()[..8]);
+
+    // Short TTL: the ttl/3 heartbeat must keep the key alive past it.
+    let reg = TailRegistration::spawn(
+        c.inner().clone(),
+        uuid,
+        addr.clone(),
+        Duration::from_millis(600),
+    )
+    .await
+    .expect("register");
+
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let found = discover_tail_endpoints(c.inner()).await.expect("discover");
+    assert!(
+        found.contains(&addr),
+        "renewed registration still present: {found:?}"
+    );
+
+    reg.deregister().await;
 }

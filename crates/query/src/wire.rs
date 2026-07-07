@@ -58,6 +58,15 @@ pub struct QueryRequest {
     /// server picks one (monotonic per-process integer).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+
+    /// Request the merged history+live view (D-054). When `true` and
+    /// `signal == logs` the server unions the stored blocks with the
+    /// still-in-flight records fanned in from the ingesters, deduplicated
+    /// across the block-commit seam by WAL-segment watermark. Requires the
+    /// server to have Valkey (for ingester discovery) — else it fails with
+    /// `QUERY_ERR_LIVE_UNAVAILABLE`. Ignored for non-logs signals in v1.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub live: bool,
 }
 
 impl Default for QueryRequest {
@@ -70,6 +79,7 @@ impl Default for QueryRequest {
             sql: None,
             limit: None,
             request_id: None,
+            live: false,
         }
     }
 }
@@ -111,6 +121,7 @@ impl QueryRequest {
                 .unwrap_or_default(),
             // Empty string = absent (same sentinel convention as `sql`).
             body_contains: self.query.body_contains.clone().unwrap_or_default(),
+            live: u8::from(self.live),
         }
     }
 
@@ -159,6 +170,7 @@ impl QueryRequest {
             sql,
             limit,
             request_id,
+            live: w.live != 0,
         }
     }
 }
@@ -182,6 +194,7 @@ mod tests {
             request_id: wire.request_id,
             trace_id: wire.trace_id,
             body_contains: wire.body_contains,
+            live: wire.live,
         };
         let back = QueryRequest::from_wire(out);
         assert_eq!(back.signal, req.signal);
@@ -193,6 +206,7 @@ mod tests {
         assert_eq!(back.sql, req.sql);
         assert_eq!(back.limit, req.limit);
         assert_eq!(back.request_id, req.request_id);
+        assert_eq!(back.live, req.live);
     }
 
     #[test]
@@ -217,6 +231,7 @@ mod tests {
             sql: Some("SELECT count(*) FROM metrics".into()),
             limit: Some(10),
             request_id: Some("test-42".into()),
+            live: false,
         });
     }
 
@@ -234,6 +249,7 @@ mod tests {
             sql: Some("SELECT count(*) FROM logs".into()),
             limit: Some(100),
             request_id: Some("logs-1".into()),
+            live: false,
         });
     }
 
@@ -271,6 +287,7 @@ mod tests {
             sql: None,
             limit: None,
             request_id: None,
+            live: false,
         });
     }
 
@@ -288,6 +305,25 @@ mod tests {
             sql: None,
             limit: None,
             request_id: None,
+            live: false,
+        });
+    }
+
+    #[test]
+    fn live_flag_roundtrips() {
+        roundtrip(QueryRequest {
+            signal: Signal::Logs as u8,
+            query: Query {
+                matchers: vec![("service".into(), "api".into())],
+                ts_min: Some(1_700_000_000_000_000_000),
+                ts_max: None,
+                trace_id: None,
+                body_contains: None,
+            },
+            sql: None,
+            limit: Some(100),
+            request_id: None,
+            live: true,
         });
     }
 }

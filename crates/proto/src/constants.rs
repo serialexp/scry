@@ -106,6 +106,12 @@ pub const ERR_HELLO_REQUIRED: u16 = 4;
 pub const ERR_SESSION_MISMATCH: u16 = 5;
 pub const ERR_INFLIGHT_EXCEEDED: u16 = 6;
 pub const ERR_AUTH: u16 = 7;
+/// A `Subscribe` frame carried a matcher spec that failed to parse.
+pub const ERR_BAD_MATCHER: u16 = 8;
+/// The queryd live-tail front-door cannot serve a subscription because it has
+/// no Valkey to discover ingesters through (see D-053). A direct `--ingest`
+/// tail does not hit this — only the queryd relay refuses.
+pub const ERR_TAIL_UNAVAILABLE: u16 = 9;
 pub const ERR_INTERNAL: u16 = 255;
 
 // ── Goodbye.reason_code ────────────────────────────────────────────────
@@ -141,6 +147,13 @@ pub const QUERY_ERR_PLAN: u16 = 0x0003;
 /// the budget freshly available.
 pub const QUERY_ERR_RESOURCES: u16 = 0x0004;
 
+/// A `live` merged history+live query (D-054) was requested but the
+/// server can't serve the live half: it has no Valkey connection, so it
+/// can't discover the ingesters to fan in from. Per decision 3 the live
+/// portion is refused outright rather than silently degraded to
+/// blocks-only. The client may retry without `--live`.
+pub const QUERY_ERR_LIVE_UNAVAILABLE: u16 = 0x0005;
+
 /// Catch-all for any other server-side failure (catalog mutex
 /// poisoned, unexpected DataFusion error, postings sidecar fetch
 /// failure mid-query, …). Message field carries human-readable
@@ -155,6 +168,7 @@ pub fn query_err_name(code: u16) -> &'static str {
         QUERY_ERR_SQL_PARSE => "QUERY_ERR_SQL_PARSE",
         QUERY_ERR_PLAN => "QUERY_ERR_PLAN",
         QUERY_ERR_RESOURCES => "QUERY_ERR_RESOURCES",
+        QUERY_ERR_LIVE_UNAVAILABLE => "QUERY_ERR_LIVE_UNAVAILABLE",
         QUERY_ERR_INTERNAL => "QUERY_ERR_INTERNAL",
         _ => "QUERY_ERR_UNKNOWN",
     }

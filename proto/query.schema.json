@@ -34,7 +34,7 @@
     },
 
     "QueryRequest": {
-      "description": "Sent by the client at the start of every query connection. Carries the target signal byte (1 = metrics, 2 = logs, 3 = traces, 4 = profiles — values match scry_proto::constants::Signal), the AND'd matcher set + time bounds (the postings preselect), optional SQL against the registered table for that signal, an optional row limit, an optional caller-supplied tracing correlation id, and an optional trace_id (16 raw bytes; empty = absent) for the traces signal's by-id lookup, and an optional body_contains substring (empty = absent) for the logs signal's full-text search. Receiver fails with QUERY_ERR_BAD_REQUEST if `signal` is 0 or names an unimplemented signal. NOTE: 'optional' fields would be the natural shape here, but as of binschema 0.5.x the Rust generator emits NotImplemented when 'optional' appears inside a discriminated_union variant (works fine in plain structs — see ingest's Span.parent_span_id). We model each optional with an explicit '*_present: uint8' companion (0 = absent, 1 = present); when absent the value field is still serialised but should be ignored by the receiver. Switch back to 'optional' once binschema gains support.",
+      "description": "Sent by the client at the start of every query connection. Carries the target signal byte (1 = metrics, 2 = logs, 3 = traces, 4 = profiles — values match scry_proto::constants::Signal), the AND'd matcher set + time bounds (the postings preselect), optional SQL against the registered table for that signal, an optional row limit, an optional caller-supplied tracing correlation id, and an optional trace_id (16 raw bytes; empty = absent) for the traces signal's by-id lookup, and an optional body_contains substring (empty = absent) for the logs signal's full-text search, and a `live` flag (0/1) requesting the merged history+live view (D-054): when 1 and signal = logs the server unions the stored blocks with the still-in-flight records fanned in from the ingesters, deduplicated across the block-commit seam by WAL-segment watermark. `live` requires Valkey for ingester discovery — the server fails with QUERY_ERR_LIVE_UNAVAILABLE if it has none. `live` is ignored for non-logs signals in v1. Receiver fails with QUERY_ERR_BAD_REQUEST if `signal` is 0 or names an unimplemented signal. NOTE: 'optional' fields would be the natural shape here, but as of binschema 0.5.x the Rust generator emits NotImplemented when 'optional' appears inside a discriminated_union variant (works fine in plain structs — see ingest's Span.parent_span_id). We model each optional with an explicit '*_present: uint8' companion (0 = absent, 1 = present); when absent the value field is still serialised but should be ignored by the receiver. Switch back to 'optional' once binschema gains support.",
       "sequence": [
         { "name": "tag", "type": "uint8", "const": 1 },
         { "name": "signal", "type": "uint8" },
@@ -47,7 +47,8 @@
         { "name": "limit",      "type": "uint64" },
         { "name": "request_id", "type": "string", "kind": "length_prefixed", "length_type": "uint16", "encoding": "ascii" },
         { "name": "trace_id",   "type": "bytes",  "kind": "length_prefixed", "length_type": "uint16" },
-        { "name": "body_contains", "type": "string", "kind": "length_prefixed", "length_type": "uint32", "encoding": "utf8" }
+        { "name": "body_contains", "type": "string", "kind": "length_prefixed", "length_type": "uint32", "encoding": "utf8" },
+        { "name": "live", "type": "uint8" }
       ]
     },
 

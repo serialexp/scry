@@ -13,6 +13,7 @@ object_store = { workspace = true }
 rusqlite     = { version = "0.31", features = ["bundled"] }
 scry-block   = { workspace = true }
 serde_json   = { workspace = true }
+tokio        = { workspace = true, features = ["rt"] }
 tracing      = { workspace = true }
 uuid         = { workspace = true }
 

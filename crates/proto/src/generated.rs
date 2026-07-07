@@ -17,6 +17,10 @@ pub enum FrameMsg {
     Ping(PingOutput),
     Pong(PongOutput),
     Goodbye(GoodbyeOutput),
+    Subscribe(SubscribeOutput),
+    TailRecord(TailRecordOutput),
+    LiveQuery(LiveQueryOutput),
+    LiveBatch(LiveBatchOutput),
     Error(ErrorOutput),
 }
 
@@ -119,6 +123,58 @@ impl FrameMsg {
                     encoder.write_uint8(b);
                 }
             }
+            FrameMsg::Subscribe(v) => {
+                encoder.write_uint8(80);
+                encoder.write_uint8(v.signal);
+                encoder.write_uint16(v.matchers.len() as u16, Endianness::BigEndian);
+                for item in &v.matchers {
+                    item.encode_into(encoder)?;
+                }
+            }
+            FrameMsg::TailRecord(v) => {
+                encoder.write_uint8(81);
+                encoder.write_uint8(v.signal);
+                encoder.write_uint64(v.ts_unix_nano, Endianness::BigEndian);
+                encoder.write_uint8(v.severity);
+                encoder.write_uint16(v.labels.len() as u16, Endianness::BigEndian);
+                for item in &v.labels {
+                    item.encode_into(encoder)?;
+                }
+                encoder.write_uint32(v.body.len() as u32, Endianness::BigEndian);
+                let string_bytes: &[u8] = v.body.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.attributes.len() as u16, Endianness::BigEndian);
+                for item in &v.attributes {
+                    item.encode_into(encoder)?;
+                }
+            }
+            FrameMsg::LiveQuery(v) => {
+                encoder.write_uint8(82);
+                encoder.write_uint8(v.signal);
+                encoder.write_uint16(v.matchers.len() as u16, Endianness::BigEndian);
+                for item in &v.matchers {
+                    item.encode_into(encoder)?;
+                }
+                encoder.write_uint64(v.ts_min_unix_nano, Endianness::BigEndian);
+                encoder.write_uint64(v.ts_max_unix_nano, Endianness::BigEndian);
+                encoder.write_uint32(v.body_contains.len() as u32, Endianness::BigEndian);
+                let string_bytes: &[u8] = v.body_contains.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+            }
+            FrameMsg::LiveBatch(v) => {
+                encoder.write_uint8(83);
+                for item in &v.writer_uuid {
+                    encoder.write_uint8(*item);
+                }
+                encoder.write_uint32(v.records.len() as u32, Endianness::BigEndian);
+                for item in &v.records {
+                    item.encode_into(encoder)?;
+                }
+            }
             FrameMsg::Error(v) => {
                 encoder.write_uint8(240);
                 encoder.write_uint16(v.code, Endianness::BigEndian);
@@ -142,6 +198,10 @@ impl FrameMsg {
             FrameMsg::Ping(_) => "Ping",
             FrameMsg::Pong(_) => "Pong",
             FrameMsg::Goodbye(_) => "Goodbye",
+            FrameMsg::Subscribe(_) => "Subscribe",
+            FrameMsg::TailRecord(_) => "TailRecord",
+            FrameMsg::LiveQuery(_) => "LiveQuery",
+            FrameMsg::LiveBatch(_) => "LiveBatch",
             FrameMsg::Error(_) => "Error",
         }
     }
@@ -184,6 +244,22 @@ impl FrameMsg {
         decoder.seek(start_pos)?;
         if let Ok(v) = GoodbyeOutput::decode_with_decoder(decoder) {
             return Ok(FrameMsg::Goodbye(v));
+        }
+        decoder.seek(start_pos)?;
+        if let Ok(v) = SubscribeOutput::decode_with_decoder(decoder) {
+            return Ok(FrameMsg::Subscribe(v));
+        }
+        decoder.seek(start_pos)?;
+        if let Ok(v) = TailRecordOutput::decode_with_decoder(decoder) {
+            return Ok(FrameMsg::TailRecord(v));
+        }
+        decoder.seek(start_pos)?;
+        if let Ok(v) = LiveQueryOutput::decode_with_decoder(decoder) {
+            return Ok(FrameMsg::LiveQuery(v));
+        }
+        decoder.seek(start_pos)?;
+        if let Ok(v) = LiveBatchOutput::decode_with_decoder(decoder) {
+            return Ok(FrameMsg::LiveBatch(v));
         }
         decoder.seek(start_pos)?;
         if let Ok(v) = ErrorOutput::decode_with_decoder(decoder) {
@@ -1125,6 +1201,533 @@ impl From<ErrorInput> for ErrorOutput {
             code: i.code,
             message: i.message,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubscribeInput {
+    pub signal: u8,
+    pub matchers: Vec<MatcherSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubscribeOutput {
+    pub tag: u8,
+    pub signal: u8,
+    pub matchers: Vec<MatcherSpec>,
+}
+
+pub type Subscribe = SubscribeOutput;
+
+impl SubscribeInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(80);
+        encoder.write_byte(self.signal);
+        encoder.write_u16_be(self.matchers.len() as u16);
+        for item in &self.matchers {
+            item.encode_into(encoder)?;
+        }
+        Ok(())
+    }
+
+}
+
+impl SubscribeOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let tag = decoder.read_byte()?;
+        if tag != 80u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 80, got {}", tag)));
+        }
+        let signal = decoder.read_byte()?;
+        let length = decoder.read_u16_be()? as usize;
+        let mut matchers = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = MatcherSpec::decode_with_decoder(decoder)?;
+            matchers.push(item);
+        }
+        Ok(Self {
+            tag,
+            signal,
+            matchers,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        SubscribeInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        SubscribeInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<SubscribeOutput> for SubscribeInput {
+    fn from(o: SubscribeOutput) -> Self {
+        Self {
+            signal: o.signal,
+            matchers: o.matchers,
+        }
+    }
+}
+
+impl From<SubscribeInput> for SubscribeOutput {
+    fn from(i: SubscribeInput) -> Self {
+        Self {
+            tag: 80u8,
+            signal: i.signal,
+            matchers: i.matchers,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatcherSpec {
+    pub spec: std::string::String,
+}
+
+impl MatcherSpec {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u16_be(self.spec.len() as u16);
+        let string_bytes: &[u8] = self.spec.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let length = decoder.read_u16_be()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let spec = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        Ok(Self {
+            spec,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TailRecordInput {
+    pub signal: u8,
+    pub ts_unix_nano: u64,
+    pub severity: u8,
+    pub labels: Vec<LabelPair>,
+    pub body: std::string::String,
+    pub attributes: Vec<LabelPair>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TailRecordOutput {
+    pub tag: u8,
+    pub signal: u8,
+    pub ts_unix_nano: u64,
+    pub severity: u8,
+    pub labels: Vec<LabelPair>,
+    pub body: std::string::String,
+    pub attributes: Vec<LabelPair>,
+}
+
+pub type TailRecord = TailRecordOutput;
+
+impl TailRecordInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(81);
+        encoder.write_byte(self.signal);
+        encoder.write_u64_be(self.ts_unix_nano);
+        encoder.write_byte(self.severity);
+        encoder.write_u16_be(self.labels.len() as u16);
+        for item in &self.labels {
+            item.encode_into(encoder)?;
+        }
+        encoder.write_u32_be(self.body.len() as u32);
+        let string_bytes: &[u8] = self.body.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_be(self.attributes.len() as u16);
+        for item in &self.attributes {
+            item.encode_into(encoder)?;
+        }
+        Ok(())
+    }
+
+}
+
+impl TailRecordOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let tag = decoder.read_byte()?;
+        if tag != 81u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 81, got {}", tag)));
+        }
+        let signal = decoder.read_byte()?;
+        let ts_unix_nano = decoder.read_u64_be()?;
+        let severity = decoder.read_byte()?;
+        let length = decoder.read_u16_be()? as usize;
+        let mut labels = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = LabelPair::decode_with_decoder(decoder)?;
+            labels.push(item);
+        }
+        let length = decoder.read_u32_be()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let body = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_be()? as usize;
+        let mut attributes = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = LabelPair::decode_with_decoder(decoder)?;
+            attributes.push(item);
+        }
+        Ok(Self {
+            tag,
+            signal,
+            ts_unix_nano,
+            severity,
+            labels,
+            body,
+            attributes,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        TailRecordInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        TailRecordInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<TailRecordOutput> for TailRecordInput {
+    fn from(o: TailRecordOutput) -> Self {
+        Self {
+            signal: o.signal,
+            ts_unix_nano: o.ts_unix_nano,
+            severity: o.severity,
+            labels: o.labels,
+            body: o.body,
+            attributes: o.attributes,
+        }
+    }
+}
+
+impl From<TailRecordInput> for TailRecordOutput {
+    fn from(i: TailRecordInput) -> Self {
+        Self {
+            tag: 81u8,
+            signal: i.signal,
+            ts_unix_nano: i.ts_unix_nano,
+            severity: i.severity,
+            labels: i.labels,
+            body: i.body,
+            attributes: i.attributes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiveQueryInput {
+    pub signal: u8,
+    pub matchers: Vec<MatcherSpec>,
+    pub ts_min_unix_nano: u64,
+    pub ts_max_unix_nano: u64,
+    pub body_contains: std::string::String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiveQueryOutput {
+    pub tag: u8,
+    pub signal: u8,
+    pub matchers: Vec<MatcherSpec>,
+    pub ts_min_unix_nano: u64,
+    pub ts_max_unix_nano: u64,
+    pub body_contains: std::string::String,
+}
+
+pub type LiveQuery = LiveQueryOutput;
+
+impl LiveQueryInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(82);
+        encoder.write_byte(self.signal);
+        encoder.write_u16_be(self.matchers.len() as u16);
+        for item in &self.matchers {
+            item.encode_into(encoder)?;
+        }
+        encoder.write_u64_be(self.ts_min_unix_nano);
+        encoder.write_u64_be(self.ts_max_unix_nano);
+        encoder.write_u32_be(self.body_contains.len() as u32);
+        let string_bytes: &[u8] = self.body_contains.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        Ok(())
+    }
+
+}
+
+impl LiveQueryOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let tag = decoder.read_byte()?;
+        if tag != 82u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 82, got {}", tag)));
+        }
+        let signal = decoder.read_byte()?;
+        let length = decoder.read_u16_be()? as usize;
+        let mut matchers = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = MatcherSpec::decode_with_decoder(decoder)?;
+            matchers.push(item);
+        }
+        let ts_min_unix_nano = decoder.read_u64_be()?;
+        let ts_max_unix_nano = decoder.read_u64_be()?;
+        let length = decoder.read_u32_be()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let body_contains = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        Ok(Self {
+            tag,
+            signal,
+            matchers,
+            ts_min_unix_nano,
+            ts_max_unix_nano,
+            body_contains,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        LiveQueryInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        LiveQueryInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<LiveQueryOutput> for LiveQueryInput {
+    fn from(o: LiveQueryOutput) -> Self {
+        Self {
+            signal: o.signal,
+            matchers: o.matchers,
+            ts_min_unix_nano: o.ts_min_unix_nano,
+            ts_max_unix_nano: o.ts_max_unix_nano,
+            body_contains: o.body_contains,
+        }
+    }
+}
+
+impl From<LiveQueryInput> for LiveQueryOutput {
+    fn from(i: LiveQueryInput) -> Self {
+        Self {
+            tag: 82u8,
+            signal: i.signal,
+            matchers: i.matchers,
+            ts_min_unix_nano: i.ts_min_unix_nano,
+            ts_max_unix_nano: i.ts_max_unix_nano,
+            body_contains: i.body_contains,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiveBatchInput {
+    pub writer_uuid: Vec<u8>,
+    pub records: Vec<LiveRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiveBatchOutput {
+    pub tag: u8,
+    pub writer_uuid: Vec<u8>,
+    pub records: Vec<LiveRecord>,
+}
+
+pub type LiveBatch = LiveBatchOutput;
+
+impl LiveBatchInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(83);
+        for item in &self.writer_uuid {
+            encoder.write_byte(*item);
+        }
+        encoder.write_u32_be(self.records.len() as u32);
+        for item in &self.records {
+            item.encode_into(encoder)?;
+        }
+        Ok(())
+    }
+
+}
+
+impl LiveBatchOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let tag = decoder.read_byte()?;
+        if tag != 83u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 83, got {}", tag)));
+        }
+        let mut writer_uuid = Vec::with_capacity(16);
+        for _ in 0..16 {
+            let item = decoder.read_byte()?;
+            writer_uuid.push(item);
+        }
+        let length = decoder.read_u32_be()? as usize;
+        let mut records = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = LiveRecord::decode_with_decoder(decoder)?;
+            records.push(item);
+        }
+        Ok(Self {
+            tag,
+            writer_uuid,
+            records,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        LiveBatchInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        LiveBatchInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<LiveBatchOutput> for LiveBatchInput {
+    fn from(o: LiveBatchOutput) -> Self {
+        Self {
+            writer_uuid: o.writer_uuid,
+            records: o.records,
+        }
+    }
+}
+
+impl From<LiveBatchInput> for LiveBatchOutput {
+    fn from(i: LiveBatchInput) -> Self {
+        Self {
+            tag: 83u8,
+            writer_uuid: i.writer_uuid,
+            records: i.records,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiveRecord {
+    pub wal_shard: u32,
+    pub wal_seg: u64,
+    pub ts_unix_nano: u64,
+    pub severity: u8,
+    pub labels: Vec<LabelPair>,
+    pub body: std::string::String,
+    pub attributes: Vec<LabelPair>,
+}
+
+impl LiveRecord {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u32_be(self.wal_shard);
+        encoder.write_u64_be(self.wal_seg);
+        encoder.write_u64_be(self.ts_unix_nano);
+        encoder.write_byte(self.severity);
+        encoder.write_u16_be(self.labels.len() as u16);
+        for item in &self.labels {
+            item.encode_into(encoder)?;
+        }
+        encoder.write_u32_be(self.body.len() as u32);
+        let string_bytes: &[u8] = self.body.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_be(self.attributes.len() as u16);
+        for item in &self.attributes {
+            item.encode_into(encoder)?;
+        }
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let wal_shard = decoder.read_u32_be()?;
+        let wal_seg = decoder.read_u64_be()?;
+        let ts_unix_nano = decoder.read_u64_be()?;
+        let severity = decoder.read_byte()?;
+        let length = decoder.read_u16_be()? as usize;
+        let mut labels = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = LabelPair::decode_with_decoder(decoder)?;
+            labels.push(item);
+        }
+        let length = decoder.read_u32_be()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let body = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_be()? as usize;
+        let mut attributes = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = LabelPair::decode_with_decoder(decoder)?;
+            attributes.push(item);
+        }
+        Ok(Self {
+            wal_shard,
+            wal_seg,
+            ts_unix_nano,
+            severity,
+            labels,
+            body,
+            attributes,
+        })
     }
 }
 

@@ -16,13 +16,13 @@ use scry_proto::{
     constants::{
         Signal, ACK_ACCEPTED, ACK_REJECTED, COMPRESSION_NONE, COMPRESSION_ZSTD,
         DEFAULT_MAX_BATCH_BYTES, DEFAULT_MAX_INFLIGHT_BATCHES, DEFAULT_SUGGESTED_BATCH_BYTES,
-        ERR_HELLO_REQUIRED, ERR_PROTOCOL_VERSION, ERR_SESSION_MISMATCH, GOODBYE_NORMAL,
-        PROTOCOL_VERSION_V0, REJECT_BAD_SCHEMA, REJECT_BATCH_TOO_LARGE,
+        ERR_BAD_MATCHER, ERR_HELLO_REQUIRED, ERR_PROTOCOL_VERSION, ERR_SESSION_MISMATCH,
+        GOODBYE_NORMAL, PROTOCOL_VERSION_V0, REJECT_BAD_SCHEMA, REJECT_BATCH_TOO_LARGE,
         REJECT_SIGNAL_NOT_ANNOUNCED, SIGNAL_BIT_LOGS, SIGNAL_BIT_METRICS, SIGNAL_BIT_PROFILES,
         SIGNAL_BIT_TRACES,
     },
     framing::{read_frame, write_frame, FrameError},
-    generated::{FrameMsg, HelloOutput},
+    generated::{FrameMsg, HelloOutput, LiveRecord},
 };
 use std::{
     future::Future,
@@ -38,8 +38,16 @@ use tokio::{
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::live_ring::{LiveLogRecord, LiveRing, RetainingLogsAppender};
 use crate::pipeline::{DecodeFn, Pipeline, ShardedPipeline};
 use crate::stats::ServerMetrics;
+use crate::tail::{SubscriptionRegistry, TappingLogsAppender};
+
+/// Per-subscriber live-tail delivery channel depth. Bounds how many
+/// records can queue for a slow tail client before the ingest tap starts
+/// dropping (best-effort — see [`crate::tail`]). A few thousand entries is
+/// a fraction of a second of a busy stream; larger just delays the drop.
+const TAIL_CHANNEL_CAP: usize = 4096;
 
 /// Type alias for the Dummy storage pipeline. Same generic machinery
 /// every signal uses; the type alias just spares call sites from
@@ -116,6 +124,18 @@ pub struct Server {
     /// low-volume/idle signal never crosses the size threshold, so its
     /// records never seal and never become queryable.
     block_max_age: Option<Duration>,
+    /// Process-local live-tail subscription registry, shared across every
+    /// connection handler. Free when idle (the ingest tap gates on
+    /// `subscriber_count() > 0`); populated by `Subscribe` frames. See
+    /// [`crate::tail`] and D-050.
+    tail: Arc<SubscriptionRegistry>,
+    /// Optional retained recent-window ring — the *live source* for the
+    /// merged history+live query (D-054). When present, the logs decode path
+    /// collects each batch's entries and pushes them (tagged with their WAL
+    /// shard+segment) so a `LiveQuery` can serve the last window from
+    /// memory. `None` ⇒ live query disabled and zero cost on the logs path
+    /// (byte-identical to pre-D-054). Only the logs signal feeds it.
+    live_ring: Option<Arc<LiveRing>>,
 }
 
 impl Server {
@@ -137,7 +157,26 @@ impl Server {
             profiles_pipeline,
             metrics: None,
             block_max_age: None,
+            tail: SubscriptionRegistry::new(),
+            live_ring: None,
         }
+    }
+
+    /// Attach a retained recent-window [`LiveRing`] as the live source for
+    /// the merged history+live query (D-054). Builder-style so `new` keeps
+    /// its signature; `None`/unset keeps the logs path byte-identical to
+    /// pre-D-054. The same `Arc` is served by the `LiveQuery` endpoint.
+    pub fn with_live_ring(mut self, ring: Option<Arc<LiveRing>>) -> Self {
+        self.live_ring = ring;
+        self
+    }
+
+    /// The process-local live-tail subscription registry. Exposed so a
+    /// caller can observe `dropped_total()` / `subscriber_count()` for
+    /// operator stats; the server wires it into every connection handler
+    /// automatically.
+    pub fn tail_registry(&self) -> Arc<SubscriptionRegistry> {
+        self.tail.clone()
     }
 
     /// Attach process-global stats. Builder-style so `new` keeps its
@@ -219,6 +258,8 @@ impl Server {
                 let traces_pipeline = self.traces_pipeline.clone();
                 let profiles_pipeline = self.profiles_pipeline.clone();
                 let metrics = self.metrics.clone();
+                let tail = self.tail.clone();
+                let live_ring = self.live_ring.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle(
                         sock,
@@ -231,6 +272,8 @@ impl Server {
                         traces_pipeline,
                         profiles_pipeline,
                         metrics,
+                        tail,
+                        live_ring,
                     )
                     .await
                     {
@@ -372,6 +415,8 @@ async fn handle(
     traces_sharded: Option<ShardedPipeline<TracesBlockBuilder>>,
     profiles_sharded: Option<ShardedPipeline<ProfilesBlockBuilder>>,
     metrics: Option<Arc<ServerMetrics>>,
+    tail: Arc<SubscriptionRegistry>,
+    live_ring: Option<Arc<LiveRing>>,
 ) -> Result<()> {
     // Pin this connection to one shard per signal (by session id). All of
     // this connection's batches for a signal funnel through the same
@@ -659,7 +704,7 @@ async fn handle(
                                     // Phase 2: commit (WAL append + merge) under lock.
                                     let mut guard = pipe.lock().await;
                                     match guard.ingest_decoded(&decompressed, scratch).await {
-                                        Ok(()) => Ok(n as u64),
+                                        Ok(_seg) => Ok(n as u64),
                                         Err(e) => {
                                             scratch.reset();
                                             Err(e)
@@ -694,7 +739,7 @@ async fn handle(
                                     // Phase 2: commit (WAL append + merge) under lock.
                                     let mut guard = pipe.lock().await;
                                     match guard.ingest_decoded(&decompressed, scratch).await {
-                                        Ok(()) => Ok(n as u64),
+                                        Ok(_seg) => Ok(n as u64),
                                         Err(e) => {
                                             scratch.reset();
                                             Err(e)
@@ -728,12 +773,78 @@ async fn handle(
                             }
                             let (decode_fn, scratch) = logs_scratch.as_mut().unwrap();
                             // Phase 1: decode into private scratch, no lock held.
-                            match decode_fn(&decompressed, scratch) {
+                            // Two optional decorators can wrap the scratch:
+                            //   - the live ring (D-054): a `RetainingLogsAppender`
+                            //     collects this batch's entries so they can be
+                            //     pushed (tagged with their WAL shard+segment) in
+                            //     phase 2 — the live source for the merged query;
+                            //   - the tail tap (D-050): forwards matching entries
+                            //     to live-tail subscribers, nested *outside* the
+                            //     retainer when both are active.
+                            // Storage semantics are identical in every case — both
+                            // decorators only observe entries flowing into the
+                            // scratch builder. `into_records()` releases the
+                            // scratch borrow before phase 2 re-uses it.
+                            let tap_on = tail.subscriber_count() > 0;
+                            let (decoded, live_records): (Result<usize>, Vec<LiveLogRecord>) =
+                                if live_ring.is_some() {
+                                    let mut retaining = RetainingLogsAppender::new(scratch);
+                                    let d = if tap_on {
+                                        let mut tap = TappingLogsAppender::new(
+                                            &mut retaining,
+                                            tail.as_ref(),
+                                            Signal::Logs as u8,
+                                        )
+                                        .await;
+                                        scry_proto::streaming::decode_logs_batch_into(
+                                            &decompressed,
+                                            &mut tap,
+                                        )
+                                        .map_err(|e| anyhow::anyhow!("LogsBatch: {e}"))
+                                    } else {
+                                        scry_proto::streaming::decode_logs_batch_into(
+                                            &decompressed,
+                                            &mut retaining,
+                                        )
+                                        .map_err(|e| anyhow::anyhow!("LogsBatch: {e}"))
+                                    };
+                                    let recs = retaining.into_records();
+                                    (d, recs)
+                                } else if tap_on {
+                                    let mut tap = TappingLogsAppender::new(
+                                        scratch,
+                                        tail.as_ref(),
+                                        Signal::Logs as u8,
+                                    )
+                                    .await;
+                                    let d = scry_proto::streaming::decode_logs_batch_into(
+                                        &decompressed,
+                                        &mut tap,
+                                    )
+                                    .map_err(|e| anyhow::anyhow!("LogsBatch: {e}"));
+                                    (d, Vec::new())
+                                } else {
+                                    (decode_fn(&decompressed, scratch), Vec::new())
+                                };
+                            match decoded {
                                 Ok(n) => {
                                     // Phase 2: commit (WAL append + merge) under lock.
                                     let mut guard = pipe.lock().await;
                                     match guard.ingest_decoded(&decompressed, scratch).await {
-                                        Ok(()) => Ok(n as u64),
+                                        Ok(seg) => {
+                                            // Feed the live ring: stamp the batch's
+                                            // WAL shard+segment onto the collected
+                                            // records and push. Nothing collected
+                                            // when the ring is disabled.
+                                            if let Some(ring) = live_ring.as_ref() {
+                                                ring.push_stamped(
+                                                    live_records,
+                                                    guard.shard_index(),
+                                                    seg.0,
+                                                );
+                                            }
+                                            Ok(n as u64)
+                                        }
                                         Err(e) => {
                                             scratch.reset();
                                             Err(e)
@@ -749,14 +860,29 @@ async fn handle(
                             // No logs pipeline: validate + count
                             // entries (streams are dictionary entries,
                             // not records — same accounting as the
-                            // pipeline path).
+                            // pipeline path). Live tail still works here —
+                            // a storage-less ingester can serve `scry tail`.
                             let mut counter = CountLogsAppender::default();
-                            scry_proto::streaming::decode_logs_batch_into(
-                                &decompressed,
-                                &mut counter,
-                            )
-                            .map(|entries| entries as u64)
-                            .map_err(|e| anyhow::anyhow!("LogsBatch: {e}"))
+                            let decoded = if tail.subscriber_count() > 0 {
+                                let mut tap = TappingLogsAppender::new(
+                                    &mut counter,
+                                    tail.as_ref(),
+                                    Signal::Logs as u8,
+                                )
+                                .await;
+                                scry_proto::streaming::decode_logs_batch_into(
+                                    &decompressed,
+                                    &mut tap,
+                                )
+                            } else {
+                                scry_proto::streaming::decode_logs_batch_into(
+                                    &decompressed,
+                                    &mut counter,
+                                )
+                            };
+                            decoded
+                                .map(|entries| entries as u64)
+                                .map_err(|e| anyhow::anyhow!("LogsBatch: {e}"))
                         }
                     }
                     Signal::Traces => {
@@ -772,7 +898,7 @@ async fn handle(
                                     // Phase 2: commit (WAL append + merge) under lock.
                                     let mut guard = pipe.lock().await;
                                     match guard.ingest_decoded(&decompressed, scratch).await {
-                                        Ok(()) => Ok(n as u64),
+                                        Ok(_seg) => Ok(n as u64),
                                         Err(e) => {
                                             scratch.reset();
                                             Err(e)
@@ -811,7 +937,7 @@ async fn handle(
                                     // Phase 2: commit (WAL append + merge) under lock.
                                     let mut guard = pipe.lock().await;
                                     match guard.ingest_decoded(&decompressed, scratch).await {
-                                        Ok(()) => Ok(n as u64),
+                                        Ok(_seg) => Ok(n as u64),
                                         Err(e) => {
                                             scratch.reset();
                                             Err(e)
@@ -910,6 +1036,141 @@ async fn handle(
 
             FrameMsg::Error(e) => {
                 warn!(%peer, code = e.code, msg = %e.message, "agent sent Error frame");
+                break;
+            }
+
+            FrameMsg::Subscribe(sub) => {
+                // A live-tail subscription turns this connection into a
+                // one-way delivery stream: we spray matching `TailRecord`s
+                // down `wr` until the client hangs up (EOF/Goodbye) or the
+                // registry channel closes. Best-effort — see `tail` + D-050.
+                let specs: Vec<String> = sub.matchers.into_iter().map(|m| m.spec).collect();
+                let filter = match scry_match::LabelFilter::parse(&specs) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        warn!(%peer, error = %e, "bad Subscribe matcher");
+                        let _ = write_frame(
+                            &mut wr,
+                            &build::error(ERR_BAD_MATCHER, &format!("bad matcher: {e}")),
+                        )
+                        .await;
+                        let _ = wr.flush().await;
+                        break;
+                    }
+                };
+                info!(
+                    %peer, session_id, signal = sub.signal,
+                    matchers = filter.len(), "tail subscribe"
+                );
+                let (sub_id, mut rx) = tail.register(sub.signal, filter, TAIL_CHANNEL_CAP).await;
+
+                loop {
+                    tokio::select! {
+                        item = rx.recv() => {
+                            match item {
+                                Some(it) => {
+                                    let frame = build::tail_record(build::TailRecordArgs {
+                                        signal: it.signal,
+                                        ts_unix_nano: it.ts_unix_nano,
+                                        severity: it.severity,
+                                        labels: (*it.labels).clone(),
+                                        body: it.body.clone(),
+                                        attributes: it.attributes.clone(),
+                                    });
+                                    if write_frame(&mut wr, &frame).await.is_err()
+                                        || wr.flush().await.is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                                // Registry dropped the sender (shutdown). Done.
+                                None => break,
+                            }
+                        }
+                        // Watch the read half so a client hangup / Goodbye
+                        // deregisters promptly instead of leaking a sub.
+                        r = read_frame::<scry_proto::Frame, _>(&mut rd) => {
+                            match r {
+                                Ok(f) => {
+                                    if matches!(f.msg, FrameMsg::Goodbye(_)) {
+                                        break;
+                                    }
+                                    // Ignore any other frame on a tail conn.
+                                }
+                                Err(_) => break, // EOF or framing error → hangup
+                            }
+                        }
+                    }
+                }
+                tail.deregister(sub_id).await;
+                info!(%peer, session_id, "tail unsubscribe");
+                break;
+            }
+
+            FrameMsg::LiveQuery(lq) => {
+                // Merged-query live snapshot (D-054): reply with the retained
+                // recent records matching the predicate, each tagged with its
+                // WAL (shard, seg) so the query daemon can dedup against the
+                // catalog high-water. Exactly one `LiveBatch`, then close.
+                //
+                // Logs only in v1. An ingester with no live ring (live disabled
+                // or a non-logs query) still answers — with an empty batch —
+                // so the daemon's fan-in never blocks on a silent peer.
+                let is_logs = lq.signal == Signal::Logs as u8;
+                let specs: Vec<String> = lq.matchers.into_iter().map(|m| m.spec).collect();
+                let filter = match scry_match::LabelFilter::parse(&specs) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        warn!(%peer, error = %e, "bad LiveQuery matcher");
+                        let _ = write_frame(
+                            &mut wr,
+                            &build::error(ERR_BAD_MATCHER, &format!("bad matcher: {e}")),
+                        )
+                        .await;
+                        let _ = wr.flush().await;
+                        break;
+                    }
+                };
+                let ts_min = lq.ts_min_unix_nano;
+                let ts_max = lq.ts_max_unix_nano;
+                let needle = lq.body_contains;
+
+                let records: Vec<LiveRecord> = match (is_logs, live_ring.as_ref()) {
+                    (true, Some(ring)) => {
+                        let snapshot = ring.collect(|r| {
+                            if ts_min != 0 && r.ts_unix_nano < ts_min {
+                                return false;
+                            }
+                            if ts_max != 0 && r.ts_unix_nano > ts_max {
+                                return false;
+                            }
+                            if !needle.is_empty() && !r.body.contains(&needle) {
+                                return false;
+                            }
+                            filter.keeps(&r.labels)
+                        });
+                        snapshot
+                            .into_iter()
+                            .map(|r| LiveRecord {
+                                wal_shard: r.wal_shard,
+                                wal_seg: r.wal_seg,
+                                ts_unix_nano: r.ts_unix_nano,
+                                severity: r.severity,
+                                labels: (*r.labels).clone(),
+                                body: r.body,
+                                attributes: r.attributes,
+                            })
+                            .collect()
+                    }
+                    _ => Vec::new(),
+                };
+                info!(
+                    %peer, session_id, signal = lq.signal,
+                    records = records.len(), "live query"
+                );
+                let frame = build::live_batch(config.writer_uuid.into_bytes(), records);
+                let _ = write_frame(&mut wr, &frame).await;
+                let _ = wr.flush().await;
                 break;
             }
 
@@ -1047,5 +1308,9 @@ fn short_msg_name(m: &FrameMsg) -> &'static str {
         FrameMsg::Pong(_) => "Pong",
         FrameMsg::Goodbye(_) => "Goodbye",
         FrameMsg::Error(_) => "Error",
+        FrameMsg::Subscribe(_) => "Subscribe",
+        FrameMsg::TailRecord(_) => "TailRecord",
+        FrameMsg::LiveQuery(_) => "LiveQuery",
+        FrameMsg::LiveBatch(_) => "LiveBatch",
     }
 }

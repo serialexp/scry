@@ -343,6 +343,14 @@ pub async fn merge_blocks(
         all_fingerprints,
         has_body_bloom,
         body_bloom_size_bytes,
+        // A compacted block merges inputs spanning many WAL segments (and
+        // potentially many writers/shards) and is never the live seam (its
+        // records are long durable), so it carries no per-writer watermark.
+        // The persistent `wal_watermarks` high-water already advanced when
+        // the L0 inputs were first inserted; a merged `None` never
+        // regresses it. Same for the shard discriminator.
+        wal_seg_max: None,
+        wal_shard: None,
     };
     let meta_bytes =
         Bytes::from(serde_json::to_vec_pretty(&meta).context("serialise merged meta")?);

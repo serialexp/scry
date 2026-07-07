@@ -13,6 +13,7 @@
 //! - `scry web` — browser query UI + byte-pipe relay to `scry query`.
 //! - `scry compact` — size-tiered block compaction (one-shot / watch).
 //! - `scry retention` — per-signal TTL retention (dry-run by default).
+//! - `scry tail` — live log tailing (best-effort, straight off the ingest hot path).
 //!
 //! Each role's flags and behaviour are identical to what the former
 //! per-binary tools exposed; this binary only adds the dispatch layer,
@@ -64,6 +65,8 @@ enum Cmd {
     Compact(scry_compact::Args),
     /// Per-signal TTL retention (dry-run by default).
     Retention(scry_retention::Args),
+    /// Live log tailing (best-effort, straight off the ingest hot path).
+    Tail(scry_tail::Args),
 }
 
 #[tokio::main]
@@ -87,5 +90,6 @@ async fn main() -> Result<()> {
         Cmd::Web(a) => scry_webui::run(a).await,
         Cmd::Compact(a) => scry_compact::run(a).await,
         Cmd::Retention(a) => scry_retention::run(a).await,
+        Cmd::Tail(a) => scry_tail::run(a).await,
     }
 }

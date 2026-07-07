@@ -572,6 +572,9 @@ async fn run_remote(
         sql,
         limit,
         request_id: None,
+        // The one-shot `scry get` CLI queries stored blocks only; the merged
+        // history+live view (D-054) is driven via the probe / a live client.
+        live: false,
     };
     let request_frame = QueryFrame {
         msg: QueryFrameMsg::QueryRequest(req.to_wire().into()),

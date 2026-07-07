@@ -24,7 +24,8 @@
 
 use crate::generated::{
     BatchAckInput, BatchInput, ErrorInput, FlowControlInput, Frame, FrameMsg, GoodbyeInput,
-    HelloAckInput, HelloInput, LabelPair, PingInput, PongInput,
+    HelloAckInput, HelloInput, LabelPair, LiveBatchInput, LiveQueryInput, LiveRecord, MatcherSpec,
+    PingInput, PongInput, SubscribeInput, TailRecordInput,
 };
 
 pub struct HelloArgs<'a> {
@@ -186,6 +187,99 @@ pub fn error(code: u16, message: &str) -> Frame {
             ErrorInput {
                 code,
                 message: message.into(),
+            }
+            .into(),
+        ),
+    }
+}
+
+/// A live-tail subscription request: match `signal` records against the
+/// Prometheus-style matcher specs (`key=value`, `key=~re`, …). An empty
+/// `matchers` slice subscribes to every record of that signal.
+pub fn subscribe(signal: u8, matchers: &[String]) -> Frame {
+    Frame {
+        msg: FrameMsg::Subscribe(
+            SubscribeInput {
+                signal,
+                matchers: matchers
+                    .iter()
+                    .map(|m| MatcherSpec { spec: m.clone() })
+                    .collect(),
+            }
+            .into(),
+        ),
+    }
+}
+
+pub struct TailRecordArgs {
+    pub signal: u8,
+    pub ts_unix_nano: u64,
+    pub severity: u8,
+    pub labels: Vec<LabelPair>,
+    pub body: String,
+    pub attributes: Vec<LabelPair>,
+}
+
+/// A single live record streamed back to a subscriber. Best-effort: no
+/// ordering, no completeness, and no relationship to stored blocks.
+pub fn tail_record(a: TailRecordArgs) -> Frame {
+    Frame {
+        msg: FrameMsg::TailRecord(
+            TailRecordInput {
+                signal: a.signal,
+                ts_unix_nano: a.ts_unix_nano,
+                severity: a.severity,
+                labels: a.labels,
+                body: a.body,
+                attributes: a.attributes,
+            }
+            .into(),
+        ),
+    }
+}
+
+pub struct LiveQueryArgs {
+    pub signal: u8,
+    pub matchers: Vec<String>,
+    /// 0 = no lower bound.
+    pub ts_min_unix_nano: u64,
+    /// 0 = no upper bound.
+    pub ts_max_unix_nano: u64,
+    /// Empty = no substring filter.
+    pub body_contains: String,
+}
+
+/// A merged-query live snapshot request (D-054): the query daemon asks a
+/// discovered ingester for its retained recent records matching these
+/// predicates. The ingester replies with exactly one [`live_batch`].
+pub fn live_query(a: LiveQueryArgs) -> Frame {
+    Frame {
+        msg: FrameMsg::LiveQuery(
+            LiveQueryInput {
+                signal: a.signal,
+                matchers: a
+                    .matchers
+                    .iter()
+                    .map(|m| MatcherSpec { spec: m.clone() })
+                    .collect(),
+                ts_min_unix_nano: a.ts_min_unix_nano,
+                ts_max_unix_nano: a.ts_max_unix_nano,
+                body_contains: a.body_contains,
+            }
+            .into(),
+        ),
+    }
+}
+
+/// An ingester's reply to a [`live_query`]: its retained recent records, each
+/// tagged with the WAL `(shard, seg)` the merged query dedups against.
+/// `writer_uuid` identifies this ingester's WAL instance.
+pub fn live_batch(writer_uuid: [u8; 16], records: Vec<LiveRecord>) -> Frame {
+    Frame {
+        msg: FrameMsg::LiveBatch(
+            LiveBatchInput {
+                writer_uuid: writer_uuid.to_vec(),
+                records,
             }
             .into(),
         ),

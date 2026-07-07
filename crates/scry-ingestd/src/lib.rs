@@ -26,12 +26,13 @@ use scry_compact::CompactConfig;
 use scry_objstore::{open as open_objstore, ObjStoreConfig};
 use scry_retention::RetentionConfig;
 use scry_server::{
-    decode, serve_stats, BlockBuilderConfig, DummyShards, LogsShards, MetricsShards,
+    decode, serve_stats, BlockBuilderConfig, DummyShards, LiveRing, LogsShards, MetricsShards,
     ProfilesShards, Server, ServerConfig, ServerMetrics, ShardedPipeline, TracesShards,
     INGEST_SHARDS,
 };
 use scry_valkey::{
-    parse_envelope, subscribe_blocks, ValkeyClient, ValkeyLeaseProvider, ValkeySink, VALKEY_URL_ENV,
+    parse_envelope, subscribe_blocks, TailRegistration, ValkeyClient, ValkeyLeaseProvider,
+    ValkeySink, VALKEY_URL_ENV,
 };
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
@@ -206,6 +207,37 @@ pub struct Args {
     /// objects (retention). Default 0 single-instance; 600 with a lease.
     #[arg(long)]
     retention_grace: Option<u64>,
+
+    /// Address to advertise into the Valkey tail registry so the `scry query`
+    /// live-tail front-door can dial this ingester (D-053). Only used when
+    /// Valkey is configured. If unset: derived from a concrete `--listen` IP,
+    /// else from `$NODE_IP` (k8s downward API) + the listen port. A wildcard
+    /// `--listen` (`0.0.0.0`/`::`) with neither set is a startup error — set
+    /// this, or `$NODE_IP`, or bind a concrete IP. Falls back to
+    /// `$SCRY_TAIL_ADVERTISE_ADDR`.
+    #[arg(long)]
+    tail_advertise_addr: Option<String>,
+
+    /// Retained recent-window for the merged history+live query (D-054): how
+    /// far back the logs live ring keeps in-flight records so a `scry query
+    /// --live` sees a full recent window even across block flushes. Logs only.
+    /// 0 disables the ring (live queries against this ingester return nothing).
+    #[arg(long, default_value_t = 90)]
+    live_window_secs: u64,
+
+    /// Hard byte cap on the logs live ring (D-054), a backstop against a spike
+    /// blowing memory when the window holds a lot. Oldest records evicted first.
+    #[arg(long, default_value_t = 128 * 1024 * 1024)]
+    live_window_max_bytes: usize,
+
+    /// Interval between catalog snapshots to the bucket (D-055). This ingester
+    /// periodically uploads its online catalog as a single object
+    /// (`_catalog/snapshot.sqlite`) so a cold `scry query` can restore it in one
+    /// GET instead of walking every block sidecar. Non-destructive (overwrites
+    /// one key), so it needs no lease. `0` disables. Requires `--storage`
+    /// with `--catalog`. Accepts `ms`/`s`/`m`/`h`/`d` (bare number = seconds).
+    #[arg(long, value_parser = parse_duration, default_value = "300s")]
+    catalog_snapshot_interval: Duration,
 }
 
 /// Instance role; see `--mode`.
@@ -321,6 +353,31 @@ pub async fn run(args: Args) -> Result<()> {
         None => (None, None),
     };
 
+    // Tail-address registry (D-053): with Valkey present, advertise this
+    // ingester's tail-serving address (its ingest `--listen` endpoint, which
+    // already serves Subscribe/TailRecord) so the `scry query` front-door can
+    // discover and fan-in from it. Resolution can hard-error on an
+    // unadvertisable wildcard bind — surfaced at startup, before we serve.
+    let tail_registration: Option<TailRegistration> = match valkey.as_ref() {
+        Some(c) => {
+            let node_ip = std::env::var("NODE_IP").ok();
+            let explicit = args
+                .tail_advertise_addr
+                .clone()
+                .or_else(|| std::env::var("SCRY_TAIL_ADVERTISE_ADDR").ok());
+            let addr =
+                resolve_tail_advertise_addr(explicit.as_deref(), &args.listen, node_ip.as_deref())
+                    .context("resolving tail advertise address")?;
+            let ttl = Duration::from_secs(args.lease_ttl.max(1));
+            Some(
+                TailRegistration::spawn(c.inner().clone(), writer_uuid, addr, ttl)
+                    .await
+                    .context("registering tail address in Valkey")?,
+            )
+        }
+        None => None,
+    };
+
     // Background-task context captured out of the storage block: the shared
     // object store, bucket name, online catalog, and block config that the
     // convergence loops + maintenance loop need. Only `Some` when `--storage`
@@ -331,6 +388,9 @@ pub async fn run(args: Args) -> Result<()> {
         bucket: String,
         catalog: Arc<std::sync::Mutex<Catalog>>,
         block_cfg: BlockBuilderConfig,
+        /// On-disk path of the online catalog — the snapshot producer (D-055)
+        /// reads it directly (via `VACUUM INTO`) off the shared mutex.
+        catalog_path: PathBuf,
     }
     let mut bg_ctx: Option<BgCtx> = None;
 
@@ -412,6 +472,11 @@ pub async fn run(args: Args) -> Result<()> {
                 bucket: bucket.clone(),
                 catalog: cat,
                 block_cfg,
+                // `catalog` is `Some` iff `--catalog` was given.
+                catalog_path: args
+                    .catalog
+                    .clone()
+                    .expect("online catalog implies --catalog path is set"),
             });
         }
 
@@ -543,6 +608,19 @@ pub async fn run(args: Args) -> Result<()> {
             .then(|| Duration::from_secs(args.block_max_age_secs)),
     );
 
+    // Retained recent-window live ring (D-054): the *live* source for a `scry
+    // query --live` merged view. Logs-only, always-on but bounded (age +
+    // byte cap). `--live-window-secs 0` disables it (no live half). The ring
+    // is fed off the logs ingest phase-2 seam inside `Server` and snapshotted
+    // to answer `LiveQuery` frames on the same `--listen` port.
+    let live_ring = (args.live_window_secs > 0).then(|| {
+        LiveRing::new(
+            Duration::from_secs(args.live_window_secs),
+            args.live_window_max_bytes,
+        )
+    });
+    server = server.with_live_ring(live_ring);
+
     // Optional stats HTTP endpoint. It shares its shutdown signal with
     // the ingest server: both listen for Ctrl-C independently (tokio's
     // `ctrl_c()` resolves every pending future on SIGINT), so a single
@@ -571,7 +649,36 @@ pub async fn run(args: Args) -> Result<()> {
             bucket,
             catalog,
             block_cfg,
+            catalog_path,
         } = ctx;
+
+        // 0. catalog snapshot producer (D-055): periodically upload this
+        // ingester's online catalog as one object so a cold `scry query` can
+        // restore it in a single GET. Non-destructive (overwrites one key) so it
+        // runs without any lease — deliberately independent of the maintenance
+        // loop (which is paused without a Valkey lease). Disabled with `0`.
+        if !args.catalog_snapshot_interval.is_zero() {
+            let store = store.clone();
+            let path = catalog_path.clone();
+            let interval = args.catalog_snapshot_interval;
+            info!(
+                interval_secs = interval.as_secs(),
+                "catalog snapshot producer enabled"
+            );
+            bg_tasks.push(tokio::spawn(async move {
+                let mut tick = tokio::time::interval(interval);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                // Skip the immediate first tick — nothing to snapshot at t=0.
+                tick.tick().await;
+                loop {
+                    tick.tick().await;
+                    match scry_catalog::save_snapshot(&path, store.as_ref()).await {
+                        Ok(r) => info!(bytes = r.bytes, "catalog snapshot uploaded"),
+                        Err(e) => warn!(error = %e, "catalog snapshot failed"),
+                    }
+                }
+            }));
+        }
 
         // 1. pub/sub convergence consumer (low-latency hint; only with Valkey).
         if let Some(url) = valkey_url.clone() {
@@ -718,6 +825,10 @@ pub async fn run(args: Args) -> Result<()> {
     if let Some(t) = &sink_task {
         t.abort();
     }
+    // Remove our tail-registry entry promptly (else it lingers until TTL).
+    if let Some(reg) = tail_registration {
+        reg.deregister().await;
+    }
     if let Some(c) = valkey {
         c.quit().await;
     }
@@ -863,6 +974,42 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
     Ok(dur)
 }
 
+/// Resolve the address to advertise into the Valkey tail registry (D-053).
+///
+/// Precedence: an explicit `--tail-advertise-addr` wins; else a concrete
+/// `--listen` IP is advertised verbatim; else (wildcard bind) `$NODE_IP` + the
+/// listen port; else a hard error (an un-advertisable wildcard). A non-IP
+/// `--listen` host (e.g. `myhost:4000`) is routable as-is and advertised
+/// verbatim.
+fn resolve_tail_advertise_addr(
+    explicit: Option<&str>,
+    listen: &str,
+    node_ip: Option<&str>,
+) -> Result<String> {
+    use std::net::SocketAddr;
+
+    if let Some(a) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
+        return Ok(a.to_string());
+    }
+
+    let listen = listen.trim();
+    match listen.parse::<SocketAddr>() {
+        // Concrete IP bind → advertise it verbatim.
+        Ok(sa) if !sa.ip().is_unspecified() => Ok(listen.to_string()),
+        // Wildcard bind → need a routable IP from NODE_IP (k8s downward API).
+        Ok(sa) => match node_ip.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(ip) => Ok(format!("{ip}:{}", sa.port())),
+            None => anyhow::bail!(
+                "cannot determine tail advertise address: --listen {listen:?} is a wildcard \
+                 and neither --tail-advertise-addr nor $NODE_IP is set. Set one of those, or \
+                 bind a concrete --listen IP."
+            ),
+        },
+        // Non-IP host (hostname:port) — routable as-is.
+        Err(_) => Ok(listen.to_string()),
+    }
+}
+
 /// Load this instance's stable writer UUID from `<wal_dir>/writer_id`, or
 /// generate one and persist it there. See the call site for why persistence
 /// matters (prefix/cursor-fan-out stability across restarts).
@@ -891,4 +1038,53 @@ fn rand_short() -> String {
         .unwrap_or_default()
         .as_nanos() as u64;
     format!("{:08x}", ns & 0xFFFF_FFFF)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_tail_advertise_addr;
+
+    #[test]
+    fn explicit_wins_over_everything() {
+        // Even a wildcard listen + NODE_IP is overridden by an explicit addr.
+        let got =
+            resolve_tail_advertise_addr(Some("1.2.3.4:9000"), "0.0.0.0:4000", Some("10.0.0.7"))
+                .unwrap();
+        assert_eq!(got, "1.2.3.4:9000");
+    }
+
+    #[test]
+    fn concrete_listen_ip_is_advertised_verbatim() {
+        let got = resolve_tail_advertise_addr(None, "192.168.1.5:4000", Some("10.0.0.7")).unwrap();
+        // NODE_IP is ignored when the bind is already a concrete IP.
+        assert_eq!(got, "192.168.1.5:4000");
+    }
+
+    #[test]
+    fn wildcard_listen_uses_node_ip_and_listen_port() {
+        let got = resolve_tail_advertise_addr(None, "0.0.0.0:4321", Some("10.0.0.7")).unwrap();
+        assert_eq!(got, "10.0.0.7:4321");
+        // IPv6 wildcard too.
+        let got6 = resolve_tail_advertise_addr(None, "[::]:4321", Some("10.0.0.7")).unwrap();
+        assert_eq!(got6, "10.0.0.7:4321");
+    }
+
+    #[test]
+    fn wildcard_listen_without_node_ip_or_explicit_is_error() {
+        let err = resolve_tail_advertise_addr(None, "0.0.0.0:4000", None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot determine tail advertise address"),
+            "unexpected: {err}"
+        );
+        // Empty NODE_IP / empty explicit are treated as unset.
+        assert!(resolve_tail_advertise_addr(Some("  "), "0.0.0.0:4000", Some("")).is_err());
+    }
+
+    #[test]
+    fn hostname_listen_is_advertised_verbatim() {
+        // A non-IP host is routable as-is (queryd resolves it).
+        let got = resolve_tail_advertise_addr(None, "myhost:4000", None).unwrap();
+        assert_eq!(got, "myhost:4000");
+    }
 }

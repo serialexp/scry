@@ -18,6 +18,7 @@ num_cpus          = { workspace = true }
 object_store      = { workspace = true }
 scry-block        = { workspace = true }
 scry-catalog      = { workspace = true }
+scry-match        = { workspace = true }
 scry-objstore     = { workspace = true }
 scry-proto        = { workspace = true }
 scry-query        = { workspace = true }

@@ -17,9 +17,9 @@ clap              = { workspace = true, features = ["env"] }
 futures           = { workspace = true }
 k8s-openapi       = { workspace = true }
 kube              = { workspace = true }
-regex             = { workspace = true }
 reqwest           = { workspace = true }
 scry-client       = { workspace = true }
+scry-match        = { workspace = true }
 scry-proto        = { workspace = true }
 serde             = { workspace = true, features = ["derive"] }
 serde_json        = { workspace = true }

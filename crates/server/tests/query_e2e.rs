@@ -355,6 +355,7 @@ async fn query_round_trip() {
         sql: None,
         limit: None,
         request_id: Some("test-matcher".into()),
+        live: false,
     };
     let result = run_query(listen_addr, req).await;
     assert_eq!(
@@ -391,6 +392,7 @@ async fn query_round_trip() {
         sql: Some("SELECT count(*) AS n FROM metrics".into()),
         limit: None,
         request_id: Some("test-sql".into()),
+        live: false,
     };
     let result_sql = run_query(listen_addr, req_sql).await;
     assert_eq!(result_sql.batches.len(), 1, "count(*) returns one batch");
@@ -433,6 +435,7 @@ async fn query_round_trip() {
         sql: None,
         limit: None,
         request_id: Some("test-matcher-replay".into()),
+        live: false,
     };
     let result_replay = run_query(listen_addr, req_replay).await;
     assert_eq!(
@@ -611,6 +614,7 @@ async fn logs_round_trip() {
         sql: None,
         limit: None,
         request_id: Some("logs-matcher".into()),
+        live: false,
     };
     let result = run_query(listen_addr, req).await;
     assert_eq!(
@@ -639,6 +643,7 @@ async fn logs_round_trip() {
         sql: Some("SELECT count(*) AS n FROM logs".into()),
         limit: None,
         request_id: Some("logs-sql".into()),
+        live: false,
     };
     let result_sql = run_query(listen_addr, req_sql).await;
     assert_eq!(result_sql.batches.len(), 1, "count(*) returns one batch");
@@ -666,6 +671,7 @@ async fn logs_round_trip() {
         sql: None,
         limit: None,
         request_id: Some("logs-default-sql".into()),
+        live: false,
     };
     let result_all = run_query(listen_addr, req_all).await;
     assert_eq!(
@@ -698,6 +704,7 @@ async fn logs_round_trip() {
         sql: None,
         limit: None,
         request_id: Some("logs-matcher-replay".into()),
+        live: false,
     };
     let result_replay = run_query(listen_addr, req_replay).await;
     assert_eq!(
@@ -835,6 +842,7 @@ async fn traces_round_trip() {
         sql: None,
         limit: None,
         request_id: Some("traces-default".into()),
+        live: false,
     };
     let result_all = run_query(listen_addr, req_all).await;
     assert_eq!(
@@ -854,6 +862,7 @@ async fn traces_round_trip() {
         sql: None,
         limit: None,
         request_id: Some("traces-by-id".into()),
+        live: false,
     };
     let result_by_id = run_query(listen_addr, req_by_id).await;
     assert_eq!(
@@ -890,6 +899,7 @@ async fn traces_round_trip() {
         sql: None,
         limit: None,
         request_id: Some("traces-matcher".into()),
+        live: false,
     };
     let result_matcher = run_query(listen_addr, req_matcher).await;
     assert_eq!(

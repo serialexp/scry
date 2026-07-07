@@ -52,10 +52,30 @@ use scry_objstore::{open_with_pool_config, BufPoolConfig, ObjStoreConfig};
 use scry_query::{
     BloomCache, BloomCacheConfig, PostingsCache, PostingsCacheConfig, QueryResultCache,
 };
-use scry_server::QueryService;
-use scry_valkey::{parse_envelope, subscribe_blocks, ValkeyClient, VALKEY_URL_ENV};
+use scry_server::{LiveDiscovery, QueryService};
+use scry_valkey::{
+    discover_tail_endpoints, parse_envelope, subscribe_blocks, ValkeyClient, VALKEY_URL_ENV,
+};
 use tracing::{info, warn};
 use uuid::Uuid;
+
+mod tail_relay;
+
+/// Valkey-backed [`LiveDiscovery`] for the D-054 merged history+live query.
+/// `scry-server` is Valkey-agnostic (it takes a `&dyn LiveDiscovery`); this is
+/// the query daemon's injected impl, reusing the D-053 tail registry — an
+/// ingester that advertises for tail advertises for live-query too (same
+/// ingest addr/port).
+struct ValkeyLiveDiscovery {
+    valkey: ValkeyClient,
+}
+
+#[async_trait::async_trait]
+impl LiveDiscovery for ValkeyLiveDiscovery {
+    async fn discover(&self) -> anyhow::Result<Vec<String>> {
+        discover_tail_endpoints(self.valkey.inner()).await
+    }
+}
 
 /// Block-event channels the convergence loops follow (every signal).
 const ALL_SIGNALS: [&str; 5] = ["dummy", "metrics", "logs", "traces", "profiles"];
@@ -73,6 +93,14 @@ pub struct Args {
     /// SQLite's WAL handles cross-process visibility).
     #[arg(long)]
     catalog: PathBuf,
+
+    /// Disable restoring the catalog from a bucket snapshot on cold boot
+    /// (D-055). By default, when the catalog file is absent, the daemon
+    /// downloads `_catalog/snapshot.sqlite` (one GET) instead of waiting on a
+    /// full bucket walk; its own poll + full-walk loops then fill the delta.
+    /// Set this to force a cold catalog (e.g. to reproduce a full reconcile).
+    #[arg(long)]
+    no_snapshot_restore: bool,
 
     // ── Buffer-pool knobs (override env / defaults) ──────────────
     //
@@ -175,6 +203,22 @@ pub struct Args {
     /// discovers brand-new prefixes).
     #[arg(long, default_value_t = 1800)]
     full_walk_interval: u64,
+
+    // ── Live-tail front-door (D-053) ──────────────────────────────
+    /// Listen address for the **live-tail relay** (`scry tail --queryd`). A
+    /// *separate* port from `--listen`: the tail sub-protocol (`Frame`) and the
+    /// query wire (`QueryFrame`) are different binschema unions whose first
+    /// bytes collide, so they can't share a socket. Unset ⇒ no tail front-door.
+    /// Requires Valkey (to discover ingesters); with `--tail-listen` set but no
+    /// Valkey, each subscription is refused with `ERR_TAIL_UNAVAILABLE`.
+    #[arg(long)]
+    tail_listen: Option<SocketAddr>,
+
+    /// Seconds between re-discovering the live ingester set from the Valkey
+    /// registry while a tail is streaming (new ingesters are dialed in, gone
+    /// ones dropped).
+    #[arg(long, default_value_t = 5)]
+    tail_rediscover_interval: u64,
 }
 
 /// Run the query daemon until ctrl-c.
@@ -201,6 +245,37 @@ pub async fn run(args: Args) -> Result<()> {
         pool_cfg.autoscale_headroom = v;
     }
     let (store, pool) = open_with_pool_config(&cfg, pool_cfg)?;
+
+    // Cold-start bootstrap (D-055): if the catalog file is absent, restore it
+    // from the bucket snapshot in a single GET instead of paying an O(all
+    // blocks) reconcile before the first query. Best-effort — on no snapshot,
+    // a schema-version mismatch, or any error we fall through to an empty
+    // catalog and let the poll + full-walk convergence loops (spawned below,
+    // Valkey or not) repopulate it exactly as before.
+    if !args.no_snapshot_restore && !args.catalog.exists() {
+        match scry_catalog::restore_snapshot(
+            &args.catalog,
+            store.as_ref(),
+            scry_catalog::CATALOG_SCHEMA_VERSION,
+        )
+        .await
+        {
+            Ok(scry_catalog::RestoreOutcome::Restored { blocks }) => {
+                info!(blocks, "restored catalog from bucket snapshot");
+            }
+            Ok(scry_catalog::RestoreOutcome::NoSnapshot) => {
+                info!("no catalog snapshot in bucket; starting cold (convergence will fill it)");
+            }
+            Ok(scry_catalog::RestoreOutcome::VersionMismatch { found, expected }) => {
+                warn!(
+                    found,
+                    expected,
+                    "catalog snapshot schema version mismatch; ignoring it, starting cold"
+                );
+            }
+            Err(e) => warn!(error = %e, "catalog snapshot restore failed; starting cold"),
+        }
+    }
 
     // Wrapped in `Mutex` so the `QueryService` is `Sync` (the
     // underlying `rusqlite::Connection` is `!Sync`). The daemon only
@@ -262,17 +337,45 @@ pub async fn run(args: Args) -> Result<()> {
     let conv_store = store.clone();
     let conv_bucket = cfg.bucket.clone();
 
-    let service = Arc::new(QueryService::new(
-        catalog,
-        store,
-        pool.clone(),
-        postings_cache.clone(),
-        bloom_cache.clone(),
-        runtime_env.clone(),
-        memory_pool.clone(),
-        result_cache.clone(),
-        args.query_cache_entry_bytes,
-    ));
+    // ── Valkey (v0.9 convergence + D-054 live discovery) ──────────
+    // Built before the service so the live-merge (D-054) discovery source can
+    // be injected: `--live` logs queries fan in to the ingesters discovered
+    // via the D-053 tail registry. With no Valkey the live half is refused
+    // (`QUERY_ERR_LIVE_UNAVAILABLE`), so we only attach a discovery when it's
+    // present.
+    let valkey_url = args
+        .valkey_url
+        .clone()
+        .or_else(|| std::env::var(VALKEY_URL_ENV).ok());
+    let valkey = match valkey_url.as_deref() {
+        Some(url) => Some(
+            ValkeyClient::connect(url, Uuid::now_v7())
+                .await
+                .with_context(|| format!("connecting to Valkey at {url}"))?,
+        ),
+        None => {
+            info!("{VALKEY_URL_ENV} unset and no --valkey-url; convergence via polling + full-walk only");
+            None
+        }
+    };
+    let live_discovery: Option<Arc<dyn LiveDiscovery>> = valkey
+        .clone()
+        .map(|vk| Arc::new(ValkeyLiveDiscovery { valkey: vk }) as Arc<dyn LiveDiscovery>);
+
+    let service = Arc::new(
+        QueryService::new(
+            catalog,
+            store,
+            pool.clone(),
+            postings_cache.clone(),
+            bloom_cache.clone(),
+            runtime_env.clone(),
+            memory_pool.clone(),
+            result_cache.clone(),
+            args.query_cache_entry_bytes,
+        )
+        .with_live_discovery(live_discovery),
+    );
 
     info!(
         listen = %args.listen,
@@ -294,23 +397,8 @@ pub async fn run(args: Args) -> Result<()> {
     // bucket so peers' freshly-written/compacted/reaped blocks become
     // queryable. No maintenance loop (no lease) — the daemon never does
     // destructive work. Stale rows a peer deleted are healed at query time by
-    // the `EvictOnNotFound` re-plan in `QueryService`.
-    let valkey_url = args
-        .valkey_url
-        .clone()
-        .or_else(|| std::env::var(VALKEY_URL_ENV).ok());
-    let valkey = match valkey_url.as_deref() {
-        Some(url) => Some(
-            ValkeyClient::connect(url, Uuid::now_v7())
-                .await
-                .with_context(|| format!("connecting to Valkey at {url}"))?,
-        ),
-        None => {
-            info!("{VALKEY_URL_ENV} unset and no --valkey-url; convergence via polling + full-walk only");
-            None
-        }
-    };
-
+    // the `EvictOnNotFound` re-plan in `QueryService`. (`valkey`/`valkey_url`
+    // were built above so the live-discovery source could be injected.)
     let mut bg_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
     // pub/sub convergence consumer (only with Valkey).
@@ -363,6 +451,29 @@ pub async fn run(args: Args) -> Result<()> {
                     Ok(_) => {}
                     Err(e) => warn!(error = %e, "convergence full-walk failed"),
                 }
+            }
+        }));
+    }
+
+    // ── Live-tail front-door (D-053) ──────────────────────────────
+    // Optional: a separate listener that speaks the ingest tail sub-protocol.
+    // It discovers live ingesters from Valkey and fans their records back to
+    // the `scry tail --queryd` client. Without Valkey it accepts connections
+    // but refuses each subscription (`ERR_TAIL_UNAVAILABLE`) — there is nothing
+    // to discover. Runs until aborted alongside the convergence loops.
+    if let Some(tail_listen) = args.tail_listen {
+        let valkey = valkey.clone();
+        let rediscover = Duration::from_secs(args.tail_rediscover_interval.max(1));
+        bg_tasks.push(tokio::spawn(async move {
+            if let Err(e) = tail_relay::serve_tail_relay(
+                tail_listen,
+                valkey,
+                rediscover,
+                std::future::pending::<()>(),
+            )
+            .await
+            {
+                warn!(error = %format!("{e:#}"), "tail-relay listener exited with error");
             }
         }));
     }

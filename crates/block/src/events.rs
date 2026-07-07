@@ -149,6 +149,8 @@ mod tests {
             all_fingerprints: None,
             has_body_bloom: false,
             body_bloom_size_bytes: None,
+            wal_seg_max: None,
+            wal_shard: None,
         }
     }
 

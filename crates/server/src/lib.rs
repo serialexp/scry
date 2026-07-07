@@ -33,11 +33,16 @@
 //! ```
 
 pub mod decode;
+pub mod live_merge;
+pub mod live_ring;
 mod pipeline;
 pub mod query_service;
 mod server;
 pub mod stats;
+pub mod tail;
 
+pub use live_merge::{fetch_live_from_ingester, LiveDiscovery};
+pub use live_ring::{LiveLogRecord, LiveRing, RetainingLogsAppender};
 pub use pipeline::{DecodeFn, Pipeline, ShardedPipeline, INGEST_SHARDS};
 pub use query_service::QueryService;
 pub use scry_block::BlockBuilderConfig;
@@ -46,3 +51,4 @@ pub use server::{
     ProfilesPipeline, ProfilesShards, Server, ServerConfig, TracesPipeline, TracesShards,
 };
 pub use stats::{serve_stats, ServerMetrics, StatsProvider, UploadStats};
+pub use tail::{SubId, SubscriptionRegistry, TailItem, TappingLogsAppender};
