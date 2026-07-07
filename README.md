@@ -212,6 +212,33 @@ scripts/dev-garage-up.sh    local single-node Garage (S3) for the smokes
 scripts/dev-valkey-up.sh    local single-node Valkey for the multi-instance smoke
 ```
 
+## Install
+
+Grab the prebuilt `scry` CLI/server binary for your platform:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/serialexp/scry/main/install.sh | sh
+```
+
+It downloads the latest release tarball for your OS/arch, verifies its
+checksum, and installs `scry` to `/usr/local/bin` (or `~/.local/bin`). Linux
+binaries are fully-static **musl** builds — one binary per arch that runs on any
+distro regardless of glibc; macOS binaries are native (Apple Silicon + Intel).
+This is the **CLI/server** binary (`scry ingest`, `scry query`, `scry agent`,
+`scry gateway`, `scry replay-opensearch`, …) — for the desktop GUI query app,
+use [`desktop/install.sh`](desktop/install.sh) instead.
+
+Prefer to pin a version or a package? The alternatives:
+
+```bash
+# A specific release, by hand — see https://github.com/serialexp/scry/releases
+curl -fsSLO https://github.com/serialexp/scry/releases/download/v0.14.0/scry-0.14.0-linux-x86_64.tar.gz
+tar -xzf scry-0.14.0-linux-x86_64.tar.gz && install -m0755 scry ~/.local/bin/
+
+# Or run the server image directly (server roles only):
+docker pull serialexp/scry:latest
+```
+
 ## Build and run locally
 
 First clone? Enable the formatting pre-commit hook once — it rejects any commit
