@@ -1,0 +1,30 @@
+[package]
+name        = "scry-replay-opensearch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "scry replay-opensearch: read documents out of an OpenSearch cluster (PIT + search_after, oldest→newest) and replay them into a scry ingest server over the native wire at a controlled, auto-ramping rate to find scry's ingest throughput ceiling."
+
+[lib]
+name = "scry_replay_opensearch"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow       = { workspace = true }
+chrono       = { workspace = true }
+clap         = { workspace = true }
+indicatif    = { workspace = true }
+reqwest      = { workspace = true }
+scry-httpsig = { workspace = true }
+scry-proto   = { workspace = true }
+serde        = { workspace = true, features = ["derive"] }
+serde_json   = { workspace = true }
+tokio        = { workspace = true }
+tracing      = { workspace = true }
+uuid         = { workspace = true }
+zstd         = { workspace = true }
+
+[lints]
+workspace = true

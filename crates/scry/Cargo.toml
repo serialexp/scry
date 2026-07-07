@@ -28,6 +28,7 @@ scry-webui         = { workspace = true }
 scry-compact       = { workspace = true }
 scry-retention     = { workspace = true }
 scry-tail          = { workspace = true }
+scry-replay-opensearch = { workspace = true }
 
 [lints]
 workspace = true

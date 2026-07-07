@@ -49,7 +49,8 @@ use serde_json::{json, Value};
 use tokio::{sync::mpsc, time::MissedTickBehavior};
 use tracing::{info, warn};
 
-use crate::{aws_sign::SigV4Signer, sink::Fanout};
+use crate::sink::Fanout;
+use scry_httpsig::SigV4Signer;
 
 /// Label keys that carry a service name, in priority order. The first present,
 /// non-empty value becomes the per-service index segment; if none match, the

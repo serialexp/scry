@@ -1,7 +1,7 @@
-//! Shared HTTP client construction for the gateway's HTTP sinks
-//! (Loki / OpenSearch / Mimir).
+//! Shared HTTP client construction for scry's HTTP-talking roles
+//! (gateway Loki/OpenSearch/Mimir sinks, replay-opensearch reader).
 //!
-//! All three reach their endpoints with a single `reqwest::Client`. By default
+//! All of them reach their endpoints with a single `reqwest::Client`. By default
 //! that client trusts only the built-in webpki roots; endpoints fronted by a
 //! private or internal CA then fail TLS verification. [`build_http_client`]
 //! optionally loads a custom CA certificate (PEM, possibly a multi-cert bundle)
@@ -12,7 +12,7 @@ use std::{path::Path, time::Duration};
 
 use anyhow::{Context, Result};
 
-/// Build the shared HTTP client for the Loki/OpenSearch/Mimir sinks.
+/// Build a shared HTTP client, optionally trusting an extra CA.
 ///
 /// When `ca_cert` is set, the file is read and parsed as a PEM bundle (one or
 /// more `-----BEGIN CERTIFICATE-----` blocks) and every certificate is added as
@@ -36,9 +36,7 @@ pub fn build_http_client(timeout: Duration, ca_cert: Option<&Path>) -> Result<re
         }
     }
 
-    builder
-        .build()
-        .context("building HTTP client for Loki/OpenSearch/Mimir sinks")
+    builder.build().context("building HTTP client")
 }
 
 #[cfg(test)]

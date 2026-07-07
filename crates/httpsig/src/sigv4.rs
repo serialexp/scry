@@ -1,11 +1,11 @@
-//! AWS SigV4 request signing for the OpenSearch sink.
+//! AWS SigV4 request signing for OpenSearch endpoints.
 //!
 //! Amazon OpenSearch Service (managed domains, signing name `es`) and OpenSearch
 //! Serverless (`aoss`) authorize requests with **AWS SigV4** rather than
-//! basic/cookie auth, so the sink must sign *every* request it makes — the bulk
-//! writes **and** the management calls (ISM policy, index template, data
-//! streams). Credentials and region come from the standard AWS chain
-//! (`aws-config`): env vars, the shared profile, EKS IRSA, or EC2/ECS IMDS.
+//! basic/cookie auth, so any client — the gateway's OpenSearch *sink* and the
+//! replay *reader* alike — must sign *every* request it makes. Credentials and
+//! region come from the standard AWS chain (`aws-config`): env vars, the shared
+//! profile, EKS IRSA, or EC2/ECS IMDS.
 //!
 //! Signing happens just before send: we build the `reqwest::Request`, sign a
 //! [`SignableRequest`] view of it (method / url / headers / body), then copy the
@@ -40,8 +40,8 @@ pub struct SigV4Signer {
     /// OpenSearch Serverless.
     service: String,
     /// Last resolved credentials, reused until near expiry so we don't hit the
-    /// provider (IMDS/STS) on every request. The OpenSearch sink worker is
-    /// single-threaded, so this `Mutex` only exists to satisfy `&self`.
+    /// provider (IMDS/STS) on every request. The callers are single-threaded, so
+    /// this `Mutex` only exists to satisfy `&self`.
     cached: Mutex<Option<Credentials>>,
 }
 
@@ -133,6 +133,29 @@ impl SigV4Signer {
         }
         Ok(())
     }
+}
+
+/// Resolve AWS credentials + region from the standard chain and build a
+/// [`SigV4Signer`]. Region precedence: the explicit `region` argument, then
+/// whatever the AWS config resolves (`AWS_REGION` / profile). `service` is the
+/// signing name (`es` for managed OpenSearch Service domains, `aoss` for
+/// Serverless).
+pub async fn build_sigv4_signer(region: Option<String>, service: String) -> Result<SigV4Signer> {
+    let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
+    if let Some(r) = region.clone() {
+        loader = loader.region(aws_config::Region::new(r));
+    }
+    let cfg = loader.load().await;
+    let resolved_region = cfg
+        .region()
+        .map(|r| r.as_ref().to_string())
+        .or(region)
+        .context("no AWS region for OpenSearch SigV4: set the region flag or AWS_REGION")?;
+    let provider = cfg
+        .credentials_provider()
+        .context("no AWS credentials resolved for OpenSearch SigV4 (env, profile, IRSA, IMDS)")?;
+    tracing::info!(region = %resolved_region, service = %service, "opensearch SigV4 signing enabled");
+    Ok(SigV4Signer::new(provider, resolved_region, service))
 }
 
 #[cfg(test)]

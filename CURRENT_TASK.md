@@ -1,61 +1,60 @@
-# CURRENT TASK: D-054 — merged history + live query with per-writer WAL-segment dedup
+# CURRENT_TASK — CLI install/release + D-056 (both COMPLETE, uncommitted)
 
-## Status: COMPLETE (pending Bart's review / regression sign-off)
-All plan tasks #39–#48 done. Full workspace builds (debug + release), `cargo test
---workspace` green (65 suites), and `scripts/smoke-live.sh` PASSES all four assertions.
+## Follow-up: prebuilt `scry` CLI binary — release artifacts + install.sh (DONE)
+Bart wanted to download+install the `scry` CLI/server binary (where
+`replay-opensearch` now lives), like `~/Projects/cool-rust-terminal` does.
+Added (modeled on that repo, headless — no desktop entry):
+- `install.sh` (repo root): detect os-arch → `GET /releases/latest` → download
+  `scry-<ver>-<os>-<arch>.tar.gz` + verify `.sha256` → install to
+  `/usr/local/bin` or `~/.local/bin`. Distinct from `desktop/install.sh` (GUI).
+- `.github/workflows/release.yml` new **`cli`** job: matrix — linux x86_64/aarch64
+  static **musl** via `cross`, macOS x86_64/aarch64 native — guards
+  tag≡workspace version, tarballs `scry`+`README.md`+`.sha256`, `softprops`
+  attaches to the SAME draft Release the `desktop` job creates (draft, publish
+  manually). No Windows.
+- Docs: README `## Install` section; CLAUDE.md Tooling bullet.
+- Verified: native static-musl build of `scry` links `statically linked`
+  (proves mimalloc-under-musl) and `scry replay-opensearch --help` runs;
+  release.yml YAML validates (jobs image/desktop/cli); `install.sh` `bash -n` +
+  `--help`/bad-arg/detect_platform all correct. (shellcheck unavailable on host —
+  used `bash -n` + review.) Choices confirmed by Bart: musl, linux+macos, no win.
+- NOT committed (git allowlist — waiting on Bart).
 
-## The milestone
-"Request the last minute": one query that unions stored parquet blocks (history) with the
-still-in-flight records at the ingesters (live), deduplicated across the block-commit seam.
-Plan: `~/.claude/plans/snazzy-zooming-riddle.md`. Logs-only first cut, Valkey-required.
+## What
+New `scry replay-opensearch` subcommand: replays an existing OpenSearch corpus
+into a `scry ingest` server at an auto-ramping, hold-at-knee rate to find scry's
+ingest throughput ceiling. Reads oldest→newest via PIT + `search_after`, maps
+each `_source` → scry log record (convention + overridable flags, faithful copy
+of the original `@timestamp`), ships over the native wire. Progress bar + stats
+line. Decision record = D-056.
 
-## Locked decisions (Bart)
-1. Live source = dedicated retained recent-window **ring** at each ingester.
-2. Dedup grain = per-record **WAL-segment tag** `(writer, shard, seg)`.
-3. Discovery = **Valkey-required, refuse otherwise** (mirror tail).
-4. Scope = **logs only**.
-5. Watermark = **persistent monotonic high-water table in the catalog** (advanced atomically
-   with insert_block; never recomputed from live blocks — sharding + compaction make that wrong).
+## Status: DONE — all tasks #55–#64 complete. NOT committed (waiting on Bart).
 
-## The dedup invariant + the segment-0 fix
-Unit of dedup = WAL instance `(writer_id, signal, shard)`. `H` = durable segment high-water
-(catalog `wal_watermarks`) = highest segment fully committed to a block. A live record tagged
-`(writer, shard, seg)` is durable (drop it) iff a watermark exists AND `seg ≤ H`.
-**Absent watermark = `None` (nothing durable) ⇒ keep ALL live records** — NOT `unwrap_or(0)`.
-WAL segments are 0-based, so `H` absent ≠ `Some(0)`: collapsing them dropped a fresh ingester's
-first-segment records before its first flush (a gap). Selector is the pure, unit-tested
-`live_record_is_durable(seg, Option<H>)` in `query_service.rs`. **This was a real bug in the
-task-#46 dedup code — fixed this session (Rule #0.5); the smoke's assertion (a) proves it.**
+### Code
+- New leaf crate `crates/httpsig` (`scry-httpsig`): `build_http_client` + `SigV4Signer`
+  extracted verbatim from `gateway/src/{tls,aws_sign}.rs` (both deleted); gateway
+  repointed to `scry_httpsig::…`, aws deps moved out of gateway into httpsig.
+- New crate `crates/replay-opensearch` (`scry-replay-opensearch`): `os.rs` (PIT read
+  client), `map.rs` (pure doc→record, 14 unit tests), `wire.rs` (hand-rolled ack-aware
+  ingest loop), `pace.rs` (token bucket + ramp controller, 3 tests), `stats.rs`
+  (indicatif bar), `lib.rs` (2-stage fetch→map+send pipeline + Args).
+- `crates/scry` main.rs + Cargo.toml: `Cmd::ReplayOpensearch` wired.
+- Workspace Cargo.toml: members + `indicatif` dep + both crate paths.
 
-## DONE — full implementation
-- **Watermark plumbing** (#39–#41): `BlockMeta.{wal_seg_max,wal_shard}` (serde default);
-  builder setters in all 5 builders; `Pipeline` stamps them in `spawn_upload` (sealed seg +
-  `shard_index`); `ingest_decoded` returns the appended `SegmentId`. Catalog columns +
-  `wal_watermarks` table + `advance_watermark`/`get_watermark`, advanced atomically with
-  `insert_block` (+ reconcile/apply_event/poll piggyback). Unit-tested.
-- **LiveRing** (#42): `crates/server/src/live_ring.rs` — logs-only bounded ring (age + byte
-  eviction), `RetainingLogsAppender` decorator. Fed off the logs phase-2 seam in `server.rs`;
-  phase-2 stamps shard+seg. 5 unit tests.
-- **Ingest wire** (#43): `LiveQuery`=0x52 / `LiveBatch`=0x53 in `proto/ingest.schema.json`,
-  regenerated bindings, `build::{live_query,live_batch}` constructors.
-- **Serve LiveQuery** (#44): `server.rs` dispatch arm snapshots the ring under the predicate
-  (scry_match filter + body_contains + ts range), replies one `LiveBatch`.
-- **Query wire** (#45): `live: bool` on `QueryRequest` (`proto/query.schema.json` + regen +
-  `crates/query/src/wire.rs`); `QUERY_ERR_LIVE_UNAVAILABLE = 0x0005`.
-- **Merge + dedup** (#46): `QueryService.fetch_live_logs` fans `LiveQuery` out to ingesters
-  discovered via an injected `&dyn LiveDiscovery` (`live_merge.rs` — Valkey-agnostic), dedups
-  with `live_record_is_durable`, registers a `logs_live` MemTable behind `CREATE VIEW logs …
-  UNION ALL …`. No Valkey ⇒ refuse with `QUERY_ERR_LIVE_UNAVAILABLE`. Live queries bypass the
-  result cache. queryd injects `ValkeyLiveDiscovery` (over the D-053 tail registry).
-- **Probe** (#47): `--live` on `scry-query-probe`.
-- **Ingestd** (#48): `--live-window-secs` (90) / `--live-window-max-bytes` (128 MiB) flags →
-  `LiveRing::new` → `Server::with_live_ring`.
-- **Docs/smoke** (#48): `scripts/smoke-live.sh` (Garage + dev Valkey), D-054 in
-  `docs/decisions.md`, CLAUDE.md updated.
+### Docs
+- `docs/decisions.md` D-056 appended.
+- `CLAUDE.md`: eleven-roles multicall paragraph + two Binaries bullets
+  (replay-opensearch, httpsig) + smoke-osreplay entry under Tooling.
+- `TODO.md`: D-056 deferred follow-ups section.
 
-## Verify (run for regression)
-`cargo build --release --workspace` ✅ + `cargo test --workspace` ✅ (65 ok).
-`scripts/smoke-live.sh` ✅ (a live-half / b history / c dedup-exact / d refuse).
-Still worth Bart running: `SIGNAL=logs scripts/smoke.sh`, `MULTI=1 scripts/smoke.sh`,
-`scripts/smoke-tail.sh`, `scripts/smoke-tail-queryd.sh` (tail untouched, but confirm).
-Dev Valkey: container `scry-valkey-smoke` on `127.0.0.1:6380`.
+### Verification (all PASS)
+- `cargo test --workspace` — 69 ok, 0 failed.
+- `cargo build --release --workspace` — clean.
+- `scripts/smoke-osreplay.sh` — 7/7 assertions (50 rows, service=api 17,
+  grep 48, ts_inherited=2, body_missing=2).
+- `scripts/smoke-gateway.sh` — PASS (httpsig extraction regression).
+- `SIGNAL=logs scripts/smoke.sh` — PASS (wire path regression).
+
+## Next
+Nothing pending. Awaiting Bart's decision to commit (conventional-commit; git is
+allowlist — do not commit until asked). No wire-schema change (no gen-proto).

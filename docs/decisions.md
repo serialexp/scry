@@ -2791,3 +2791,104 @@ block) with no parse failures.
 full reconcile); lease-gating snapshot production to cut redundant multi-instance
 uploads; snapshot history/GC and compression; folding restore into `scry get` /
 one-shot query paths. No wire-protocol change — object-layout + boot-path only.
+
+---
+
+## D-056 — `scry replay-opensearch`: high-speed OpenSearch → scry replay bench
+
+**Problem.** We want to know *where scry gives up* — the ingest throughput
+ceiling — against a realistic corpus, and the most realistic corpus available is
+an existing multi-TB OpenSearch cluster. scry already speaks OpenSearch as a
+*sink* (`crates/gateway/src/opensearch.rs` writes via `_bulk`), but there was no
+*reader* — nothing to scroll documents *out* of a cluster and replay them into a
+`scry ingest` server at a controlled rate.
+
+**Decision.** A new first-class multicall role `scry replay-opensearch` (lib
+crate `scry-replay-opensearch`, wired into `crates/scry`): read a whole index
+oldest→newest via **PIT + `search_after`**, map each `_source` to a scry log
+record by convention (overridable field flags), and ship it over the native wire
+at an **auto-ramping** record rate that **holds at the knee** the moment scry
+sustains back-pressure. A progress bar over the `_count` corpus plus a rolling
+stats line show the ceiling hands-off.
+
+**Reader (`os.rs`).** `POST /<index>/_count` seeds the progress-bar length;
+`POST /<index>/_pit?keep_alive=…` opens a point-in-time; `POST /_search` pages
+with `sort:[{<ts_field>:asc},{_shard_doc:asc}]` + `search_after` (cursor = the
+last hit's `sort` array), `track_total_hits:false`; `DELETE /_pit` closes it
+best-effort. `_shard_doc` is the PIT tiebreaker. Auth is one of none / HTTP basic
+(common on self-hosted OS, absent from the sink) / bearer / AWS SigV4 — the last
+three via the shared `scry-httpsig` crate (see below). PIT (not the legacy
+`scroll`) is the v1 API; a `scroll` fallback for pre-2.4 clusters is deferred.
+
+**Mapping (`map.rs`, pure + unit-tested).** `doc_to_record`: **timestamp** from
+`--timestamp-field` (default `@timestamp`) — RFC3339 string *or* epoch number
+(s/ms/µs/ns auto-detected by magnitude) → unix-nanos; **missing/unparseable ⇒
+carry-forward the previous doc's timestamp** (docs arrive in sort order, so the
+cursor is monotonic; seeded with ingest-now before the first valid ts), counted
+as `ts_inherited`. **body** = first present of `--body-field` (default
+`message,body`); missing ⇒ empty, counted `body_missing`. **severity** =
+`--severity-field` (default `severity,log.level,level`) — numeric passthrough
+(already OTel 1–24) else string level mapped to the band start (inverse of
+`scry_tail::severity_name`); absent ⇒ INFO(9). **service label** = first present
+of `--service-field` (default `service.name,service,app,k8s_app` — the sink's
+`SERVICE_KEYS` priority, so an OS-sink→replay round-trip is stable). **Stream
+labels** (low-card, fingerprinted via `scry_proto::fingerprint`) = `service` +
+`--label-field` values; **attributes** (per-entry, high-card OK) = every other
+scalar flattened to dotted keys, capped at `--max-attrs` (64). The original
+`@timestamp` is preserved as the record timestamp — a **faithful copy**, not
+ingest-now.
+
+**Wire (`wire.rs`) — hand-rolled, not `scry-client`.** The bench needs per-ack
+**status** (`ACK_THROTTLED`/`ACK_REJECTED`) and **latency**, which
+`scry_client::Client` deliberately hides (it collapses acks to `()` credits). So
+the loop is the spewer's proven Hello/HelloAck + `build::batch` +
+`zstd::encode_all(_, 3)` + framing, with a reader task that stamps a send-`Instant`
+per `batch_id` and reports `(status, latency)` back; one reconnect-and-resend on
+link drop. `scry-client` is left untouched.
+
+**Pacing + auto-ramp (`pace.rs`).** A per-record token bucket (`Pacer`) advances a
+deadline by `n/rate` and `sleep_until`s. The `RampController` starts at `--rate`
+(500 rec/s), adds `--rate-step` (500) every `--rate-step-interval` (15s) up to
+`--rate-max` (0 = unbounded) — **but freezes permanently** the first interval that
+saw sustained `ACK_THROTTLED` *or* ≥90% inflight saturation (`Stats::interval_pressure`).
+Hold-at-knee auto-finds the ceiling without overshooting into a rejection storm.
+
+**Observability (`stats.rs`).** An `indicatif` bar (len = `_count`) whose message
+is refreshed each second: target vs achieved rec/s, inflight/max, ok/throttled/
+rejected counts, ack p50 latency, and the `ts_inherited`/`body_missing` tallies.
+The final summary is also logged via `tracing::info!` so it survives a non-TTY
+(the bar itself is hidden when stderr isn't a terminal).
+
+**Pipeline (`lib.rs`).** Two stages over a bounded `mpsc(4)`: a **fetcher** task
+runs the PIT `search_after` loop and streams pages of `_source`; the **sender**
+maps each doc, groups consecutive records into per-fingerprint `LogStream`s,
+flushes at `--batch-records` (5000), paces, and ships. `tokio::select!` folds in
+the ramp tick and the 1s UI tick. Drain-once-to-PIT-open-time is the core;
+`--follow` past open-time is deferred.
+
+**Shared HTTP+SigV4 → new leaf crate `scry-httpsig` (D-056a).** `build_http_client`
+(custom-CA trust, was `gateway/src/tls.rs`) and `SigV4Signer` + `build_sigv4_signer`
+(was `gateway/src/aws_sign.rs`) are exactly what the reader needs and must not be
+duplicated (Rule #2). Both moved **verbatim** into `crates/httpsig`
+(`client.rs`/`sigv4.rs`), pulling the `aws-config`/`aws-sigv4` deps out of gateway
+into it; gateway now depends on `scry-httpsig` and its call sites in
+`cli.rs`/`opensearch.rs` repoint to `scry_httpsig::…`. A reader depending on the
+fan-out-hub crate would be the wrong dependency direction — a shared leaf crate is
+correct.
+
+**Sealed by `scripts/smoke-osreplay.sh`** (Garage only, no Valkey): a python3 stub
+OpenSearch implementing `_count`, `_pit` (POST open / DELETE close), and `_search`
+`search_after` over M=50 synthetic docs (ascending epoch-ms `@timestamp`,
+round-robin `api`/`worker`/`scheduler`, 2 docs missing `@timestamp` and 2 missing
+`message`) → `scry replay-opensearch --page-size 10` (forces multiple pages) →
+`scry ingest --storage` → Garage → `scry list`/`scry get`. Asserts the reconciled
+catalog holds exactly 50 rows in ≥1 logs block, `scry get` scans 50 back,
+`--matcher service=api` selects 17 (labels preserved), `--grep "log line"` selects
+48 = 50 − 2 empty-body (bodies preserved), and the replay summary reports
+`ts_inherited=2` / `body_missing=2` (carry-forward + empty-body accounting). No
+wire-protocol change — reuses the existing `Batch`/`LogsBatch`.
+
+**Deferred:** `--follow` live-tailing past PIT open-time; PIT `slice` parallelism /
+multi-connection fan-out for when a single reader caps below scry's ceiling; the
+legacy `scroll` fallback for pre-2.4 clusters; metrics/traces/profiles replay
+(logs-only); resumable checkpointing of the `search_after` cursor.

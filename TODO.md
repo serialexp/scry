@@ -1,4 +1,16 @@
 
+## D-056 replay-opensearch (follow-ups, non-blocking)
+- [ ] `--follow`: after draining to PIT open-time, re-open the PIT and continue
+      past the last-seen timestamp for a live tail (core is drain-once-to-now).
+- [ ] PIT `slice` parallelism / multi-connection fan-out — split the corpus into
+      N `slice` shards each on its own reader+connection, for when a single
+      reader caps below scry's ingest ceiling (would surface `--slices`).
+- [ ] Legacy `scroll` API fallback for pre-2.4 OpenSearch/Elasticsearch clusters
+      (PIT-only today).
+- [ ] Replay metrics/traces/profiles, not just logs (logs-only in v1).
+- [ ] Resumable checkpointing of the `search_after` cursor so an interrupted
+      multi-TB run can resume instead of restarting from the oldest doc.
+
 ## D-055 catalog snapshot bootstrap (follow-ups, non-blocking)
 - [ ] Real `ALTER TABLE`-based catalog migration framework. Today
       `Catalog::init_schema` is `CREATE TABLE IF NOT EXISTS` only and cross-version

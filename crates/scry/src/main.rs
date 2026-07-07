@@ -14,6 +14,7 @@
 //! - `scry compact` — size-tiered block compaction (one-shot / watch).
 //! - `scry retention` — per-signal TTL retention (dry-run by default).
 //! - `scry tail` — live log tailing (best-effort, straight off the ingest hot path).
+//! - `scry replay-opensearch` — replay an OpenSearch corpus into a scry ingest server (throughput bench).
 //!
 //! Each role's flags and behaviour are identical to what the former
 //! per-binary tools exposed; this binary only adds the dispatch layer,
@@ -67,6 +68,8 @@ enum Cmd {
     Retention(scry_retention::Args),
     /// Live log tailing (best-effort, straight off the ingest hot path).
     Tail(scry_tail::Args),
+    /// Replay an OpenSearch corpus into a scry ingest server (throughput bench).
+    ReplayOpensearch(scry_replay_opensearch::Args),
 }
 
 #[tokio::main]
@@ -91,5 +94,6 @@ async fn main() -> Result<()> {
         Cmd::Compact(a) => scry_compact::run(a).await,
         Cmd::Retention(a) => scry_retention::run(a).await,
         Cmd::Tail(a) => scry_tail::run(a).await,
+        Cmd::ReplayOpensearch(a) => scry_replay_opensearch::run(a).await,
     }
 }

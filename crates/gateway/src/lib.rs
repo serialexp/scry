@@ -23,7 +23,6 @@
 //! `loki::to_push_request`, `opensearch::to_bulk_ndjson`, …) are pure and
 //! unit-tested; the handlers and sink workers are thin shells over them.
 
-pub mod aws_sign;
 pub mod cli;
 pub mod loki;
 pub mod mimir;
@@ -33,7 +32,6 @@ pub mod promwrite;
 pub mod pyroscope;
 pub mod sink;
 pub mod sink_scry;
-pub mod tls;
 pub mod wire;
 
 use axum::{routing::post, Router};
