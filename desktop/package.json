@@ -16,6 +16,7 @@
     "gen-proto": "bash ../scripts/gen-proto-ts.sh"
   },
   "dependencies": {
+    "@solidjs/router": "^0.16.1",
     "@tauri-apps/api": "^2.9.0",
     "apache-arrow": "^18.1.0",
     "solid-js": "^1.9.3",

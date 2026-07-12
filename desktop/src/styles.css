@@ -1,16 +1,43 @@
 :root {
-  --bg: #0f1117;
-  --panel: #171a23;
-  --panel-2: #1f2330;
-  --border: #2a2f3d;
-  --text: #e6e8ee;
-  --muted: #9aa3b2;
-  --accent: #6aa3ff;
-  --accent-press: #4d86e6;
-  --danger: #ff6b6b;
-  --warn: #f0b429;
-  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
-  --sans: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  /* Design language from the v1.0 web-ui mock (docs/design/v1.0-web-ui.md):
+     warm near-black canvas, amber accent, teal secondary, IBM Plex Mono data. */
+
+  /* Surfaces (darkest → lightest) */
+  --bg: #14120e; /* app canvas */
+  --panel: #16140f; /* chrome bars (header, sidebar) */
+  --panel-2: #1c1a15; /* inputs, raised chips */
+  --canvas-sunken: #111009; /* scroll bodies (results, fleet) */
+
+  /* Borders */
+  --border: #2b2822; /* separators */
+  --border-2: #38342b; /* input / control borders */
+
+  /* Text */
+  --text: #f0ece3; /* primary */
+  --muted: #9a9385; /* secondary */
+  --faint: #6f6a5e; /* tertiary / captions */
+
+  /* Accents */
+  --accent: #e8a33d; /* amber — primary actions, brand, selection */
+  --accent-press: #cf8f2f; /* amber pressed */
+  --teal: #5bb6a8; /* secondary — query keys, INFO */
+
+  /* Status */
+  --danger: #e5695f;
+  --warn: #e8a33d;
+
+  /* Log/severity levels (mirror severity.ts) */
+  --level-error: #e5695f;
+  --level-warn: #e8a33d;
+  --level-info: #5bb6a8;
+  --level-debug: #8f8a7d;
+
+  /* IBM Plex Mono is the mock's data font; falls back gracefully until the
+     woff2 is bundled (tracked as a Phase 0 follow-up). */
+  --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo,
+    Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, system-ui, "Segoe UI", Roboto,
+    sans-serif;
 }
 
 * {
@@ -40,22 +67,11 @@ body {
 
 .app-header {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 8px;
-  padding: 10px 16px;
+  padding: 8px 16px;
   border-bottom: 1px solid var(--border);
   background: var(--panel);
-}
-
-.app-header h1 {
-  margin: 0;
-  font-size: 18px;
-  letter-spacing: 0.5px;
-}
-
-.subtitle {
-  color: var(--muted);
-  font-size: 12px;
 }
 
 /* Pushed to the right edge; the logout button (when shown) follows it. */
@@ -80,10 +96,98 @@ body {
   border-color: var(--accent);
 }
 
+/* ── Brand + primary nav (routed shell) ───────────────────────────── */
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.brand-mark {
+  width: 14px;
+  height: 14px;
+  border-radius: 4px;
+  background: var(--accent);
+}
+
+.brand-name {
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  color: var(--text);
+}
+
+.app-nav {
+  display: flex;
+  gap: 2px;
+  margin-left: 10px;
+}
+
+.nav-link {
+  padding: 6px 12px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--muted);
+  text-decoration: none;
+  transition:
+    background 0.12s,
+    color 0.12s;
+}
+
+.nav-link:hover {
+  color: var(--text);
+  background: var(--panel-2);
+}
+
+.nav-link.active {
+  color: var(--text);
+  background: var(--panel-2);
+}
+
 .app-loading {
   margin: auto;
   padding: 48px;
   color: var(--muted);
+}
+
+/* ── View placeholders (Dashboards / Fleet / Alerts pre-build) ─────── */
+
+.view-placeholder {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 48px;
+  text-align: center;
+  color: var(--muted);
+}
+
+.view-placeholder h2 {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.view-placeholder p {
+  margin: 0;
+  max-width: 440px;
+  line-height: 1.5;
+}
+
+.inert-badge {
+  padding: 3px 10px;
+  border-radius: 6px;
+  background: rgba(232, 163, 61, 0.14);
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.02em;
 }
 
 /* ── Login ────────────────────────────────────────────────────────── */

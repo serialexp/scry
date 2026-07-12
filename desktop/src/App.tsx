@@ -1,38 +1,48 @@
-//! Top-level layout: a query form in the sidebar, results on the right,
-//! and an error banner driven by run status.
+//! Top-level routed shell.
 //!
 //! In the browser shell (served by `scry-webui`) the whole app is gated behind
 //! a password → cookie session: until `/api/me` confirms a session we show a
 //! loading placeholder, then either the login form or the app. The desktop
 //! (Tauri) shell talks straight to the daemon and is always "authed".
+//!
+//! Once authed, the app is a `@solidjs/router` with four views — Explore,
+//! Dashboards, Alerts, Fleet — hosted under a shared shell (brand + nav +
+//! version + logout). The query path lives entirely in Explore; the other
+//! views are placeholders until their phases land.
 
-import { Show, onMount, type Component } from "solid-js";
+import { Show, onMount, type Component, type JSX } from "solid-js";
+import { HashRouter, Route, Navigate, A } from "@solidjs/router";
 
-import QueryForm from "./components/QueryForm";
-import LabelBrowser from "./components/LabelBrowser";
-import ResultsTable from "./components/ResultsTable";
-import VolumePanel from "./components/VolumePanel";
 import LoginForm from "./components/LoginForm";
-import {
-  state,
-  inBrowser,
-  authed,
-  authChecked,
-  checkSession,
-  logout,
-} from "./store";
+import Explore from "./views/Explore";
+import Dashboards from "./views/Dashboards";
+import Alerts from "./views/Alerts";
+import Fleet from "./views/Fleet";
+import { inBrowser, authed, authChecked, checkSession, logout } from "./store";
 
-const App: Component = () => {
-  // Browser shell: probe the existing session cookie once on startup.
-  onMount(() => {
-    void checkSession();
-  });
-
+/** Shared chrome: brand, primary nav, version, logout. Wraps every route. */
+const Shell: Component<{ children?: JSX.Element }> = (props) => {
   return (
     <div class="app">
       <header class="app-header">
-        <h1>scry</h1>
-        <span class="subtitle">query</span>
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true" />
+          <span class="brand-name">scry</span>
+        </div>
+        <nav class="app-nav">
+          <A href="/explore" class="nav-link" activeClass="active">
+            Explore
+          </A>
+          <A href="/dashboards" class="nav-link" activeClass="active">
+            Dashboards
+          </A>
+          <A href="/alerts" class="nav-link" activeClass="active">
+            Alerts
+          </A>
+          <A href="/fleet" class="nav-link" activeClass="active">
+            Fleet
+          </A>
+        </nav>
         <span class="version" title="scry version">
           v{__APP_VERSION__}
         </span>
@@ -42,30 +52,34 @@ const App: Component = () => {
           </button>
         </Show>
       </header>
-
-      <Show
-        when={authChecked()}
-        fallback={<div class="app-loading">Loading…</div>}
-      >
-        <Show when={authed()} fallback={<LoginForm />}>
-          <div class="app-body">
-            <aside class="sidebar">
-              <QueryForm />
-              <LabelBrowser />
-            </aside>
-            <main class="main">
-              <Show when={state.status === "error" && state.error}>
-                <div class="error-banner" role="alert">
-                  {state.error}
-                </div>
-              </Show>
-              <VolumePanel />
-              <ResultsTable />
-            </main>
-          </div>
-        </Show>
-      </Show>
+      {props.children}
     </div>
+  );
+};
+
+const App: Component = () => {
+  // Browser shell: probe the existing session cookie once on startup.
+  onMount(() => {
+    void checkSession();
+  });
+
+  return (
+    <Show
+      when={authChecked()}
+      fallback={<div class="app-loading">Loading…</div>}
+    >
+      <Show when={authed()} fallback={<LoginForm />}>
+        <HashRouter root={Shell}>
+          <Route path="/" component={() => <Navigate href="/explore" />} />
+          <Route path="/explore" component={Explore} />
+          <Route path="/dashboards" component={Dashboards} />
+          <Route path="/alerts" component={Alerts} />
+          <Route path="/fleet" component={Fleet} />
+          {/* Unknown paths land on Explore. */}
+          <Route path="*" component={Explore} />
+        </HashRouter>
+      </Show>
+    </Show>
   );
 };
 
