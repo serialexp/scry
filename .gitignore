@@ -5,3 +5,9 @@ docker/garage/.env
 /flamegraphs/
 perf.data
 perf.data.old
+
+# Claude Design mock artifacts (visual target for the v1.0 web UI — see
+# docs/design/v1.0-web-ui.md). Large generated bundles / design inputs, kept
+# local, not tracked.
+/scry - Redesign (standalone).html
+/scry-source/

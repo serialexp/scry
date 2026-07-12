@@ -1,60 +1,42 @@
-# CURRENT_TASK — CLI install/release + D-056 (both COMPLETE, uncommitted)
-
-## Follow-up: prebuilt `scry` CLI binary — release artifacts + install.sh (DONE)
-Bart wanted to download+install the `scry` CLI/server binary (where
-`replay-opensearch` now lives), like `~/Projects/cool-rust-terminal` does.
-Added (modeled on that repo, headless — no desktop entry):
-- `install.sh` (repo root): detect os-arch → `GET /releases/latest` → download
-  `scry-<ver>-<os>-<arch>.tar.gz` + verify `.sha256` → install to
-  `/usr/local/bin` or `~/.local/bin`. Distinct from `desktop/install.sh` (GUI).
-- `.github/workflows/release.yml` new **`cli`** job: matrix — linux x86_64/aarch64
-  static **musl** via `cross`, macOS x86_64/aarch64 native — guards
-  tag≡workspace version, tarballs `scry`+`README.md`+`.sha256`, `softprops`
-  attaches to the SAME draft Release the `desktop` job creates (draft, publish
-  manually). No Windows.
-- Docs: README `## Install` section; CLAUDE.md Tooling bullet.
-- Verified: native static-musl build of `scry` links `statically linked`
-  (proves mimalloc-under-musl) and `scry replay-opensearch --help` runs;
-  release.yml YAML validates (jobs image/desktop/cli); `install.sh` `bash -n` +
-  `--help`/bad-arg/detect_platform all correct. (shellcheck unavailable on host —
-  used `bash -n` + review.) Choices confirmed by Bart: musl, linux+macos, no win.
-- NOT committed (git allowlist — waiting on Bart).
+# CURRENT_TASK — v1.0 web UI (own observability frontend)
 
 ## What
-New `scry replay-opensearch` subcommand: replays an existing OpenSearch corpus
-into a `scry ingest` server at an auto-ramping, hold-at-knee rate to find scry's
-ingest throughput ceiling. Reads oldest→newest via PIT + `search_after`, maps
-each `_source` → scry log record (convention + overridable flags, faithful copy
-of the original `@timestamp`), ships over the native wire. Progress bar + stats
-line. Decision record = D-056.
+Build scry's own operator frontend (the v1.0 "own UI" milestone), replacing the
+Grafana-adapter direction. Design target = a Claude Design mock
+(`scry - Redesign (standalone).html` + `scry-source/`, both gitignored) — a
+visual spec in Claude's dc-runtime DSL, NOT portable code. Full design +
+phasing + decisions live in **docs/design/v1.0-web-ui.md**.
 
-## Status: DONE — all tasks #55–#64 complete. NOT committed (waiting on Bart).
+Four views in one routed SolidJS app (`desktop/`, served in-browser by
+scry-webui): **Explore** (Logs/Traces/Metrics query), **Dashboards**,
+**Alerts**, **Fleet status**.
 
-### Code
-- New leaf crate `crates/httpsig` (`scry-httpsig`): `build_http_client` + `SigV4Signer`
-  extracted verbatim from `gateway/src/{tls,aws_sign}.rs` (both deleted); gateway
-  repointed to `scry_httpsig::…`, aws deps moved out of gateway into httpsig.
-- New crate `crates/replay-opensearch` (`scry-replay-opensearch`): `os.rs` (PIT read
-  client), `map.rs` (pure doc→record, 14 unit tests), `wire.rs` (hand-rolled ack-aware
-  ingest loop), `pace.rs` (token bucket + ramp controller, 3 tests), `stats.rs`
-  (indicatif bar), `lib.rs` (2-stage fetch→map+send pipeline + Args).
-- `crates/scry` main.rs + Cargo.toml: `Cmd::ReplayOpensearch` wired.
-- Workspace Cargo.toml: members + `indicatif` dep + both crate paths.
+## Decisions (settled with Bart)
+- **Scope:** full v1.0 UI, built in `desktop/` + scry-webui. Daemons' standalone
+  stats.rs pages on :4098 stay untouched.
+- **Fleet data path:** the UI asks queryd (new FleetStatusRequest/Response
+  frames on the query wire); queryd forwards what it pulls from Valkey via
+  discover_status_blobs. scry-webui stays a dumb byte-pipe. No Valkey ⇒ queryd
+  refuses with StreamError ("fleet requires Valkey") — no single-instance fake.
+- **Dashboards persistence:** object store = source of truth (reserved-prefix
+  JSON), catalog table = runtime index. Not Valkey.
+- **Alerts:** engine deferred past v1.0. Ship the view inert, gated behind a
+  "no backend support yet" state.
 
-### Docs
-- `docs/decisions.md` D-056 appended.
-- `CLAUDE.md`: eleven-roles multicall paragraph + two Binaries bullets
-  (replay-opensearch, httpsig) + smoke-osreplay entry under Tooling.
-- `TODO.md`: D-056 deferred follow-ups section.
+## Phasing (see design doc checklist)
+- Phase 0 — design tokens + @solidjs/router + routed app shell (nav). ← NEXT
+- Phase 1 / 1a — Explore rebuild (logs/traces re-skin) + Metrics tab.
+- Phase 2 — Fleet view + FleetStatus wire frames + queryd handler.
+- Phase 3 — Dashboards (object-store persistence + catalog index + grid UI).
+- Phase 4 — Alerts view (inert).
 
-### Verification (all PASS)
-- `cargo test --workspace` — 69 ok, 0 failed.
-- `cargo build --release --workspace` — clean.
-- `scripts/smoke-osreplay.sh` — 7/7 assertions (50 rows, service=api 17,
-  grep 48, ts_inherited=2, body_missing=2).
-- `scripts/smoke-gateway.sh` — PASS (httpsig extraction regression).
-- `SIGNAL=logs scripts/smoke.sh` — PASS (wire path regression).
+## Still open (non-blocking for Phases 0–2)
+- Tauri parity for Fleet (browser-only vs desktop too).
+- Metrics query shape — does the wire return what a multi-series chart needs, or
+  is a server-side step/downsample needed? (Investigate in Phase 1a.)
+- Auth surface — confirm single-password webui session suffices for all views.
 
-## Next
-Nothing pending. Awaiting Bart's decision to commit (conventional-commit; git is
-allowlist — do not commit until asked). No wire-schema change (no gen-proto).
+## Status
+Design doc written + scope decided. No UI code yet — starting Phase 0.
+Prior work (D-057 status pages + webui relay timeout + label errors) committed
+in 614f29b.
