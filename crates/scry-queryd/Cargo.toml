@@ -31,6 +31,7 @@ scry-query         = { workspace = true }
 scry-server        = { workspace = true }
 scry-tail          = { workspace = true }
 scry-valkey        = { workspace = true }
+serde_json         = { workspace = true }
 tokio              = { workspace = true }
 tracing            = { workspace = true }
 uuid               = { workspace = true }

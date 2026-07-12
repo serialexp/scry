@@ -1,6 +1,8 @@
 //! Auth surface tests: login / logout / me + the signed session cookie.
 //! Exercised against the real `router` via `tower::ServiceExt::oneshot`.
 
+use std::time::Duration;
+
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use axum_extra::extract::cookie::Key;
@@ -29,6 +31,7 @@ fn state_with_secure(secure: bool) -> AppState {
         Key::from(&[7u8; 64]),
         3600,
         secure,
+        Duration::from_secs(30),
     )
 }
 

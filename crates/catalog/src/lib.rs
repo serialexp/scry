@@ -383,6 +383,18 @@ impl Catalog {
         Ok(n as usize)
     }
 
+    /// Total live-block row count (Σ `row_count` over non-deleted blocks). One
+    /// indexed aggregate; used by the query daemon's status page to report how
+    /// many records are currently queryable.
+    pub fn live_row_count(&self) -> Result<u64> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(row_count), 0) FROM blocks WHERE deleted_at IS NULL",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n as u64)
+    }
+
     /// Mark a set of input blocks as superseded by a freshly-written
     /// compaction output (`merged`). Sets `superseded_by = merged` on
     /// every input UUID. After this returns the inputs no longer appear

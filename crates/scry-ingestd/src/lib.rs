@@ -26,13 +26,13 @@ use scry_compact::CompactConfig;
 use scry_objstore::{open as open_objstore, ObjStoreConfig};
 use scry_retention::RetentionConfig;
 use scry_server::{
-    decode, serve_stats, BlockBuilderConfig, DummyShards, LiveRing, LogsShards, MetricsShards,
-    ProfilesShards, Server, ServerConfig, ServerMetrics, ShardedPipeline, TracesShards,
-    INGEST_SHARDS,
+    decode, serve_status, BlockBuilderConfig, DummyShards, FleetSource, LiveRing, LocalStatus,
+    LogsShards, MetricsShards, ProfilesShards, Server, ServerConfig, ServerMetrics,
+    ShardedPipeline, TracesShards, INGEST_SHARDS,
 };
 use scry_valkey::{
-    parse_envelope, subscribe_blocks, TailRegistration, ValkeyClient, ValkeyLeaseProvider,
-    ValkeySink, VALKEY_URL_ENV,
+    discover_status_blobs, parse_envelope, subscribe_blocks, StatusRegistration, TailRegistration,
+    ValkeyClient, ValkeyLeaseProvider, ValkeySink, STATUS_TTL, VALKEY_URL_ENV,
 };
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
@@ -42,6 +42,25 @@ use uuid::Uuid;
 /// The convergence/maintenance channels cover every signal that has a
 /// pipeline (Dummy included — the smoke harness exercises it).
 const ALL_SIGNALS: [&str; 5] = ["dummy", "metrics", "logs", "traces", "profiles"];
+
+/// Valkey-backed [`FleetSource`] for the status page (D-057): enumerates every
+/// live instance's published snapshot with one Lua `SCAN`. Keeps `scry-server`
+/// Valkey-agnostic (it takes a `&dyn FleetSource`).
+struct ValkeyFleetSource {
+    valkey: ValkeyClient,
+}
+
+#[async_trait::async_trait]
+impl FleetSource for ValkeyFleetSource {
+    async fn blobs(&self) -> Vec<String> {
+        discover_status_blobs(self.valkey.inner())
+            .await
+            .unwrap_or_else(|e| {
+                warn!(error = %e, "status fleet discovery failed");
+                Vec::new()
+            })
+    }
+}
 
 /// CLI arguments for the `scry ingest` subcommand.
 #[derive(Parser, Debug)]
@@ -77,14 +96,15 @@ pub struct Args {
     #[arg(long)]
     catalog: Option<PathBuf>,
 
-    /// Optional address for the live stats HTTP endpoint (e.g.
-    /// `127.0.0.1:4098`). Serves a self-updating dashboard at `/` and a
-    /// JSON snapshot at `/stats.json` (ingest rates, per-signal upload
-    /// state, RSS, and a bottleneck classification that flags when we're
-    /// bounded by S3 upload speed). When unset, no stats server runs and
-    /// the ingest path pays no metrics cost. Bind to loopback — there's
-    /// no auth.
-    #[arg(long)]
+    /// Live status HTTP endpoint (the fleet dashboard, D-057). A bare
+    /// `--stats-listen` binds `127.0.0.1:4098`; pass an explicit `host:port`
+    /// to override. Serves a self-updating dashboard at `/` and a JSON
+    /// snapshot at `/stats.json` (ingest rates, per-signal upload state, RSS,
+    /// and a bottleneck classification). With Valkey configured the page shows
+    /// the whole fleet — every ingest and query instance — because each one
+    /// heartbeats its snapshot into Valkey. When unset, no status server runs
+    /// and the ingest path pays no metrics cost. Bind to loopback — no auth.
+    #[arg(long, num_args = 0..=1, default_missing_value = "127.0.0.1:4098")]
     stats_listen: Option<String>,
 
     /// Block compression mode (only meaningful with `--storage`). The
@@ -315,10 +335,12 @@ pub async fn run(args: Args) -> Result<()> {
     // When present, it's shared three ways: the ingest path bumps its
     // counters, each signal's pipeline reports its upload gauges into
     // it, and the stats HTTP server reads snapshots from it.
-    let stats_metrics: Option<Arc<ServerMetrics>> = args
-        .stats_listen
-        .as_ref()
-        .map(|_| Arc::new(ServerMetrics::new(upload_concurrency)));
+    let stats_metrics: Option<Arc<ServerMetrics>> = args.stats_listen.as_ref().map(|_| {
+        Arc::new(
+            ServerMetrics::new(upload_concurrency)
+                .with_identity(writer_uuid.to_string(), args.listen.clone()),
+        )
+    });
 
     // ---- Multi-instance coordination (v0.9) -------------------------------
     // Resolve the Valkey URL (flag overrides env). When present we connect a
@@ -621,21 +643,51 @@ pub async fn run(args: Args) -> Result<()> {
     });
     server = server.with_live_ring(live_ring);
 
-    // Optional stats HTTP endpoint. It shares its shutdown signal with
+    // Optional status HTTP endpoint (D-057). Shares its shutdown signal with
     // the ingest server: both listen for Ctrl-C independently (tokio's
-    // `ctrl_c()` resolves every pending future on SIGINT), so a single
-    // Ctrl-C drains the ingest pipeline *and* stops the stats server.
-    let stats_task = match (args.stats_listen.clone(), stats_metrics.clone()) {
-        (Some(addr), Some(metrics)) => Some(tokio::spawn(async move {
-            if let Err(e) = serve_stats(addr, metrics, async {
-                let _ = tokio::signal::ctrl_c().await;
-            })
-            .await
-            {
-                warn!(error = %e, "stats endpoint failed");
-            }
-        })),
-        _ => None,
+    // `ctrl_c()` resolves every pending future on SIGINT), so a single Ctrl-C
+    // drains the ingest pipeline *and* stops the status server. With Valkey
+    // present it publishes this instance's snapshot into the fleet registry and
+    // renders the whole fleet; without it, just this instance.
+    let (stats_task, status_registration) = match (args.stats_listen.clone(), stats_metrics.clone())
+    {
+        (Some(addr), Some(metrics)) => {
+            // Heartbeat this instance's snapshot into Valkey (if any).
+            let status_registration = match valkey.as_ref() {
+                Some(c) => {
+                    let m = metrics.clone();
+                    let producer: scry_valkey::StatusProducer =
+                        Arc::new(move || serde_json::to_string(&m.snapshot()).unwrap_or_default());
+                    Some(
+                        StatusRegistration::spawn(
+                            c.inner().clone(),
+                            writer_uuid,
+                            STATUS_TTL,
+                            producer,
+                        )
+                        .await
+                        .context("registering status in Valkey")?,
+                    )
+                }
+                None => None,
+            };
+            let fleet: Option<Arc<dyn FleetSource>> = valkey
+                .as_ref()
+                .map(|c| Arc::new(ValkeyFleetSource { valkey: c.clone() }) as Arc<dyn FleetSource>);
+            let local: Arc<dyn LocalStatus> = metrics;
+            let self_id = writer_uuid.to_string();
+            let task = tokio::spawn(async move {
+                if let Err(e) = serve_status(addr, local, fleet, self_id, async {
+                    let _ = tokio::signal::ctrl_c().await;
+                })
+                .await
+                {
+                    warn!(error = %e, "status endpoint failed");
+                }
+            });
+            (Some(task), status_registration)
+        }
+        _ => (None, None),
     };
 
     // ---- Multi-instance background loops (v0.9) ---------------------------
@@ -827,6 +879,10 @@ pub async fn run(args: Args) -> Result<()> {
     }
     // Remove our tail-registry entry promptly (else it lingers until TTL).
     if let Some(reg) = tail_registration {
+        reg.deregister().await;
+    }
+    // Remove our status-registry entry promptly (else it lingers until TTL).
+    if let Some(reg) = status_registration {
         reg.deregister().await;
     }
     if let Some(c) = valkey {

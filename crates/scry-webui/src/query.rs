@@ -71,13 +71,18 @@ pub async fn query(
         warn!(target = ?requested, "query for unknown target id");
         return Err(StatusCode::BAD_REQUEST);
     };
-    // Own the addr before the await: `state` is borrowed and `relay` is async.
+    // Own the addr and timeout before the await.
     let addr = addr.to_string();
-    match relay(&addr, &body).await {
-        Ok(resp) => Ok(resp),
-        Err(e) => {
+    let timeout = state.relay_timeout();
+    match tokio::time::timeout(timeout, relay(&addr, &body)).await {
+        Ok(Ok(resp)) => Ok(resp),
+        Ok(Err(e)) => {
             warn!(queryd = %addr, error = %e, "query relay to scry-queryd failed");
             Err(StatusCode::BAD_GATEWAY)
+        }
+        Err(_elapsed) => {
+            warn!(queryd = %addr, timeout_secs = timeout.as_secs(), "query relay to scry-queryd timed out");
+            Err(StatusCode::GATEWAY_TIMEOUT)
         }
     }
 }

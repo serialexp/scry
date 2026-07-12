@@ -50,5 +50,8 @@ pub use server::{
     DummyPipeline, DummyShards, LogsPipeline, LogsShards, MetricsPipeline, MetricsShards,
     ProfilesPipeline, ProfilesShards, Server, ServerConfig, TracesPipeline, TracesShards,
 };
-pub use stats::{serve_stats, ServerMetrics, StatsProvider, UploadStats};
+pub use stats::{
+    serve_status, FleetSource, LocalStatus, QueryMetrics, ServerMetrics, StatusSnapshot,
+    UploadStats,
+};
 pub use tail::{SubId, SubscriptionRegistry, TailItem, TappingLogsAppender};

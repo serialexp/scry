@@ -52,9 +52,12 @@ use scry_objstore::{open_with_pool_config, BufPoolConfig, ObjStoreConfig};
 use scry_query::{
     BloomCache, BloomCacheConfig, PostingsCache, PostingsCacheConfig, QueryResultCache,
 };
-use scry_server::{LiveDiscovery, QueryService};
+use scry_server::{
+    serve_status, FleetSource, LiveDiscovery, LocalStatus, QueryMetrics, QueryService,
+};
 use scry_valkey::{
-    discover_tail_endpoints, parse_envelope, subscribe_blocks, ValkeyClient, VALKEY_URL_ENV,
+    discover_status_blobs, discover_tail_endpoints, parse_envelope, subscribe_blocks,
+    StatusRegistration, ValkeyClient, STATUS_TTL, VALKEY_URL_ENV,
 };
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -74,6 +77,25 @@ struct ValkeyLiveDiscovery {
 impl LiveDiscovery for ValkeyLiveDiscovery {
     async fn discover(&self) -> anyhow::Result<Vec<String>> {
         discover_tail_endpoints(self.valkey.inner()).await
+    }
+}
+
+/// Valkey-backed [`FleetSource`] for the status page (D-057): enumerates every
+/// live instance's published snapshot with one Lua `SCAN`. Keeps `scry-server`
+/// Valkey-agnostic (it takes a `&dyn FleetSource`).
+struct ValkeyFleetSource {
+    valkey: ValkeyClient,
+}
+
+#[async_trait::async_trait]
+impl FleetSource for ValkeyFleetSource {
+    async fn blobs(&self) -> Vec<String> {
+        discover_status_blobs(self.valkey.inner())
+            .await
+            .unwrap_or_else(|e| {
+                warn!(error = %e, "status fleet discovery failed");
+                Vec::new()
+            })
     }
 }
 
@@ -219,6 +241,18 @@ pub struct Args {
     /// ones dropped).
     #[arg(long, default_value_t = 5)]
     tail_rediscover_interval: u64,
+
+    // ── Status page (D-057) ───────────────────────────────────────
+    /// Live status HTTP endpoint (the fleet dashboard, D-057). A bare
+    /// `--stats-listen` binds `127.0.0.1:4098`; pass an explicit `host:port`
+    /// to override. Serves a self-updating dashboard at `/` and a JSON
+    /// snapshot at `/stats.json` (queries in-flight/total, cache hit rates,
+    /// DataFusion memory reserved, catalog block + row counts). With Valkey
+    /// configured the page shows the whole fleet — every ingest and query
+    /// instance — because each one heartbeats its snapshot into Valkey. Bind
+    /// to loopback — no auth.
+    #[arg(long, num_args = 0..=1, default_missing_value = "127.0.0.1:4098")]
+    stats_listen: Option<String>,
 }
 
 /// Run the query daemon until ctrl-c.
@@ -347,9 +381,13 @@ pub async fn run(args: Args) -> Result<()> {
         .valkey_url
         .clone()
         .or_else(|| std::env::var(VALKEY_URL_ENV).ok());
+    // Ephemeral per-process identity — the query daemon has no persistent
+    // writer_id (it writes no blocks), so it mints one UUID at startup and
+    // reuses it as the Valkey client id AND the status-registry / self_id key.
+    let instance_uuid = Uuid::now_v7();
     let valkey = match valkey_url.as_deref() {
         Some(url) => Some(
-            ValkeyClient::connect(url, Uuid::now_v7())
+            ValkeyClient::connect(url, instance_uuid)
                 .await
                 .with_context(|| format!("connecting to Valkey at {url}"))?,
         ),
@@ -361,6 +399,24 @@ pub async fn run(args: Args) -> Result<()> {
     let live_discovery: Option<Arc<dyn LiveDiscovery>> = valkey
         .clone()
         .map(|vk| Arc::new(ValkeyLiveDiscovery { valkey: vk }) as Arc<dyn LiveDiscovery>);
+
+    // Status metrics (D-057): built only when `--stats-listen` is set. Shares
+    // the caches / memory pool / catalog the service already holds, so a
+    // snapshot is a handful of live reads with no hot-path cost. `catalog` is
+    // moved into the service below, so hand `QueryMetrics` the `conv_catalog`
+    // clone (same underlying connection).
+    let query_metrics: Option<Arc<QueryMetrics>> = args.stats_listen.as_ref().map(|_| {
+        Arc::new(QueryMetrics::new(
+            instance_uuid.to_string(),
+            args.listen.to_string(),
+            postings_cache.clone(),
+            bloom_cache.clone(),
+            result_cache.clone(),
+            memory_pool.clone(),
+            conv_catalog.clone(),
+            valkey.as_ref().map(|c| c.health()),
+        ))
+    });
 
     let service = Arc::new(
         QueryService::new(
@@ -374,7 +430,8 @@ pub async fn run(args: Args) -> Result<()> {
             result_cache.clone(),
             args.query_cache_entry_bytes,
         )
-        .with_live_discovery(live_discovery),
+        .with_live_discovery(live_discovery)
+        .with_metrics(query_metrics.clone()),
     );
 
     info!(
@@ -478,6 +535,49 @@ pub async fn run(args: Args) -> Result<()> {
         }));
     }
 
+    // ── Status page (D-057) ───────────────────────────────────────
+    // Optional HTTP status server. With Valkey it heartbeats this instance's
+    // snapshot into the fleet registry and renders the whole fleet from Redis;
+    // without Valkey it serves just this instance (`source: "local"`).
+    let status_registration = match (args.stats_listen.clone(), query_metrics.clone()) {
+        (Some(addr), Some(metrics)) => {
+            let status_registration = match valkey.as_ref() {
+                Some(c) => {
+                    let m = metrics.clone();
+                    let producer: scry_valkey::StatusProducer =
+                        Arc::new(move || serde_json::to_string(&m.snapshot()).unwrap_or_default());
+                    Some(
+                        StatusRegistration::spawn(
+                            c.inner().clone(),
+                            instance_uuid,
+                            STATUS_TTL,
+                            producer,
+                        )
+                        .await
+                        .context("registering status in Valkey")?,
+                    )
+                }
+                None => None,
+            };
+            let fleet: Option<Arc<dyn FleetSource>> = valkey
+                .as_ref()
+                .map(|c| Arc::new(ValkeyFleetSource { valkey: c.clone() }) as Arc<dyn FleetSource>);
+            let local: Arc<dyn LocalStatus> = metrics;
+            let self_id = instance_uuid.to_string();
+            bg_tasks.push(tokio::spawn(async move {
+                if let Err(e) = serve_status(addr, local, fleet, self_id, async {
+                    let _ = tokio::signal::ctrl_c().await;
+                })
+                .await
+                {
+                    warn!(error = %e, "status endpoint failed");
+                }
+            }));
+            status_registration
+        }
+        _ => None,
+    };
+
     let serve_result = service
         .serve_with_shutdown(args.listen, async {
             let _ = tokio::signal::ctrl_c().await;
@@ -487,6 +587,10 @@ pub async fn run(args: Args) -> Result<()> {
     // Process is exiting — stop the convergence loops and close Valkey.
     for t in &bg_tasks {
         t.abort();
+    }
+    // Remove our status-registry entry promptly (else it lingers until TTL).
+    if let Some(reg) = status_registration {
+        reg.deregister().await;
     }
     if let Some(c) = valkey {
         c.quit().await;

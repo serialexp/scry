@@ -78,6 +78,7 @@ use scry_query::{
 };
 
 use crate::live_merge::{fetch_live_from_ingester, LiveDiscovery};
+use crate::stats::QueryMetrics;
 use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, info_span, warn, Instrument, Span};
@@ -154,6 +155,9 @@ pub struct QueryService {
     /// logs query is then refused with `QUERY_ERR_LIVE_UNAVAILABLE`
     /// rather than silently degraded to blocks-only (decision 3).
     live_discovery: Option<Arc<dyn LiveDiscovery>>,
+    /// Process-global query metrics for the status page (D-057). `None` when
+    /// `--stats-listen` is unset, so the query hot path pays nothing.
+    metrics: Option<Arc<QueryMetrics>>,
 }
 
 impl QueryService {
@@ -181,7 +185,15 @@ impl QueryService {
             result_cache_entry_bytes,
             next_request_id: AtomicU64::new(0),
             live_discovery: None,
+            metrics: None,
         }
+    }
+
+    /// Attach the status-page query metrics (D-057). Builder-style — call
+    /// before wrapping the service in an `Arc`.
+    pub fn with_metrics(mut self, metrics: Option<Arc<QueryMetrics>>) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     /// Attach a live-ingester discovery source (D-054). Enables the merged
@@ -882,6 +894,11 @@ impl QueryService {
             result: self.result_cache.stats(),
         };
         let t0 = Instant::now();
+        // Status-page accounting (D-057): count this query and track it
+        // in-flight. The guard folds wall-time into the latency total on drop
+        // and, unless `mark_ok` is called at a success terminator, counts an
+        // error — so every early return below is accounted correctly.
+        let mut inflight = self.metrics.as_ref().map(|m| m.begin());
         // Pre-allocate row counter so we can pass it to emit_scan_complete
         // on every exit path (success + each error path).
         let mut rows_total: u64 = 0;
@@ -985,6 +1002,9 @@ impl QueryService {
             let key = data_query_cache_key(signal, &req, &candidates);
             if !req.live {
                 if let Some(bytes) = self.result_cache.get(key) {
+                    if let Some(g) = inflight.as_mut() {
+                        g.mark_ok();
+                    }
                     if let Err(e) = wr.write_all(&bytes).await {
                         warn!(error = %e, "client disconnected while writing cached response");
                     }
@@ -1202,6 +1222,9 @@ impl QueryService {
         }
 
         // Normal completion: EndOfStream terminator.
+        if let Some(g) = inflight.as_mut() {
+            g.mark_ok();
+        }
         let end_frame = QueryFrame {
             msg: QueryFrameMsg::EndOfStream(
                 EndOfStreamInput {
@@ -1307,6 +1330,13 @@ impl QueryService {
         // The Span wrapping the call site carries `request_id`; no
         // need to log it explicitly here.
         let _ = Span::current();
+
+        // Status-page accounting (D-057): fold this scan's row + object-store
+        // byte counts into the process-global totals. One call per terminal
+        // path, so it double-counts nothing.
+        if let Some(m) = &self.metrics {
+            m.record_scan(rows_total, bytes_scanned as u64);
+        }
     }
 }
 

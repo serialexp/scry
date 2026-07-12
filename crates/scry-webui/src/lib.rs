@@ -16,6 +16,7 @@ pub mod auth;
 pub mod query;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use axum::extract::{DefaultBodyLimit, FromRef};
@@ -63,6 +64,12 @@ pub struct Args {
         value_parser = clap::builder::BoolishValueParser::new(),
     )]
     pub secure_cookie: bool,
+
+    /// Timeout for the TCP relay to `scry-queryd`, in seconds. Covers the
+    /// entire exchange (connect + write + read). Requests that exceed this
+    /// return **504 Gateway Timeout** instead of hanging indefinitely.
+    #[arg(long, default_value_t = 30)]
+    pub relay_timeout: u64,
 }
 
 /// Serve the browser query UI and relay queries to the query daemon.
@@ -92,6 +99,7 @@ pub async fn run(args: Args) -> Result<()> {
         key,
         args.session_ttl,
         args.secure_cookie,
+        Duration::from_secs(args.relay_timeout),
     );
     let app = router(state);
 
@@ -225,6 +233,8 @@ struct Inner {
     /// browser reaches scry-webui over HTTPS (e.g. behind a TLS reverse proxy);
     /// a `Secure` cookie is dropped by the browser over plain `http://`.
     secure_cookie: bool,
+    /// Timeout for the entire TCP relay exchange to `scry-queryd`.
+    relay_timeout: Duration,
 }
 
 impl AppState {
@@ -235,6 +245,7 @@ impl AppState {
         key: Key,
         session_ttl: i64,
         secure_cookie: bool,
+        relay_timeout: Duration,
     ) -> Self {
         Self(Arc::new(Inner {
             targets,
@@ -243,6 +254,7 @@ impl AppState {
             key,
             session_ttl,
             secure_cookie,
+            relay_timeout,
         }))
     }
 
@@ -278,6 +290,10 @@ impl AppState {
 
     pub fn secure_cookie(&self) -> bool {
         self.0.secure_cookie
+    }
+
+    pub fn relay_timeout(&self) -> Duration {
+        self.0.relay_timeout
     }
 }
 
@@ -373,6 +389,7 @@ mod tests {
             Key::from(&[7u8; 64]),
             60,
             false,
+            Duration::from_secs(30),
         );
         assert_eq!(state.resolve_target(Some("gothab")), Some("127.0.0.1:4100"));
         assert_eq!(state.resolve_target(Some("local")), Some("127.0.0.1:4101"));

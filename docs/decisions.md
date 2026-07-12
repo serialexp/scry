@@ -2892,3 +2892,74 @@ wire-protocol change — reuses the existing `Batch`/`LogsBatch`.
 multi-connection fan-out for when a single reader caps below scry's ceiling; the
 legacy `scroll` fallback for pre-2.4 clusters; metrics/traces/profiles replay
 (logs-only); resumable checkpointing of the `search_after` cursor.
+
+## D-057: daemon status pages + Valkey-aggregated fleet view
+
+**The problem.** Only `scry ingest` had an operator status surface — the hand-rolled
+HTTP/1.1 server in `crates/server/src/stats.rs` (`serve_stats` + a `StatsProvider`
+trait + `ServerMetrics`). `scry query` had nothing; its observability was logs only.
+And in a multi-instance deployment (v0.9: 1–N instances on one bucket coordinated
+via Valkey) there was no single place to see the whole fleet — you'd curl each
+instance's endpoint separately, and query instances had no endpoint at all.
+
+**The shape.** Both daemons expose an **opt-in** status HTTP endpoint,
+`--stats-listen` (a bare flag defaults to `127.0.0.1:4098`; pass `host:port` to
+override). Opt-in preserves the ingest hot-path: with the flag absent, no
+`ServerMetrics` is built and the ingest path pays zero metrics cost — byte-for-byte
+the pre-D-057 behaviour. When both an ingest and a query instance share a Valkey,
+**each heartbeats its full status snapshot into Valkey**, and **either page renders
+the whole fleet from Redis** — every ingest and query instance — marking which entry
+is the local reporter. Per the design call: *no privileged local rendering path when
+Valkey is present* — every field that could come from the local instance is also in
+Redis, so the page is a pure function of the fleet snapshot set (self included via
+the same SCAN), not a local-first merge. With no Valkey, the page falls back to a
+single local snapshot (`source: "local"`).
+
+**Keeping `scry-server` Valkey-agnostic.** The seam discipline of D-038/D-039 holds:
+`scry-server` never depends on `scry-valkey`. The serde envelope `StatusSnapshot
+{ role, instance_id, addr, now_unix_ms, uptime_secs, rss_kib, data }` (with a
+role-specific `data: serde_json::Value`) and two traits live in `scry-server`:
+`LocalStatus` (produce this instance's snapshot — implemented by `ServerMetrics`
+role=`ingest` and the new `QueryMetrics` role=`query`) and `FleetSource` (async;
+supply the *other* instances' snapshots as opaque JSON blobs). `serve_status(addr,
+local, fleet, self_id, shutdown)` serves `GET /stats.json` (`{ source, self_id,
+instances: [StatusSnapshot…] }`) and `GET /` (a self-contained dashboard that polls
+`/stats.json` every 1s, groups instances into Ingest/Query sections, diffs
+successive polls keyed on `instance_id` for per-instance rates, and badges the
+`self_id` entry "this instance"). `scry-valkey` only ever stores/returns opaque JSON
+strings — exactly like the tail registry stores opaque addrs — via the new
+`status.rs`: `StatusRegistration::spawn` `SET`s `scry/status/<uuid> = producer()`
+with a `PX` TTL (6s) and, **unlike the tail registry whose value is static**,
+re-invokes the producer and re-`SET`s the fresh JSON every `ttl/3` (~2s) so the live
+counters actually reach Redis; `discover_status_blobs` is one read-only Lua `SCAN`
+over `scry/status/*`. Each daemon crate owns a tiny `ValkeyFleetSource` newtype
+implementing `FleetSource` over `discover_status_blobs` (the small duplication that
+keeps the dependency arrow correct).
+
+**Query metrics.** Most of what a query dashboard wants is already live state on
+`QueryService`, read at snapshot time with no hot-path cost: postings/bloom/result
+cache hit-miss (`*CacheStats`), `GreedyMemoryPool.reserved()`, catalog block count +
+live row count (new `Catalog::live_row_count`), and a Valkey-connected bool (from the
+client's health watch). The only genuinely new counters — queries aren't per-record
+hot, so plain atomics — are `queries_total`, `queries_in_flight` (an RAII
+`QueryInFlight` guard that on drop decrements the gauge, folds wall-time into
+`query_nanos_total`, and counts an error unless `mark_ok` was called), plus
+`rows_returned_total` / `bytes_scanned_total` bumped once per terminal path in
+`emit_scan_complete`. Attached via `QueryService::with_metrics(Option<Arc<QueryMetrics>>)`.
+
+**Identity.** An ingest instance keys its status on its persistent `writer_uuid`
+(the same id it uses for blocks / tail registration). A query instance has no
+persistent writer id, so it mints one ephemeral `Uuid::now_v7()` at startup and
+reuses it as its Valkey client id, its status-registry key, and its `self_id`.
+
+Sealed by `scripts/smoke-status.sh` (dev Valkey only — no Garage): a storage-less
+`scry ingest --stats-listen --valkey-url` + a `scry query --stats-listen
+--valkey-url` on one Valkey, asserting each page's `/stats.json` (source `valkey`)
+lists **both** instances with the correct role and a `self_id` that resolves to
+exactly one listed entry — i.e. fleet aggregation works from either side — plus a
+Valkey-less `scry query --stats-listen` serving a one-entry `source: "local"` page.
+
+**Deferred:** auth (the endpoint is loopback-only, no auth, like the old stats
+page); a persisted history / time-series of the counters (the page diffs live polls
+client-side, nothing is retained server-side); gateway/agent status surfaces
+(ingest + query only for now).

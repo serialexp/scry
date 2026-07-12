@@ -20,9 +20,12 @@ use std::time::Duration;
 use fred::prelude::ClientLike;
 use scry_block::{BlockEvent, BlockEventSink, Envelope};
 use scry_cluster::{LeaseGuard, LeaseProvider};
+use std::sync::Arc;
+
 use scry_valkey::{
-    channel_for, discover_tail_endpoints, parse_envelope, publish_envelope, subscribe_blocks,
-    TailRegistration, ValkeyClient, ValkeyLeaseProvider, ValkeySink,
+    channel_for, discover_status_blobs, discover_tail_endpoints, parse_envelope, publish_envelope,
+    subscribe_blocks, StatusRegistration, TailRegistration, ValkeyClient, ValkeyLeaseProvider,
+    ValkeySink,
 };
 use uuid::Uuid;
 
@@ -262,4 +265,64 @@ async fn tail_registration_renews_past_its_ttl() {
     );
 
     reg.deregister().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a real Valkey (scripts/dev-valkey-up.sh)"]
+async fn status_registration_publishes_fresh_snapshots_and_deregisters() {
+    let c = client().await;
+
+    // The producer stamps a unique marker (so a shared registry can't collide)
+    // and a monotonic counter, so we can prove the value CHURNS each heartbeat
+    // (the property that distinguishes the status registry from the tail one).
+    let uuid = Uuid::now_v7();
+    let marker = format!("marker-{}", uuid.simple());
+    let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let m = marker.clone();
+    let cnt = counter.clone();
+    let producer: scry_valkey::StatusProducer = Arc::new(move || {
+        let n = cnt.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!(r#"{{"marker":"{m}","tick":{n}}}"#)
+    });
+
+    // Short TTL so the ttl/3 heartbeat must both keep the key alive AND refresh
+    // its value past the TTL.
+    let reg = StatusRegistration::spawn(
+        c.inner().clone(),
+        uuid,
+        Duration::from_millis(600),
+        producer,
+    )
+    .await
+    .expect("register status");
+
+    // Discoverable immediately (initial SET is synchronous).
+    let blobs = discover_status_blobs(c.inner()).await.expect("discover");
+    let mine: Vec<&String> = blobs.iter().filter(|b| b.contains(&marker)).collect();
+    assert_eq!(mine.len(), 1, "exactly one of our blobs present: {blobs:?}");
+    let first_tick: u64 = serde_json::from_str::<serde_json::Value>(mine[0]).unwrap()["tick"]
+        .as_u64()
+        .unwrap();
+
+    // After several heartbeats the key is still alive (past TTL) and its value
+    // has advanced (a re-published fresh snapshot, not just a TTL bump).
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let blobs = discover_status_blobs(c.inner()).await.expect("discover");
+    let mine: Vec<&String> = blobs.iter().filter(|b| b.contains(&marker)).collect();
+    assert_eq!(mine.len(), 1, "still present past TTL: {blobs:?}");
+    let later_tick: u64 = serde_json::from_str::<serde_json::Value>(mine[0]).unwrap()["tick"]
+        .as_u64()
+        .unwrap();
+    assert!(
+        later_tick > first_tick,
+        "status value churns each heartbeat ({first_tick} → {later_tick})"
+    );
+
+    // Deregister removes it promptly.
+    reg.deregister().await;
+    let blobs = discover_status_blobs(c.inner()).await.expect("discover");
+    assert!(
+        !blobs.iter().any(|b| b.contains(&marker)),
+        "gone after deregister: {blobs:?}"
+    );
 }

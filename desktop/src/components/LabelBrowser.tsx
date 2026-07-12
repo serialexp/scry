@@ -13,6 +13,7 @@ import {
   state,
   labelNames,
   labelStatus,
+  labelError,
   labelValues,
   labelValueCounts,
   refreshLabels,
@@ -71,7 +72,11 @@ const LabelBrowser: Component = () => {
           when={labelStatus() !== "loading"}
           fallback={<p class="hint">Loading labels…</p>}
         >
-          <Show when={labelStatus() !== "error"} fallback={<p class="hint">Could not load labels.</p>}>
+          <Show when={labelStatus() !== "error"} fallback={
+            <div class="label-error" role="alert">
+              {labelError() ?? "Could not load labels."}
+            </div>
+          }>
             <Show
               when={labelNames().length > 0}
               fallback={<p class="hint">No labels for this signal / range.</p>}

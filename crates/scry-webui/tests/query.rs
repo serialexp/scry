@@ -2,6 +2,8 @@
 //! the upstream `scry-queryd` is unreachable, the `/api/targets` listing, and
 //! `X-Scry-Target` routing across multiple configured targets.
 
+use std::time::Duration;
+
 use axum::body::{to_bytes, Body};
 use axum::http::{header, Request, StatusCode};
 use axum::Router;
@@ -22,8 +24,15 @@ fn app(queryd: &str) -> Router {
     app_targets(&[queryd.to_string()])
 }
 
-/// Build a router over a parsed target allowlist (raw `--queryd` values).
+/// Build a router over a parsed target allowlist (raw `--queryd` values),
+/// using a generous default relay timeout (30s — existing tests finish fast
+/// because the fake queryd responds immediately or the port refuses instantly).
 fn app_targets(raw: &[String]) -> Router {
+    app_targets_timeout(raw, Duration::from_secs(30))
+}
+
+/// Build a router with an explicit relay timeout (used by the 504 test).
+fn app_targets_timeout(raw: &[String], relay_timeout: Duration) -> Router {
     let (targets, default) = parse_targets(raw).unwrap();
     let state = AppState::new(
         targets,
@@ -32,6 +41,7 @@ fn app_targets(raw: &[String]) -> Router {
         Key::from(&[9u8; 64]),
         3600,
         false,
+        relay_timeout,
     );
     router(state)
 }
@@ -266,4 +276,35 @@ async fn query_unknown_target_is_400() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn query_returns_504_on_timeout() {
+    // Bind a listener that accepts the connection but never sends a byte,
+    // simulating a hung upstream. The relay timeout fires and produces 504.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        // Accept and hold the connection open indefinitely.
+        let (_sock, _) = listener.accept().await.unwrap();
+        // Keep _sock alive so the relay doesn't see a connection reset.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    });
+
+    let app = app_targets_timeout(&[addr.clone().into()], Duration::from_secs(1));
+    let cookie = login_cookie(&app).await;
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/query")
+                .header(header::COOKIE, cookie)
+                .body(Body::from(vec![0u8; 8]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::GATEWAY_TIMEOUT);
 }

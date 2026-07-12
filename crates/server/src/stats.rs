@@ -1,72 +1,150 @@
-//! Live operator stats: a tiny hand-rolled HTTP/1.1 server plus the
-//! process-global ingest metrics it serves.
+//! Live operator status: a tiny hand-rolled HTTP/1.1 server plus the
+//! process-global metrics both daemons serve, and the typed snapshot they
+//! publish into Valkey so any instance's status page shows the whole fleet.
 //!
-//! Two halves:
+//! Three halves:
 //!
-//! 1. **Signal-agnostic HTTP plumbing** — [`serve_stats`] + the
-//!    [`StatsProvider`] trait. A minimal HTTP/1.1 responder over a
-//!    `tokio` `TcpListener` with exactly two GET routes: `/` (an HTML
-//!    page) and `/stats.json` (a JSON snapshot). `Connection: close`
-//!    per request, so there's no keep-alive state machine — every XHR
-//!    poll is a fresh, cheap connection. This half knows nothing about
-//!    ingest; `scry-queryd` can implement [`StatsProvider`] later and
-//!    reuse it verbatim.
+//! 1. **Signal-agnostic HTTP plumbing** — [`serve_status`] + the
+//!    [`LocalStatus`] and [`FleetSource`] traits. A minimal HTTP/1.1 responder
+//!    over a `tokio` `TcpListener` with two GET routes: `/` (the fleet HTML
+//!    dashboard) and `/stats.json` (a JSON array of instance snapshots).
+//!    `Connection: close` per request, so there's no keep-alive state machine.
+//!    This half knows nothing about ingest vs query — both wire in their own
+//!    [`LocalStatus`] impl.
 //!
-//! 2. **The ingest provider** — [`ServerMetrics`] (+ per-signal
-//!    [`UploadStats`]). Process-global atomics bumped at *batch*
-//!    granularity by the ingest path (`server.rs`) and at
-//!    *block-rotation* granularity by the upload pipeline
-//!    (`pipeline.rs`). It implements [`StatsProvider`] to render both
-//!    the JSON snapshot and the live HTML dashboard.
+//! 2. **The role providers** — [`ServerMetrics`] (+ per-signal [`UploadStats`])
+//!    for ingest, [`QueryMetrics`] for query. Process-global atomics plus, for
+//!    query, live reads of the shared caches / memory pool / catalog. Each
+//!    implements [`LocalStatus`], producing a [`StatusSnapshot`].
 //!
-//! The headline feature is the `uploads_queued` gauge: under sustained
-//! ingest above bucket bandwidth, finished block builders pile up
-//! waiting for an upload permit, and this counter is exactly the depth
-//! of that in-memory pile. The dashboard turns its status banner
-//! yellow/red when it climbs, so "we're bounded by S3 push speed"
-//! becomes a visible warning rather than something reconstructed from
-//! logs.
+//! 3. **The fleet view** — every instance heartbeats its full [`StatusSnapshot`]
+//!    (as JSON) into Valkey via `scry_valkey::StatusRegistration`; `/stats.json`
+//!    reads *all* live snapshots back through a [`FleetSource`] (one Lua `SCAN`)
+//!    and marks which one is self. With no Valkey the page falls back to the
+//!    single local snapshot. Per the design, nothing is withheld from Redis —
+//!    the local instance is rendered from its own published snapshot, marked
+//!    only as "this instance".
 
 use std::borrow::Cow;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+use scry_catalog::Catalog;
 use scry_proto::constants::Signal;
+use scry_query::{BloomCache, PostingsCache, QueryResultCache};
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
 use tracing::{info, warn};
+
+// ─────────────────────────── status snapshot ──────────────────────────────
+
+/// One instance's status, the unit published into Valkey and rendered by the
+/// dashboard. The envelope fields are common to both roles; `data` carries the
+/// role-specific payload (ingest throughput / upload pipeline, or query rates /
+/// cache hit-rates), rendered by the JS that branches on `role`.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct StatusSnapshot {
+    /// `"ingest"` or `"query"`.
+    pub role: String,
+    /// Stable per-instance id (ingest: the writer UUID; query: the daemon's
+    /// ephemeral Valkey holder UUID). Also the Valkey status key suffix and
+    /// what the page matches against `self_id` to mark "this instance".
+    pub instance_id: String,
+    /// The instance's primary listen/advertise address, for display.
+    pub addr: String,
+    pub now_unix_ms: u64,
+    pub uptime_secs: f64,
+    pub rss_kib: Option<u64>,
+    /// Role-specific payload (see `ServerMetrics::ingest_data` /
+    /// `QueryMetrics::query_data`).
+    pub data: serde_json::Value,
+}
+
+/// Produces this process's [`StatusSnapshot`]. Implemented by [`ServerMetrics`]
+/// (ingest) and [`QueryMetrics`] (query). Cheap: read a handful of atomics (+
+/// for query, one indexed catalog SELECT) and serialise.
+pub trait LocalStatus: Send + Sync + 'static {
+    fn snapshot(&self) -> StatusSnapshot;
+}
+
+/// Supplies the *other* instances' snapshots as raw JSON blobs. The Valkey-
+/// backed impl (in the daemon crates) enumerates `scry/status/*` with one Lua
+/// `SCAN`. Kept as a trait so `scry-server` stays Valkey-agnostic.
+#[async_trait::async_trait]
+pub trait FleetSource: Send + Sync + 'static {
+    /// All live status blobs currently registered (including this instance's
+    /// own, since it publishes too). Best-effort — returns empty on error.
+    async fn blobs(&self) -> Vec<String>;
+}
 
 // ───────────────────────────── HTTP plumbing ──────────────────────────────
 
-/// Supplies the bodies for the two stats routes. Each binary that wants
-/// a stats endpoint implements this (ingest does so via [`ServerMetrics`]
-/// below; the query daemon will get its own impl later).
-pub trait StatsProvider: Send + Sync + 'static {
-    /// Body for `GET /stats.json`. Called once per poll; should be
-    /// cheap (read a handful of atomics + serialise).
-    fn stats_json(&self) -> String;
-
-    /// Body for `GET /`. Typically a `'static` HTML string with inline
-    /// JS that polls `/stats.json`.
-    fn index_html(&self) -> Cow<'static, str>;
+/// Shared state for the status server: the local snapshot source, the optional
+/// fleet source, and this instance's id (to mark self in the rendered fleet).
+struct StatusState {
+    local: Arc<dyn LocalStatus>,
+    fleet: Option<Arc<dyn FleetSource>>,
+    self_id: String,
 }
 
-/// Bind `listen_addr` and serve stats until `shutdown` resolves.
+impl StatusState {
+    /// Build the `/stats.json` body: the full fleet plus which entry is self.
+    async fn stats_json(&self) -> String {
+        let (source, mut instances): (&str, Vec<StatusSnapshot>) = match &self.fleet {
+            Some(f) => {
+                let blobs = f.blobs().await;
+                let parsed = blobs
+                    .iter()
+                    .filter_map(|b| serde_json::from_str::<StatusSnapshot>(b).ok())
+                    .collect();
+                ("valkey", parsed)
+            }
+            None => ("local", Vec::new()),
+        };
+        // Ensure this instance is represented even before its first heartbeat
+        // has landed in Redis (startup race), and always in the no-Valkey case.
+        if !instances.iter().any(|s| s.instance_id == self.self_id) {
+            instances.push(self.local.snapshot());
+        }
+        serde_json::json!({
+            "source": source,
+            "self_id": self.self_id,
+            "instances": instances,
+        })
+        .to_string()
+    }
+}
+
+/// Bind `listen_addr` and serve the status page until `shutdown` resolves.
 ///
-/// Errors only on the initial bind; per-connection failures are logged
-/// and dropped (a broken stats poll must never take down ingest).
-pub async fn serve_stats<P, F>(listen_addr: String, provider: Arc<P>, shutdown: F) -> Result<()>
+/// Errors only on the initial bind; per-connection failures are logged and
+/// dropped (a broken status poll must never take down ingest or query).
+pub async fn serve_status<F>(
+    listen_addr: String,
+    local: Arc<dyn LocalStatus>,
+    fleet: Option<Arc<dyn FleetSource>>,
+    self_id: String,
+    shutdown: F,
+) -> Result<()>
 where
-    P: StatsProvider,
     F: Future<Output = ()>,
 {
     let listener = TcpListener::bind(&listen_addr)
         .await
-        .with_context(|| format!("binding stats endpoint {listen_addr}"))?;
-    info!(addr = %listen_addr, "stats HTTP endpoint listening (GET / and /stats.json)");
+        .with_context(|| format!("binding status endpoint {listen_addr}"))?;
+    info!(addr = %listen_addr, "status HTTP endpoint listening (GET / and /stats.json)");
+
+    let state = Arc::new(StatusState {
+        local,
+        fleet,
+        self_id,
+    });
 
     tokio::pin!(shutdown);
     loop {
@@ -74,18 +152,18 @@ where
             accepted = listener.accept() => {
                 match accepted {
                     Ok((sock, _peer)) => {
-                        let provider = provider.clone();
+                        let state = state.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_http(sock, provider).await {
-                                tracing::debug!(error = %e, "stats connection ended with error");
+                            if let Err(e) = handle_http(sock, state).await {
+                                tracing::debug!(error = %e, "status connection ended with error");
                             }
                         });
                     }
-                    Err(e) => warn!(error = %e, "stats accept failed"),
+                    Err(e) => warn!(error = %e, "status accept failed"),
                 }
             }
             _ = &mut shutdown => {
-                info!("stats endpoint shutting down");
+                info!("status endpoint shutting down");
                 break;
             }
         }
@@ -93,16 +171,14 @@ where
     Ok(())
 }
 
-/// Read one request, route it, write the response, close. We only care
-/// about the request line (`GET <path> HTTP/1.1`); headers and body are
-/// ignored for GET. Request reads are capped so a hostile or broken
-/// client can't make us buffer unbounded bytes.
-async fn handle_http<P: StatsProvider>(mut sock: TcpStream, provider: Arc<P>) -> Result<()> {
+/// Read one request, route it, write the response, close. We only care about
+/// the request line (`GET <path> HTTP/1.1`); headers and body are ignored for
+/// GET. Request reads are capped so a hostile or broken client can't make us
+/// buffer unbounded bytes.
+async fn handle_http(mut sock: TcpStream, state: Arc<StatusState>) -> Result<()> {
     const MAX_REQUEST_BYTES: usize = 8 * 1024;
     let mut buf = Vec::with_capacity(256);
     let mut tmp = [0u8; 1024];
-    // Read until we've seen the end of the request headers (\r\n\r\n) or
-    // hit the cap. GET requests have no body we consume.
     loop {
         if find_subslice(&buf, b"\r\n\r\n").is_some() {
             break;
@@ -120,11 +196,15 @@ async fn handle_http<P: StatsProvider>(mut sock: TcpStream, provider: Arc<P>) ->
     let (method, path) = parse_request_line(&buf);
 
     let (status, content_type, body): (&str, &str, Cow<'static, str>) = match (method, path) {
-        (Some("GET"), Some("/")) => ("200 OK", "text/html; charset=utf-8", provider.index_html()),
+        (Some("GET"), Some("/")) => (
+            "200 OK",
+            "text/html; charset=utf-8",
+            Cow::Borrowed(FLEET_DASHBOARD_HTML),
+        ),
         (Some("GET"), Some("/stats.json")) => (
             "200 OK",
             "application/json",
-            Cow::Owned(provider.stats_json()),
+            Cow::Owned(state.stats_json().await),
         ),
         (Some("GET"), Some(_)) => (
             "404 Not Found",
@@ -156,13 +236,11 @@ async fn handle_http<P: StatsProvider>(mut sock: TcpStream, provider: Arc<P>) ->
         .await
         .context("writing HTTP response")?;
     sock.flush().await.ok();
-    // Best-effort half-close; ignore errors (peer may have already gone).
     let _ = sock.shutdown().await;
     Ok(())
 }
 
 /// Extract `(method, path)` from the first line of an HTTP request.
-/// Returns `None`s if the buffer doesn't contain a parseable line.
 fn parse_request_line(buf: &[u8]) -> (Option<&str>, Option<&str>) {
     let line_end = find_subslice(buf, b"\r\n").unwrap_or(buf.len());
     let line = match std::str::from_utf8(&buf[..line_end]) {
@@ -182,9 +260,8 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-/// Current process resident set size in KiB, read from
-/// `/proc/self/status` (`VmRSS:`). `None` on non-Linux or if the file
-/// can't be read/parsed — the dashboard shows "n/a" in that case.
+/// Current process resident set size in KiB, read from `/proc/self/status`
+/// (`VmRSS:`). `None` on non-Linux or if the file can't be read/parsed.
 pub fn rss_kib() -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
     for line in status.lines() {
@@ -195,15 +272,8 @@ pub fn rss_kib() -> Option<u64> {
     None
 }
 
-/// System 1-minute load average, read from `/proc/loadavg` (the first
-/// whitespace-separated field). `None` on non-Linux or if the file can't
-/// be read/parsed.
-///
-/// Used by the adaptive-compression policy (`--compression auto`) to tell
-/// whether the host has spare CPU: normalised by physical core count, a
-/// low ratio means we can afford the denser (slower) ZSTD level, a high
-/// ratio means encode is the active constraint and we should drop to the
-/// fast level. See `Pipeline::adaptive_level`.
+/// System 1-minute load average, read from `/proc/loadavg`. `None` on non-Linux
+/// or if the file can't be read/parsed. Used by the adaptive-compression policy.
 pub fn load_avg_1m() -> Option<f64> {
     let loadavg = std::fs::read_to_string("/proc/loadavg").ok()?;
     loadavg
@@ -212,36 +282,26 @@ pub fn load_avg_1m() -> Option<f64> {
         .and_then(|v| v.parse().ok())
 }
 
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 // ─────────────────────────── ingest metrics ───────────────────────────────
 
-/// Per-signal upload pipeline gauges. Shared (`Arc`) between
-/// [`ServerMetrics`] and the signal's [`crate::Pipeline`], which bumps
-/// them from `spawn_upload` / `run_upload`.
+/// Per-signal upload pipeline gauges. Shared (`Arc`) between [`ServerMetrics`]
+/// and the signal's [`crate::Pipeline`], which bumps them from `spawn_upload` /
+/// `run_upload`.
 #[derive(Default, Debug)]
 pub struct UploadStats {
-    /// Uploads holding a semaphore permit and actively encoding +
-    /// PUTting. Bounded by the shared upload-concurrency cap.
     uploads_inflight: AtomicU64,
-    /// Ingest paths *currently blocked* waiting for an upload permit.
-    /// Because the upload permit is now acquired inside `spawn_upload`
-    /// while the pipeline mutex is held (see `pipeline.rs`), a non-zero
-    /// value means ingest for this signal is being throttled to bucket
-    /// write speed — the live, memory-safe "bounded by S3" signal.
-    /// Bounded by the number of signals (the per-signal mutex serialises
-    /// ingest), so it's effectively 0 or 1 per signal.
     upload_waiters: AtomicU64,
-    /// Σ wall-clock nanos ingest has spent blocked waiting for an upload
-    /// permit since process start — the cumulative cost of being
-    /// upload-bound.
     upload_stall_nanos_total: AtomicU64,
-    /// Blocks successfully uploaded since process start.
     blocks_uploaded: AtomicU64,
-    /// Total uploaded parquet bytes (block `byte_size` summed).
     bytes_uploaded: AtomicU64,
-    /// Uploads that failed (block left in WAL for replay).
     upload_failures: AtomicU64,
-    /// Σ wall-clock nanos spent inside `finish_and_upload` — divide
-    /// `bytes_uploaded` by this (in seconds) for effective bandwidth.
     upload_nanos_total: AtomicU64,
 }
 
@@ -272,8 +332,7 @@ impl UploadStats {
         self.uploads_inflight.fetch_sub(1, Ordering::Relaxed);
     }
 
-    /// Record a successful upload of `bytes` parquet bytes taking
-    /// `nanos` wall-clock.
+    /// Record a successful upload of `bytes` parquet bytes taking `nanos`.
     #[inline]
     pub fn record_success(&self, bytes: u64, nanos: u64) {
         self.blocks_uploaded.fetch_add(1, Ordering::Relaxed);
@@ -310,13 +369,17 @@ impl UploadStats {
     }
 }
 
-/// Process-global ingest metrics. Counters that track inbound records
-/// are bumped once per *batch* (the same cadence as the per-connection
-/// `Counters` in `server.rs`), so exposing them adds no per-record
-/// hot-path cost. Construct one with [`ServerMetrics::new`], share it
-/// via `Arc`.
+/// Process-global ingest metrics. Record counters are bumped once per *batch*
+/// (the same cadence as the per-connection `Counters` in `server.rs`), so
+/// exposing them adds no per-record hot-path cost. Construct with
+/// [`ServerMetrics::new`], set identity with [`ServerMetrics::with_identity`],
+/// share via `Arc`.
 pub struct ServerMetrics {
     started: Instant,
+    /// Instance id + advertised addr for the status envelope. Empty until
+    /// [`with_identity`](Self::with_identity) is called (e.g. in tests).
+    instance_id: String,
+    addr: String,
     active_connections: AtomicU64,
     total_connections: AtomicU64,
     batches: AtomicU64,
@@ -328,9 +391,6 @@ pub struct ServerMetrics {
     bytes_in: AtomicU64,
     bytes_out: AtomicU64,
     rejected: AtomicU64,
-    /// The shared upload-concurrency cap (physical core count in
-    /// production). Reported as `max_inflight_uploads` and used by the
-    /// classifier to decide when the *pool* is saturated.
     upload_concurrency: u64,
     metrics_upload: Arc<UploadStats>,
     logs_upload: Arc<UploadStats>,
@@ -340,13 +400,13 @@ pub struct ServerMetrics {
 }
 
 impl ServerMetrics {
-    /// `upload_concurrency` is the shared cap on concurrent block
-    /// encode+upload tasks across all signals (see
-    /// `Pipeline::with_upload_sem`). Sized to the host's physical core
-    /// count in production.
+    /// `upload_concurrency` is the shared cap on concurrent block encode+upload
+    /// tasks across all signals. Sized to the host's physical core count.
     pub fn new(upload_concurrency: usize) -> Self {
         Self {
             started: Instant::now(),
+            instance_id: String::new(),
+            addr: String::new(),
             active_connections: AtomicU64::new(0),
             total_connections: AtomicU64::new(0),
             batches: AtomicU64::new(0),
@@ -367,8 +427,13 @@ impl ServerMetrics {
         }
     }
 
-    /// The per-signal upload gauges, for handing to the matching
-    /// `Pipeline` via `Pipeline::with_upload_stats`.
+    /// Stamp the instance identity used in the published status envelope.
+    pub fn with_identity(mut self, instance_id: String, addr: String) -> Self {
+        self.instance_id = instance_id;
+        self.addr = addr;
+        self
+    }
+
     pub fn metrics_upload(&self) -> Arc<UploadStats> {
         self.metrics_upload.clone()
     }
@@ -438,9 +503,6 @@ impl ServerMetrics {
             .iter()
             .map(|u| u.upload_waiters.load(Ordering::Relaxed))
             .sum();
-        // The pool is shared across signals, so saturation is a
-        // pool-wide condition: total in-flight uploads have filled every
-        // permit.
         let total_inflight: u64 = uploads
             .iter()
             .map(|u| u.uploads_inflight.load(Ordering::Relaxed))
@@ -476,15 +538,10 @@ impl ServerMetrics {
         }
     }
 
-    fn snapshot(&self) -> serde_json::Value {
-        let now_unix_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+    /// The ingest-specific payload embedded in the status snapshot's `data`.
+    fn ingest_data(&self) -> serde_json::Value {
         let (status, severity, message) = self.bottleneck();
         serde_json::json!({
-            "now_unix_ms": now_unix_ms,
-            "uptime_secs": self.started.elapsed().as_secs_f64(),
             "active_connections": self.active_connections.load(Ordering::Relaxed),
             "total_connections": self.total_connections.load(Ordering::Relaxed),
             "batches": self.batches.load(Ordering::Relaxed),
@@ -497,7 +554,6 @@ impl ServerMetrics {
             "bytes_out": self.bytes_out.load(Ordering::Relaxed),
             "rejected": self.rejected.load(Ordering::Relaxed),
             "max_inflight_uploads": self.upload_concurrency,
-            "rss_kib": rss_kib(),
             "uploads": {
                 "metrics": self.metrics_upload.snapshot(),
                 "logs": self.logs_upload.snapshot(),
@@ -514,130 +570,363 @@ impl ServerMetrics {
     }
 }
 
-impl StatsProvider for ServerMetrics {
-    fn stats_json(&self) -> String {
-        self.snapshot().to_string()
-    }
-    fn index_html(&self) -> Cow<'static, str> {
-        Cow::Borrowed(INGEST_DASHBOARD_HTML)
+impl LocalStatus for ServerMetrics {
+    fn snapshot(&self) -> StatusSnapshot {
+        StatusSnapshot {
+            role: "ingest".to_string(),
+            instance_id: self.instance_id.clone(),
+            addr: self.addr.clone(),
+            now_unix_ms: now_unix_ms(),
+            uptime_secs: self.started.elapsed().as_secs_f64(),
+            rss_kib: rss_kib(),
+            data: self.ingest_data(),
+        }
     }
 }
 
-/// The ingest dashboard: a single self-contained page (no framework, no
-/// build step) that polls `/stats.json` once a second, diffs successive
-/// snapshots into rec/s + MiB/s, and renders a status banner that turns
-/// yellow/red when the pipeline goes upload-bound.
-const INGEST_DASHBOARD_HTML: &str = r#"<!doctype html>
+// ─────────────────────────── query metrics ────────────────────────────────
+
+/// Process-global query metrics. The counters below are bumped once per *query*
+/// (not per row), so they're cheap; the rest of the snapshot is live reads of
+/// state the [`crate::QueryService`] already owns (the sidecar caches, the
+/// DataFusion memory pool, and the catalog), so there is no extra hot-path cost.
+/// Construct with [`QueryMetrics::new`], share via `Arc`.
+pub struct QueryMetrics {
+    started: Instant,
+    instance_id: String,
+    addr: String,
+    queries_total: AtomicU64,
+    queries_in_flight: AtomicU64,
+    query_errors_total: AtomicU64,
+    query_nanos_total: AtomicU64,
+    rows_returned_total: AtomicU64,
+    bytes_scanned_total: AtomicU64,
+    // Live-read handles into the query service's shared state.
+    postings_cache: Arc<PostingsCache>,
+    bloom_cache: Arc<BloomCache>,
+    result_cache: Arc<QueryResultCache>,
+    memory_pool: Arc<GreedyMemoryPool>,
+    catalog: Arc<Mutex<Catalog>>,
+    /// Connection health of this daemon's Valkey link, if any. `None` ⇒ no
+    /// Valkey configured; `Some(false)` ⇒ configured but currently down.
+    valkey_health: Option<watch::Receiver<bool>>,
+}
+
+impl QueryMetrics {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        instance_id: String,
+        addr: String,
+        postings_cache: Arc<PostingsCache>,
+        bloom_cache: Arc<BloomCache>,
+        result_cache: Arc<QueryResultCache>,
+        memory_pool: Arc<GreedyMemoryPool>,
+        catalog: Arc<Mutex<Catalog>>,
+        valkey_health: Option<watch::Receiver<bool>>,
+    ) -> Self {
+        Self {
+            started: Instant::now(),
+            instance_id,
+            addr,
+            queries_total: AtomicU64::new(0),
+            queries_in_flight: AtomicU64::new(0),
+            query_errors_total: AtomicU64::new(0),
+            query_nanos_total: AtomicU64::new(0),
+            rows_returned_total: AtomicU64::new(0),
+            bytes_scanned_total: AtomicU64::new(0),
+            postings_cache,
+            bloom_cache,
+            result_cache,
+            memory_pool,
+            catalog,
+            valkey_health,
+        }
+    }
+
+    /// Begin tracking one in-flight query: bumps `queries_total` and the
+    /// in-flight gauge, and returns an RAII guard that — on drop — decrements
+    /// the gauge, folds the query's wall-time into `query_nanos_total`, and (if
+    /// [`mark_ok`](QueryInFlight::mark_ok) was not called) counts an error. So
+    /// every early return / `?` in the handler is accounted correctly.
+    pub fn begin(self: &Arc<Self>) -> QueryInFlight {
+        self.queries_total.fetch_add(1, Ordering::Relaxed);
+        self.queries_in_flight.fetch_add(1, Ordering::Relaxed);
+        QueryInFlight {
+            metrics: self.clone(),
+            start: Instant::now(),
+            ok: false,
+        }
+    }
+
+    /// Record a completed scan's row + object-store byte counts. Called once
+    /// per terminal path from `emit_scan_complete`.
+    pub fn record_scan(&self, rows: u64, bytes_scanned: u64) {
+        self.rows_returned_total.fetch_add(rows, Ordering::Relaxed);
+        self.bytes_scanned_total
+            .fetch_add(bytes_scanned, Ordering::Relaxed);
+    }
+
+    fn query_data(&self) -> serde_json::Value {
+        let queries = self.queries_total.load(Ordering::Relaxed);
+        let nanos = self.query_nanos_total.load(Ordering::Relaxed);
+        let avg_ms = if queries > 0 {
+            (nanos as f64 / queries as f64) / 1e6
+        } else {
+            0.0
+        };
+        let p = self.postings_cache.stats();
+        let b = self.bloom_cache.stats();
+        let r = self.result_cache.stats();
+        // Catalog: one indexed COUNT/SUM under the brief mutex. On a poisoned
+        // lock (a panicked query holder) fall back to zeros rather than panic
+        // the status server.
+        let (catalog_blocks, catalog_rows) = match self.catalog.lock() {
+            Ok(cat) => (
+                cat.block_count().unwrap_or(0) as u64,
+                cat.live_row_count().unwrap_or(0),
+            ),
+            Err(_) => (0, 0),
+        };
+        let valkey_connected = self.valkey_health.as_ref().map(|rx| *rx.borrow());
+        serde_json::json!({
+            "queries_total": queries,
+            "queries_in_flight": self.queries_in_flight.load(Ordering::Relaxed),
+            "query_errors_total": self.query_errors_total.load(Ordering::Relaxed),
+            "avg_query_ms": avg_ms,
+            "rows_returned_total": self.rows_returned_total.load(Ordering::Relaxed),
+            "bytes_scanned_total": self.bytes_scanned_total.load(Ordering::Relaxed),
+            "postings_cache": {
+                "hits": p.hits, "misses": p.misses, "evictions": p.evictions,
+                "entries": p.entries, "bytes_in": p.bytes_in, "budget_bytes": p.budget_bytes,
+            },
+            "bloom_cache": {
+                "hits": b.hits, "misses": b.misses, "evictions": b.evictions,
+                "entries": b.entries, "bytes_in": b.bytes_in, "budget_bytes": b.budget_bytes,
+            },
+            "result_cache": {
+                "hits": r.hits, "misses": r.misses, "inserts": r.inserts, "evictions": r.evictions,
+                "entries": r.entries, "bytes_in": r.bytes_in, "budget_bytes": r.budget_bytes,
+            },
+            "memory_reserved_bytes": self.memory_pool.reserved(),
+            "catalog_blocks": catalog_blocks,
+            "catalog_rows": catalog_rows,
+            "valkey_connected": valkey_connected,
+        })
+    }
+}
+
+impl LocalStatus for QueryMetrics {
+    fn snapshot(&self) -> StatusSnapshot {
+        StatusSnapshot {
+            role: "query".to_string(),
+            instance_id: self.instance_id.clone(),
+            addr: self.addr.clone(),
+            now_unix_ms: now_unix_ms(),
+            uptime_secs: self.started.elapsed().as_secs_f64(),
+            rss_kib: rss_kib(),
+            data: self.query_data(),
+        }
+    }
+}
+
+/// RAII in-flight guard for one query (see [`QueryMetrics::begin`]).
+pub struct QueryInFlight {
+    metrics: Arc<QueryMetrics>,
+    start: Instant,
+    ok: bool,
+}
+
+impl QueryInFlight {
+    /// Mark the query as having completed successfully (reached its
+    /// `EndOfStream` terminator or served a cache hit). Without this, the drop
+    /// counts an error.
+    #[inline]
+    pub fn mark_ok(&mut self) {
+        self.ok = true;
+    }
+}
+
+impl Drop for QueryInFlight {
+    fn drop(&mut self) {
+        self.metrics
+            .queries_in_flight
+            .fetch_sub(1, Ordering::Relaxed);
+        self.metrics
+            .query_nanos_total
+            .fetch_add(self.start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        if !self.ok {
+            self.metrics
+                .query_errors_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+// ─────────────────────────── fleet dashboard ──────────────────────────────
+
+/// The fleet dashboard: a single self-contained page (no framework, no build
+/// step) that polls `/stats.json` once a second and renders one card per live
+/// instance, grouped into Ingest and Query sections, computing per-instance
+/// rates by diffing successive polls keyed on `instance_id`. The card for this
+/// instance (matching `self_id`) is badged "this instance".
+const FLEET_DASHBOARD_HTML: &str = r#"<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>scry ingest</title>
+<title>scry status</title>
 <style>
   :root { color-scheme: dark; }
   body { font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
          margin: 0; padding: 1.5rem; background: #0d1117; color: #c9d1d9; }
-  h1 { font-size: 1.1rem; margin: 0 0 1rem; color: #58a6ff; }
-  #banner { padding: .75rem 1rem; border-radius: 6px; margin-bottom: 1.25rem;
-            font-weight: 600; border: 1px solid transparent; }
+  h1 { font-size: 1.1rem; margin: 0 0 .25rem; color: #58a6ff; }
+  #meta { color: #6e7681; margin-bottom: 1.25rem; }
+  h2 { font-size: .95rem; color: #8b949e; margin: 1.5rem 0 .5rem;
+       border-bottom: 1px solid #21262d; padding-bottom: .25rem; }
+  .cards { display: flex; flex-wrap: wrap; gap: 1rem; }
+  .card { background: #161b22; border: 1px solid #21262d; border-radius: 8px;
+          padding: .9rem 1.1rem; min-width: 300px; flex: 1 1 300px; max-width: 460px; }
+  .card.self { border-color: #1f6feb; box-shadow: 0 0 0 1px #1f6feb inset; }
+  .card h3 { margin: 0 0 .1rem; font-size: .95rem; color: #c9d1d9; }
+  .badge { font-size: .7rem; font-weight: 600; padding: .05rem .4rem; border-radius: 4px;
+           background: #1f6feb; color: #fff; margin-left: .4rem; vertical-align: middle; }
+  .addr { color: #6e7681; font-size: .8rem; margin-bottom: .5rem; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: .1rem .5rem .1rem 0; }
+  th { color: #8b949e; font-weight: 500; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .banner { padding: .35rem .6rem; border-radius: 5px; margin: .4rem 0 .6rem;
+            font-size: .8rem; border: 1px solid transparent; }
   .ok       { background: #0f2a16; border-color: #238636; color: #7ee787; }
   .info     { background: #0d2233; border-color: #1f6feb; color: #79c0ff; }
   .warn     { background: #332701; border-color: #9e6a03; color: #e3b341; }
   .critical { background: #3a0d0d; border-color: #da3633; color: #ff7b72; }
-  table { border-collapse: collapse; margin-bottom: 1.5rem; min-width: 320px; }
-  th, td { text-align: left; padding: .25rem 1.25rem .25rem 0; }
-  th { color: #8b949e; font-weight: 500; }
-  td.num { text-align: right; font-variant-numeric: tabular-nums; }
-  h2 { font-size: .95rem; color: #8b949e; margin: 1.25rem 0 .5rem; }
-  .muted { color: #6e7681; }
-  .grid { display: flex; flex-wrap: wrap; gap: 2.5rem; }
+  .empty { color: #6e7681; font-style: italic; }
 </style>
 </head>
 <body>
-<h1>scry ingest &mdash; live stats</h1>
-<div id="banner" class="info">connecting&hellip;</div>
+<h1>scry &mdash; fleet status</h1>
+<div id="meta">connecting&hellip;</div>
 
-<div class="grid">
-  <div>
-    <h2>throughput</h2>
-    <table id="tp"></table>
-  </div>
-  <div>
-    <h2>process</h2>
-    <table id="proc"></table>
-  </div>
-</div>
+<h2>ingest</h2>
+<div class="cards" id="ingest"><span class="empty">none</span></div>
 
-<h2>per-signal upload pipeline</h2>
-<table id="up"></table>
-
-<p class="muted" id="foot"></p>
+<h2>query</h2>
+<div class="cards" id="query"><span class="empty">none</span></div>
 
 <script>
-let prev = null;
+const prev = new Map();      // instance_id -> last DISTINCT snapshot (rate baseline)
+const cardCache = new Map(); // instance_id -> last rendered card HTML (held across duplicate polls)
 const $ = id => document.getElementById(id);
-const fmt = n => (n == null ? "n/a" : n.toLocaleString("en-US", {maximumFractionDigits: 2}));
-const mib = b => (b == null ? "n/a" : (b / 1048576).toFixed(2) + " MiB");
+const fmt = n => (n == null ? "n/a" : Number(n).toLocaleString("en-US", {maximumFractionDigits: 2}));
+const mib = b => (b == null ? "n/a" : (b / 1048576).toFixed(1) + " MiB");
 const mibps = b => (b == null ? "n/a" : (b / 1048576).toFixed(2) + " MiB/s");
+const pct = (h, m) => { const t = (h||0) + (m||0); return t === 0 ? "—" : ((100*h/t).toFixed(0) + "% (" + fmt(t) + ")"); };
 
-function rows(tbl, pairs) {
-  tbl.innerHTML = pairs.map(([k, v]) =>
-    `<tr><th>${k}</th><td class="num">${v}</td></tr>`).join("");
+function rateFn(s, p) {
+  const dt = (p && s.now_unix_ms > p.now_unix_ms) ? (s.now_unix_ms - p.now_unix_ms) / 1000 : 0;
+  return (curPath, prevPath) => {
+    if (!p || dt <= 0) return null;
+    return (curPath - prevPath) / dt;
+  };
 }
 
-function render(s) {
-  let dt = 0;
-  if (prev) dt = (s.now_unix_ms - prev.now_unix_ms) / 1000;
-  const rate = (cur, key) => (prev && dt > 0) ? (cur - prev[key]) / dt : null;
+function tbl(pairs) {
+  return "<table>" + pairs.map(([k, v]) =>
+    `<tr><th>${k}</th><td class="num">${v}</td></tr>`).join("") + "</table>";
+}
 
-  const b = s.bottleneck;
-  const banner = $("banner");
-  banner.className = b.severity;
-  banner.textContent = b.message;
+function ingestCard(s, p, isSelf) {
+  const d = s.data, pd = p ? p.data : null;
+  const r = rateFn(s, p);
+  const b = d.bottleneck || {severity: "info", message: "", status: ""};
+  const rate = (k) => (pd ? r(d[k], pd[k]) : null);
+  const body =
+    `<div class="banner ${b.severity}">${b.message}</div>` +
+    tbl([
+      ["metric samples/s", fmt(rate("metric_samples"))],
+      ["log entries/s",    fmt(rate("log_entries"))],
+      ["spans/s",          fmt(rate("spans"))],
+      ["batches/s",        fmt(rate("batches"))],
+      ["ingest in",        mibps(rate("bytes_in"))],
+      ["active conns",     fmt(d.active_connections)],
+      ["rejected",         fmt(d.rejected)],
+      ["max inflight up.", fmt(d.max_inflight_uploads)],
+    ]);
+  return card(s, isSelf, body);
+}
 
-  rows($("tp"), [
-    ["metric samples/s", fmt(rate(s.metric_samples, "metric_samples"))],
-    ["log entries/s",    fmt(rate(s.log_entries, "log_entries"))],
-    ["batches/s",        fmt(rate(s.batches, "batches"))],
-    ["ingest in",        mibps(rate(s.bytes_in, "bytes_in"))],
-    ["ingest out (decoded)", mibps(rate(s.bytes_out, "bytes_out"))],
-    ["rejected (total)", fmt(s.rejected)],
+function queryCard(s, p, isSelf) {
+  const d = s.data, pd = p ? p.data : null;
+  const r = rateFn(s, p);
+  const rate = (k) => (pd ? r(d[k], pd[k]) : null);
+  const vk = d.valkey_connected;
+  const vkTxt = vk == null ? "—" : (vk ? "connected" : "down");
+  const pc = d.postings_cache || {}, bc = d.bloom_cache || {}, rc = d.result_cache || {};
+  const body = tbl([
+    ["queries/s",        fmt(rate("queries_total"))],
+    ["in-flight",        fmt(d.queries_in_flight)],
+    ["queries (total)",  fmt(d.queries_total)],
+    ["errors (total)",   fmt(d.query_errors_total)],
+    ["avg latency",      fmt(d.avg_query_ms) + " ms"],
+    ["rows scanned/s",   fmt(rate("rows_returned_total"))],
+    ["bytes scanned/s",  mibps(rate("bytes_scanned_total"))],
+    ["postings hit",     pct(pc.hits, pc.misses)],
+    ["bloom hit",        pct(bc.hits, bc.misses)],
+    ["result hit",       pct(rc.hits, rc.misses)],
+    ["mem reserved",     mib(d.memory_reserved_bytes)],
+    ["catalog blocks",   fmt(d.catalog_blocks)],
+    ["catalog rows",     fmt(d.catalog_rows)],
+    ["valkey",           vkTxt],
   ]);
+  return card(s, isSelf, body);
+}
 
-  rows($("proc"), [
-    ["RSS",               s.rss_kib == null ? "n/a" : (s.rss_kib / 1024).toFixed(1) + " MiB"],
-    ["active conns",      fmt(s.active_connections)],
-    ["total conns",       fmt(s.total_connections)],
-    ["uptime",            fmt(s.uptime_secs) + " s"],
-    ["max inflight up.",  fmt(s.max_inflight_uploads)],
-    ["samples (total)",   fmt(s.metric_samples)],
-    ["log entries (total)", fmt(s.log_entries)],
-  ]);
+function card(s, isSelf, body) {
+  const shortId = (s.instance_id || "?").slice(0, 8);
+  const badge = isSelf ? '<span class="badge">this instance</span>' : "";
+  const up = s.uptime_secs == null ? "" : " · up " + Math.round(s.uptime_secs) + "s";
+  const rss = s.rss_kib == null ? "" : " · " + (s.rss_kib / 1024).toFixed(0) + " MiB rss";
+  return `<div class="card${isSelf ? ' self' : ''}">` +
+    `<h3>${shortId}${badge}</h3>` +
+    `<div class="addr">${s.addr || "?"}${up}${rss}</div>` +
+    body + `</div>`;
+}
 
-  const up = $("up");
-  const sigs = ["metrics", "logs", "dummy"];
-  let html = "<tr><th>signal</th><th class='num'>waiting</th><th class='num'>inflight</th>" +
-             "<th class='num'>blocks</th><th class='num'>uploaded</th>" +
-             "<th class='num'>eff. bw</th><th class='num'>stalled</th>" +
-             "<th class='num'>failures</th></tr>";
-  for (const sig of sigs) {
-    const u = s.uploads[sig];
-    const w = u.upload_waiters;
-    const cls = w > 0 ? "warn" : "";
-    html += `<tr><th>${sig}</th>` +
-      `<td class="num ${cls}">${fmt(w)}</td>` +
-      `<td class="num">${fmt(u.uploads_inflight)}</td>` +
-      `<td class="num">${fmt(u.blocks_uploaded)}</td>` +
-      `<td class="num">${mib(u.bytes_uploaded)}</td>` +
-      `<td class="num">${mibps(u.effective_upload_bytes_per_sec)}</td>` +
-      `<td class="num">${fmt(u.upload_stall_seconds_total)} s</td>` +
-      `<td class="num">${fmt(u.upload_failures)}</td></tr>`;
+function render(payload) {
+  const insts = payload.instances || [];
+  const selfId = payload.self_id;
+  $("meta").textContent =
+    `${insts.length} instance(s) · source=${payload.source} · ` +
+    `self=${(selfId||"?").slice(0,8)} · ${new Date().toLocaleTimeString()}`;
+
+  const groups = {ingest: [], query: []};
+  for (const s of insts) (groups[s.role] || (groups[s.role] = [])).push(s);
+
+  for (const role of ["ingest", "query"]) {
+    const el = $(role);
+    const list = (groups[role] || []).sort((a, b) => a.instance_id.localeCompare(b.instance_id));
+    if (list.length === 0) { el.innerHTML = '<span class="empty">none</span>'; continue; }
+    el.innerHTML = list.map(s => {
+      const p = prev.get(s.instance_id);
+      const isSelf = s.instance_id === selfId;
+      // A snapshot only advances once per heartbeat (~STATUS_TTL/3), which is
+      // slower than our 1s poll — so the same blob is served for several polls.
+      // Diff rates against the last *distinct* snapshot and hold the rendered
+      // card across duplicate polls, so nothing flips to n/a between beats.
+      const stale = p && s.now_unix_ms <= p.now_unix_ms;
+      if (stale && cardCache.has(s.instance_id)) return cardCache.get(s.instance_id);
+      const html = role === "ingest" ? ingestCard(s, p, isSelf) : queryCard(s, p, isSelf);
+      cardCache.set(s.instance_id, html);
+      prev.set(s.instance_id, s);   // advance the rate baseline only on a fresh snapshot
+      return html;
+    }).join("");
   }
-  up.innerHTML = html;
 
-  $("foot").textContent = "polled " + new Date(s.now_unix_ms).toLocaleTimeString() +
-    " · status=" + b.status;
-  prev = s;
+  // Drop bookkeeping for instances that vanished from the fleet.
+  const live = new Set(insts.map(s => s.instance_id));
+  for (const k of [...prev.keys()]) if (!live.has(k)) prev.delete(k);
+  for (const k of [...cardCache.keys()]) if (!live.has(k)) cardCache.delete(k);
 }
 
 async function poll() {
@@ -645,10 +934,7 @@ async function poll() {
     const r = await fetch("/stats.json", {cache: "no-store"});
     render(await r.json());
   } catch (e) {
-    const banner = $("banner");
-    banner.className = "critical";
-    banner.textContent = "stats endpoint unreachable: " + e;
-    prev = null;
+    $("meta").textContent = "status endpoint unreachable: " + e;
   }
 }
 poll();
@@ -665,18 +951,33 @@ mod tests {
     use tokio::io::AsyncReadExt;
     use tokio::sync::Notify;
 
-    struct StubProvider;
-    impl StatsProvider for StubProvider {
-        fn stats_json(&self) -> String {
-            r#"{"ok":true}"#.to_string()
-        }
-        fn index_html(&self) -> Cow<'static, str> {
-            Cow::Borrowed("<html>hi</html>")
+    struct StubLocal(StatusSnapshot);
+    impl LocalStatus for StubLocal {
+        fn snapshot(&self) -> StatusSnapshot {
+            self.0.clone()
         }
     }
 
-    /// Send a raw request line over a fresh connection and return the
-    /// full response text.
+    fn stub_snapshot(role: &str, id: &str) -> StatusSnapshot {
+        StatusSnapshot {
+            role: role.to_string(),
+            instance_id: id.to_string(),
+            addr: "127.0.0.1:1".to_string(),
+            now_unix_ms: 1,
+            uptime_secs: 1.0,
+            rss_kib: Some(1),
+            data: serde_json::json!({"ok": true}),
+        }
+    }
+
+    struct StubFleet(Vec<String>);
+    #[async_trait::async_trait]
+    impl FleetSource for StubFleet {
+        async fn blobs(&self) -> Vec<String> {
+            self.0.clone()
+        }
+    }
+
     async fn request(addr: std::net::SocketAddr, line: &str) -> String {
         let mut sock = TcpStream::connect(addr).await.unwrap();
         sock.write_all(format!("{line}\r\nHost: x\r\n\r\n").as_bytes())
@@ -688,49 +989,103 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_routes() {
+    async fn http_routes_and_local_fallback() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        drop(listener); // free the port; serve_stats rebinds it
+        drop(listener);
 
         let shutdown = Arc::new(Notify::new());
         let shutdown_wait = shutdown.clone();
+        let local: Arc<dyn LocalStatus> = Arc::new(StubLocal(stub_snapshot("query", "self-1")));
         let handle = tokio::spawn(async move {
-            serve_stats(addr.to_string(), Arc::new(StubProvider), async move {
-                shutdown_wait.notified().await
-            })
+            serve_status(
+                addr.to_string(),
+                local,
+                None,
+                "self-1".to_string(),
+                async move { shutdown_wait.notified().await },
+            )
             .await
             .unwrap();
         });
-        // Give the server a moment to bind.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let index = request(addr, "GET / HTTP/1.1").await;
         assert!(index.starts_with("HTTP/1.1 200 OK"), "index: {index}");
-        assert!(index.contains("text/html"));
-        assert!(index.contains("<html>hi</html>"));
+        assert!(index.contains("fleet status"));
 
         let json = request(addr, "GET /stats.json HTTP/1.1").await;
-        assert!(json.starts_with("HTTP/1.1 200 OK"), "json: {json}");
-        assert!(json.contains("application/json"));
         let body = json.split("\r\n\r\n").nth(1).unwrap();
         let v: Value = serde_json::from_str(body).unwrap();
-        assert_eq!(v["ok"], serde_json::json!(true));
+        assert_eq!(v["source"], serde_json::json!("local"));
+        assert_eq!(v["self_id"], serde_json::json!("self-1"));
+        assert_eq!(v["instances"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            v["instances"][0]["instance_id"],
+            serde_json::json!("self-1")
+        );
 
         let missing = request(addr, "GET /nope HTTP/1.1").await;
-        assert!(
-            missing.starts_with("HTTP/1.1 404 Not Found"),
-            "404: {missing}"
-        );
-
-        let method = request(addr, "POST / HTTP/1.1").await;
-        assert!(
-            method.starts_with("HTTP/1.1 405 Method Not Allowed"),
-            "405: {method}"
-        );
+        assert!(missing.starts_with("HTTP/1.1 404 Not Found"));
 
         shutdown.notify_waiters();
         handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fleet_merges_and_marks_self() {
+        // Fleet has two peers (an ingest and a query). Self is the query one,
+        // and it's already present in the blob set (no local push needed).
+        let blobs = vec![
+            serde_json::to_string(&stub_snapshot("ingest", "ingest-1")).unwrap(),
+            serde_json::to_string(&stub_snapshot("query", "query-self")).unwrap(),
+        ];
+        let state = StatusState {
+            local: Arc::new(StubLocal(stub_snapshot("query", "query-self"))),
+            fleet: Some(Arc::new(StubFleet(blobs))),
+            self_id: "query-self".to_string(),
+        };
+        let v: Value = serde_json::from_str(&state.stats_json().await).unwrap();
+        assert_eq!(v["source"], serde_json::json!("valkey"));
+        let insts = v["instances"].as_array().unwrap();
+        // Both peers present, self not duplicated.
+        assert_eq!(insts.len(), 2);
+        assert_eq!(
+            insts
+                .iter()
+                .filter(|s| s["instance_id"] == "query-self")
+                .count(),
+            1
+        );
+        // Both roles represented.
+        assert!(insts.iter().any(|s| s["role"] == "ingest"));
+        assert!(insts.iter().any(|s| s["role"] == "query"));
+    }
+
+    #[tokio::test]
+    async fn fleet_injects_self_before_first_heartbeat() {
+        // Valkey present but self's heartbeat hasn't landed yet — the local
+        // snapshot is injected so the page never omits the reporting instance.
+        let blobs = vec![serde_json::to_string(&stub_snapshot("ingest", "ingest-1")).unwrap()];
+        let state = StatusState {
+            local: Arc::new(StubLocal(stub_snapshot("query", "query-self"))),
+            fleet: Some(Arc::new(StubFleet(blobs))),
+            self_id: "query-self".to_string(),
+        };
+        let v: Value = serde_json::from_str(&state.stats_json().await).unwrap();
+        let insts = v["instances"].as_array().unwrap();
+        assert_eq!(insts.len(), 2);
+        assert!(insts.iter().any(|s| s["instance_id"] == "query-self"));
+    }
+
+    #[test]
+    fn snapshot_round_trips() {
+        let s = stub_snapshot("ingest", "abc");
+        let json = serde_json::to_string(&s).unwrap();
+        let back: StatusSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.role, "ingest");
+        assert_eq!(back.instance_id, "abc");
+        assert_eq!(back.data, serde_json::json!({"ok": true}));
     }
 
     #[test]
@@ -738,60 +1093,57 @@ mod tests {
         const CAP: usize = 4;
         let m = ServerMetrics::new(CAP);
 
-        // Nothing in flight → healthy.
         let (status, severity, _) = m.bottleneck();
         assert_eq!((status, severity), ("healthy", "ok"));
 
-        // Inflight below the pool cap, no ingest blocked → still healthy.
         m.metrics_upload
             .uploads_inflight
             .store(CAP as u64 - 1, Ordering::Relaxed);
         let (status, severity, _) = m.bottleneck();
         assert_eq!((status, severity), ("healthy", "ok"));
 
-        // Inflight summed across signals fills the pool, no ingest
-        // blocked → saturated but keeping pace.
         m.dummy_upload.uploads_inflight.store(1, Ordering::Relaxed);
         let (status, severity, _) = m.bottleneck();
         assert_eq!((status, severity), ("upload_saturated", "info"));
 
-        // An ingest path blocked waiting for a slot → upload_bound / warn.
         m.metrics_upload.upload_waiters.store(1, Ordering::Relaxed);
         let (status, severity, _) = m.bottleneck();
         assert_eq!((status, severity), ("upload_bound", "warn"));
     }
 
     #[test]
-    fn stats_json_is_valid_and_complete() {
+    fn ingest_snapshot_is_valid_and_complete() {
         const CAP: usize = 8;
-        let m = ServerMetrics::new(CAP);
+        let m =
+            ServerMetrics::new(CAP).with_identity("iid".to_string(), "127.0.0.1:4000".to_string());
         m.add_batch(100);
         m.add_bytes_out(400);
         m.add_records(Signal::Metrics, 50);
         m.add_records(Signal::Logs, 7);
         m.conn_open();
 
-        let v: Value = serde_json::from_str(&m.stats_json()).unwrap();
-        assert_eq!(v["metric_samples"], serde_json::json!(50));
-        assert_eq!(v["log_entries"], serde_json::json!(7));
-        assert_eq!(v["batches"], serde_json::json!(1));
-        assert_eq!(v["bytes_in"], serde_json::json!(100));
-        assert_eq!(v["active_connections"], serde_json::json!(1));
-        assert_eq!(v["max_inflight_uploads"], serde_json::json!(CAP));
-        assert!(v["uploads"]["metrics"].is_object());
-        assert!(v["bottleneck"]["status"].is_string());
-        assert!(v.get("now_unix_ms").is_some());
+        let snap = m.snapshot();
+        assert_eq!(snap.role, "ingest");
+        assert_eq!(snap.instance_id, "iid");
+        assert_eq!(snap.addr, "127.0.0.1:4000");
+        let d = &snap.data;
+        assert_eq!(d["metric_samples"], serde_json::json!(50));
+        assert_eq!(d["log_entries"], serde_json::json!(7));
+        assert_eq!(d["batches"], serde_json::json!(1));
+        assert_eq!(d["bytes_in"], serde_json::json!(100));
+        assert_eq!(d["active_connections"], serde_json::json!(1));
+        assert_eq!(d["max_inflight_uploads"], serde_json::json!(CAP));
+        assert!(d["uploads"]["metrics"].is_object());
+        assert!(d["bottleneck"]["status"].is_string());
     }
 
     #[test]
     fn upload_stats_transitions() {
         let u = UploadStats::default();
-        // Ingest blocks waiting for a slot, then gets one.
         u.begin_wait();
         assert_eq!(u.upload_waiters.load(Ordering::Relaxed), 1);
-        u.end_wait(500_000_000); // stalled 0.5 s
+        u.end_wait(500_000_000);
         assert_eq!(u.upload_waiters.load(Ordering::Relaxed), 0);
-        // Upload runs to completion.
         u.start_inflight();
         assert_eq!(u.uploads_inflight.load(Ordering::Relaxed), 1);
         u.record_success(1024, 1_000_000_000);
@@ -800,7 +1152,6 @@ mod tests {
         let snap = u.snapshot();
         assert_eq!(snap["blocks_uploaded"], serde_json::json!(1));
         assert_eq!(snap["bytes_uploaded"], serde_json::json!(1024));
-        // 1024 bytes in 1.0 s → 1024 B/s.
         assert_eq!(
             snap["effective_upload_bytes_per_sec"],
             serde_json::json!(1024.0)

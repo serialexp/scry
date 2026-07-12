@@ -330,8 +330,9 @@ export type LabelStatus = "idle" | "loading" | "ready" | "error";
 
 const [labelNames, setLabelNames] = createSignal<string[]>([]);
 const [labelStatus, setLabelStatus] = createSignal<LabelStatus>("idle");
+const [labelError, setLabelError] = createSignal<string | null>(null);
 const [labelValues, setLabelValues] = createSignal<Record<string, string[]>>({});
-export { labelNames, labelStatus, labelValues };
+export { labelNames, labelStatus, labelError, labelValues };
 
 /** Signals with a postings/promoted-column label surface. Profiles carry
  *  their labels inside the opaque pprof blob, so metadata is empty there. */
@@ -388,16 +389,21 @@ export async function refreshLabels(force = false): Promise<void> {
   metaKey = key;
   const seq = ++metaSeq;
   setLabelValues({});
+  setLabelError(null);
   setLabelStatus("loading");
   try {
     const transport = await getTransport();
     const names = await fetchLabelNames(transport, dest, scope);
     if (seq !== metaSeq) return; // superseded by a newer scope
     setLabelNames(names);
+    setLabelError(null);
     setLabelStatus("ready");
-  } catch {
+  } catch (e) {
     if (seq !== metaSeq) return;
+    const message =
+      e instanceof Error ? e.message : String(e);
     setLabelNames([]);
+    setLabelError(message);
     setLabelStatus("error");
   }
 }
