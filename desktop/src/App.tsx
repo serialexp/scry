@@ -14,6 +14,7 @@ import { Show, onMount, type Component, type JSX } from "solid-js";
 import { HashRouter, Route, Navigate, A } from "@solidjs/router";
 
 import LoginForm from "./components/LoginForm";
+import ConnectionPicker from "./components/ConnectionPicker";
 import Explore from "./views/Explore";
 import Dashboards from "./views/Dashboards";
 import Alerts from "./views/Alerts";
@@ -43,14 +44,17 @@ const Shell: Component<{ children?: JSX.Element }> = (props) => {
             Fleet
           </A>
         </nav>
-        <span class="version" title="scry version">
-          v{__APP_VERSION__}
-        </span>
-        <Show when={inBrowser && authed()}>
-          <button type="button" class="logout" onClick={() => void logout()}>
-            Log out
-          </button>
-        </Show>
+        <div class="app-header-right">
+          <ConnectionPicker />
+          <span class="version" title="scry version">
+            v{__APP_VERSION__}
+          </span>
+          <Show when={inBrowser && authed()}>
+            <button type="button" class="logout" onClick={() => void logout()}>
+              Log out
+            </button>
+          </Show>
+        </div>
       </header>
       {props.children}
     </div>

@@ -18,7 +18,7 @@ import {
   layoutSpans,
   singleTraceId,
 } from "../traces";
-import { state, resultTable, resultKind } from "../store";
+import { state, resultTable, resultKind, selected, setSelected } from "../store";
 import { severity } from "../severity";
 import TracesView, { type TraceData } from "./TracesView";
 import FramesView, { type FramesData } from "./FramesView";
@@ -83,13 +83,19 @@ function primaryLabels(labels: [string, string][]): [string, string][] {
   return out.length > 0 ? out : labels.slice(0, 4);
 }
 
-/** Shorten a label key for chip display: drop the agent's `k8s_` prefix and
- *  collapse `app.kubernetes.io/name` → `name`. */
-function shortKey(k: string): string {
-  let s = k.startsWith("k8s_") ? k.slice(4) : k;
-  const slash = s.lastIndexOf("/");
-  if (slash >= 0) s = s.slice(slash + 1);
-  return s;
+/** The identifying service/workload for the compact grid's Service column:
+ *  the first present primary label value. */
+function serviceOf(labels: [string, string][]): string {
+  const p = primaryLabels(labels);
+  return p.length > 0 ? p[0]![1] : "";
+}
+
+/** A trace id from a log entry's attributes, if present (Trace column). */
+function traceOf(attrs: [string, string][]): string {
+  for (const [k, v] of attrs) {
+    if (k === "trace_id" || k === "traceId" || k === "trace.id") return v;
+  }
+  return "";
 }
 
 // ── component ──────────────────────────────────────────────────────────
@@ -245,70 +251,59 @@ const ResultsTable: Component = () => {
                   raw
                 </label>
               </div>
-              <div class="log-list">
-                <For each={filteredLogs()}>
-                  {(r) => {
-                    const sev = severity(r.sev);
-                    const ts = fmtTs(r.ts);
-                    const primary = primaryLabels(r.labels);
-                    const extra = r.labels.length + r.attrs.length;
-                    return (
-                      <div class={`log-entry ${sev.cls}`}>
-                        <div class="log-head">
-                          <span class="log-ts" title={ts.full}>
+              <div class="logs-grid">
+                <div class="logs-grid-head">
+                  <span>Time</span>
+                  <span>Level</span>
+                  <span>Service</span>
+                  <span>Message</span>
+                  <span>Trace</span>
+                </div>
+                <div class="logs-grid-body">
+                  <For each={filteredLogs()}>
+                    {(r) => {
+                      const sev = severity(r.sev);
+                      const ts = fmtTs(r.ts);
+                      const svc = serviceOf(r.labels);
+                      const trace = traceOf(r.attrs);
+                      const isSel = () => {
+                        const s = selected();
+                        return !!s && s.ts === r.ts && s.body === r.body;
+                      };
+                      return (
+                        <button
+                          type="button"
+                          class={`log-row ${sev.cls}`}
+                          classList={{ selected: isSel() }}
+                          onClick={() =>
+                            setSelected({
+                              kind: "log",
+                              ts: r.ts,
+                              sev: r.sev,
+                              body: r.body,
+                              labels: r.labels,
+                              attrs: r.attrs,
+                            })
+                          }
+                        >
+                          <span class="lg-ts" title={ts.full}>
                             {ts.short}
                           </span>
-                          <span class={`log-sev ${sev.cls}`}>{sev.label}</span>
-                          <span class="log-body">{r.body}</span>
-                        </div>
-                        <Show when={primary.length > 0}>
-                          <div class="log-labels">
-                            <For each={primary}>
-                              {([k, v]) => (
-                                <span class="chip lbl" title={k}>
-                                  <b>{shortKey(k)}</b>
-                                  <span>{v}</span>
-                                </span>
-                              )}
-                            </For>
-                          </div>
-                        </Show>
-                        <Show when={extra > 0}>
-                          <details class="log-attrs">
-                            <summary>
-                              {r.labels.length} label{r.labels.length === 1 ? "" : "s"} ·{" "}
-                              {r.attrs.length} attr{r.attrs.length === 1 ? "" : "s"}
-                            </summary>
-                            <Show when={r.labels.length > 0}>
-                              <div class="log-attr-chips">
-                                <For each={r.labels}>
-                                  {([k, v]) => (
-                                    <span class="chip">
-                                      <b>{k}</b>
-                                      <span>{v}</span>
-                                    </span>
-                                  )}
-                                </For>
-                              </div>
-                            </Show>
-                            <Show when={r.attrs.length > 0}>
-                              <div class="log-attr-chips">
-                                <For each={r.attrs}>
-                                  {([k, v]) => (
-                                    <span class="chip attr">
-                                      <b>{k}</b>
-                                      <span>{v}</span>
-                                    </span>
-                                  )}
-                                </For>
-                              </div>
-                            </Show>
-                          </details>
-                        </Show>
-                      </div>
-                    );
-                  }}
-                </For>
+                          <span class="lg-level">
+                            <span class={`log-sev ${sev.cls}`}>{sev.label}</span>
+                          </span>
+                          <span class="lg-svc" title={svc}>
+                            {svc}
+                          </span>
+                          <span class="lg-msg">{r.body}</span>
+                          <span class="lg-trace" title={trace}>
+                            {trace ? trace.slice(0, 12) : ""}
+                          </span>
+                        </button>
+                      );
+                    }}
+                  </For>
+                </div>
               </div>
             </>
           )}

@@ -26,6 +26,7 @@ import {
 import { severity, severityRank } from "./severity";
 import {
   chooseStepMs,
+  snapQuickRangeNs,
   stepIntervalSql,
   type VolumeData,
   type VolumeSeries,
@@ -91,6 +92,71 @@ const [resultTable, setResultTable] = createSignal<Table | null>(null);
 const [resultKind, setResultKind] = createSignal<"default" | "frames">("default");
 
 export { state, resultTable, resultKind };
+
+// ── Inspector selection ──────────────────────────────────────────────
+//
+// The Explore inspector rail shows the currently-selected result item. Only
+// logs carry a purpose-built inspector for now; other signals clear it. Kept
+// in a signal (not the store) so it can hold the raw label/attr tuples.
+
+export interface InspectorLog {
+  kind: "log";
+  ts: bigint;
+  sev: number;
+  body: string;
+  /** Stream labels (service identity). */
+  labels: [string, string][];
+  /** Per-entry attributes (stream, trace_id, …). */
+  attrs: [string, string][];
+}
+
+export type InspectorItem = InspectorLog;
+
+const [selected, setSelectedSig] = createSignal<InspectorItem | null>(null);
+export { selected };
+
+/** Set (or clear) the inspector selection. */
+export function setSelected(item: InspectorItem | null): void {
+  setSelectedSig(item);
+}
+
+// ── Quick time-range presets ─────────────────────────────────────────
+//
+// The query bar's range pills. Centralized here (not in a component) so the
+// active preset is shared state: applying a preset stamps `activeRange`,
+// while any manual ts edit clears it (see `setField`).
+
+/** Quick time-range presets: label → span in milliseconds. */
+export const QUICK_RANGES: { label: string; ms: number }[] = [
+  { label: "5m", ms: 5 * 60_000 },
+  { label: "15m", ms: 15 * 60_000 },
+  { label: "1h", ms: 60 * 60_000 },
+  { label: "6h", ms: 6 * 60 * 60_000 },
+  { label: "24h", ms: 24 * 60 * 60_000 },
+  { label: "7d", ms: 7 * 24 * 60 * 60_000 },
+];
+
+/** The label of the currently-applied quick range, or null when the bounds
+ *  were set manually / cleared. Drives the range-pill active highlight. */
+const [activeRange, setActiveRange] = createSignal<string | null>(null);
+export { activeRange };
+
+/** Set ts_min/ts_max to [now - span, now] in unix nanoseconds, snapping the
+ *  upper bound down to the range's bucket step so repeated refreshes within a
+ *  bucket hit the queryd result cache. Stamps `activeRange` for the pill UI. */
+export function applyQuickRange(ms: number, label: string): void {
+  const { tsMinNs, tsMaxNs } = snapQuickRangeNs(Date.now(), ms);
+  setState({ tsMin: String(tsMinNs), tsMax: String(tsMaxNs) });
+  setActiveRange(label);
+  void refreshLabels();
+  if (state.signal === "Logs") void runLogVolume();
+}
+
+/** Clear both time bounds (and the active-range highlight). */
+export function clearTimeRange(): void {
+  setState({ tsMin: "", tsMax: "" });
+  setActiveRange(null);
+}
 
 // ── Auth (browser only) ──────────────────────────────────────────────
 //
@@ -181,6 +247,8 @@ export async function logout(): Promise<void> {
 
 export function setField<K extends keyof FormState>(key: K, value: FormState[K]): void {
   setState(key, value);
+  // A manual time-bound edit means we're no longer on a named preset.
+  if (key === "tsMin" || key === "tsMax") setActiveRange(null);
 }
 
 export function addMatcher(): void {
@@ -193,6 +261,16 @@ export function removeMatcher(index: number): void {
 
 export function setMatcher(index: number, field: keyof MatcherRow, value: string): void {
   setState("matchers", index, field, value);
+}
+
+/** Remove the matcher at `index` outright (unlike `removeMatcher`, which keeps
+ *  a minimum of one row for the sidebar form). Collapses to a single blank row
+ *  when the last matcher is deleted, so the store invariant (≥1 row) holds. */
+export function deleteMatcher(index: number): void {
+  setState("matchers", (m) => {
+    const next = m.filter((_, i) => i !== index);
+    return next.length === 0 ? [{ name: "", value: "" }] : next;
+  });
 }
 
 /** Add (or fill) a `name=value` matcher from the label browser. Reuses the
@@ -279,6 +357,8 @@ function specFromForm(): QuerySpec {
  *  form-driven query and the traces frames-overview / drill-in actions. */
 async function runSpec(spec: QuerySpec, kind: "default" | "frames"): Promise<void> {
   setState({ status: "running", error: null });
+  // A fresh result invalidates the inspector selection (it references old rows).
+  setSelectedSig(null);
   try {
     const transport = await getTransport();
     // Desktop dials a raw `host:port`; browser sends a target *id* the server
