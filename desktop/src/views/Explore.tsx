@@ -12,6 +12,7 @@ import FieldsStrip from "../components/explore/FieldsStrip";
 import InspectorRail from "../components/explore/InspectorRail";
 import ResultsTable from "../components/ResultsTable";
 import VolumePanel from "../components/VolumePanel";
+import MetricsPanel from "../components/explore/MetricsPanel";
 import { state } from "../store";
 
 const Explore: Component = () => {
@@ -27,6 +28,7 @@ const Explore: Component = () => {
             </div>
           </Show>
           <VolumePanel />
+          <MetricsPanel />
           <ResultsTable />
         </main>
         <InspectorRail />

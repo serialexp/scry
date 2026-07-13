@@ -278,7 +278,7 @@ export class QueryFrameDecoder extends SeekableBitStreamDecoder {
 }
 
 /**
- * Sent by the client at the start of every query connection. Carries the target signal byte (1 = metrics, 2 = logs, 3 = traces, 4 = profiles — values match scry_proto::constants::Signal), the AND'd matcher set + time bounds (the postings preselect), optional SQL against the registered table for that signal, an optional row limit, an optional caller-supplied tracing correlation id, and an optional trace_id (16 raw bytes; empty = absent) for the traces signal's by-id lookup, and an optional body_contains substring (empty = absent) for the logs signal's full-text search. Receiver fails with QUERY_ERR_BAD_REQUEST if `signal` is 0 or names an unimplemented signal. NOTE: 'optional' fields would be the natural shape here, but as of binschema 0.5.x the Rust generator emits NotImplemented when 'optional' appears inside a discriminated_union variant (works fine in plain structs — see ingest's Span.parent_span_id). We model each optional with an explicit '*_present: uint8' companion (0 = absent, 1 = present); when absent the value field is still serialised but should be ignored by the receiver. Switch back to 'optional' once binschema gains support.
+ * Sent by the client at the start of every query connection. Carries the target signal byte (1 = metrics, 2 = logs, 3 = traces, 4 = profiles — values match scry_proto::constants::Signal), the AND'd matcher set + time bounds (the postings preselect), optional SQL against the registered table for that signal, an optional row limit, an optional caller-supplied tracing correlation id, and an optional trace_id (16 raw bytes; empty = absent) for the traces signal's by-id lookup, and an optional body_contains substring (empty = absent) for the logs signal's full-text search, and a `live` flag (0/1) requesting the merged history+live view (D-054): when 1 and signal = logs the server unions the stored blocks with the still-in-flight records fanned in from the ingesters, deduplicated across the block-commit seam by WAL-segment watermark. `live` requires Valkey for ingester discovery — the server fails with QUERY_ERR_LIVE_UNAVAILABLE if it has none. `live` is ignored for non-logs signals in v1. A `with_labels` flag (0/1) requesting the opt-in fingerprint→label join for the metrics signal: when 1 and signal = metrics the server appends a synthesised `labels` Map<Utf8,Utf8> column to the result rows (each series' resolved labels, inverted from the postings sidecars), so a series can be named by its labels instead of its opaque fingerprint. Off by default so fingerprint-only metrics queries stay cheap; materialised only when the projection actually selects `labels`. Ignored for non-metrics signals (logs already carry a `labels` column unconditionally). Receiver fails with QUERY_ERR_BAD_REQUEST if `signal` is 0 or names an unimplemented signal. NOTE: 'optional' fields would be the natural shape here, but as of binschema 0.5.x the Rust generator emits NotImplemented when 'optional' appears inside a discriminated_union variant (works fine in plain structs — see ingest's Span.parent_span_id). We model each optional with an explicit '*_present: uint8' companion (0 = absent, 1 = present); when absent the value field is still serialised but should be ignored by the receiver. Switch back to 'optional' once binschema gains support.
  */
 export interface QueryRequestInput {
   /**
@@ -344,10 +344,20 @@ export interface QueryRequestInput {
    * Length prefix type: uint32
    */
   body_contains: string;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  live: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  with_labels: number;
 }
 
 /**
- * Sent by the client at the start of every query connection. Carries the target signal byte (1 = metrics, 2 = logs, 3 = traces, 4 = profiles — values match scry_proto::constants::Signal), the AND'd matcher set + time bounds (the postings preselect), optional SQL against the registered table for that signal, an optional row limit, an optional caller-supplied tracing correlation id, and an optional trace_id (16 raw bytes; empty = absent) for the traces signal's by-id lookup, and an optional body_contains substring (empty = absent) for the logs signal's full-text search. Receiver fails with QUERY_ERR_BAD_REQUEST if `signal` is 0 or names an unimplemented signal. NOTE: 'optional' fields would be the natural shape here, but as of binschema 0.5.x the Rust generator emits NotImplemented when 'optional' appears inside a discriminated_union variant (works fine in plain structs — see ingest's Span.parent_span_id). We model each optional with an explicit '*_present: uint8' companion (0 = absent, 1 = present); when absent the value field is still serialised but should be ignored by the receiver. Switch back to 'optional' once binschema gains support.
+ * Sent by the client at the start of every query connection. Carries the target signal byte (1 = metrics, 2 = logs, 3 = traces, 4 = profiles — values match scry_proto::constants::Signal), the AND'd matcher set + time bounds (the postings preselect), optional SQL against the registered table for that signal, an optional row limit, an optional caller-supplied tracing correlation id, and an optional trace_id (16 raw bytes; empty = absent) for the traces signal's by-id lookup, and an optional body_contains substring (empty = absent) for the logs signal's full-text search, and a `live` flag (0/1) requesting the merged history+live view (D-054): when 1 and signal = logs the server unions the stored blocks with the still-in-flight records fanned in from the ingesters, deduplicated across the block-commit seam by WAL-segment watermark. `live` requires Valkey for ingester discovery — the server fails with QUERY_ERR_LIVE_UNAVAILABLE if it has none. `live` is ignored for non-logs signals in v1. A `with_labels` flag (0/1) requesting the opt-in fingerprint→label join for the metrics signal: when 1 and signal = metrics the server appends a synthesised `labels` Map<Utf8,Utf8> column to the result rows (each series' resolved labels, inverted from the postings sidecars), so a series can be named by its labels instead of its opaque fingerprint. Off by default so fingerprint-only metrics queries stay cheap; materialised only when the projection actually selects `labels`. Ignored for non-metrics signals (logs already carry a `labels` column unconditionally). Receiver fails with QUERY_ERR_BAD_REQUEST if `signal` is 0 or names an unimplemented signal. NOTE: 'optional' fields would be the natural shape here, but as of binschema 0.5.x the Rust generator emits NotImplemented when 'optional' appears inside a discriminated_union variant (works fine in plain structs — see ingest's Span.parent_span_id). We model each optional with an explicit '*_present: uint8' companion (0 = absent, 1 = present); when absent the value field is still serialised but should be ignored by the receiver. Switch back to 'optional' once binschema gains support.
  */
 export interface QueryRequestOutput {
   /**
@@ -418,6 +428,16 @@ export interface QueryRequestOutput {
    * Length prefix type: uint32
    */
   body_contains: string;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  live: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  with_labels: number;
 }
 
 export type QueryRequest = QueryRequestOutput;
@@ -469,6 +489,8 @@ export class QueryRequestEncoder extends BitStreamEncoder {
     for (const byte of value_body_contains_bytes) {
       this.writeUint8(byte);
     }
+    this.writeUint8(value.live);
+    this.writeUint8(value.with_labels);
     return this.finish();
   }
 
@@ -495,6 +517,7 @@ export class QueryRequestEncoder extends BitStreamEncoder {
     size += 2; // length prefix (uint16)
     // body_contains: string (utf8)
     size += new TextEncoder().encode(value.body_contains).length;
+    size += 2; // live + with_labels
     return size;
   }
 }
@@ -560,6 +583,8 @@ export class QueryRequestDecoder extends SeekableBitStreamDecoder {
     } catch (e) {
       throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
     }
+    value.live = this.readUint8();
+    value.with_labels = this.readUint8();
     return value;
   }
 }

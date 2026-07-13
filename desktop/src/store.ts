@@ -31,6 +31,14 @@ import {
   type VolumeData,
   type VolumeSeries,
 } from "./volume";
+import {
+  decodeMetricsChart,
+  decodeSeriesNames,
+  type AggFn,
+  type MetricsChartData,
+} from "./metricsChart";
+
+export type { AggFn } from "./metricsChart";
 
 export interface MatcherRow {
   name: string;
@@ -150,6 +158,7 @@ export function applyQuickRange(ms: number, label: string): void {
   setActiveRange(label);
   void refreshLabels();
   if (state.signal === "Logs") void runLogVolume();
+  if (state.signal === "Metrics") void runMetricsChart();
 }
 
 /** Clear both time bounds (and the active-range highlight). */
@@ -592,6 +601,9 @@ export async function runCurrentQuery(): Promise<void> {
   // so a repeated range is ~free.
   if (state.signal === "Logs") void runLogVolume();
   else clearVolume();
+  // For metrics, refresh the time-series chart alongside the table.
+  if (state.signal === "Metrics") void runMetricsChart();
+  else clearMetricsChart();
 }
 
 /** The Explore drill-down loop: add a `name=value` matcher, then re-run the
@@ -736,6 +748,185 @@ function decodeVolume(table: Table, stepMs: number): VolumeData {
   }));
 
   return { buckets, series, total, stepMs };
+}
+
+// ── Metrics time-series chart (Phase 1a) ─────────────────────────────
+//
+// A downsampled line chart for the Metrics signal — the counterpart to the
+// logs volume histogram. The chosen metric is just the `__name__` matcher; the
+// chart rides the same query wire via a server-side `date_bin` aggregation
+// (no protocol change). Two modes: a single aggregated line (avg/sum/min/max/
+// count across all matching series) or one line per series. In per-series mode
+// the legend resolves fingerprints to their label set best-effort via the
+// D-058 opt-in label join (`with_labels`), falling back to fingerprint hex.
+// Metrics-only; the result lives in its own signals so the table view is
+// untouched.
+
+const [metricAgg, setMetricAggSig] = createSignal<AggFn>("avg");
+const [metricGrouped, setMetricGroupedSig] = createSignal(false);
+const [metricsChartData, setMetricsChartData] = createSignal<MetricsChartData | null>(null);
+const [metricsChartStatus, setMetricsChartStatus] = createSignal<VolumeStatus>("idle");
+export { metricAgg, metricGrouped, metricsChartData, metricsChartStatus };
+
+/** The metric currently charted — the value of the `__name__` matcher, or ""
+ *  when none is set. (Metrics have no separate "metric" field; the chart's
+ *  subject is a label matcher like any other.) */
+export function selectedMetric(): string {
+  const m = state.matchers.find((r) => r.name.trim() === "__name__");
+  return m ? m.value.trim() : "";
+}
+
+/** Set (replace / add / clear) the `__name__` matcher that names the charted
+ *  metric, then re-run the table + chart. */
+export function setMetricName(name: string): void {
+  const n = name.trim();
+  const idx = state.matchers.findIndex((r) => r.name.trim() === "__name__");
+  if (idx >= 0) {
+    if (n === "") deleteMatcher(idx);
+    else setState("matchers", idx, "value", n);
+  } else if (n !== "") {
+    applyLabelMatcher("__name__", n);
+  }
+  void runCurrentQuery();
+}
+
+/** Change the chart aggregation and re-run just the chart (the table is
+ *  aggregation-independent). */
+export function setMetricAgg(fn: AggFn): void {
+  setMetricAggSig(fn);
+  void runMetricsChart();
+}
+
+/** Toggle per-series vs single-aggregated and re-run just the chart. */
+export function setMetricGrouped(on: boolean): void {
+  setMetricGroupedSig(on);
+  void runMetricsChart();
+}
+
+/** Monotonic guard so a slow metrics-chart response can't clobber a newer one. */
+let metricsChartSeq = 0;
+
+function clearMetricsChart(): void {
+  metricsChartSeq++;
+  setMetricsChartData(null);
+  setMetricsChartStatus("idle");
+}
+
+/** Max rows scanned to resolve fingerprint→labels for the per-series legend.
+ *  Bounds the cost; a metric's distinct series count is far below this in
+ *  practice, and a truncated scan still maps every fingerprint it saw. */
+const SERIES_NAME_SCAN_CAP = 20000n;
+
+/** Best-effort fingerprint→label-set resolution for the per-series legend, via
+ *  the D-058 opt-in label join. Returns an empty map on any failure — the
+ *  chart then legends by fingerprint hex. */
+async function resolveMetricSeriesNames(
+  dest: string,
+  matchers: { name: string; value: string }[],
+  tsMin: bigint,
+  tsMax: bigint,
+): Promise<Map<string, string>> {
+  try {
+    const transport = await getTransport();
+    const res = await runQuery(transport, dest, {
+      signal: Signal.Metrics,
+      matchers,
+      tsMin,
+      tsMax,
+      sql: `SELECT series_fingerprint AS fp, labels FROM metrics LIMIT ${SERIES_NAME_SCAN_CAP}`,
+      withLabels: true,
+      requestId: "webui-metrics-series",
+    });
+    return decodeSeriesNames(res.table);
+  } catch {
+    return new Map();
+  }
+}
+
+/** Run the metrics time-series aggregation for the current form (metric +
+ *  matchers + range) and decode it into `metricsChartData`. Requires a chosen
+ *  metric (`__name__`) and a bounded [ts_min, ts_max] range (like the volume
+ *  panel) so the bucket step is well-defined and the window is cacheable. */
+export async function runMetricsChart(): Promise<void> {
+  if (state.signal !== "Metrics") {
+    clearMetricsChart();
+    return;
+  }
+
+  const metric = selectedMetric();
+  let tsMin: bigint | undefined;
+  let tsMax: bigint | undefined;
+  let matchers: { name: string; value: string }[];
+  try {
+    tsMin = parseBigIntOpt(state.tsMin);
+    tsMax = parseBigIntOpt(state.tsMax);
+    matchers = state.matchers
+      .map((m) => ({ name: m.name.trim(), value: m.value }))
+      .filter((m) => m.name !== "");
+  } catch {
+    setMetricsChartData(null);
+    setMetricsChartStatus("error");
+    return;
+  }
+
+  // Need a metric to chart and a bounded range to pick a bucket width. Without
+  // both, skip quietly — the panel prompts the user.
+  if (metric === "" || tsMin === undefined || tsMax === undefined || tsMax <= tsMin) {
+    clearMetricsChart();
+    setMetricsChartStatus("empty");
+    return;
+  }
+
+  const grouped = metricGrouped();
+  const agg = metricAgg();
+  // The aggregate doubles as the intra-bucket downsample reducer.
+  const reducer = agg === "count" ? "count(value)" : `${agg}(value)`;
+  const spanMs = Number((tsMax - tsMin) / 1_000_000n);
+  const stepMs = chooseStepMs(spanMs);
+  const bucket =
+    `CAST(date_bin(${stepIntervalSql(stepMs)}, ` +
+    `to_timestamp_nanos(ts_unix_nano)) AS BIGINT) AS bucket_ns`;
+  const sql = grouped
+    ? `SELECT ${bucket}, series_fingerprint AS fp, ${reducer} AS v ` +
+      `FROM metrics GROUP BY fp, bucket_ns ORDER BY bucket_ns`
+    : `SELECT ${bucket}, ${reducer} AS v ` +
+      `FROM metrics GROUP BY bucket_ns ORDER BY bucket_ns`;
+
+  const seq = ++metricsChartSeq;
+  setMetricsChartStatus("loading");
+  try {
+    const transport = await getTransport();
+    const dest = metaDest();
+    const res = await runQuery(transport, dest, {
+      signal: Signal.Metrics,
+      matchers,
+      tsMin,
+      tsMax,
+      sql,
+      requestId: "webui-metrics-chart",
+    });
+    if (seq !== metricsChartSeq) return; // superseded
+
+    // Per-series: resolve the legend labels best-effort. Never fails the chart.
+    let names: Map<string, string> | undefined;
+    if (grouped) {
+      names = await resolveMetricSeriesNames(dest, matchers, tsMin, tsMax);
+      if (seq !== metricsChartSeq) return;
+    }
+
+    const decoded = decodeMetricsChart(res.table, stepMs, grouped, names);
+    setMetricsChartData(decoded);
+    setMetricsChartStatus(decoded.buckets.length === 0 ? "empty" : "ready");
+  } catch (e) {
+    if (seq !== metricsChartSeq) return;
+    if (e instanceof UnauthorizedError) {
+      setAuthed(false);
+      clearMetricsChart();
+      return;
+    }
+    setMetricsChartData(null);
+    setMetricsChartStatus("error");
+  }
 }
 
 /** Max frames the overview aggregate returns. Slowest-first, so the cap keeps

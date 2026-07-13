@@ -1150,6 +1150,98 @@ textarea {
   height: 9px;
 }
 
+/* ── Metrics time-series chart (Phase 1a) ──────────────────────────── */
+.metrics-panel {
+  margin: 0 0 10px;
+  padding: 8px 10px 6px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.metrics-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 6px;
+}
+
+.metric-field {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.metric-select,
+.agg-select {
+  padding: 3px 6px;
+  font-size: 12px;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.metric-select {
+  min-width: 200px;
+  max-width: 360px;
+}
+
+.metric-check {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.metric-check input {
+  cursor: pointer;
+}
+
+.metrics-meta {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.metrics-plot {
+  width: 100%;
+}
+
+.metrics-plot.hidden {
+  display: none;
+}
+
+.metrics-empty {
+  padding: 18px 6px;
+  font-size: 12px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.metrics-hint {
+  margin-top: 2px;
+  font-size: 10px;
+  color: var(--muted);
+  opacity: 0.8;
+}
+
+/* uPlot legend: compact + themed to the dark panel (matches volume). */
+.metrics-panel .u-legend {
+  font-size: 10px;
+  color: var(--muted);
+}
+.metrics-panel .u-legend .u-marker {
+  width: 9px;
+  height: 9px;
+}
+
 /* Per-value entry-count suffix on drill-down chips. */
 .value-chip .value-count {
   margin-left: 6px;
@@ -2105,7 +2197,8 @@ textarea {
 }
 
 /* Explore results panels sit on the sunken canvas below the query bar. */
-.explore-main .volume-panel {
+.explore-main .volume-panel,
+.explore-main .metrics-panel {
   margin-top: 0;
 }
 

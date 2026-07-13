@@ -70,6 +70,11 @@ export interface QuerySpec {
   traceId?: Uint8Array;
   /** Full-text substring over log `body` (logs only). Omit / "" = absent. */
   bodyContains?: string;
+  /** Merged history+live view (logs only, D-054). Omit / false = blocks only. */
+  live?: boolean;
+  /** Metrics only: request the synthesised `labels` `Map<Utf8,Utf8>` column
+   *  (the D-058 fingerprint→label join). Omit / false = fingerprint-only. */
+  withLabels?: boolean;
 }
 
 export interface QueryResult {
@@ -109,6 +114,8 @@ function buildRequestFrame(spec: QuerySpec): Uint8Array {
     request_id: spec.requestId ?? "",
     trace_id: spec.traceId ? Array.from(spec.traceId) : [],
     body_contains: spec.bodyContains ?? "",
+    live: spec.live ? 1 : 0,
+    with_labels: spec.withLabels ? 1 : 0,
   };
   // Cast: the runtime encoder wants the tagged `{ type, value }` shape
   // (see TaggedFrame note above), which the declared `QueryFrameInput`
