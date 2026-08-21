@@ -158,6 +158,11 @@ pub const QUERY_ERR_RESOURCES: u16 = 0x0004;
 /// blocks-only. The client may retry without `--live`.
 pub const QUERY_ERR_LIVE_UNAVAILABLE: u16 = 0x0005;
 
+/// A fleet-status request reached a query daemon without Valkey-backed fleet
+/// discovery. A local-only response would be misleading because it cannot
+/// represent the deployment, so the request is refused explicitly.
+pub const QUERY_ERR_FLEET_UNAVAILABLE: u16 = 0x0006;
+
 /// Catch-all for any other server-side failure (catalog mutex
 /// poisoned, unexpected DataFusion error, postings sidecar fetch
 /// failure mid-query, …). Message field carries human-readable
@@ -173,6 +178,7 @@ pub fn query_err_name(code: u16) -> &'static str {
         QUERY_ERR_PLAN => "QUERY_ERR_PLAN",
         QUERY_ERR_RESOURCES => "QUERY_ERR_RESOURCES",
         QUERY_ERR_LIVE_UNAVAILABLE => "QUERY_ERR_LIVE_UNAVAILABLE",
+        QUERY_ERR_FLEET_UNAVAILABLE => "QUERY_ERR_FLEET_UNAVAILABLE",
         QUERY_ERR_INTERNAL => "QUERY_ERR_INTERNAL",
         _ => "QUERY_ERR_UNKNOWN",
     }

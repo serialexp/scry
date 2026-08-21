@@ -112,6 +112,7 @@ mod tests {
     use super::*;
     use crate::build;
     use crate::generated::FrameMsg;
+    use crate::QueryFrameMsg;
 
     #[tokio::test]
     async fn roundtrip_ping() {
@@ -213,6 +214,36 @@ mod tests {
                 assert_eq!(q.limit, 0);
             }
             other => panic!("expected QueryRequest, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn query_fleet_status_frames_round_trip() {
+        let request = QueryFrame {
+            msg: QueryFrameMsg::FleetStatusRequest(crate::FleetStatusRequestInput {}.into()),
+        };
+        let response = QueryFrame {
+            msg: QueryFrameMsg::FleetStatusResponse(
+                crate::FleetStatusResponseInput {
+                    instances_json: vec!["{\"role\":\"agent\"}".into()],
+                }
+                .into(),
+            ),
+        };
+
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &request).await.unwrap();
+        write_frame(&mut buf, &response).await.unwrap();
+        let mut cursor = std::io::Cursor::new(buf);
+        assert!(matches!(
+            read_frame::<QueryFrame, _>(&mut cursor).await.unwrap().msg,
+            QueryFrameMsg::FleetStatusRequest(_)
+        ));
+        match read_frame::<QueryFrame, _>(&mut cursor).await.unwrap().msg {
+            QueryFrameMsg::FleetStatusResponse(status) => {
+                assert_eq!(status.instances_json, ["{\"role\":\"agent\"}"]);
+            }
+            other => panic!("expected FleetStatusResponse, got {other:?}"),
         }
     }
 }

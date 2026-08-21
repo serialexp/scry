@@ -24,6 +24,8 @@ export const QueryErrCode = {
   SQL_PARSE: 0x0002,
   PLAN: 0x0003,
   RESOURCES: 0x0004,
+  LIVE_UNAVAILABLE: 0x0005,
+  FLEET_UNAVAILABLE: 0x0006,
   INTERNAL: 0x00ff,
 } as const;
 
@@ -32,6 +34,8 @@ const QUERY_ERR_NAMES: Record<number, string> = {
   [QueryErrCode.SQL_PARSE]: "QUERY_ERR_SQL_PARSE",
   [QueryErrCode.PLAN]: "QUERY_ERR_PLAN",
   [QueryErrCode.RESOURCES]: "QUERY_ERR_RESOURCES",
+  [QueryErrCode.LIVE_UNAVAILABLE]: "QUERY_ERR_LIVE_UNAVAILABLE",
+  [QueryErrCode.FLEET_UNAVAILABLE]: "QUERY_ERR_FLEET_UNAVAILABLE",
   [QueryErrCode.INTERNAL]: "QUERY_ERR_INTERNAL",
 };
 

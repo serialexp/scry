@@ -53,13 +53,13 @@ use scry_catalog::CatalogEntry;
 use scry_objstore::{BufPool, PoolStats};
 use scry_proto::{
     constants::{
-        Signal, QUERY_ERR_BAD_REQUEST, QUERY_ERR_INTERNAL, QUERY_ERR_LIVE_UNAVAILABLE,
-        QUERY_ERR_PLAN, QUERY_ERR_RESOURCES, QUERY_ERR_SQL_PARSE,
+        Signal, QUERY_ERR_BAD_REQUEST, QUERY_ERR_FLEET_UNAVAILABLE, QUERY_ERR_INTERNAL,
+        QUERY_ERR_LIVE_UNAVAILABLE, QUERY_ERR_PLAN, QUERY_ERR_RESOURCES, QUERY_ERR_SQL_PARSE,
     },
     framing::{read_frame, write_frame, Framed, MAX_FRAME_BYTES},
-    BatchMsgInput, EndOfStreamInput, LabelNamesRequestOutput, LabelNamesResponseInput,
-    LabelValuesRequestOutput, LabelValuesResponseInput, QueryFrame, QueryFrameMsg, SchemaMsgInput,
-    StreamErrorInput,
+    BatchMsgInput, EndOfStreamInput, FleetStatusResponseInput, LabelNamesRequestOutput,
+    LabelNamesResponseInput, LabelValuesRequestOutput, LabelValuesResponseInput, QueryFrame,
+    QueryFrameMsg, SchemaMsgInput, StreamErrorInput,
 };
 use scry_query::{
     collect_label_names, collect_label_values, hash128, list_metrics_candidates,
@@ -161,6 +161,10 @@ pub struct QueryService {
     /// relaxed atomics) so `queries_in_flight` / `blocks_scanned` are always
     /// visible; the `--stats-listen` HTTP page just reads the same handle.
     metrics: Option<Arc<QueryMetrics>>,
+    /// Valkey-backed fleet discovery for `FleetStatusRequest`. Kept behind the
+    /// server-level trait so this crate has no direct Valkey dependency. `None`
+    /// deliberately means "fleet unavailable", not a one-instance fallback.
+    fleet: Option<Arc<dyn crate::stats::FleetSource>>,
     /// Default query look-back window in nanoseconds. When a request carries no
     /// time bounds at all, `ts_min` is clamped to `now - this` before candidate
     /// selection so a boundless query doesn't fan out over the whole catalog.
@@ -199,6 +203,7 @@ impl QueryService {
             next_request_id: AtomicU64::new(0),
             live_discovery: None,
             metrics: None,
+            fleet: None,
             default_query_window_nanos: scry_query::DEFAULT_QUERY_WINDOW_SECS * 1_000_000_000,
             memory_guard: None,
         }
@@ -208,6 +213,14 @@ impl QueryService {
     /// before wrapping the service in an `Arc`.
     pub fn with_metrics(mut self, metrics: Option<Arc<QueryMetrics>>) -> Self {
         self.metrics = metrics;
+        self
+    }
+
+    /// Attach the fleet registry exposed over the query wire. A daemon should
+    /// only set this when it has Valkey; callers otherwise receive an explicit
+    /// `QUERY_ERR_FLEET_UNAVAILABLE` rather than an incomplete local view.
+    pub fn with_fleet_source(mut self, fleet: Option<Arc<dyn crate::stats::FleetSource>>) -> Self {
+        self.fleet = fleet;
         self
     }
 
@@ -354,6 +367,9 @@ impl QueryService {
             QueryFrameMsg::LabelValuesRequest(m) => {
                 return self.handle_label_values(m, &mut wr, peer).await;
             }
+            QueryFrameMsg::FleetStatusRequest(_) => {
+                return self.handle_fleet_status(&mut wr, peer).await;
+            }
             other => {
                 let name = match other {
                     QueryFrameMsg::SchemaMsg(_) => "SchemaMsg",
@@ -361,10 +377,12 @@ impl QueryService {
                     QueryFrameMsg::EndOfStream(_) => "EndOfStream",
                     QueryFrameMsg::LabelNamesResponse(_) => "LabelNamesResponse",
                     QueryFrameMsg::LabelValuesResponse(_) => "LabelValuesResponse",
+                    QueryFrameMsg::FleetStatusResponse(_) => "FleetStatusResponse",
                     QueryFrameMsg::StreamError(_) => "StreamError",
                     QueryFrameMsg::QueryRequest(_)
                     | QueryFrameMsg::LabelNamesRequest(_)
-                    | QueryFrameMsg::LabelValuesRequest(_) => unreachable!(),
+                    | QueryFrameMsg::LabelValuesRequest(_)
+                    | QueryFrameMsg::FleetStatusRequest(_) => unreachable!(),
                 };
                 let _ = emit_stream_error(
                     &mut wr,
@@ -878,6 +896,37 @@ impl QueryService {
         };
         if let Err(e) = write_frame(wr, &frame).await {
             warn!(%peer, error = %e, "writing LabelValuesResponse");
+        }
+        let _ = wr.flush().await;
+        Ok(())
+    }
+
+    /// `FleetStatusRequest` → one `FleetStatusResponse`. Invalid JSON blobs are
+    /// dropped at this trust boundary so every document sent to clients is a
+    /// valid, canonical [`StatusSnapshot`](crate::stats::StatusSnapshot).
+    async fn handle_fleet_status<W>(&self, wr: &mut BufWriter<W>, peer: SocketAddr) -> Result<()>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        let Some(fleet) = &self.fleet else {
+            let _ = emit_stream_error(
+                wr,
+                QUERY_ERR_FLEET_UNAVAILABLE,
+                "fleet unavailable: queryd is not connected to Valkey",
+            )
+            .await;
+            let _ = wr.flush().await;
+            return Ok(());
+        };
+
+        let instances_json = canonical_fleet_json(fleet.blobs().await);
+        let frame = QueryFrame {
+            msg: QueryFrameMsg::FleetStatusResponse(
+                FleetStatusResponseInput { instances_json }.into(),
+            ),
+        };
+        if let Err(e) = write_frame(wr, &frame).await {
+            warn!(%peer, error = %e, "writing FleetStatusResponse");
         }
         let _ = wr.flush().await;
         Ok(())
@@ -1789,9 +1838,59 @@ fn live_record_is_durable(wal_seg: u64, watermark: Option<u64>) -> bool {
     matches!(watermark, Some(h) if wal_seg <= h)
 }
 
+/// Validate, sort, and canonicalize the opaque registry values before exposing
+/// them over the public query wire. Invalid or partially-written entries are
+/// ignored just like the standalone status endpoint ignores them.
+fn canonical_fleet_json(blobs: Vec<String>) -> Vec<String> {
+    let mut snapshots: Vec<crate::stats::StatusSnapshot> = blobs
+        .into_iter()
+        .filter_map(|blob| serde_json::from_str(&blob).ok())
+        .collect();
+    snapshots.sort_by(|a, b| {
+        a.role
+            .cmp(&b.role)
+            .then_with(|| a.instance_id.cmp(&b.instance_id))
+    });
+    snapshots
+        .into_iter()
+        .filter_map(|snapshot| serde_json::to_string(&snapshot).ok())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::live_record_is_durable;
+    use super::{canonical_fleet_json, live_record_is_durable};
+
+    #[test]
+    fn fleet_json_drops_invalid_records_and_sorts_stably() {
+        let make = |role: &str, id: &str| {
+            serde_json::json!({
+                "role": role,
+                "instance_id": id,
+                "addr": id,
+                "now_unix_ms": 1,
+                "uptime_secs": 2.0,
+                "rss_kib": null,
+                "data": {}
+            })
+            .to_string()
+        };
+        let result = canonical_fleet_json(vec![
+            make("query", "q-2"),
+            "not json".into(),
+            make("agent", "a-1"),
+            make("query", "q-1"),
+        ]);
+        let ids: Vec<String> = result
+            .iter()
+            .map(|json| {
+                serde_json::from_str::<crate::stats::StatusSnapshot>(json)
+                    .unwrap()
+                    .instance_id
+            })
+            .collect();
+        assert_eq!(ids, ["a-1", "q-1", "q-2"]);
+    }
 
     #[test]
     fn absent_watermark_keeps_everything_including_segment_zero() {

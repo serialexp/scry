@@ -206,6 +206,87 @@ body {
   line-height: 1.5;
 }
 
+/* ── Fleet ─────────────────────────────────────────────────────────── */
+
+.fleet-view {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 28px 32px 48px;
+  background: var(--canvas-sunken);
+}
+
+.fleet-toolbar,
+.fleet-toolbar-actions,
+.fleet-card-header,
+.fleet-basics > div,
+.fleet-data > div {
+  display: flex;
+  align-items: center;
+}
+
+.fleet-toolbar {
+  justify-content: space-between;
+  gap: 24px;
+  margin-bottom: 24px;
+}
+
+.fleet-toolbar h1,
+.fleet-card h2,
+.fleet-group h2 {
+  margin: 0;
+  color: var(--text);
+}
+
+.fleet-toolbar h1 { font-size: 24px; }
+.fleet-toolbar p { margin: 5px 0 0; color: var(--muted); }
+.fleet-toolbar-actions { gap: 12px; color: var(--faint); font-family: var(--mono); font-size: 11px; }
+.fleet-toolbar button { padding: 7px 12px; border: 1px solid var(--border); border-radius: 5px; background: var(--panel-2); color: var(--text); cursor: pointer; }
+.fleet-toolbar button:disabled { opacity: 0.55; cursor: default; }
+
+.fleet-error {
+  margin-bottom: 18px;
+  padding: 10px 12px;
+  border: 1px solid rgba(229, 105, 95, 0.55);
+  border-radius: 5px;
+  background: rgba(229, 105, 95, 0.1);
+  color: var(--error, #e5695f);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.fleet-empty { padding: 64px 16px; text-align: center; color: var(--muted); }
+.fleet-groups { display: flex; flex-direction: column; gap: 30px; }
+.fleet-group > h2 { margin-bottom: 12px; font-size: 14px; text-transform: capitalize; }
+.fleet-group > h2 span { color: var(--faint); font-family: var(--mono); font-size: 11px; font-weight: 400; }
+.fleet-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(310px, 1fr)); gap: 14px; }
+
+.fleet-card { min-width: 0; padding: 16px; border: 1px solid var(--border); border-radius: 7px; background: var(--panel); }
+.fleet-card-header { align-items: flex-start; justify-content: space-between; gap: 14px; }
+.fleet-card h2 { margin-top: 7px; overflow: hidden; font-family: var(--mono); font-size: 13px; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
+.fleet-role { padding: 2px 6px; border-radius: 3px; background: rgba(143, 138, 125, 0.14); color: var(--muted); font-family: var(--mono); font-size: 9px; text-transform: uppercase; }
+.fleet-role-agent { background: rgba(91, 182, 168, 0.12); color: var(--secondary); }
+.fleet-role-ingest { background: rgba(232, 163, 61, 0.12); color: var(--accent); }
+.fleet-role-query { background: rgba(143, 138, 125, 0.14); color: var(--text); }
+.fleet-health { color: var(--secondary); font-family: var(--mono); font-size: 10px; text-transform: uppercase; }
+.fleet-health.stale { color: var(--accent); }
+.fleet-address { margin: 10px 0 14px; overflow: hidden; color: var(--muted); font-family: var(--mono); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.fleet-basics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 0 0 14px; }
+.fleet-basics > div { align-items: flex-start; flex-direction: column; gap: 3px; padding: 8px; border-radius: 4px; background: var(--panel-2); }
+.fleet-basics dt,
+.fleet-data dt { color: var(--faint); font-size: 9px; text-transform: uppercase; }
+.fleet-basics dd,
+.fleet-data dd { margin: 0; color: var(--text); font-family: var(--mono); font-size: 11px; }
+.fleet-data { display: grid; grid-template-columns: 1fr 1fr; gap: 0 14px; margin: 0; border-top: 1px solid var(--border); }
+.fleet-data > div { justify-content: space-between; gap: 10px; min-width: 0; padding: 7px 0; border-bottom: 1px solid var(--border); }
+.fleet-data dt { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+@media (max-width: 700px) {
+  .fleet-view { padding: 20px 14px 36px; }
+  .fleet-toolbar { align-items: flex-start; flex-direction: column; }
+  .fleet-grid { grid-template-columns: 1fr; }
+}
+
 .inert-badge {
   padding: 3px 10px;
   border-radius: 6px;

@@ -20,8 +20,10 @@ import {
   QueryError,
   fetchLabelNames,
   fetchLabelValues,
+  fetchFleetStatus,
   type QuerySpec,
   type MetaScope,
+  type FleetInstance,
 } from "./protocol/client";
 import { severity, severityRank } from "./severity";
 import {
@@ -315,6 +317,36 @@ function getTransport(): Promise<Transport> {
       : import("./protocol/transport-http").then((m) => new m.HttpTransport());
   }
   return transportPromise;
+}
+
+// ── Fleet status ─────────────────────────────────────────────────────
+
+export type FleetStatus = "idle" | "loading" | "ready" | "error";
+const [fleetStatus, setFleetStatus] = createSignal<FleetStatus>("idle");
+const [fleetInstances, setFleetInstances] = createSignal<FleetInstance[]>([]);
+const [fleetError, setFleetError] = createSignal<string | null>(null);
+const [fleetUpdatedAt, setFleetUpdatedAt] = createSignal<number | null>(null);
+export { fleetStatus, fleetInstances, fleetError, fleetUpdatedAt };
+
+/** Refresh the complete fleet through the selected queryd. Safe to call from a
+ * timer: failures preserve the previous snapshot while exposing the error. */
+export async function refreshFleet(): Promise<void> {
+  setFleetStatus("loading");
+  setFleetError(null);
+  try {
+    const transport = await getTransport();
+    const instances = await fetchFleetStatus(transport, inBrowser ? state.target : state.addr);
+    instances.sort(
+      (a, b) => a.role.localeCompare(b.role) || a.instance_id.localeCompare(b.instance_id),
+    );
+    setFleetInstances(instances);
+    setFleetUpdatedAt(Date.now());
+    setFleetStatus("ready");
+  } catch (err) {
+    if (err instanceof UnauthorizedError) setAuthed(false);
+    setFleetError(err instanceof Error ? err.message : String(err));
+    setFleetStatus("error");
+  }
 }
 
 function parseBigIntOpt(raw: string): bigint | undefined {

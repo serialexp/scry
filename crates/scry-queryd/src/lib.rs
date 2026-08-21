@@ -469,6 +469,12 @@ pub async fn run(args: Args) -> Result<()> {
     let live_discovery: Option<Arc<dyn LiveDiscovery>> = valkey
         .clone()
         .map(|vk| Arc::new(ValkeyLiveDiscovery { valkey: vk }) as Arc<dyn LiveDiscovery>);
+    // Fleet discovery is part of the query protocol, not the optional standalone
+    // status HTTP page. A Valkey-connected queryd can therefore serve the Web UI
+    // even when `--stats-listen` is disabled.
+    let fleet_source: Option<Arc<dyn FleetSource>> = valkey
+        .clone()
+        .map(|vk| Arc::new(ValkeyFleetSource { valkey: vk }) as Arc<dyn FleetSource>);
 
     // Query metrics: **always built now** (D-059) — the lightweight query
     // counters (`queries_total`/`queries_in_flight`/`blocks_scanned_total`, a
@@ -504,6 +510,7 @@ pub async fn run(args: Args) -> Result<()> {
             args.query_cache_entry_bytes,
         )
         .with_live_discovery(live_discovery)
+        .with_fleet_source(fleet_source.clone())
         .with_metrics(Some(query_metrics.clone()))
         .with_default_window(args.default_query_window_secs)
         .with_memory_guard(memory_guard),
@@ -666,9 +673,7 @@ pub async fn run(args: Args) -> Result<()> {
                 }
                 None => None,
             };
-            let fleet: Option<Arc<dyn FleetSource>> = valkey
-                .as_ref()
-                .map(|c| Arc::new(ValkeyFleetSource { valkey: c.clone() }) as Arc<dyn FleetSource>);
+            let fleet = fleet_source.clone();
             let local: Arc<dyn LocalStatus> = metrics;
             let self_id = instance_uuid.to_string();
             bg_tasks.push(tokio::spawn(async move {

@@ -23,18 +23,20 @@ export interface QueryFrameInput {
    * @remarks
    *
    * Discriminator: peek uint8
-   * Variants: 9
+   * Variants: 11
    * - QueryRequest (when value === 0x01)
    * - LabelNamesRequest (when value === 0x02)
    * - LabelValuesRequest (when value === 0x03)
+   * - FleetStatusRequest (when value === 0x04)
    * - SchemaMsg (when value === 0x10)
    * - BatchMsg (when value === 0x11)
    * - EndOfStream (when value === 0x1F)
    * - LabelNamesResponse (when value === 0x20)
    * - LabelValuesResponse (when value === 0x21)
+   * - FleetStatusResponse (when value === 0x22)
    * - StreamError (when value === 0xF0)
    */
-  msg: { type: 'QueryRequest'; value: QueryRequestInput } | { type: 'LabelNamesRequest'; value: LabelNamesRequestInput } | { type: 'LabelValuesRequest'; value: LabelValuesRequestInput } | { type: 'SchemaMsg'; value: SchemaMsgInput } | { type: 'BatchMsg'; value: BatchMsgInput } | { type: 'EndOfStream'; value: EndOfStreamInput } | { type: 'LabelNamesResponse'; value: LabelNamesResponseInput } | { type: 'LabelValuesResponse'; value: LabelValuesResponseInput } | { type: 'StreamError'; value: StreamErrorInput };
+  msg: { type: 'QueryRequest'; value: QueryRequestInput } | { type: 'LabelNamesRequest'; value: LabelNamesRequestInput } | { type: 'LabelValuesRequest'; value: LabelValuesRequestInput } | { type: 'FleetStatusRequest'; value: FleetStatusRequestInput } | { type: 'SchemaMsg'; value: SchemaMsgInput } | { type: 'BatchMsg'; value: BatchMsgInput } | { type: 'EndOfStream'; value: EndOfStreamInput } | { type: 'LabelNamesResponse'; value: LabelNamesResponseInput } | { type: 'LabelValuesResponse'; value: LabelValuesResponseInput } | { type: 'FleetStatusResponse'; value: FleetStatusResponseInput } | { type: 'StreamError'; value: StreamErrorInput };
 }
 
 /**
@@ -48,18 +50,20 @@ export interface QueryFrameOutput {
    * @remarks
    *
    * Discriminator: peek uint8
-   * Variants: 9
+   * Variants: 11
    * - QueryRequest (when value === 0x01)
    * - LabelNamesRequest (when value === 0x02)
    * - LabelValuesRequest (when value === 0x03)
+   * - FleetStatusRequest (when value === 0x04)
    * - SchemaMsg (when value === 0x10)
    * - BatchMsg (when value === 0x11)
    * - EndOfStream (when value === 0x1F)
    * - LabelNamesResponse (when value === 0x20)
    * - LabelValuesResponse (when value === 0x21)
+   * - FleetStatusResponse (when value === 0x22)
    * - StreamError (when value === 0xF0)
    */
-  msg: { type: 'QueryRequest'; value: QueryRequestOutput } | { type: 'LabelNamesRequest'; value: LabelNamesRequestOutput } | { type: 'LabelValuesRequest'; value: LabelValuesRequestOutput } | { type: 'SchemaMsg'; value: SchemaMsgOutput } | { type: 'BatchMsg'; value: BatchMsgOutput } | { type: 'EndOfStream'; value: EndOfStreamOutput } | { type: 'LabelNamesResponse'; value: LabelNamesResponseOutput } | { type: 'LabelValuesResponse'; value: LabelValuesResponseOutput } | { type: 'StreamError'; value: StreamErrorOutput };
+  msg: { type: 'QueryRequest'; value: QueryRequestOutput } | { type: 'LabelNamesRequest'; value: LabelNamesRequestOutput } | { type: 'LabelValuesRequest'; value: LabelValuesRequestOutput } | { type: 'FleetStatusRequest'; value: FleetStatusRequestOutput } | { type: 'SchemaMsg'; value: SchemaMsgOutput } | { type: 'BatchMsg'; value: BatchMsgOutput } | { type: 'EndOfStream'; value: EndOfStreamOutput } | { type: 'LabelNamesResponse'; value: LabelNamesResponseOutput } | { type: 'LabelValuesResponse'; value: LabelValuesResponseOutput } | { type: 'FleetStatusResponse'; value: FleetStatusResponseOutput } | { type: 'StreamError'; value: StreamErrorOutput };
 }
 
 export type QueryFrame = QueryFrameOutput;
@@ -71,11 +75,13 @@ export const enum QueryFrameMsgVariant {
   QueryRequest = 'QueryRequest',
   LabelNamesRequest = 'LabelNamesRequest',
   LabelValuesRequest = 'LabelValuesRequest',
+  FleetStatusRequest = 'FleetStatusRequest',
   SchemaMsg = 'SchemaMsg',
   BatchMsg = 'BatchMsg',
   EndOfStream = 'EndOfStream',
   LabelNamesResponse = 'LabelNamesResponse',
   LabelValuesResponse = 'LabelValuesResponse',
+  FleetStatusResponse = 'FleetStatusResponse',
   StreamError = 'StreamError',
 }
 
@@ -106,6 +112,13 @@ export class QueryFrameEncoder extends BitStreamEncoder {
     }
     else if (value.msg.type === 'LabelValuesRequest') {
       const encoder_value = new LabelValuesRequestEncoder();
+      const encoded_value = encoder_value.encode(value.msg.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
+    }
+    else if (value.msg.type === 'FleetStatusRequest') {
+      const encoder_value = new FleetStatusRequestEncoder();
       const encoded_value = encoder_value.encode(value.msg.value);
       for (const byte of encoded_value) {
         this.writeUint8(byte);
@@ -146,6 +159,13 @@ export class QueryFrameEncoder extends BitStreamEncoder {
         this.writeUint8(byte);
       }
     }
+    else if (value.msg.type === 'FleetStatusResponse') {
+      const encoder_value = new FleetStatusResponseEncoder();
+      const encoded_value = encoder_value.encode(value.msg.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
+    }
     else if (value.msg.type === 'StreamError') {
       const encoder_value = new StreamErrorEncoder();
       const encoded_value = encoder_value.encode(value.msg.value);
@@ -176,6 +196,10 @@ export class QueryFrameEncoder extends BitStreamEncoder {
       const _enc = new LabelValuesRequestEncoder();
       size += _enc.calculateSize(value.msg.value);
     }
+    else if (value.msg.type === 'FleetStatusRequest') {
+      const _enc = new FleetStatusRequestEncoder();
+      size += _enc.calculateSize(value.msg.value);
+    }
     else if (value.msg.type === 'SchemaMsg') {
       const _enc = new SchemaMsgEncoder();
       size += _enc.calculateSize(value.msg.value);
@@ -194,6 +218,10 @@ export class QueryFrameEncoder extends BitStreamEncoder {
     }
     else if (value.msg.type === 'LabelValuesResponse') {
       const _enc = new LabelValuesResponseEncoder();
+      size += _enc.calculateSize(value.msg.value);
+    }
+    else if (value.msg.type === 'FleetStatusResponse') {
+      const _enc = new FleetStatusResponseEncoder();
       size += _enc.calculateSize(value.msg.value);
     }
     else if (value.msg.type === 'StreamError') {
@@ -235,6 +263,12 @@ export class QueryFrameDecoder extends SeekableBitStreamDecoder {
       this.byteOffset += decoder.byteOffset;
       value.msg = { type: 'LabelValuesRequest', value: decodedValue };
     }
+    else if (discriminator === 0x04) {
+      const decoder = new FleetStatusRequestDecoder(this.bytes.slice(this.byteOffset), value);
+      const decodedValue = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.msg = { type: 'FleetStatusRequest', value: decodedValue };
+    }
     else if (discriminator === 0x10) {
       const decoder = new SchemaMsgDecoder(this.bytes.slice(this.byteOffset), value);
       const decodedValue = decoder.decode();
@@ -264,6 +298,12 @@ export class QueryFrameDecoder extends SeekableBitStreamDecoder {
       const decodedValue = decoder.decode();
       this.byteOffset += decoder.byteOffset;
       value.msg = { type: 'LabelValuesResponse', value: decodedValue };
+    }
+    else if (discriminator === 0x22) {
+      const decoder = new FleetStatusResponseDecoder(this.bytes.slice(this.byteOffset), value);
+      const decodedValue = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.msg = { type: 'FleetStatusResponse', value: decodedValue };
     }
     else if (discriminator === 0xF0) {
       const decoder = new StreamErrorDecoder(this.bytes.slice(this.byteOffset), value);
@@ -1162,6 +1202,169 @@ export class LabelValuesResponseDecoder extends SeekableBitStreamDecoder {
         throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
       }
       value.values.push(values__iter);
+    }
+    return value;
+  }
+}
+
+/**
+ * Client → server. Requests the complete live fleet snapshot currently registered in the query daemon's Valkey. The request has no fields. A Valkey-connected daemon replies with one FleetStatusResponse and closes; a daemon without fleet discovery replies with QUERY_ERR_FLEET_UNAVAILABLE.
+ */
+export interface FleetStatusRequestInput {
+}
+
+/**
+ * Client → server. Requests the complete live fleet snapshot currently registered in the query daemon's Valkey. The request has no fields. A Valkey-connected daemon replies with one FleetStatusResponse and closes; a daemon without fleet discovery replies with QUERY_ERR_FLEET_UNAVAILABLE.
+ */
+export interface FleetStatusRequestOutput {
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  tag: number;
+}
+
+export type FleetStatusRequest = FleetStatusRequestOutput;
+
+export class FleetStatusRequestEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("msb_first");
+  }
+
+  encode(value: FleetStatusRequestInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint8(4);
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a FleetStatusRequest value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: FleetStatusRequest): number {
+    return 1; // tag (const)
+  }
+}
+
+export class FleetStatusRequestDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "msb_first");
+  }
+
+  decode(): FleetStatusRequestOutput {
+    const value: any = {};
+
+    value.tag = this.readUint8();
+    return value;
+  }
+}
+
+/**
+ * Server → client. One terminal response containing the valid live StatusSnapshot JSON documents discovered from Valkey. Records are canonical JSON strings so the query protocol remains independent of role-specific status payload evolution.
+ */
+export interface FleetStatusResponseInput {
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  instances_json: string[];
+}
+
+/**
+ * Server → client. One terminal response containing the valid live StatusSnapshot JSON documents discovered from Valkey. Records are canonical JSON strings so the query protocol remains independent of role-specific status payload evolution.
+ */
+export interface FleetStatusResponseOutput {
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  tag: number;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  instances_json: string[];
+}
+
+export type FleetStatusResponse = FleetStatusResponseOutput;
+
+export class FleetStatusResponseEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("msb_first");
+  }
+
+  encode(value: FleetStatusResponseInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint8(34);
+    this.writeUint32(value.instances_json.length, "big_endian");
+    for (let value_instances_json__iter_index = 0; value_instances_json__iter_index < value.instances_json.length; value_instances_json__iter_index++) {
+      const value_instances_json__iter = value.instances_json[value_instances_json__iter_index];
+      const value_instances_json__iter_bytes = new TextEncoder().encode(value_instances_json__iter);
+      this.writeUint32(value_instances_json__iter_bytes.length, "big_endian");
+      for (const byte of value_instances_json__iter_bytes) {
+        this.writeUint8(byte);
+      }
+    }
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a FleetStatusResponse value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: FleetStatusResponse): number {
+    let size = 0;
+    size += 1; // tag (const)
+    // instances_json: array (kind: length_prefixed)
+    for (const item of value.instances_json) {
+      size += 0;
+    }
+    size += 4; // length prefix (uint32)
+    return size;
+  }
+}
+
+export class FleetStatusResponseDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "msb_first");
+  }
+
+  decode(): FleetStatusResponseOutput {
+    const value: any = {};
+
+    value.tag = this.readUint8();
+    value.instances_json = [];
+    const instances_json_length = this.readUint32("big_endian");
+    for (let i = 0; i < instances_json_length; i++) {
+      let instances_json__iter: any;
+      const instances_json__iter_length = this.readUint32("big_endian");
+      const instances_json__iter_bytes = this.readBytesSlice(instances_json__iter_length);
+      try {
+        instances_json__iter = new TextDecoder("utf-8", { fatal: true }).decode(instances_json__iter_bytes);
+      } catch (e) {
+        throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
+      }
+      value.instances_json.push(instances_json__iter);
     }
     return value;
   }

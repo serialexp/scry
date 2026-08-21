@@ -12,11 +12,13 @@ pub enum QueryFrameMsg {
     QueryRequest(QueryRequestOutput),
     LabelNamesRequest(LabelNamesRequestOutput),
     LabelValuesRequest(LabelValuesRequestOutput),
+    FleetStatusRequest(FleetStatusRequestOutput),
     SchemaMsg(SchemaMsgOutput),
     BatchMsg(BatchMsgOutput),
     EndOfStream(EndOfStreamOutput),
     LabelNamesResponse(LabelNamesResponseOutput),
     LabelValuesResponse(LabelValuesResponseOutput),
+    FleetStatusResponse(FleetStatusResponseOutput),
     StreamError(StreamErrorOutput),
 }
 
@@ -84,6 +86,9 @@ impl QueryFrameMsg {
                 encoder.write_uint8(v.ts_max_present);
                 encoder.write_uint64(v.ts_max, Endianness::BigEndian);
             }
+            QueryFrameMsg::FleetStatusRequest(_) => {
+                encoder.write_uint8(4);
+            }
             QueryFrameMsg::SchemaMsg(v) => {
                 encoder.write_uint8(16);
                 encoder.write_uint32(v.ipc_bytes.len() as u32, Endianness::BigEndian);
@@ -122,6 +127,16 @@ impl QueryFrameMsg {
                     }
                 }
             }
+            QueryFrameMsg::FleetStatusResponse(v) => {
+                encoder.write_uint8(34);
+                encoder.write_uint32(v.instances_json.len() as u32, Endianness::BigEndian);
+                for item in &v.instances_json {
+                    encoder.write_uint32(item.len() as u32, Endianness::BigEndian);
+                    for b in item.as_bytes() {
+                        encoder.write_uint8(*b);
+                    }
+                }
+            }
             QueryFrameMsg::StreamError(v) => {
                 encoder.write_uint8(240);
                 encoder.write_uint16(v.code, Endianness::BigEndian);
@@ -140,11 +155,13 @@ impl QueryFrameMsg {
             QueryFrameMsg::QueryRequest(_) => "QueryRequest",
             QueryFrameMsg::LabelNamesRequest(_) => "LabelNamesRequest",
             QueryFrameMsg::LabelValuesRequest(_) => "LabelValuesRequest",
+            QueryFrameMsg::FleetStatusRequest(_) => "FleetStatusRequest",
             QueryFrameMsg::SchemaMsg(_) => "SchemaMsg",
             QueryFrameMsg::BatchMsg(_) => "BatchMsg",
             QueryFrameMsg::EndOfStream(_) => "EndOfStream",
             QueryFrameMsg::LabelNamesResponse(_) => "LabelNamesResponse",
             QueryFrameMsg::LabelValuesResponse(_) => "LabelValuesResponse",
+            QueryFrameMsg::FleetStatusResponse(_) => "FleetStatusResponse",
             QueryFrameMsg::StreamError(_) => "StreamError",
         }
     }
@@ -169,6 +186,10 @@ impl QueryFrameMsg {
             return Ok(QueryFrameMsg::LabelValuesRequest(v));
         }
         decoder.seek(start_pos)?;
+        if let Ok(v) = FleetStatusRequestOutput::decode_with_decoder(decoder) {
+            return Ok(QueryFrameMsg::FleetStatusRequest(v));
+        }
+        decoder.seek(start_pos)?;
         if let Ok(v) = SchemaMsgOutput::decode_with_decoder(decoder) {
             return Ok(QueryFrameMsg::SchemaMsg(v));
         }
@@ -187,6 +208,10 @@ impl QueryFrameMsg {
         decoder.seek(start_pos)?;
         if let Ok(v) = LabelValuesResponseOutput::decode_with_decoder(decoder) {
             return Ok(QueryFrameMsg::LabelValuesResponse(v));
+        }
+        decoder.seek(start_pos)?;
+        if let Ok(v) = FleetStatusResponseOutput::decode_with_decoder(decoder) {
+            return Ok(QueryFrameMsg::FleetStatusResponse(v));
         }
         decoder.seek(start_pos)?;
         if let Ok(v) = StreamErrorOutput::decode_with_decoder(decoder) {
@@ -831,6 +856,152 @@ impl From<LabelValuesResponseInput> for LabelValuesResponseOutput {
         Self {
             tag: 33u8,
             values: i.values,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FleetStatusRequestInput {
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FleetStatusRequestOutput {
+    pub tag: u8,
+}
+
+pub type FleetStatusRequest = FleetStatusRequestOutput;
+
+impl FleetStatusRequestInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(4);
+        Ok(())
+    }
+
+}
+
+impl FleetStatusRequestOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let tag = decoder.read_byte()?;
+        if tag != 4u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 4, got {}", tag)));
+        }
+        Ok(Self {
+            tag,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        FleetStatusRequestInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        FleetStatusRequestInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<FleetStatusRequestOutput> for FleetStatusRequestInput {
+    fn from(_o: FleetStatusRequestOutput) -> Self {
+        Self {
+        }
+    }
+}
+
+impl From<FleetStatusRequestInput> for FleetStatusRequestOutput {
+    fn from(_i: FleetStatusRequestInput) -> Self {
+        Self {
+            tag: 4u8,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FleetStatusResponseInput {
+    pub instances_json: Vec<std::string::String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FleetStatusResponseOutput {
+    pub tag: u8,
+    pub instances_json: Vec<std::string::String>,
+}
+
+pub type FleetStatusResponse = FleetStatusResponseOutput;
+
+impl FleetStatusResponseInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(34);
+        encoder.write_u32_be(self.instances_json.len() as u32);
+        for item in &self.instances_json {
+            encoder.write_u32_be(item.len() as u32);
+            for b in item.as_bytes() {
+                encoder.write_byte(*b);
+            }
+        }
+        Ok(())
+    }
+
+}
+
+impl FleetStatusResponseOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let tag = decoder.read_byte()?;
+        if tag != 34u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 34, got {}", tag)));
+        }
+        let length = decoder.read_u32_be()? as usize;
+        let mut instances_json = Vec::with_capacity(length);
+        for _ in 0..length {
+            let str_len = decoder.read_u32_be()? as usize;
+            let str_bytes = decoder.read_bytes_vec(str_len)?;
+            let item = std::string::String::from_utf8(str_bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+            instances_json.push(item);
+        }
+        Ok(Self {
+            tag,
+            instances_json,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        FleetStatusResponseInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        FleetStatusResponseInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<FleetStatusResponseOutput> for FleetStatusResponseInput {
+    fn from(o: FleetStatusResponseOutput) -> Self {
+        Self {
+            instances_json: o.instances_json,
+        }
+    }
+}
+
+impl From<FleetStatusResponseInput> for FleetStatusResponseOutput {
+    fn from(i: FleetStatusResponseInput) -> Self {
+        Self {
+            tag: 34u8,
+            instances_json: i.instances_json,
         }
     }
 }

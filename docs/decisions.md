@@ -3050,5 +3050,10 @@ delete it; the TTL removes it within 20 seconds. ingestd never renews an agent r
 without receiving a fresh frame. Status/Valkey failures never block or fail data
 ingestion.
 
-The standalone `/stats.json`/HTML status surface includes agents. Forwarding this fleet
-through queryd into the SolidJS Fleet screen remains the separate D-057 Phase-2 work.
+The standalone `/stats.json`/HTML status surface includes agents. D-057 Phase 2 now
+also exposes the same live registry through `FleetStatusRequest` / `FleetStatusResponse`
+on the queryd wire. The fleet source is attached whenever queryd has Valkey,
+independently of the opt-in `--stats-listen` HTTP page; without Valkey queryd returns
+`QUERY_ERR_FLEET_UNAVAILABLE`. scry-webui remains a dumb authenticated byte-pipe and
+the SolidJS Fleet screen polls the selected queryd through the shared browser/Tauri
+transport.

@@ -21,6 +21,8 @@ import {
   type LabelValuesRequestInput,
   type LabelNamesResponseOutput,
   type LabelValuesResponseOutput,
+  type FleetStatusRequestInput,
+  type FleetStatusResponseOutput,
   type SchemaMsgOutput,
   type BatchMsgOutput,
   type EndOfStreamOutput,
@@ -48,6 +50,7 @@ type TaggedFrame =
   | { type: "EndOfStream"; value: EndOfStreamOutput }
   | { type: "LabelNamesResponse"; value: LabelNamesResponseOutput }
   | { type: "LabelValuesResponse"; value: LabelValuesResponseOutput }
+  | { type: "FleetStatusResponse"; value: FleetStatusResponseOutput }
   | { type: "StreamError"; value: StreamErrorOutput };
 
 /** High-level, ergonomic query description (the UI's vocabulary). */
@@ -269,4 +272,56 @@ export async function fetchLabelValues(
   if (msg.type === "StreamError") throw new QueryError(msg.value.code, msg.value.message);
   if (msg.type === "LabelValuesResponse") return msg.value.values;
   throw new Error(`expected LabelValuesResponse, got ${msg.type}`);
+}
+
+// ── Fleet status ─────────────────────────────────────────────────────
+
+/** Common status envelope published by agents, ingestd, and queryd. `data`
+ * remains role-specific so new counters can be added without a wire change. */
+export interface FleetInstance {
+  role: string;
+  instance_id: string;
+  addr: string;
+  now_unix_ms: number;
+  uptime_secs: number;
+  rss_kib: number | null;
+  data: Record<string, unknown>;
+}
+
+/** Fetch every currently-live status document from the selected queryd's
+ * Valkey registry. The response is one terminal, non-Arrow frame. */
+export async function fetchFleetStatus(
+  transport: Transport,
+  addr: string,
+): Promise<FleetInstance[]> {
+  const value: FleetStatusRequestInput = {};
+  const frameInput = {
+    msg: { type: "FleetStatusRequest", value },
+  } as unknown as QueryFrameInput;
+  const requestFrame = frame(new QueryFrameEncoder().encode(frameInput));
+  const responseBytes = await transport.query(addr, requestFrame);
+  const msg = decodeMetaResponse(responseBytes);
+  if (msg.type === "StreamError") throw new QueryError(msg.value.code, msg.value.message);
+  if (msg.type !== "FleetStatusResponse") {
+    throw new Error(`expected FleetStatusResponse, got ${msg.type}`);
+  }
+
+  return msg.value.instances_json.map((json) => {
+    const parsed = JSON.parse(json) as FleetInstance;
+    if (
+      !parsed ||
+      typeof parsed.role !== "string" ||
+      typeof parsed.instance_id !== "string" ||
+      typeof parsed.addr !== "string" ||
+      typeof parsed.now_unix_ms !== "number" ||
+      typeof parsed.uptime_secs !== "number" ||
+      (parsed.rss_kib !== null && typeof parsed.rss_kib !== "number") ||
+      !parsed.data ||
+      typeof parsed.data !== "object" ||
+      Array.isArray(parsed.data)
+    ) {
+      throw new Error("queryd returned an invalid fleet status document");
+    }
+    return parsed;
+  });
 }

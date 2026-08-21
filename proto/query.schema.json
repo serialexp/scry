@@ -22,11 +22,13 @@
             { "type": "QueryRequest",       "when": "value === 0x01" },
             { "type": "LabelNamesRequest",  "when": "value === 0x02" },
             { "type": "LabelValuesRequest", "when": "value === 0x03" },
+            { "type": "FleetStatusRequest", "when": "value === 0x04" },
             { "type": "SchemaMsg",          "when": "value === 0x10" },
             { "type": "BatchMsg",           "when": "value === 0x11" },
             { "type": "EndOfStream",        "when": "value === 0x1F" },
             { "type": "LabelNamesResponse", "when": "value === 0x20" },
             { "type": "LabelValuesResponse","when": "value === 0x21" },
+            { "type": "FleetStatusResponse","when": "value === 0x22" },
             { "type": "StreamError",        "when": "value === 0xF0" }
           ]
         }
@@ -101,6 +103,22 @@
         { "name": "tag",    "type": "uint8", "const": 33 },
         { "name": "values", "type": "array", "kind": "length_prefixed", "length_type": "uint32",
           "items": { "type": "string", "kind": "length_prefixed", "length_type": "uint16", "encoding": "utf8" } }
+      ]
+    },
+
+    "FleetStatusRequest": {
+      "description": "Client → server. Requests the complete live fleet snapshot currently registered in the query daemon's Valkey. The request has no fields. A Valkey-connected daemon replies with one FleetStatusResponse and closes; a daemon without fleet discovery replies with QUERY_ERR_FLEET_UNAVAILABLE.",
+      "sequence": [
+        { "name": "tag", "type": "uint8", "const": 4 }
+      ]
+    },
+
+    "FleetStatusResponse": {
+      "description": "Server → client. One terminal response containing the valid live StatusSnapshot JSON documents discovered from Valkey. Records are canonical JSON strings so the query protocol remains independent of role-specific status payload evolution.",
+      "sequence": [
+        { "name": "tag", "type": "uint8", "const": 34 },
+        { "name": "instances_json", "type": "array", "kind": "length_prefixed", "length_type": "uint32",
+          "items": { "type": "string", "kind": "length_prefixed", "length_type": "uint32", "encoding": "utf8" } }
       ]
     },
 
