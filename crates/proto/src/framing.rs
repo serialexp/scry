@@ -167,6 +167,8 @@ mod tests {
             body_contains: String::new(),
             // 0 = blocks-only (no merged history+live view).
             live: 0,
+            // 0 = fingerprint-only (no opt-in metrics label join).
+            with_labels: 0,
         };
         let frame = QueryFrame {
             msg: QueryFrameMsg::QueryRequest(req.clone().into()),

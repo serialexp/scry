@@ -601,6 +601,11 @@ pub struct QueryMetrics {
     query_nanos_total: AtomicU64,
     rows_returned_total: AtomicU64,
     bytes_scanned_total: AtomicU64,
+    /// Cumulative count of candidate blocks selected for scanning (pre-pruning),
+    /// summed across all queries. This is what explodes on an unbounded query,
+    /// so the periodic activity logger reports its per-interval delta as the
+    /// headline "blocks scanned recently" number.
+    blocks_scanned_total: AtomicU64,
     // Live-read handles into the query service's shared state.
     postings_cache: Arc<PostingsCache>,
     bloom_cache: Arc<BloomCache>,
@@ -634,6 +639,7 @@ impl QueryMetrics {
             query_nanos_total: AtomicU64::new(0),
             rows_returned_total: AtomicU64::new(0),
             bytes_scanned_total: AtomicU64::new(0),
+            blocks_scanned_total: AtomicU64::new(0),
             postings_cache,
             bloom_cache,
             result_cache,
@@ -666,6 +672,24 @@ impl QueryMetrics {
             .fetch_add(bytes_scanned, Ordering::Relaxed);
     }
 
+    /// Record how many candidate blocks a query selected for scanning
+    /// (pre-pruning). Called once per query, right after `list_candidates`.
+    pub fn record_candidates(&self, blocks: u64) {
+        self.blocks_scanned_total
+            .fetch_add(blocks, Ordering::Relaxed);
+    }
+
+    /// Cheap atomic snapshot for the periodic activity logger:
+    /// `(queries_total, queries_in_flight, blocks_scanned_total)`. The logger
+    /// diffs the cumulative counters between ticks to report per-interval rates.
+    pub fn activity_snapshot(&self) -> (u64, u64, u64) {
+        (
+            self.queries_total.load(Ordering::Relaxed),
+            self.queries_in_flight.load(Ordering::Relaxed),
+            self.blocks_scanned_total.load(Ordering::Relaxed),
+        )
+    }
+
     fn query_data(&self) -> serde_json::Value {
         let queries = self.queries_total.load(Ordering::Relaxed);
         let nanos = self.query_nanos_total.load(Ordering::Relaxed);
@@ -695,6 +719,7 @@ impl QueryMetrics {
             "avg_query_ms": avg_ms,
             "rows_returned_total": self.rows_returned_total.load(Ordering::Relaxed),
             "bytes_scanned_total": self.bytes_scanned_total.load(Ordering::Relaxed),
+            "blocks_scanned_total": self.blocks_scanned_total.load(Ordering::Relaxed),
             "postings_cache": {
                 "hits": p.hits, "misses": p.misses, "evictions": p.evictions,
                 "entries": p.entries, "bytes_in": p.bytes_in, "budget_bytes": p.budget_bytes,

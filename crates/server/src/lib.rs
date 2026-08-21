@@ -35,6 +35,7 @@
 pub mod decode;
 pub mod live_merge;
 pub mod live_ring;
+pub mod memory_guard;
 mod pipeline;
 pub mod query_service;
 mod server;
@@ -43,6 +44,7 @@ pub mod tail;
 
 pub use live_merge::{fetch_live_from_ingester, LiveDiscovery};
 pub use live_ring::{LiveLogRecord, LiveRing, RetainingLogsAppender};
+pub use memory_guard::{CgroupMemoryGuard, QueryMemoryGuard, QUERY_TOO_LARGE_MESSAGE};
 pub use pipeline::{DecodeFn, Pipeline, ShardedPipeline, INGEST_SHARDS};
 pub use query_service::QueryService;
 pub use scry_block::BlockBuilderConfig;

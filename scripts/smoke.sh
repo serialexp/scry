@@ -517,6 +517,114 @@ if [[ "$SIGNAL" != "dummy" ]]; then
     done
 fi
 
+# ── Metrics label join: opt-in `--with-labels` (fingerprint → labels) ─
+# Metrics rows are `(series_fingerprint, ts_unix_nano, value)`; the
+# fingerprint is a one-way xxh3-64 of the sorted labels, so a consumer
+# can't name a series without the labels. `--with-labels` appends a
+# synthesised `labels` Map<Utf8,Utf8> column (inverted from the postings
+# sidecars, reusing the logs LabelEnrichExec) so each series can be named
+# by its `{label: value}` set. Prove three things on a real bucket:
+#   (1) with the flag + `SELECT *`, a `labels` column is materialised and
+#       carries real labels (contains `__name__` at least);
+#   (2) WITHOUT the flag, the same `SELECT *` returns exactly the 3
+#       original columns and no `labels` (opt-in is truly off by default);
+#   (3) with the flag but a `count(*)` projection that never selects
+#       `labels`, the column is NOT materialised (projection-gated — the
+#       flag doesn't force per-row enrichment) and the count is unchanged.
+# The comfy_table `--show` renderer prints a header `|`-row then data
+# `|`-rows; we parse the header cells the same way the traces/body-pick
+# legs above do.
+if [[ "$SIGNAL" == "metrics" || "$SIGNAL" == "both" || "$SIGNAL" == "all" ]]; then
+    echo "[smoke] ──── metrics label join (--with-labels) ────"
+    # Count the pipe-separated header cells of a comfy_table `--show` dump
+    # (fields 2..NF-1 are the real columns; border rows start with '+').
+    header_col_count() {
+        awk -F'|' '/^\|/ {
+            n = 0
+            for (i = 2; i < NF; i++) {
+                f = $i; gsub(/^[ \t]+|[ \t]+$/, "", f)
+                if (f != "") n++
+            }
+            print n; exit
+        }' "$1"
+    }
+    header_line() { awk '/^\|/ { print; exit }' "$1"; }
+
+    # (1) With the flag: `labels` column present + populated with __name__.
+    ./target/release/scry get \
+        --catalog "$SMOKE_DIR/recon.sqlite" \
+        --signal metrics --with-labels --show \
+        --sql "SELECT * FROM metrics LIMIT 5" \
+        > "$SMOKE_DIR/query.metrics-labels.txt" 2>&1 || true
+    wl_header="$(header_line "$SMOKE_DIR/query.metrics-labels.txt")"
+    wl_cols="$(header_col_count "$SMOKE_DIR/query.metrics-labels.txt")"
+    echo "[smoke] with-labels header : ${wl_header:-<none>} (${wl_cols:-?} cols)"
+    if ! grep -qw labels <<<"$wl_header"; then
+        echo "[smoke] FAIL: --with-labels SELECT * has no 'labels' column"
+        cat "$SMOKE_DIR/query.metrics-labels.txt"
+        failed=1
+    fi
+    if [[ "${wl_cols:-0}" -ne 4 ]]; then
+        echo "[smoke] FAIL: --with-labels SELECT * has ${wl_cols:-?} columns, expected 4 (series_fingerprint, ts_unix_nano, value, labels)"
+        cat "$SMOKE_DIR/query.metrics-labels.txt"
+        failed=1
+    fi
+    # The rendered map cells must actually carry labels — every metrics
+    # series carries `__name__`, so it must appear in the body somewhere.
+    if ! grep -q "__name__" "$SMOKE_DIR/query.metrics-labels.txt"; then
+        echo "[smoke] FAIL: --with-labels rows carry no resolved labels (no __name__ in output)"
+        cat "$SMOKE_DIR/query.metrics-labels.txt"
+        failed=1
+    fi
+
+    # (2) Without the flag: exactly the 3 base columns, no `labels`.
+    ./target/release/scry get \
+        --catalog "$SMOKE_DIR/recon.sqlite" \
+        --signal metrics --show \
+        --sql "SELECT * FROM metrics LIMIT 5" \
+        > "$SMOKE_DIR/query.metrics-nolabels.txt" 2>&1 || true
+    nl_header="$(header_line "$SMOKE_DIR/query.metrics-nolabels.txt")"
+    nl_cols="$(header_col_count "$SMOKE_DIR/query.metrics-nolabels.txt")"
+    echo "[smoke] no-labels header   : ${nl_header:-<none>} (${nl_cols:-?} cols)"
+    if grep -qw labels <<<"$nl_header"; then
+        echo "[smoke] FAIL: default (no --with-labels) SELECT * leaked a 'labels' column — opt-in is not off by default"
+        cat "$SMOKE_DIR/query.metrics-nolabels.txt"
+        failed=1
+    fi
+    if [[ "${nl_cols:-0}" -ne 3 ]]; then
+        echo "[smoke] FAIL: default SELECT * has ${nl_cols:-?} columns, expected 3 (series_fingerprint, ts_unix_nano, value)"
+        cat "$SMOKE_DIR/query.metrics-nolabels.txt"
+        failed=1
+    fi
+
+    # (3) Flag on but projection excludes labels: not materialised, count
+    # unchanged. `count(*)` never references `labels`, so the projection
+    # prunes it — proving the flag doesn't force per-row enrichment.
+    case "$SIGNAL" in
+        metrics) metrics_exp="$sink_accepted" ;;
+        *)       metrics_exp="$sink_metrics" ;;
+    esac
+    ./target/release/scry get \
+        --catalog "$SMOKE_DIR/recon.sqlite" \
+        --signal metrics --with-labels --show \
+        --sql "SELECT count(*) AS n FROM metrics" \
+        > "$SMOKE_DIR/query.metrics-count.txt" 2>&1 || true
+    cnt_header="$(header_line "$SMOKE_DIR/query.metrics-count.txt")"
+    # Data row cell under the single `n` column.
+    cnt_val="$(awk -F'|' '/^\|/ { cnt++; if (cnt == 2) { f=$2; gsub(/^[ \t]+|[ \t]+$/,"",f); print f; exit } }' "$SMOKE_DIR/query.metrics-count.txt")"
+    echo "[smoke] with-labels count  : ${cnt_val:-<none>} (expected $metrics_exp; header: ${cnt_header:-<none>})"
+    if grep -qw labels <<<"$cnt_header"; then
+        echo "[smoke] FAIL: --with-labels count(*) materialised a 'labels' column — projection gate failed"
+        cat "$SMOKE_DIR/query.metrics-count.txt"
+        failed=1
+    fi
+    if [[ "${cnt_val:-}" != "$metrics_exp" ]]; then
+        echo "[smoke] FAIL: --with-labels count(*) = ${cnt_val:-<none>}, expected $metrics_exp (enrichment must not change row count)"
+        cat "$SMOKE_DIR/query.metrics-count.txt"
+        failed=1
+    fi
+fi
+
 # ── Label discoverability (D-050) ───────────────────────────────────
 # Metadata frames answer "what can I match on?" without a data scan: the
 # catalog label cache, warmed lazily from the postings sidecars. Assert

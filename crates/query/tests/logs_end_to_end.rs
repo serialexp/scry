@@ -192,6 +192,7 @@ async fn logs_querier_end_to_end() {
         ts_max: None,
         trace_id: None,
         body_contains: None,
+        with_labels: false,
     };
     let (batches, _plan) = run_query(&catalog, store.clone(), &q1).await;
     assert_eq!(total_rows(&batches), 200);
@@ -209,6 +210,7 @@ async fn logs_querier_end_to_end() {
         ts_max: None,
         trace_id: None,
         body_contains: None,
+        with_labels: false,
     };
     let (batches, _plan) = run_query(&catalog, store.clone(), &q2).await;
     assert_eq!(total_rows(&batches), 400);
@@ -226,6 +228,7 @@ async fn logs_querier_end_to_end() {
         ts_max: None,
         trace_id: None,
         body_contains: None,
+        with_labels: false,
     };
     let candidates = list_logs_candidates(&catalog, &q3).unwrap();
     let table = build_logs_table_from_candidates(candidates, store.clone(), None, None, &q3)
@@ -246,6 +249,7 @@ async fn logs_querier_end_to_end() {
         ts_max: None,
         trace_id: None,
         body_contains: None,
+        with_labels: false,
     };
     let (batches, _plan) = run_query(&catalog, store.clone(), &q4).await;
     assert_eq!(total_rows(&batches), 0);
@@ -270,6 +274,7 @@ async fn logs_querier_end_to_end() {
         ts_max: Some(2_000_150),
         trace_id: None,
         body_contains: None,
+        with_labels: false,
     };
     let candidates = list_logs_candidates(&catalog, &q6).unwrap();
     let table = build_logs_table_from_candidates(candidates, store.clone(), None, None, &q6)
@@ -343,6 +348,7 @@ async fn logs_body_contains_bloom_skip_equals_scan() {
         ts_max: None,
         trace_id: None,
         body_contains: Some(needle.to_string()),
+        with_labels: false,
     };
 
     // (a) The bloom skip must drop block B before scan. `None` bloom

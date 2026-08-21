@@ -53,7 +53,8 @@ use scry_query::{
     BloomCache, BloomCacheConfig, PostingsCache, PostingsCacheConfig, QueryResultCache,
 };
 use scry_server::{
-    serve_status, FleetSource, LiveDiscovery, LocalStatus, QueryMetrics, QueryService,
+    serve_status, CgroupMemoryGuard, FleetSource, LiveDiscovery, LocalStatus, QueryMemoryGuard,
+    QueryMetrics, QueryService,
 };
 use scry_valkey::{
     discover_status_blobs, discover_tail_endpoints, parse_envelope, subscribe_blocks,
@@ -208,6 +209,13 @@ pub struct Args {
     #[arg(long, default_value_t = 1024)]
     query_memory_budget_mib: usize,
 
+    /// Headroom below the Linux cgroup memory limit at which queryd refuses new
+    /// work and cancels running query streams. Covers Arrow/Parquet/cache and
+    /// allocator memory that DataFusion's pool does not account for. `0`
+    /// disables the cgroup guard; hosts with an unlimited cgroup skip it.
+    #[arg(long, default_value_t = 256)]
+    query_memory_reserve_mib: u64,
+
     // ── Multi-instance convergence (v0.9) ─────────────────────────
     /// Valkey URL for pub/sub catalog convergence. Falls back to
     /// `$SCRY_VALKEY_URL`. The query daemon is **query-only**: it never
@@ -253,6 +261,24 @@ pub struct Args {
     /// to loopback — no auth.
     #[arg(long, num_args = 0..=1, default_missing_value = "127.0.0.1:4098")]
     stats_listen: Option<String>,
+
+    // ── Query safety net (D-059) ──────────────────────────────────
+    /// Default query look-back window, in seconds. When a query request carries
+    /// **neither** a lower nor an upper time bound, `ts_min` is clamped to
+    /// `now - this` before candidate selection, so an unbounded query no longer
+    /// fans out over every block in the bucket. An explicit bound of either kind
+    /// is honored exactly. `0` disables the default (queries with no bounds scan
+    /// everything again). See D-059.
+    #[arg(long, default_value_t = scry_query::DEFAULT_QUERY_WINDOW_SECS)]
+    default_query_window_secs: u64,
+
+    /// Seconds between periodic query-activity log lines (queries started /
+    /// in-flight / candidate blocks scanned since the last tick). Always on by
+    /// default so runaway queries are visible in `kubectl logs`; `0` disables.
+    /// Independent of `--stats-listen` (the lightweight query counters are
+    /// always built now). See D-059.
+    #[arg(long, default_value_t = 30)]
+    stats_log_interval: u64,
 }
 
 /// Run the query daemon until ctrl-c.
@@ -363,6 +389,22 @@ pub async fn run(args: Args) -> Result<()> {
             .build()
             .context("building shared DataFusion RuntimeEnv")?,
     );
+    let memory_guard: Option<Arc<dyn QueryMemoryGuard>> = if args.query_memory_reserve_mib == 0 {
+        None
+    } else {
+        let reserve_bytes = args.query_memory_reserve_mib.saturating_mul(1024 * 1024);
+        CgroupMemoryGuard::detect(reserve_bytes)
+            .context("detecting Linux cgroup memory limit")?
+            .map(|guard| {
+                info!(
+                    cgroup_memory_limit_bytes = guard.limit_bytes(),
+                    query_reject_at_bytes = guard.reject_at_bytes(),
+                    query_memory_reserve_bytes = reserve_bytes,
+                    "enabled cgroup-aware query memory guard"
+                );
+                Arc::new(guard) as Arc<dyn QueryMemoryGuard>
+            })
+    };
 
     // Clones for the convergence loops, captured before `catalog`/`store` are
     // moved into the service. The daemon and the loops share one catalog
@@ -400,23 +442,26 @@ pub async fn run(args: Args) -> Result<()> {
         .clone()
         .map(|vk| Arc::new(ValkeyLiveDiscovery { valkey: vk }) as Arc<dyn LiveDiscovery>);
 
-    // Status metrics (D-057): built only when `--stats-listen` is set. Shares
-    // the caches / memory pool / catalog the service already holds, so a
-    // snapshot is a handful of live reads with no hot-path cost. `catalog` is
-    // moved into the service below, so hand `QueryMetrics` the `conv_catalog`
-    // clone (same underlying connection).
-    let query_metrics: Option<Arc<QueryMetrics>> = args.stats_listen.as_ref().map(|_| {
-        Arc::new(QueryMetrics::new(
-            instance_uuid.to_string(),
-            args.listen.to_string(),
-            postings_cache.clone(),
-            bloom_cache.clone(),
-            result_cache.clone(),
-            memory_pool.clone(),
-            conv_catalog.clone(),
-            valkey.as_ref().map(|c| c.health()),
-        ))
-    });
+    // Query metrics: **always built now** (D-059) — the lightweight query
+    // counters (`queries_total`/`queries_in_flight`/`blocks_scanned_total`, a
+    // few `Relaxed` atomics) back the periodic activity log, which is on by
+    // default so runaway queries are visible in `kubectl logs`. This narrows
+    // D-057's opt-in to just the `--stats-listen` HTTP page + Valkey fleet
+    // heartbeat below; the counters themselves are free. Shares the caches /
+    // memory pool / catalog the service already holds, so a snapshot is a
+    // handful of live reads with no hot-path cost. `catalog` is moved into the
+    // service below, so hand `QueryMetrics` the `conv_catalog` clone (same
+    // underlying connection).
+    let query_metrics: Arc<QueryMetrics> = Arc::new(QueryMetrics::new(
+        instance_uuid.to_string(),
+        args.listen.to_string(),
+        postings_cache.clone(),
+        bloom_cache.clone(),
+        result_cache.clone(),
+        memory_pool.clone(),
+        conv_catalog.clone(),
+        valkey.as_ref().map(|c| c.health()),
+    ));
 
     let service = Arc::new(
         QueryService::new(
@@ -431,7 +476,9 @@ pub async fn run(args: Args) -> Result<()> {
             args.query_cache_entry_bytes,
         )
         .with_live_discovery(live_discovery)
-        .with_metrics(query_metrics.clone()),
+        .with_metrics(Some(query_metrics.clone()))
+        .with_default_window(args.default_query_window_secs)
+        .with_memory_guard(memory_guard),
     );
 
     info!(
@@ -512,6 +559,38 @@ pub async fn run(args: Args) -> Result<()> {
         }));
     }
 
+    // ── Periodic query-activity log (D-059) ───────────────────────
+    // On by default: every `--stats-log-interval` secs, log the delta since the
+    // last tick (queries started, candidate blocks scanned) plus the current
+    // in-flight count, so a runaway unbounded query is visible in `kubectl logs`
+    // instead of looking like a silent hang. `0` disables.
+    if args.stats_log_interval > 0 {
+        let metrics = query_metrics.clone();
+        let interval = Duration::from_secs(args.stats_log_interval);
+        bg_tasks.push(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Prime the baseline so the first logged delta covers one interval,
+            // not since-boot.
+            let (mut prev_queries, _, mut prev_blocks) = metrics.activity_snapshot();
+            loop {
+                tick.tick().await;
+                let (queries_total, in_flight, blocks_total) = metrics.activity_snapshot();
+                let queries_started = queries_total.saturating_sub(prev_queries);
+                let blocks_scanned = blocks_total.saturating_sub(prev_blocks);
+                prev_queries = queries_total;
+                prev_blocks = blocks_total;
+                info!(
+                    queries_in_flight = in_flight,
+                    queries_started,
+                    blocks_scanned,
+                    interval_secs = args.stats_log_interval,
+                    "queryd activity"
+                );
+            }
+        }));
+    }
+
     // ── Live-tail front-door (D-053) ──────────────────────────────
     // Optional: a separate listener that speaks the ingest tail sub-protocol.
     // It discovers live ingesters from Valkey and fans their records back to
@@ -539,7 +618,7 @@ pub async fn run(args: Args) -> Result<()> {
     // Optional HTTP status server. With Valkey it heartbeats this instance's
     // snapshot into the fleet registry and renders the whole fleet from Redis;
     // without Valkey it serves just this instance (`source: "local"`).
-    let status_registration = match (args.stats_listen.clone(), query_metrics.clone()) {
+    let status_registration = match (args.stats_listen.clone(), Some(query_metrics.clone())) {
         (Some(addr), Some(metrics)) => {
             let status_registration = match valkey.as_ref() {
                 Some(c) => {

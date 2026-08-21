@@ -51,11 +51,15 @@ use datafusion::datasource::physical_plan::{FileScanConfigBuilder, ParquetSource
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::logical_expr::utils::conjunction;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
-use datafusion::physical_expr::expressions::lit as physical_lit;
+use datafusion::physical_expr::expressions::{lit as physical_lit, Column};
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::ExecutionPlan;
 use scry_block::{block_path, BlockMeta};
 use scry_catalog::CatalogEntry;
+
+use crate::label_enrich::{expr_references_labels, labels_field, FpLabels, LabelEnrichExec};
 
 /// The Arrow schema of a metrics block's main parquet, as written by
 /// `crates/block/src/metrics.rs::MetricsBlockBuilder::main_schema`.
@@ -67,6 +71,21 @@ fn metrics_schema() -> SchemaRef {
         Field::new("ts_unix_nano", DataType::UInt64, false),
         Field::new("value", DataType::Float64, false),
     ]))
+}
+
+/// The metrics *table* schema exposed to queries when the opt-in
+/// fingerprint→label join is on: the physical [`metrics_schema`] columns
+/// plus the synthesised `labels` column appended last (same shape the logs
+/// table uses). The physical columns keep their indices; `labels` is at
+/// index 3. When the join is off the table schema is just [`metrics_schema`].
+fn metrics_table_schema() -> SchemaRef {
+    let mut fields: Vec<Field> = metrics_schema()
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone())
+        .collect();
+    fields.push(labels_field());
+    Arc::new(Schema::new(fields))
 }
 
 /// Build the `s3://<bucket>` URL we register the object store under
@@ -111,6 +130,12 @@ pub struct MetricsTable {
     blocks: Vec<BlockEntry>,
     ts_min: Option<u64>,
     ts_max: Option<u64>,
+    /// `fingerprint → labels` for every series across the candidate blocks,
+    /// inverted from their postings sidecars. `Some` iff the query opted into
+    /// the label join (`Query::with_labels`); drives the synthesised `labels`
+    /// column via [`LabelEnrichExec`]. `None` = fingerprint-only results, the
+    /// pre-existing byte-for-byte behaviour.
+    fp_labels: Option<Arc<FpLabels>>,
 }
 
 impl std::fmt::Debug for MetricsTable {
@@ -142,13 +167,22 @@ impl MetricsTable {
         blocks: Vec<BlockEntry>,
         ts_min: Option<u64>,
         ts_max: Option<u64>,
+        fp_labels: Option<Arc<FpLabels>>,
     ) -> DfResult<Self> {
         Ok(Self {
-            schema: metrics_schema(),
+            // The *table* schema: physical columns, plus the synthesised
+            // `labels` column when the label join is on. The parquet scans
+            // below always read the physical schema only.
+            schema: if fp_labels.is_some() {
+                metrics_table_schema()
+            } else {
+                metrics_schema()
+            },
             object_store_url: object_store_url_for(bucket)?,
             blocks,
             ts_min,
             ts_max,
+            fp_labels,
         })
     }
 
@@ -213,7 +247,35 @@ impl TableProvider for MetricsTable {
         // empty input list, and "no blocks overlap" is a legitimate
         // result that needs to keep the schema for downstream
         // operators (e.g. `SELECT count(*) FROM metrics` returns 0).
-        let df_schema = DFSchema::try_from(self.schema())?;
+        // The parquet files carry only the *physical* schema; `labels` (when
+        // requested) is synthesised on top by [`LabelEnrichExec`]. So the
+        // predicate and the `ParquetSource` use `physical_schema`, while
+        // `projection` (which indexes into the *table* schema, `labels` last)
+        // is translated below. Mirrors `LogsTable::scan`.
+        let physical_schema = metrics_schema();
+        let table_schema = self.schema();
+        let labels_idx = physical_schema.fields().len();
+        let df_schema = DFSchema::try_from(physical_schema.clone())?;
+
+        // Is the synthesised `labels` column both available (the query opted
+        // in) and actually requested (`None` projection = all columns = yes)?
+        // When it isn't we take the exact pre-existing code path: the parquet
+        // scan produces the requested physical columns and no enrichment plan
+        // is added — `SELECT count(*)` / label-free SQL stay byte-for-byte as
+        // before, and a label-less query never even builds `fp_labels`.
+        let want_labels =
+            self.fp_labels.is_some() && projection.map_or(true, |p| p.contains(&labels_idx));
+
+        // Physical projection pushed into the parquet scan. When labels are
+        // wanted we read the full physical schema (so `series_fingerprint` is
+        // present for the join) and let the enrich + a final projection shape
+        // the output; otherwise the requested indices are already physical
+        // and map 1:1.
+        let phys_projection: Option<Vec<usize>> = if want_labels {
+            None
+        } else {
+            projection.cloned()
+        };
 
         let make_branch = |fp_set: Option<&Arc<Vec<u64>>>,
                            file_path: String,
@@ -255,7 +317,7 @@ impl TableProvider for MetricsTable {
             // this our ts bounds + fp IN-list would prune row groups
             // but still hand back every row in the surviving groups.
             let source = Arc::new(
-                ParquetSource::new(self.schema())
+                ParquetSource::new(physical_schema.clone())
                     .with_predicate(predicate)
                     .with_pushdown_filters(true),
             );
@@ -266,56 +328,109 @@ impl TableProvider for MetricsTable {
             // adds a `GlobalLimitExec` above the union that terminates
             // the stream early once enough rows arrive.
             let builder = FileScanConfigBuilder::new(self.object_store_url.clone(), source)
-                .with_projection_indices(projection.cloned())?
+                .with_projection_indices(phys_projection.clone())?
                 .with_limit(limit)
                 .with_file(PartitionedFile::new(file_path, file_size));
 
             Ok(DataSourceExec::from_data_source(builder.build()))
         };
 
-        if self.blocks.is_empty() {
-            // No overlapping blocks. Emit a single empty
-            // `DataSourceExec` (no files) with the schema preserved
-            // so downstream operators have a typed input —
-            // `SELECT count(*) FROM metrics` with no blocks returns
-            // 0 cleanly. We bypass `make_branch` here since there's
-            // no fingerprint set to apply and no file to attach.
-            let source = Arc::new(ParquetSource::new(self.schema()).with_pushdown_filters(true));
+        // Build the physical scan plan (the parquet union), producing the
+        // physical columns only. The `labels` enrichment is layered on after.
+        let scan_plan: Arc<dyn ExecutionPlan> = if self.blocks.is_empty() {
+            // No overlapping blocks. Emit a single empty `DataSourceExec` (no
+            // files) with the physical schema preserved so downstream
+            // operators have a typed input — `SELECT count(*) FROM metrics`
+            // with no blocks returns 0 cleanly. We bypass `make_branch` here
+            // since there's no fingerprint set to apply and no file to attach.
+            let source =
+                Arc::new(ParquetSource::new(physical_schema.clone()).with_pushdown_filters(true));
             let builder = FileScanConfigBuilder::new(self.object_store_url.clone(), source)
-                .with_projection_indices(projection.cloned())?
+                .with_projection_indices(phys_projection.clone())?
                 .with_limit(limit);
-            return Ok(DataSourceExec::from_data_source(builder.build()));
+            DataSourceExec::from_data_source(builder.build())
+        } else {
+            let mut branches: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(self.blocks.len());
+            for block in &self.blocks {
+                let meta = &block.entry.meta;
+                let path = block_path(
+                    &meta.signal,
+                    meta.ts_min_unix_nano,
+                    meta.writer_id,
+                    meta.uuid,
+                    "parquet",
+                );
+                branches.push(make_branch(block.fp_set.as_ref(), path, meta.byte_size)?);
+            }
+            // `try_new` returns the single branch directly when there's only
+            // one, so we don't gain a UnionExec layer for 1-block queries. For
+            // ≥2 branches the planner can later parallelise them across
+            // partitions if it chooses.
+            UnionExec::try_new(branches)?
+        };
+
+        // ── Label-join tail (opt-in, mirrors `LogsTable::scan`) ───────────
+        //
+        // When labels aren't wanted the physical scan IS the answer — no
+        // enrichment plan, zero added cost. When they are, wrap the scan with
+        // a `LabelEnrichExec` that appends the `labels` `Map<Utf8,Utf8>`
+        // column (joined from `series_fingerprint`), then project down to the
+        // exact requested column set/order. A `None` projection means "all
+        // columns" → the enriched plan is already exactly that.
+        if !want_labels {
+            return Ok(scan_plan);
         }
 
-        let mut branches: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(self.blocks.len());
-        for block in &self.blocks {
-            let meta = &block.entry.meta;
-            let path = block_path(
-                &meta.signal,
-                meta.ts_min_unix_nano,
-                meta.writer_id,
-                meta.uuid,
-                "parquet",
-            );
-            branches.push(make_branch(block.fp_set.as_ref(), path, meta.byte_size)?);
-        }
+        let fp_labels = self
+            .fp_labels
+            .clone()
+            .expect("want_labels implies fp_labels is Some");
+        let enriched: Arc<dyn ExecutionPlan> = Arc::new(LabelEnrichExec::try_new(
+            scan_plan,
+            table_schema.clone(),
+            fp_labels,
+            "series_fingerprint",
+        )?);
 
-        // `try_new` returns the single branch directly when there's
-        // only one, so we don't gain a UnionExec layer for 1-block
-        // queries. For ≥2 branches the planner can later parallelise
-        // them across partitions if it chooses.
-        UnionExec::try_new(branches)
+        match projection {
+            None => Ok(enriched),
+            Some(proj) => {
+                let exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = proj
+                    .iter()
+                    .map(|&i| {
+                        let f = table_schema.field(i);
+                        (
+                            Arc::new(Column::new(f.name(), i)) as Arc<dyn PhysicalExpr>,
+                            f.name().to_string(),
+                        )
+                    })
+                    .collect();
+                Ok(Arc::new(ProjectionExec::try_new(exprs, enriched)?))
+            }
+        }
     }
 
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
     ) -> DfResult<Vec<TableProviderFilterPushDown>> {
-        // `Inexact` mirrors the parquet_index example: the parquet
-        // pruning we do (row-group stats + row filter) may produce
-        // false positives at the row level, so DataFusion keeps the
-        // filter at the `FilterExec` layer too as a safety net.
-        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+        // A filter that references the synthesised `labels` column can't be
+        // pushed into the parquet scan (there is no physical `labels` column)
+        // — report it `Unsupported` so DataFusion keeps it at the `FilterExec`
+        // layer above the enrich. Everything else is `Inexact`: the parquet
+        // pruning we do (row-group stats + row filter) may produce false
+        // positives at the row level, so DataFusion keeps those filters at the
+        // `FilterExec` layer too as a safety net.
+        Ok(filters
+            .iter()
+            .map(|f| {
+                if expr_references_labels(f) {
+                    TableProviderFilterPushDown::Unsupported
+                } else {
+                    TableProviderFilterPushDown::Inexact
+                }
+            })
+            .collect())
     }
 }
 

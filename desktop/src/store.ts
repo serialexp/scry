@@ -73,13 +73,18 @@ export interface FormState {
   elapsedMs: number;
 }
 
+const INITIAL_RANGE_MS = 15 * 60_000;
+const initialRange = snapQuickRangeNs(Date.now(), INITIAL_RANGE_MS);
+
 const INITIAL: FormState = {
   addr: "127.0.0.1:4100",
   target: "",
   signal: "Metrics",
   matchers: [{ name: "", value: "" }],
-  tsMin: "",
-  tsMax: "",
+  // Start bounded: loading Explore must never ask queryd to discover fields or
+  // scan data across the entire bucket. The user can still clear or widen it.
+  tsMin: String(initialRange.tsMinNs),
+  tsMax: String(initialRange.tsMaxNs),
   sql: "",
   limit: "1000",
   traceId: "",
@@ -146,7 +151,7 @@ export const QUICK_RANGES: { label: string; ms: number }[] = [
 
 /** The label of the currently-applied quick range, or null when the bounds
  *  were set manually / cleared. Drives the range-pill active highlight. */
-const [activeRange, setActiveRange] = createSignal<string | null>(null);
+const [activeRange, setActiveRange] = createSignal<string | null>("15m");
 export { activeRange };
 
 /** Set ts_min/ts_max to [now - span, now] in unix nanoseconds, snapping the
@@ -512,8 +517,13 @@ export async function ensureLabelValues(name: string): Promise<void> {
     const values = await fetchLabelValues(transport, dest, scope, n);
     if ((metaKey || keyAtStart) !== keyAtStart) return; // scope changed under us
     setLabelValues((prev) => ({ ...prev, [n]: values }));
-  } catch {
-    // Leave uncached so a later interaction can retry.
+  } catch (e) {
+    // Leave uncached so a later interaction can retry. Surface the failure too:
+    // the metrics picker loads `__name__` without opening the fields strip, and
+    // silently swallowing this made a dead queryd look like "no metrics".
+    if ((metaKey || keyAtStart) !== keyAtStart) return;
+    setLabelError(e instanceof Error ? e.message : String(e));
+    setLabelStatus("error");
   }
 }
 

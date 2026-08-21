@@ -298,22 +298,28 @@ async fn query_round_trip() {
             .build()
             .expect("build RuntimeEnv"),
     );
-    let service = Arc::new(QueryService::new(
-        Arc::new(Mutex::new(catalog)),
-        store.clone(),
-        pool,
-        postings_cache.clone(),
-        bloom_cache.clone(),
-        runtime_env,
-        memory_pool,
-        // Result cache disabled here: this test asserts *postings*-cache
-        // warmth on an identical replay, which the result cache would
-        // otherwise short-circuit before postings are ever read. The
-        // result cache gets its own integration coverage in
-        // `logs_round_trip` below (plus unit tests + smoke.sh).
-        Arc::new(scry_query::QueryResultCache::with_budget_bytes(0)),
-        scry_query::DEFAULT_QUERY_CACHE_ENTRY_BYTES,
-    ));
+    let service = Arc::new(
+        QueryService::new(
+            Arc::new(Mutex::new(catalog)),
+            store.clone(),
+            pool,
+            postings_cache.clone(),
+            bloom_cache.clone(),
+            runtime_env,
+            memory_pool,
+            // Result cache disabled here: this test asserts *postings*-cache
+            // warmth on an identical replay, which the result cache would
+            // otherwise short-circuit before postings are ever read. The
+            // result cache gets its own integration coverage in
+            // `logs_round_trip` below (plus unit tests + smoke.sh).
+            Arc::new(scry_query::QueryResultCache::with_budget_bytes(0)),
+            scry_query::DEFAULT_QUERY_CACHE_ENTRY_BYTES,
+        )
+        // These tests query with no time bounds over blocks built with fixed
+        // synthetic timestamps; disable the 1h default look-back (D-059) so an
+        // unbounded query still scans the whole block, as it did pre-D-059.
+        .with_default_window(0),
+    );
 
     // Pre-bind to capture the chosen port before spawning the serve
     // task. Same loopback-handoff trick as the Flight version: bind,
@@ -351,6 +357,7 @@ async fn query_round_trip() {
             ts_max: None,
             trace_id: None,
             body_contains: None,
+            with_labels: false,
         },
         sql: None,
         limit: None,
@@ -431,6 +438,7 @@ async fn query_round_trip() {
             ts_max: None,
             trace_id: None,
             body_contains: None,
+            with_labels: false,
         },
         sql: None,
         limit: None,
@@ -462,7 +470,9 @@ async fn query_round_trip() {
     //
     // The two planted blocks carry labels `__name__` and `env` only.
     // Names must union+dedupe+sort across both blocks; values for a name
-    // likewise. This exercises the postings→cache warm path end-to-end.
+    // likewise. Metadata projects only (name,value), so it must not populate
+    // or perturb the full fingerprint postings cache.
+    let metadata_cache_before = postings_cache.stats();
     let names = fetch_label_names(listen_addr, Signal::Metrics).await;
     assert_eq!(
         names,
@@ -484,6 +494,13 @@ async fn query_round_trip() {
     // Unknown label ⇒ empty, not an error.
     let missing = fetch_label_values(listen_addr, Signal::Metrics, "nope").await;
     assert!(missing.is_empty(), "unknown label yields no values");
+    let metadata_cache_after = postings_cache.stats();
+    assert_eq!(metadata_cache_after.hits, metadata_cache_before.hits);
+    assert_eq!(metadata_cache_after.misses, metadata_cache_before.misses);
+    assert_eq!(
+        metadata_cache_after.bytes_in,
+        metadata_cache_before.bytes_in
+    );
 
     // ── Clean shutdown ─────────────────────────────────────────────
     let _ = shutdown_tx.send(());
@@ -569,19 +586,25 @@ async fn logs_round_trip() {
             .build()
             .expect("build RuntimeEnv"),
     );
-    let service = Arc::new(QueryService::new(
-        Arc::new(Mutex::new(catalog)),
-        store.clone(),
-        pool,
-        postings_cache.clone(),
-        bloom_cache.clone(),
-        runtime_env,
-        memory_pool,
-        Arc::new(scry_query::QueryResultCache::with_budget_bytes(
-            scry_query::DEFAULT_QUERY_CACHE_BYTES,
-        )),
-        scry_query::DEFAULT_QUERY_CACHE_ENTRY_BYTES,
-    ));
+    let service = Arc::new(
+        QueryService::new(
+            Arc::new(Mutex::new(catalog)),
+            store.clone(),
+            pool,
+            postings_cache.clone(),
+            bloom_cache.clone(),
+            runtime_env,
+            memory_pool,
+            Arc::new(scry_query::QueryResultCache::with_budget_bytes(
+                scry_query::DEFAULT_QUERY_CACHE_BYTES,
+            )),
+            scry_query::DEFAULT_QUERY_CACHE_ENTRY_BYTES,
+        )
+        // These tests query with no time bounds over blocks built with fixed
+        // synthetic timestamps; disable the 1h default look-back (D-059) so an
+        // unbounded query still scans the whole block, as it did pre-D-059.
+        .with_default_window(0),
+    );
 
     let bind = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -610,6 +633,7 @@ async fn logs_round_trip() {
             ts_max: None,
             trace_id: None,
             body_contains: None,
+            with_labels: false,
         },
         sql: None,
         limit: None,
@@ -700,6 +724,7 @@ async fn logs_round_trip() {
             ts_max: None,
             trace_id: None,
             body_contains: None,
+            with_labels: false,
         },
         sql: None,
         limit: None,
@@ -806,19 +831,25 @@ async fn traces_round_trip() {
             .build()
             .expect("build RuntimeEnv"),
     );
-    let service = Arc::new(QueryService::new(
-        Arc::new(Mutex::new(catalog)),
-        store.clone(),
-        pool,
-        postings_cache.clone(),
-        bloom_cache.clone(),
-        runtime_env,
-        memory_pool,
-        Arc::new(scry_query::QueryResultCache::with_budget_bytes(
-            scry_query::DEFAULT_QUERY_CACHE_BYTES,
-        )),
-        scry_query::DEFAULT_QUERY_CACHE_ENTRY_BYTES,
-    ));
+    let service = Arc::new(
+        QueryService::new(
+            Arc::new(Mutex::new(catalog)),
+            store.clone(),
+            pool,
+            postings_cache.clone(),
+            bloom_cache.clone(),
+            runtime_env,
+            memory_pool,
+            Arc::new(scry_query::QueryResultCache::with_budget_bytes(
+                scry_query::DEFAULT_QUERY_CACHE_BYTES,
+            )),
+            scry_query::DEFAULT_QUERY_CACHE_ENTRY_BYTES,
+        )
+        // These tests query with no time bounds over blocks built with fixed
+        // synthetic timestamps; disable the 1h default look-back (D-059) so an
+        // unbounded query still scans the whole block, as it did pre-D-059.
+        .with_default_window(0),
+    );
 
     let bind = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();

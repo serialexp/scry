@@ -35,7 +35,7 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
 use arrow_ipc::writer::{write_message, DictionaryTracker, IpcDataGenerator, IpcWriteOptions};
@@ -78,6 +78,7 @@ use scry_query::{
 };
 
 use crate::live_merge::{fetch_live_from_ingester, LiveDiscovery};
+use crate::memory_guard::{QueryMemoryGuard, QUERY_TOO_LARGE_MESSAGE};
 use crate::stats::QueryMetrics;
 use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
@@ -155,9 +156,21 @@ pub struct QueryService {
     /// logs query is then refused with `QUERY_ERR_LIVE_UNAVAILABLE`
     /// rather than silently degraded to blocks-only (decision 3).
     live_discovery: Option<Arc<dyn LiveDiscovery>>,
-    /// Process-global query metrics for the status page (D-057). `None` when
-    /// `--stats-listen` is unset, so the query hot path pays nothing.
+    /// Process-global query metrics for the status page (D-057) and the
+    /// periodic activity log. Built unconditionally on the daemon (a handful of
+    /// relaxed atomics) so `queries_in_flight` / `blocks_scanned` are always
+    /// visible; the `--stats-listen` HTTP page just reads the same handle.
     metrics: Option<Arc<QueryMetrics>>,
+    /// Default query look-back window in nanoseconds. When a request carries no
+    /// time bounds at all, `ts_min` is clamped to `now - this` before candidate
+    /// selection so a boundless query doesn't fan out over the whole catalog.
+    /// `0` disables the default (unbounded queries scan everything). Set via
+    /// [`QueryService::with_default_window`].
+    default_query_window_nanos: u64,
+    /// Process-level guard for memory DataFusion does not account for. When it
+    /// reaches its cgroup safety threshold, new work is refused and running
+    /// planning/streaming work is cancelled with QUERY_ERR_RESOURCES.
+    memory_guard: Option<Arc<dyn QueryMemoryGuard>>,
 }
 
 impl QueryService {
@@ -186,6 +199,8 @@ impl QueryService {
             next_request_id: AtomicU64::new(0),
             live_discovery: None,
             metrics: None,
+            default_query_window_nanos: scry_query::DEFAULT_QUERY_WINDOW_SECS * 1_000_000_000,
+            memory_guard: None,
         }
     }
 
@@ -194,6 +209,27 @@ impl QueryService {
     pub fn with_metrics(mut self, metrics: Option<Arc<QueryMetrics>>) -> Self {
         self.metrics = metrics;
         self
+    }
+
+    /// Set the default look-back window (seconds) applied to a request that
+    /// carries no time bounds. `0` disables the default. Builder-style — call
+    /// before wrapping the service in an `Arc`.
+    pub fn with_default_window(mut self, window_secs: u64) -> Self {
+        self.default_query_window_nanos = window_secs.saturating_mul(1_000_000_000);
+        self
+    }
+
+    pub fn with_memory_guard(mut self, guard: Option<Arc<dyn QueryMemoryGuard>>) -> Self {
+        self.memory_guard = guard;
+        self
+    }
+
+    fn apply_default_window(&self, query: &mut Query) -> bool {
+        let now_unix_nano = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        scry_query::apply_default_window(query, now_unix_nano, self.default_query_window_nanos)
     }
 
     /// Attach a live-ingester discovery source (D-054). Enables the merged
@@ -298,6 +334,15 @@ impl QueryService {
                 return Ok(());
             }
         };
+        if let Some(guard) = &self.memory_guard {
+            if let Err(e) = guard.check() {
+                warn!(%peer, error = %e, "refusing query at process memory safety threshold");
+                let _ =
+                    emit_stream_error(&mut wr, QUERY_ERR_RESOURCES, QUERY_TOO_LARGE_MESSAGE).await;
+                let _ = wr.flush().await;
+                return Ok(());
+            }
+        }
         let wire_req = match req_frame.msg {
             QueryFrameMsg::QueryRequest(q) => q,
             // Metadata (discoverability) requests are self-contained: one
@@ -332,11 +377,26 @@ impl QueryService {
                 return Ok(());
             }
         };
-        let req = QueryRequest::from_wire(wire_req);
+        let mut req = QueryRequest::from_wire(wire_req);
 
         let request_id = req.request_id.clone().unwrap_or_else(|| {
             format!("q-{}", self.next_request_id.fetch_add(1, Ordering::Relaxed))
         });
+
+        // Guard-rail: a query with neither time bound would otherwise select
+        // every block in the bucket as a scan candidate (`time_overlaps` lets
+        // all blocks through when both bounds are `None`), doing O(catalog)
+        // work. Clamp the look-back to the last `default_query_window_nanos`
+        // unless the caller was explicit. Applied *before* the span so it
+        // logs the effective bounds. See D-059.
+        if self.apply_default_window(&mut req.query) {
+            info!(
+                request_id = %request_id,
+                ts_min = req.query.ts_min,
+                window_secs = self.default_query_window_nanos / 1_000_000_000,
+                "query has no time bounds; defaulting look-back to last window"
+            );
+        }
 
         // Resolve the signal byte up-front. An unknown / zero byte
         // is a client bug and we'd rather surface a clean
@@ -742,11 +802,22 @@ impl QueryService {
         let Some(signal) = self.resolve_meta_signal(m.signal, wr).await? else {
             return Ok(());
         };
-        let q = meta_query(
+        let mut q = meta_query(
             (m.ts_min_present != 0).then_some(m.ts_min),
             (m.ts_max_present != 0).then_some(m.ts_max),
         );
-        let names = match self.collect_label_names(signal, &q).await {
+        self.apply_default_window(&mut q);
+        let collected = if let Some(guard) = &self.memory_guard {
+            tokio::select! {
+                result = self.collect_label_names(signal, &q) => result,
+                _ = guard.wait_until_exhausted() => {
+                    Err((QUERY_ERR_RESOURCES, QUERY_TOO_LARGE_MESSAGE.to_string()))
+                }
+            }
+        } else {
+            self.collect_label_names(signal, &q).await
+        };
+        let names = match collected {
             Ok(n) => n,
             Err((code, msg)) => {
                 warn!(%peer, signal = signal_name(signal), code, %msg, "label-names request failed");
@@ -778,11 +849,22 @@ impl QueryService {
         let Some(signal) = self.resolve_meta_signal(m.signal, wr).await? else {
             return Ok(());
         };
-        let q = meta_query(
+        let mut q = meta_query(
             (m.ts_min_present != 0).then_some(m.ts_min),
             (m.ts_max_present != 0).then_some(m.ts_max),
         );
-        let values = match self.collect_label_values(signal, &m.label_name, &q).await {
+        self.apply_default_window(&mut q);
+        let collected = if let Some(guard) = &self.memory_guard {
+            tokio::select! {
+                result = self.collect_label_values(signal, &m.label_name, &q) => result,
+                _ = guard.wait_until_exhausted() => {
+                    Err((QUERY_ERR_RESOURCES, QUERY_TOO_LARGE_MESSAGE.to_string()))
+                }
+            }
+        } else {
+            self.collect_label_values(signal, &m.label_name, &q).await
+        };
+        let values = match collected {
             Ok(v) => v,
             Err((code, msg)) => {
                 warn!(%peer, signal = signal_name(signal), code, %msg, "label-values request failed");
@@ -903,6 +985,27 @@ impl QueryService {
         // on every exit path (success + each error path).
         let mut rows_total: u64 = 0;
 
+        // A second admission check closes the gap between reading the request
+        // and beginning expensive planning (metadata requests are checked at
+        // connection admission and use their projected streaming path).
+        if let Some(guard) = &self.memory_guard {
+            if guard.check().is_err() {
+                let _ =
+                    emit_stream_error(&mut wr, QUERY_ERR_RESOURCES, QUERY_TOO_LARGE_MESSAGE).await;
+                let _ = wr.flush().await;
+                self.emit_scan_complete(
+                    signal,
+                    None,
+                    rows_total,
+                    pool_start,
+                    cache_start,
+                    "miss",
+                    t0.elapsed(),
+                );
+                return Ok(());
+            }
+        }
+
         // ── Live fan-in (D-054) ──────────────────────────────────────────
         //
         // For a `live` logs query, fan in the ingesters' retained recent
@@ -994,6 +1097,13 @@ impl QueryService {
                 }
             };
 
+            // Record the candidate count (pre-pruning) so the periodic activity
+            // log surfaces query fan-out — exactly what explodes on an unbounded
+            // query. See D-059.
+            if let Some(m) = self.metrics.as_ref() {
+                m.record_candidates(candidates.len() as u64);
+            }
+
             // (2) Cache key + hit short-circuit. The cached value is the exact
             // concatenation of the SchemaMsg + BatchMsg… + EndOfStream frames,
             // so a hit is a single write_all. A `live` query is time-varying
@@ -1025,11 +1135,27 @@ impl QueryService {
                 }
             }
 
-            // (3) Miss → plan + execute against the candidate set.
-            match self
-                .plan_and_execute(signal, &req, store.clone(), candidates, live_rows.clone())
-                .await
-            {
+            // (3) Miss → plan + execute against the candidate set. Planning
+            // resolves postings and may build DataFusion state, so race it
+            // against the process-level guard as well as guarding the stream.
+            let planned = if let Some(guard) = &self.memory_guard {
+                tokio::select! {
+                    result = self.plan_and_execute(
+                        signal,
+                        &req,
+                        store.clone(),
+                        candidates,
+                        live_rows.clone(),
+                    ) => result,
+                    _ = guard.wait_until_exhausted() => {
+                        Err((QUERY_ERR_RESOURCES, QUERY_TOO_LARGE_MESSAGE.to_string()))
+                    }
+                }
+            } else {
+                self.plan_and_execute(signal, &req, store.clone(), candidates, live_rows.clone())
+                    .await
+            };
+            match planned {
                 Ok((stream, physical)) => break (stream, physical, key),
                 Err((code, msg)) => {
                     let evicted = evict.take_evicted();
@@ -1119,8 +1245,36 @@ impl QueryService {
             return Ok(());
         }
 
-        // Stream batches.
-        while let Some(batch_res) = stream.next().await {
+        // Stream batches. Race each await against the process-level memory
+        // guard so work outside DataFusion's reservation accounting cannot run
+        // all the way into the cgroup OOM killer.
+        loop {
+            let next = if let Some(guard) = &self.memory_guard {
+                tokio::select! {
+                    batch = stream.next() => batch,
+                    _ = guard.wait_until_exhausted() => {
+                        let _ = emit_stream_error(
+                            &mut wr,
+                            QUERY_ERR_RESOURCES,
+                            QUERY_TOO_LARGE_MESSAGE,
+                        ).await;
+                        let _ = wr.flush().await;
+                        self.emit_scan_complete(
+                            signal,
+                            Some(physical.as_ref()),
+                            rows_total,
+                            pool_start,
+                            cache_start,
+                            "miss",
+                            t0.elapsed(),
+                        );
+                        return Ok(());
+                    }
+                }
+            } else {
+                stream.next().await
+            };
+            let Some(batch_res) = next else { break };
             let batch = match batch_res {
                 Ok(b) => b,
                 Err(e) => {
@@ -1509,6 +1663,11 @@ fn data_query_cache_key(signal: Signal, req: &QueryRequest, candidates: &[Catalo
         }
         None => buf.push(0),
     }
+    // `with_labels` changes the result SCHEMA (metrics gains a `labels`
+    // column), so a label-less and a label-ful request over the same
+    // candidates must NOT share a cache entry — else the client decodes the
+    // wrong column count. Hash it into the key.
+    buf.push(u8::from(req.query.with_labels));
 
     // Candidate block UUIDs, sorted — the invalidation-carrying component.
     let mut uuids: Vec<Uuid> = candidates.iter().map(|c| c.meta.uuid).collect();

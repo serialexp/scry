@@ -122,6 +122,7 @@ impl QueryRequest {
             // Empty string = absent (same sentinel convention as `sql`).
             body_contains: self.query.body_contains.clone().unwrap_or_default(),
             live: u8::from(self.live),
+            with_labels: u8::from(self.query.with_labels),
         }
     }
 
@@ -166,6 +167,7 @@ impl QueryRequest {
                 ts_max,
                 trace_id,
                 body_contains,
+                with_labels: w.with_labels != 0,
             },
             sql,
             limit,
@@ -195,6 +197,7 @@ mod tests {
             trace_id: wire.trace_id,
             body_contains: wire.body_contains,
             live: wire.live,
+            with_labels: wire.with_labels,
         };
         let back = QueryRequest::from_wire(out);
         assert_eq!(back.signal, req.signal);
@@ -203,6 +206,7 @@ mod tests {
         assert_eq!(back.query.ts_max, req.query.ts_max);
         assert_eq!(back.query.trace_id, req.query.trace_id);
         assert_eq!(back.query.body_contains, req.query.body_contains);
+        assert_eq!(back.query.with_labels, req.query.with_labels);
         assert_eq!(back.sql, req.sql);
         assert_eq!(back.limit, req.limit);
         assert_eq!(back.request_id, req.request_id);
@@ -227,6 +231,8 @@ mod tests {
                 ts_max: Some(1_700_000_001_000_000_000),
                 trace_id: None,
                 body_contains: None,
+                // Exercise the opt-in metrics label-join flag round-tripping true.
+                with_labels: true,
             },
             sql: Some("SELECT count(*) FROM metrics".into()),
             limit: Some(10),
@@ -245,6 +251,7 @@ mod tests {
                 ts_max: None,
                 trace_id: None,
                 body_contains: Some("connection refused".into()),
+                with_labels: false,
             },
             sql: Some("SELECT count(*) FROM logs".into()),
             limit: Some(100),
@@ -264,6 +271,7 @@ mod tests {
                 ts_max: None,
                 trace_id: None,
                 body_contains: None,
+                with_labels: false,
             },
             ..Default::default()
         });
@@ -283,6 +291,7 @@ mod tests {
                 ts_max: None,
                 trace_id: Some(id),
                 body_contains: None,
+                with_labels: false,
             },
             sql: None,
             limit: None,
@@ -301,6 +310,7 @@ mod tests {
                 ts_max: None,
                 trace_id: None,
                 body_contains: Some("req_id=8f3a91c2".into()),
+                with_labels: false,
             },
             sql: None,
             limit: None,
@@ -319,6 +329,7 @@ mod tests {
                 ts_max: None,
                 trace_id: None,
                 body_contains: None,
+                with_labels: false,
             },
             sql: None,
             limit: Some(100),

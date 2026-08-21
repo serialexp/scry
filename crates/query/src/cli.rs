@@ -103,6 +103,14 @@ pub struct Args {
     #[arg(long)]
     until: Option<u64>,
 
+    /// When neither `--from` nor `--until` is given, default the look-back to
+    /// the last this-many seconds (sets an implicit lower bound of `now - N`)
+    /// instead of scanning every block in the bucket. An explicit `--from` or
+    /// `--until` overrides this entirely. `0` disables (scan everything). See
+    /// D-059.
+    #[arg(long, default_value_t = crate::DEFAULT_QUERY_WINDOW_SECS)]
+    default_window_secs: u64,
+
     /// Row cap. Applied via a `LIMIT` on the implicit `SELECT *`.
     /// Ignored when `--sql` is given (write `LIMIT N` in your SQL).
     #[arg(long)]
@@ -134,6 +142,17 @@ pub struct Args {
     /// narrow the candidate set first.
     #[arg(long = "grep")]
     grep: Option<String>,
+
+    /// Metrics-only: append a synthesised `labels` `Map<Utf8,Utf8>` column to
+    /// the result rows, mapping each `series_fingerprint` back to its resolved
+    /// `{label: value}` set (inverted from the postings sidecars) so a series
+    /// can be named by its labels instead of the opaque fingerprint. Opt-in —
+    /// off by default so fingerprint-only queries stay cheap; even when set the
+    /// column is only materialised when the projection selects it (e.g.
+    /// `SELECT *`, not `SELECT count(*)`). No effect on logs (which always
+    /// carry labels) or traces/profiles (no postings sidecar).
+    #[arg(long = "with-labels")]
+    with_labels: bool,
 
     /// Discoverability: instead of running a query, list the distinct label
     /// **names** matchable for the chosen signal (+ optional `--from`/`--until`
@@ -296,13 +315,38 @@ pub async fn run(args: Args) -> Result<()> {
         args.signal
     };
 
-    let q = Query {
+    let mut q = Query {
         matchers: args.matchers.clone(),
         ts_min: args.from,
         ts_max: args.until,
         trace_id: args.trace_id,
         body_contains: args.grep.clone(),
+        with_labels: args.with_labels,
     };
+
+    // Guard-rail (shared with the query daemon): a query with neither time
+    // bound would scan every block in the bucket. Clamp the look-back to the
+    // last `--default-window-secs` unless the caller was explicit. See D-059.
+    let now_unix_nano = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    if crate::apply_default_window(
+        &mut q,
+        now_unix_nano,
+        args.default_window_secs.saturating_mul(1_000_000_000),
+    ) {
+        // Diagnostic to **stderr** — the shared `scry` tracing subscriber routes
+        // to stdout, which is `scry get`'s data channel (rows / label lists), so
+        // an `info!` here would corrupt the output the caller parses. Same
+        // rationale as `scry tail`'s deliberate `eprintln!`.
+        eprintln!(
+            "scry: no --from/--until; defaulting look-back to last {}s (ts_min={}). \
+             Pass --from/--until or --default-window-secs 0 to scan everything.",
+            args.default_window_secs,
+            q.ts_min.unwrap_or(0),
+        );
+    }
 
     // ── Remote mode short-circuit ──────────────────────────────────
     //

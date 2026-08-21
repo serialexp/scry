@@ -28,15 +28,21 @@
 //! **Locking discipline.** `rusqlite::Connection` (and therefore [`Catalog`])
 //! is `!Sync`; callers wrap it in a `std::sync::Mutex`. The catalog lock is
 //! never held across an `.await`: [`warm_label_cache`] locks to list candidates
-//! + read the warmed set (phase 1), drops the guard for the async postings
-//! fetches (phase 2), then re-locks to upsert (phase 3).
+//! + read the warmed set, then for each cold block projects only
+//! `(label_name,label_value)` from its postings sidecar without the lock and
+//! briefly re-locks to persist that block before moving to the next.
 
 use std::sync::{Arc, Mutex};
 
+use arrow::array::StringArray;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::prelude::SessionConfig;
-use object_store::ObjectStore;
+use futures::TryStreamExt;
+use object_store::{path::Path as ObjPath, ObjectStore, ObjectStoreExt};
+use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
+use parquet::arrow::ProjectionMask;
+use scry_block::block_path;
 use scry_catalog::{Catalog, CatalogEntry};
 use scry_proto::constants::{Signal, QUERY_ERR_BAD_REQUEST, QUERY_ERR_INTERNAL};
 use uuid::Uuid;
@@ -121,7 +127,7 @@ pub async fn collect_label_values(
 async fn warm_label_cache(
     catalog: &Mutex<Catalog>,
     store: Arc<dyn ObjectStore>,
-    postings: &PostingsCache,
+    _postings: &PostingsCache,
     signal: Signal,
     q: &Query,
 ) -> Result<Vec<Uuid>, MetaError> {
@@ -148,46 +154,78 @@ async fn warm_label_cache(
 
     let all_uuids: Vec<Uuid> = candidates.iter().map(|c| c.meta.uuid).collect();
 
-    // Phase 2 — fetch + enumerate cold blocks (no catalog lock held).
-    let mut warmed_pairs: Vec<(Uuid, Vec<(String, String)>)> = Vec::new();
+    // Phase 2 — fetch + enumerate cold blocks, then persist one block before
+    // fetching the next. The catalog lock is never held over an await, and peak
+    // memory is bounded to one projected (name,value) sidecar rather than the
+    // union of every cold block in the requested range.
     for entry in &candidates {
         if warm.contains(&entry.meta.uuid) {
             continue;
         }
-        // No postings ⇒ nothing enumerable; still mark warmed (empty) so it
-        // isn't refetched every request.
-        if !entry.meta.has_postings {
-            warmed_pairs.push((entry.meta.uuid, Vec::new()));
-            continue;
-        }
-        match postings.get_or_fetch(store.clone(), &entry.meta).await {
-            Ok(idx) => {
-                let mut pairs = Vec::with_capacity(idx.entry_count());
-                for lname in idx.label_names() {
-                    for value in idx.label_values(lname) {
-                        pairs.push((lname.to_string(), value.to_string()));
-                    }
+        let pairs = if entry.meta.has_postings {
+            match fetch_label_pairs(store.clone(), &entry.meta).await {
+                Ok(pairs) => pairs,
+                Err(e) => {
+                    tracing::warn!(uuid = %entry.meta.uuid, error = %e,
+                        "metadata: postings fetch failed; skipping block this round");
+                    continue;
                 }
-                warmed_pairs.push((entry.meta.uuid, pairs));
             }
-            Err(e) => {
-                tracing::warn!(uuid = %entry.meta.uuid, error = %e,
-                    "metadata: postings fetch failed; skipping block this round");
-            }
-        }
-    }
-
-    // Phase 3 — persist the newly warmed blocks (one lock).
-    if !warmed_pairs.is_empty() {
+        } else {
+            // No postings ⇒ nothing enumerable; still mark warmed (empty) so
+            // it isn't refetched every request.
+            Vec::new()
+        };
         let guard = lock(catalog)?;
-        for (uuid, pairs) in &warmed_pairs {
-            if let Err(e) = guard.upsert_block_labels(*uuid, pairs) {
-                tracing::warn!(uuid = %uuid, error = %e, "metadata: upsert_block_labels failed");
-            }
+        if let Err(e) = guard.upsert_block_labels(entry.meta.uuid, &pairs) {
+            tracing::warn!(uuid = %entry.meta.uuid, error = %e,
+                "metadata: upsert_block_labels failed");
         }
     }
 
     Ok(all_uuids)
+}
+
+/// Read only the two scalar columns metadata discovery needs from one postings
+/// sidecar. In particular, do **not** decode or retain the `fingerprints`
+/// `List<u64>` column: on high-cardinality metrics that column is nearly the
+/// entire sidecar and materialising it through [`PostingsCache`] made a small
+/// field-list request consume hundreds of MiB.
+async fn fetch_label_pairs(
+    store: Arc<dyn ObjectStore>,
+    meta: &scry_block::BlockMeta,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let path = ObjPath::from(block_path(
+        &meta.signal,
+        meta.ts_min_unix_nano,
+        meta.writer_id,
+        meta.uuid,
+        "postings.parquet",
+    ));
+    let object_meta = store.head(&path).await.map_err(anyhow::Error::from)?;
+    let reader = ParquetObjectReader::new(store, path.clone()).with_file_size(object_meta.size);
+    let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
+    let projection = ProjectionMask::leaves(builder.parquet_schema(), [0, 1]);
+    let mut stream = builder.with_projection(projection).build()?;
+    let mut pairs = Vec::new();
+
+    while let Some(batch) = stream.try_next().await? {
+        let names = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| anyhow::anyhow!("postings col 0 not StringArray"))?;
+        let values = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| anyhow::anyhow!("postings col 1 not StringArray"))?;
+        pairs.reserve(batch.num_rows());
+        for row in 0..batch.num_rows() {
+            pairs.push((names.value(row).to_owned(), values.value(row).to_owned()));
+        }
+    }
+    Ok(pairs)
 }
 
 /// Distinct values of a promoted trace label, via a `SELECT DISTINCT` over the
@@ -265,6 +303,7 @@ pub fn meta_query(ts_min: Option<u64>, ts_max: Option<u64>) -> Query {
         ts_max,
         trace_id: None,
         body_contains: None,
+        with_labels: false,
     }
 }
 

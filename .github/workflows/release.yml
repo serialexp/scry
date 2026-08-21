@@ -58,7 +58,11 @@ jobs:
           PUSH_LATEST: "true"
 
   # ── Desktop app bundles (Tauri, per-platform) ──────────────────────────
+  # Disabled: scry ships/tests the browser web UI now; building four unused
+  # Tauri bundles added substantial release latency. Keep the job definition
+  # in place for reference in case native packaging is revived.
   desktop:
+    if: ${{ false }}
     permissions:
       contents: write          # create the GitHub Release + upload assets
     strategy:

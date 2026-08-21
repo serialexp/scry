@@ -2963,3 +2963,52 @@ Valkey-less `scry query --stats-listen` serving a one-entry `source: "local"` pa
 page); a persisted history / time-series of the counters (the page diffs live polls
 client-side, nothing is retained server-side); gateway/agent status surfaces
 (ingest + query only for now).
+
+## D-059: query safety net — default 1h look-back window + always-on activity log
+
+**Problem.** A `scry query` (daemon or local `scry get`) with **no time bounds**
+(`Query.ts_min`/`ts_max` both `None`) is a footgun: `table::time_overlaps(meta,
+None, None)` lets *every* block through, so candidate selection fans out over the
+entire catalog. In production this looked exactly like a hang — the webui relay
+504'd at 30s and the 1536Mi queryd pod periodically OOMKilled — while a probe with
+even a 5-minute window returned in 3s. Two gaps: (a) an unbounded query silently
+does O(catalog) work, and (b) nothing logs mid-scan, so a legitimate heavy query
+is indistinguishable from a dead process.
+
+**Decision.** Two independent guard-rails, both on by default.
+
+**(A) Default look-back window.** A pure, injected-`now` helper
+`scry_query::apply_default_window(&mut Query, now_unix_nano, window_nanos) -> bool`
+(next to `Query` in `crates/query/src/lib.rs`, mirroring retention's testable-clock
+pattern): when the query carries **neither** bound it sets `ts_min = now - window`
+(leaving `ts_max` open so recent data is never excluded by clock skew) and returns
+`true`; an explicit bound of *either* kind is a no-op, and `window == 0` disables.
+`DEFAULT_QUERY_WINDOW_SECS = 3600` (one hour). Scanning three years stays possible
+— you just ask for it explicitly (`--from/--until`, or `--default-window-secs 0`).
+Applied at **both** entry points: the daemon (`QueryService::run_query`, *before*
+the tracing span + `list_candidates`, so the span logs the effective bounds; window
+from the `default_query_window_nanos` field / `with_default_window` builder /
+`--default-query-window-secs` flag) and local `scry get`
+(`crates/query/src/cli.rs`, right after building `Query`, covering the local-bucket
+*and* `run_remote` paths — idempotent with the daemon's own apply; `--default-window-secs`
+flag). Both `info!` when a default is applied.
+
+**(B) Always-on activity log + candidate counter.** `QueryMetrics` gains
+`blocks_scanned_total: AtomicU64` (bumped by `record_candidates(n)` from
+`candidates.len()` — the pre-pruning fan-out, exactly what explodes on an unbounded
+query) and an `activity_snapshot() -> (queries_total, in_flight, blocks_scanned)`.
+Crucially, `QueryMetrics` is now **always built** in `scry query` (previously
+D-057-gated on `--stats-listen`): the lightweight query atomics are a few `Relaxed`
+ops, so this narrows D-057's opt-in to just the HTTP status page + Valkey fleet
+heartbeat. A background task (`tokio::time::interval` + `MissedTickBehavior::Skip`,
+like the convergence loops) logs the per-interval delta every
+`--stats-log-interval` secs (default 30; `0` disables): `queries_in_flight`,
+`queries_started`, `blocks_scanned`, so a runaway query is visible in `kubectl logs`.
+
+**No deployment change.** The new defaults (1h window, 30s activity log) activate on
+image upgrade; the existing `scry query --listen … --catalog …` command needs no new
+flags.
+
+**Deferred:** a per-query cost budget / admission control (hard row/byte cap that
+aborts a scan mid-flight); a `slow query` log keyed on elapsed time; surfacing the
+default-applied fact to the client (it's server-log-only today).

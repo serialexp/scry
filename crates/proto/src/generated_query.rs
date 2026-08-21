@@ -61,6 +61,7 @@ impl QueryFrameMsg {
                     encoder.write_uint8(b);
                 }
                 encoder.write_uint8(v.live);
+                encoder.write_uint8(v.with_labels);
             }
             QueryFrameMsg::LabelNamesRequest(v) => {
                 encoder.write_uint8(2);
@@ -239,6 +240,7 @@ pub struct QueryRequestInput {
     pub trace_id: Vec<u8>,
     pub body_contains: std::string::String,
     pub live: u8,
+    pub with_labels: u8,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -256,6 +258,7 @@ pub struct QueryRequestOutput {
     pub trace_id: Vec<u8>,
     pub body_contains: std::string::String,
     pub live: u8,
+    pub with_labels: u8,
 }
 
 pub type QueryRequest = QueryRequestOutput;
@@ -299,6 +302,7 @@ impl QueryRequestInput {
             encoder.write_byte(b);
         }
         encoder.write_byte(self.live);
+        encoder.write_byte(self.with_labels);
         Ok(())
     }
 
@@ -343,6 +347,7 @@ impl QueryRequestOutput {
         let bytes = decoder.read_bytes_vec(length)?;
         let body_contains = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
         let live = decoder.read_byte()?;
+        let with_labels = decoder.read_byte()?;
         Ok(Self {
             tag,
             signal,
@@ -357,6 +362,7 @@ impl QueryRequestOutput {
             trace_id,
             body_contains,
             live,
+            with_labels,
         })
     }
     pub fn encode(&self) -> Result<Vec<u8>> {
@@ -382,6 +388,7 @@ impl From<QueryRequestOutput> for QueryRequestInput {
             trace_id: o.trace_id,
             body_contains: o.body_contains,
             live: o.live,
+            with_labels: o.with_labels,
         }
     }
 }
@@ -402,6 +409,7 @@ impl From<QueryRequestInput> for QueryRequestOutput {
             trace_id: i.trace_id,
             body_contains: i.body_contains,
             live: i.live,
+            with_labels: i.with_labels,
         }
     }
 }

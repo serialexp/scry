@@ -111,6 +111,7 @@ async fn main() -> Result<()> {
             ts_max: args.ts_max,
             trace_id: None,
             body_contains: args.body_contains,
+            with_labels: false,
         },
         sql: args.sql,
         limit: args.limit,

@@ -42,6 +42,7 @@ pub mod bloom_cache;
 pub mod body_bloom;
 pub mod cli;
 pub mod evict;
+pub mod label_enrich;
 pub mod logs;
 pub mod metadata;
 pub mod postings;
@@ -60,12 +61,16 @@ use datafusion::prelude::DataFrame;
 use object_store::ObjectStore;
 use scry_catalog::{Catalog, CatalogEntry};
 use serde::{Deserialize, Serialize};
+use tracing::warn;
+
+use crate::label_enrich::{freeze_fp_labels, FpAcc};
 
 pub use bloom_cache::{
     BloomCache, BloomCacheConfig, BloomCacheStats,
     DEFAULT_BUDGET_BYTES as DEFAULT_BLOOM_CACHE_BYTES,
 };
 pub use evict::EvictOnNotFound;
+pub use label_enrich::{FpLabels, LabelEnrichExec, LabelPairs};
 pub use metadata::{collect_label_names, collect_label_values, meta_query, MetaError};
 pub use postings::resolve_fingerprints;
 pub use postings_cache::{
@@ -141,6 +146,44 @@ pub struct Query {
     /// it — another "new optional field everyone ignores" growth.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body_contains: Option<String>,
+    /// Opt-in fingerprint→label join, meaningful only for the metrics
+    /// signal. When `true`, [`crate::table::MetricsTable`] exposes a
+    /// synthesised `labels` `Map<Utf8,Utf8>` column (each series' resolved
+    /// labels, inverted from the postings sidecars) so a series can be named
+    /// by its labels instead of its opaque `series_fingerprint`. Off by
+    /// default so fingerprint-only metrics queries stay byte-for-byte as
+    /// cheap as before; even when `true` the column is only materialised
+    /// when the query's projection actually selects it. Logs already carry a
+    /// `labels` column unconditionally, so they ignore this flag; traces /
+    /// profiles have no postings sidecar and ignore it too.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub with_labels: bool,
+}
+
+/// Default query look-back window (seconds) applied when a query specifies no
+/// time bounds at all. An unbounded query selects *every* block in the bucket
+/// as a scan candidate ([`table::time_overlaps`] passes all blocks when both
+/// bounds are `None`), so on a large catalog the work is proportional to total
+/// history — enough to blow client timeouts and OOM the daemon. Defaulting to
+/// the last hour keeps a boundless query cheap; scanning further back is fine
+/// but must be requested explicitly (any explicit bound disables the default).
+pub const DEFAULT_QUERY_WINDOW_SECS: u64 = 3600;
+
+/// When a query specifies **neither** time bound, clamp its look-back to the
+/// last `window_nanos` (sets `ts_min = now - window`, leaving `ts_max` open so
+/// recent data is never excluded by clock skew). An explicit bound of either
+/// kind is honored exactly (no-op), and `window_nanos == 0` disables the
+/// default entirely (no-op).
+///
+/// Returns `true` when a default was applied (so callers can log it).
+/// `now_unix_nano` is injected rather than read from the clock inline, mirroring
+/// the retention engine's determinism pattern, so the behaviour is unit-testable.
+pub fn apply_default_window(q: &mut Query, now_unix_nano: u64, window_nanos: u64) -> bool {
+    if window_nanos == 0 || q.ts_min.is_some() || q.ts_max.is_some() {
+        return false;
+    }
+    q.ts_min = Some(now_unix_nano.saturating_sub(window_nanos));
+    true
 }
 
 /// Default name the `MetricsTable` is registered under in a
@@ -212,8 +255,19 @@ pub async fn build_metrics_table_from_candidates(
         }
         None => {
             // No overlapping blocks at all. Return an empty table so
-            // SQL like `SELECT count(*) FROM metrics` still works.
-            return Ok(MetricsTable::new("", Vec::new(), q.ts_min, q.ts_max)?);
+            // SQL like `SELECT count(*) FROM metrics` still works. When labels
+            // were requested we still hand an (empty) `fp_labels` so the table
+            // exposes the 4-column schema — a `SELECT *` returns the `labels`
+            // column (with zero rows) rather than a schema that flips shape
+            // depending on whether any block happened to overlap.
+            let fp_labels = q.with_labels.then(|| Arc::new(FpLabels::new()));
+            return Ok(MetricsTable::new(
+                "",
+                Vec::new(),
+                q.ts_min,
+                q.ts_max,
+                fp_labels,
+            )?);
         }
     };
 
@@ -233,6 +287,10 @@ pub async fn build_metrics_table_from_candidates(
     // set per file.
     let mut blocks: Vec<BlockEntry> = Vec::with_capacity(candidates.len());
     let matchers_empty = q.matchers.is_empty();
+    // Opt-in fingerprint→label join (D-058): accumulate `fingerprint → labels`
+    // by inverting each surviving block's postings sidecar. `None` unless the
+    // query asked for it, so a label-less query never inverts anything.
+    let mut fp_acc: Option<FpAcc> = q.with_labels.then(FpAcc::new);
     for entry in candidates {
         // Use the cache when one is provided. The cache resolves
         // empty matchers via the un-cached fallback path so callers
@@ -264,12 +322,41 @@ pub async fn build_metrics_table_from_candidates(
                     v.sort_unstable();
                     Some(Arc::new(v))
                 };
+                // Labels wanted → invert this surviving block's postings into
+                // the accumulator. The matcher resolve above already fetched +
+                // cached the parsed index (`PostingsCache::resolve` calls
+                // `get_or_fetch` internally), so with a cache present this is a
+                // cache hit and adds no object-store I/O. Only the empty-matcher
+                // path (which resolves fingerprints from the meta sidecar, not
+                // the postings) pays one postings GET per block for the labels.
+                // A fetch failure is non-fatal: labels for this block are simply
+                // omitted (each row still carries an — empty — `labels` map).
+                if let Some(acc) = fp_acc.as_mut() {
+                    let index = match cache {
+                        Some(c) => c.get_or_fetch(store.clone(), &entry.meta).await,
+                        None => postings::fetch_and_parse_postings(store.clone(), &entry.meta)
+                            .await
+                            .map(Arc::new),
+                    };
+                    match index {
+                        Ok(idx) => idx.invert_into(acc),
+                        Err(e) => warn!(
+                            block = %entry.meta.uuid,
+                            error = %e,
+                            "metrics label join: postings fetch failed; labels omitted for this block"
+                        ),
+                    }
+                }
                 blocks.push(BlockEntry { entry, fp_set });
             }
         }
     }
 
-    MetricsTable::new(&bucket, blocks, q.ts_min, q.ts_max)
+    // Freeze the accumulator (when labels were requested) into the shared
+    // `fingerprint → labels` map handed to the table.
+    let fp_labels = fp_acc.map(|acc| Arc::new(freeze_fp_labels(acc)));
+
+    MetricsTable::new(&bucket, blocks, q.ts_min, q.ts_max, fp_labels)
         .map_err(|e| anyhow::anyhow!("constructing MetricsTable: {e}"))
 }
 
@@ -327,4 +414,58 @@ pub async fn metrics_query(
     ctx.table(METRICS_TABLE_NAME)
         .await
         .with_context(|| format!("looking up table {METRICS_TABLE_NAME}"))
+}
+
+#[cfg(test)]
+mod default_window_tests {
+    use super::{apply_default_window, Query};
+
+    const HOUR_NS: u64 = 3600 * 1_000_000_000;
+    const NOW: u64 = 10 * HOUR_NS; // an arbitrary "now" well past the epoch
+
+    #[test]
+    fn applies_when_both_bounds_absent() {
+        let mut q = Query::default();
+        assert!(apply_default_window(&mut q, NOW, HOUR_NS));
+        assert_eq!(q.ts_min, Some(NOW - HOUR_NS));
+        assert_eq!(q.ts_max, None, "ts_max stays open");
+    }
+
+    #[test]
+    fn noop_when_ts_min_set() {
+        let mut q = Query {
+            ts_min: Some(123),
+            ..Query::default()
+        };
+        assert!(!apply_default_window(&mut q, NOW, HOUR_NS));
+        assert_eq!(q.ts_min, Some(123));
+        assert_eq!(q.ts_max, None);
+    }
+
+    #[test]
+    fn noop_when_ts_max_set() {
+        let mut q = Query {
+            ts_max: Some(456),
+            ..Query::default()
+        };
+        assert!(!apply_default_window(&mut q, NOW, HOUR_NS));
+        assert_eq!(q.ts_min, None, "an explicit ts_max is honored exactly");
+        assert_eq!(q.ts_max, Some(456));
+    }
+
+    #[test]
+    fn noop_when_window_zero() {
+        let mut q = Query::default();
+        assert!(!apply_default_window(&mut q, NOW, 0));
+        assert_eq!(q.ts_min, None);
+        assert_eq!(q.ts_max, None);
+    }
+
+    #[test]
+    fn saturates_when_now_before_window() {
+        // now < window must not underflow-panic.
+        let mut q = Query::default();
+        assert!(apply_default_window(&mut q, 5, HOUR_NS));
+        assert_eq!(q.ts_min, Some(0));
+    }
 }

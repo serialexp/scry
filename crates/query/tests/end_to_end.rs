@@ -217,6 +217,7 @@ async fn querier_end_to_end() {
         ts_max: None,
         trace_id: None,
         body_contains: None,
+        with_labels: false,
     };
     let (batches, plan) = run_query(&catalog, store.clone(), &q1).await;
     assert_eq!(total_rows(&batches), 300);
@@ -241,6 +242,7 @@ async fn querier_end_to_end() {
         ts_max: None,
         trace_id: None,
         body_contains: None,
+        with_labels: false,
     };
     let (batches, _plan) = run_query(&catalog, store.clone(), &q2).await;
     assert_eq!(total_rows(&batches), 400);
@@ -259,6 +261,7 @@ async fn querier_end_to_end() {
         ts_max: None,
         trace_id: None,
         body_contains: None,
+        with_labels: false,
     };
     let table = build_metrics_table(&catalog, store.clone(), &q3)
         .await
@@ -283,6 +286,7 @@ async fn querier_end_to_end() {
         ts_max: None,
         trace_id: None,
         body_contains: None,
+        with_labels: false,
     };
     let (batches, _plan) = run_query(&catalog, store.clone(), &q4).await;
     assert_eq!(total_rows(&batches), 0);
@@ -299,6 +303,7 @@ async fn querier_end_to_end() {
         ts_max: Some(2_000_150),
         trace_id: None,
         body_contains: None,
+        with_labels: false,
     };
     let table = build_metrics_table(&catalog, store.clone(), &q6)
         .await
