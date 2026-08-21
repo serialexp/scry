@@ -308,11 +308,15 @@ pub async fn run(args: Args) -> Result<()> {
 
     // Cold-start bootstrap (D-055): if the catalog file is absent, restore it
     // from the bucket snapshot in a single GET instead of paying an O(all
-    // blocks) reconcile before the first query. Best-effort — on no snapshot,
-    // a schema-version mismatch, or any error we fall through to an empty
-    // catalog and let the poll + full-walk convergence loops (spawned below,
-    // Valkey or not) repopulate it exactly as before.
-    if !args.no_snapshot_restore && !args.catalog.exists() {
+    // blocks) reconcile before the first query. If the snapshot is unavailable
+    // or unusable, remember that this process must perform a full seed below.
+    // That seed runs in the main container before the TCP listener opens: in
+    // Kubernetes the pod is visibly Running but remains unready, and operators
+    // can follow its progress through the normal queryd logs (unlike an init
+    // container, which leaves the application container stuck at Initializing).
+    let catalog_was_absent = !args.catalog.exists();
+    let mut needs_cold_seed = args.no_snapshot_restore && catalog_was_absent;
+    if !args.no_snapshot_restore && catalog_was_absent {
         match scry_catalog::restore_snapshot(
             &args.catalog,
             store.as_ref(),
@@ -324,16 +328,21 @@ pub async fn run(args: Args) -> Result<()> {
                 info!(blocks, "restored catalog from bucket snapshot");
             }
             Ok(scry_catalog::RestoreOutcome::NoSnapshot) => {
-                info!("no catalog snapshot in bucket; starting cold (convergence will fill it)");
+                needs_cold_seed = true;
+                info!("no catalog snapshot in bucket; a full catalog seed is required");
             }
             Ok(scry_catalog::RestoreOutcome::VersionMismatch { found, expected }) => {
+                needs_cold_seed = true;
                 warn!(
                     found,
                     expected,
-                    "catalog snapshot schema version mismatch; ignoring it, starting cold"
+                    "catalog snapshot schema version mismatch; a full catalog seed is required"
                 );
             }
-            Err(e) => warn!(error = %e, "catalog snapshot restore failed; starting cold"),
+            Err(e) => {
+                needs_cold_seed = true;
+                warn!(error = %e, "catalog snapshot restore failed; a full catalog seed is required");
+            }
         }
     }
 
@@ -346,6 +355,25 @@ pub async fn run(args: Args) -> Result<()> {
         Catalog::open(&args.catalog, &cfg.bucket)
             .with_context(|| format!("opening catalog at {}", args.catalog.display()))?,
     ));
+
+    if needs_cold_seed {
+        info!(
+            catalog = %args.catalog.display(),
+            bucket = %cfg.bucket,
+            "catalog seed starting; query listener will remain unready until it completes"
+        );
+        let started = std::time::Instant::now();
+        let report = full_walk(store.as_ref(), catalog.as_ref(), &cfg.bucket)
+            .await
+            .context("seeding catalog from bucket")?;
+        info!(
+            seen = report.seen,
+            inserted = report.inserted,
+            failed = report.failed,
+            elapsed_secs = started.elapsed().as_secs_f64(),
+            "catalog seed complete"
+        );
+    }
 
     // Postings cache: env defaults, overridden by --postings-cache-bytes.
     let mut cache_cfg =

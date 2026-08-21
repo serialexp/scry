@@ -20,6 +20,7 @@
 //! advance (monotonic), so re-listing already-known blocks is a no-op.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
@@ -94,7 +95,13 @@ where
     S: ObjectStore + ?Sized,
 {
     let mut report = PollReport::default();
+    tracing::info!("catalog full-walk starting bucket listing");
     let locations = collect_meta_locations(store, None).await?;
+    let total = locations.len();
+    tracing::info!(
+        meta_objects = total,
+        "catalog full-walk listing complete; fetching sidecars"
+    );
     fetch_and_apply(store, catalog, bucket, locations, &mut report).await?;
     Ok(report)
 }
@@ -162,6 +169,8 @@ where
     // Highest UUID seen per (signal, writer_id, date) this pass, so we issue
     // one monotonic cursor advance per prefix at the end.
     let mut high: HashMap<(String, Uuid, String), Uuid> = HashMap::new();
+    let total = locations.len();
+    let mut last_progress = Instant::now();
 
     for loc in locations {
         report.seen += 1;
@@ -199,6 +208,17 @@ where
                 }
             })
             .or_insert(meta.uuid);
+
+        if last_progress.elapsed() >= Duration::from_secs(10) {
+            tracing::info!(
+                processed = report.seen,
+                total,
+                inserted = report.inserted,
+                failed = report.failed,
+                "catalog sidecar fetch progress"
+            );
+            last_progress = Instant::now();
+        }
     }
 
     for ((signal, writer_id, date), uuid) in high {

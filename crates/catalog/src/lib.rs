@@ -106,6 +106,15 @@ impl Catalog {
     }
 
     fn init_schema(&self) -> Result<()> {
+        // D-054 added per-block WAL watermark columns after catalogs already
+        // existed in production. `CREATE TABLE IF NOT EXISTS` does not evolve an
+        // existing `blocks` table, so migrate that v1 shape before any query or
+        // insert can reference the new columns. The guards make repeated opens
+        // idempotent and also repair the old ingest PVC before it writes a v2
+        // snapshot for queryd.
+        self.add_column_if_missing("blocks", "wal_seg_max", "INTEGER")?;
+        self.add_column_if_missing("blocks", "wal_shard", "INTEGER")?;
+
         // The DDL matches ARCHITECTURE.md § The catalog § Schema with
         // the `buckets` table omitted (one bucket in v0.1) and the
         // `blocks.bucket REFERENCES buckets(name)` FK relaxed to plain
@@ -210,6 +219,28 @@ impl Catalog {
         self.conn
             .pragma_update(None, "user_version", snapshot::CATALOG_SCHEMA_VERSION)
             .context("stamping PRAGMA user_version")?;
+        Ok(())
+    }
+
+    /// Add one column to an existing table when upgrading an older on-disk
+    /// catalog. SQLite has no `ADD COLUMN IF NOT EXISTS`, so inspect
+    /// `PRAGMA table_info` first; fresh catalogs skip both ALTERs because the
+    /// complete table definition above already contains the columns.
+    fn add_column_if_missing(&self, table: &str, column: &str, sql_type: &str) -> Result<()> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .with_context(|| format!("reading {table} columns"))?;
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if !columns.iter().any(|name| name == column) && !columns.is_empty() {
+            self.conn
+                .execute_batch(&format!(
+                    "ALTER TABLE {table} ADD COLUMN {column} {sql_type}"
+                ))
+                .with_context(|| format!("adding {table}.{column}"))?;
+        }
         Ok(())
     }
 

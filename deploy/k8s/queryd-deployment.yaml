@@ -55,6 +55,10 @@ spec:
           ports:
             - name: query
               containerPort: 4100
+          # The listener only opens after the one-object catalog snapshot restore
+          # finishes. Until then the pod is Running but unready, and startup logs
+          # remain visible from the main container. The daemon's background
+          # convergence fills any snapshot delta after the listener is up.
           readinessProbe:
             tcpSocket:
               port: 4100
@@ -65,9 +69,16 @@ spec:
               cpu: "100m"
               memory: "256Mi"
             limits:
-              # Headroom over the daemon's default 1024 MiB DataFusion budget
-              # (streaming operators aren't accounted, so true RSS runs higher).
+              # Defaults total more than this pod: 1 GiB DataFusion + 256 MiB
+              # postings + 256 MiB result + 64 MiB bloom, before runtime/SQLite.
+              # Keep explicit budgets below the cgroup limit; the 256 MiB cgroup
+              # reserve then rejects work before Linux has to OOM-kill queryd.
               memory: "1536Mi"
+          args:
+            - --query-memory-budget-mib=768
+            - --postings-cache-bytes=134217728
+            - --query-cache-bytes=134217728
+            - --bloom-cache-bytes=33554432
           volumeMounts:
             - name: catalog
               mountPath: /catalog

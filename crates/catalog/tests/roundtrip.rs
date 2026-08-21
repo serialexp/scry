@@ -5,8 +5,9 @@ use bytes::Bytes;
 use object_store::{
     memory::InMemory, path::Path as ObjPath, ObjectStore, ObjectStoreExt, PutPayload,
 };
+use rusqlite::Connection;
 use scry_block::BlockMeta;
-use scry_catalog::Catalog;
+use scry_catalog::{Catalog, CATALOG_SCHEMA_VERSION};
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -94,10 +95,60 @@ fn wal_watermark_advances_monotonically_per_instance() {
 #[test]
 fn open_creates_schema_and_is_empty() {
     let tmp = TempDir::new().unwrap();
-    let cat = Catalog::open(&tmp.path().join("cat.sqlite"), "scry-dev").unwrap();
+    let path = tmp.path().join("cat.sqlite");
+    let cat = Catalog::open(&path, "scry-dev").unwrap();
     assert_eq!(cat.block_count().unwrap(), 0);
     assert!(cat.list_blocks().unwrap().is_empty());
     assert_eq!(cat.bucket(), "scry-dev");
+    drop(cat);
+
+    let conn = Connection::open(path).unwrap();
+    let version: u32 = conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, CATALOG_SCHEMA_VERSION);
+}
+
+#[test]
+fn open_upgrades_v1_blocks_table_before_stamping_v2() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("cat.sqlite");
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(
+        r#"
+        CREATE TABLE blocks (
+          uuid TEXT PRIMARY KEY, bucket TEXT NOT NULL, signal TEXT NOT NULL,
+          date TEXT NOT NULL, writer_id TEXT NOT NULL, level INTEGER NOT NULL DEFAULT 0,
+          ts_min INTEGER NOT NULL, ts_max INTEGER NOT NULL, row_count INTEGER NOT NULL,
+          byte_size INTEGER NOT NULL, postings_size_bytes INTEGER,
+          has_postings INTEGER NOT NULL DEFAULT 0, body_bloom_size_bytes INTEGER,
+          has_body_bloom INTEGER NOT NULL DEFAULT 0, schema_version INTEGER NOT NULL,
+          fingerprint BLOB, superseded_by TEXT REFERENCES blocks(uuid), deleted_at INTEGER
+        );
+        PRAGMA user_version = 1;
+        "#,
+    )
+    .unwrap();
+    drop(conn);
+
+    let cat = Catalog::open(&path, "scry-dev").unwrap();
+    assert!(cat.list_blocks().unwrap().is_empty());
+    drop(cat);
+
+    let conn = Connection::open(path).unwrap();
+    let columns: Vec<String> = conn
+        .prepare("PRAGMA table_info(blocks)")
+        .unwrap()
+        .query_map([], |row| row.get(1))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert!(columns.iter().any(|name| name == "wal_seg_max"));
+    assert!(columns.iter().any(|name| name == "wal_shard"));
+    let version: u32 = conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, CATALOG_SCHEMA_VERSION);
 }
 
 #[test]
