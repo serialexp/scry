@@ -50,7 +50,8 @@ pub use query_service::QueryService;
 pub use scry_block::BlockBuilderConfig;
 pub use server::{
     DummyPipeline, DummyShards, LogsPipeline, LogsShards, MetricsPipeline, MetricsShards,
-    ProfilesPipeline, ProfilesShards, Server, ServerConfig, TracesPipeline, TracesShards,
+    ProfilesPipeline, ProfilesShards, RemoteAgentStatus, RemoteStatusRelay, Server, ServerConfig,
+    TracesPipeline, TracesShards,
 };
 pub use stats::{
     serve_status, FleetSource, LocalStatus, QueryMetrics, ServerMetrics, StatusSnapshot,

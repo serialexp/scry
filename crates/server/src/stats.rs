@@ -78,6 +78,11 @@ pub trait LocalStatus: Send + Sync + 'static {
 /// `SCAN`. Kept as a trait so `scry-server` stays Valkey-agnostic.
 #[async_trait::async_trait]
 pub trait FleetSource: Send + Sync + 'static {
+    /// Human-readable aggregation source reported by `/stats.json`.
+    fn source(&self) -> &'static str {
+        "valkey"
+    }
+
     /// All live status blobs currently registered (including this instance's
     /// own, since it publishes too). Best-effort — returns empty on error.
     async fn blobs(&self) -> Vec<String>;
@@ -98,12 +103,13 @@ impl StatusState {
     async fn stats_json(&self) -> String {
         let (source, mut instances): (&str, Vec<StatusSnapshot>) = match &self.fleet {
             Some(f) => {
+                let source = f.source();
                 let blobs = f.blobs().await;
                 let parsed = blobs
                     .iter()
                     .filter_map(|b| serde_json::from_str::<StatusSnapshot>(b).ok())
                     .collect();
-                ("valkey", parsed)
+                (source, parsed)
             }
             None => ("local", Vec::new()),
         };
@@ -282,7 +288,7 @@ pub fn load_avg_1m() -> Option<f64> {
         .and_then(|v| v.parse().ok())
 }
 
-fn now_unix_ms() -> u64 {
+pub(crate) fn unix_ms_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -576,7 +582,7 @@ impl LocalStatus for ServerMetrics {
             role: "ingest".to_string(),
             instance_id: self.instance_id.clone(),
             addr: self.addr.clone(),
-            now_unix_ms: now_unix_ms(),
+            now_unix_ms: unix_ms_now(),
             uptime_secs: self.started.elapsed().as_secs_f64(),
             rss_kib: rss_kib(),
             data: self.ingest_data(),
@@ -746,7 +752,7 @@ impl LocalStatus for QueryMetrics {
             role: "query".to_string(),
             instance_id: self.instance_id.clone(),
             addr: self.addr.clone(),
-            now_unix_ms: now_unix_ms(),
+            now_unix_ms: unix_ms_now(),
             uptime_secs: self.started.elapsed().as_secs_f64(),
             rss_kib: rss_kib(),
             data: self.query_data(),
@@ -833,6 +839,9 @@ const FLEET_DASHBOARD_HTML: &str = r#"<!doctype html>
 <h1>scry &mdash; fleet status</h1>
 <div id="meta">connecting&hellip;</div>
 
+<h2>agent</h2>
+<div class="cards" id="agent"><span class="empty">none</span></div>
+
 <h2>ingest</h2>
 <div class="cards" id="ingest"><span class="empty">none</span></div>
 
@@ -859,6 +868,24 @@ function rateFn(s, p) {
 function tbl(pairs) {
   return "<table>" + pairs.map(([k, v]) =>
     `<tr><th>${k}</th><td class="num">${v}</td></tr>`).join("") + "</table>";
+}
+
+function agentCard(s, p, isSelf) {
+  const d = s.data, pd = p ? p.data : null;
+  const r = rateFn(s, p);
+  const rate = (k) => (pd ? r(d[k], pd[k]) : null);
+  const body = tbl([
+    ["metric samples/s", fmt(rate("metric_samples"))],
+    ["log records/s",    fmt(rate("log_records"))],
+    ["metric queue",     fmt(d.metric_queue_depth) + " / " + fmt(d.metric_queue_capacity)],
+    ["log queue",        fmt(d.log_queue_depth) + " / " + fmt(d.log_queue_capacity)],
+    ["pending samples",  fmt(d.metric_pending_samples)],
+    ["pending logs",     fmt(d.log_pending_records)],
+    ["reconnects",       fmt(d.reconnect_successes) + " / " + fmt(d.reconnect_attempts)],
+    ["filtered metrics", fmt(d.metric_dropped)],
+    ["filtered logs",    fmt(d.log_dropped)],
+  ]);
+  return card(s, isSelf, body);
 }
 
 function ingestCard(s, p, isSelf) {
@@ -925,10 +952,10 @@ function render(payload) {
     `${insts.length} instance(s) · source=${payload.source} · ` +
     `self=${(selfId||"?").slice(0,8)} · ${new Date().toLocaleTimeString()}`;
 
-  const groups = {ingest: [], query: []};
+  const groups = {agent: [], ingest: [], query: []};
   for (const s of insts) (groups[s.role] || (groups[s.role] = [])).push(s);
 
-  for (const role of ["ingest", "query"]) {
+  for (const role of ["agent", "ingest", "query"]) {
     const el = $(role);
     const list = (groups[role] || []).sort((a, b) => a.instance_id.localeCompare(b.instance_id));
     if (list.length === 0) { el.innerHTML = '<span class="empty">none</span>'; continue; }
@@ -941,7 +968,8 @@ function render(payload) {
       // card across duplicate polls, so nothing flips to n/a between beats.
       const stale = p && s.now_unix_ms <= p.now_unix_ms;
       if (stale && cardCache.has(s.instance_id)) return cardCache.get(s.instance_id);
-      const html = role === "ingest" ? ingestCard(s, p, isSelf) : queryCard(s, p, isSelf);
+      const html = role === "agent" ? agentCard(s, p, isSelf) :
+        (role === "ingest" ? ingestCard(s, p, isSelf) : queryCard(s, p, isSelf));
       cardCache.set(s.instance_id, html);
       prev.set(s.instance_id, s);   // advance the rate baseline only on a fresh snapshot
       return html;

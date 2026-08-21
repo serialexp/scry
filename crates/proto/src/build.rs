@@ -23,9 +23,9 @@
 //! <https://github.com/anthropics/binschema> Rust codegen notes.
 
 use crate::generated::{
-    BatchAckInput, BatchInput, ErrorInput, FlowControlInput, Frame, FrameMsg, GoodbyeInput,
-    HelloAckInput, HelloInput, LabelPair, LiveBatchInput, LiveQueryInput, LiveRecord, MatcherSpec,
-    PingInput, PongInput, SubscribeInput, TailRecordInput,
+    AgentStatusInput, BatchAckInput, BatchInput, ErrorInput, FlowControlInput, Frame, FrameMsg,
+    GoodbyeInput, HelloAckInput, HelloInput, LabelPair, LiveBatchInput, LiveQueryInput, LiveRecord,
+    MatcherSpec, PingInput, PongInput, SubscribeInput, TailRecordInput,
 };
 
 pub struct HelloArgs<'a> {
@@ -76,6 +76,25 @@ pub fn hello_ack(a: HelloAckArgs<'_>) -> Frame {
                 suggested_batch_bytes: a.suggested_batch_bytes,
                 max_batch_bytes: a.max_batch_bytes,
                 max_inflight_batches: a.max_inflight_batches,
+            }
+            .into(),
+        ),
+    }
+}
+
+pub struct AgentStatusArgs<'a> {
+    pub session_id: u64,
+    pub sequence: u64,
+    pub snapshot_json: &'a str,
+}
+
+pub fn agent_status(a: AgentStatusArgs<'_>) -> Frame {
+    Frame {
+        msg: FrameMsg::AgentStatus(
+            AgentStatusInput {
+                session_id: a.session_id,
+                sequence: a.sequence,
+                snapshot_json: a.snapshot_json.into(),
             }
             .into(),
         ),

@@ -83,6 +83,23 @@ pub type LogsShards = ShardedPipeline<LogsBlockBuilder>;
 pub type TracesShards = ShardedPipeline<TracesBlockBuilder>;
 pub type ProfilesShards = ShardedPipeline<ProfilesBlockBuilder>;
 
+/// Canonical agent status accepted from one authenticated ingest connection.
+#[derive(Clone, Debug)]
+pub struct RemoteAgentStatus {
+    pub instance_id: String,
+    pub owner_token: Uuid,
+    pub sequence: u64,
+    pub snapshot: crate::StatusSnapshot,
+}
+
+/// Non-blocking sink for best-effort remote agent fleet accounting.
+pub trait RemoteStatusRelay: Send + Sync + 'static {
+    fn report(&self, status: RemoteAgentStatus);
+    fn remove(&self, instance_id: &str, owner_token: Uuid);
+}
+
+const MAX_AGENT_STATUS_JSON_BYTES: usize = 64 * 1024;
+
 /// Static configuration for a [`Server`]. Cheap to construct, cloned
 /// into each spawned connection task.
 #[derive(Clone, Debug)]
@@ -136,6 +153,7 @@ pub struct Server {
     /// memory. `None` ⇒ live query disabled and zero cost on the logs path
     /// (byte-identical to pre-D-054). Only the logs signal feeds it.
     live_ring: Option<Arc<LiveRing>>,
+    remote_status: Option<Arc<dyn RemoteStatusRelay>>,
 }
 
 impl Server {
@@ -159,6 +177,7 @@ impl Server {
             block_max_age: None,
             tail: SubscriptionRegistry::new(),
             live_ring: None,
+            remote_status: None,
         }
     }
 
@@ -184,6 +203,11 @@ impl Server {
     /// `serve_stats` so the endpoint and the ingest path share state.
     pub fn with_metrics(mut self, metrics: Arc<ServerMetrics>) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    pub fn with_remote_status_relay(mut self, relay: Arc<dyn RemoteStatusRelay>) -> Self {
+        self.remote_status = Some(relay);
         self
     }
 
@@ -260,6 +284,7 @@ impl Server {
                 let metrics = self.metrics.clone();
                 let tail = self.tail.clone();
                 let live_ring = self.live_ring.clone();
+                let remote_status = self.remote_status.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle(
                         sock,
@@ -274,6 +299,7 @@ impl Server {
                         metrics,
                         tail,
                         live_ring,
+                        remote_status,
                     )
                     .await
                     {
@@ -417,6 +443,7 @@ async fn handle(
     metrics: Option<Arc<ServerMetrics>>,
     tail: Arc<SubscriptionRegistry>,
     live_ring: Option<Arc<LiveRing>>,
+    remote_status: Option<Arc<dyn RemoteStatusRelay>>,
 ) -> Result<()> {
     // Pin this connection to one shard per signal (by session id). All of
     // this connection's batches for a signal funnel through the same
@@ -505,7 +532,11 @@ async fn handle(
             protocol_version: PROTOCOL_VERSION_V0,
             writer_id: &config.writer_id,
             session_id,
-            capabilities: 0,
+            capabilities: if remote_status.is_some() {
+                scry_proto::constants::CAP_AGENT_STATUS
+            } else {
+                0
+            },
             suggested_batch_bytes: DEFAULT_SUGGESTED_BATCH_BYTES,
             max_batch_bytes: DEFAULT_MAX_BATCH_BYTES,
             max_inflight_batches: DEFAULT_MAX_INFLIGHT_BATCHES,
@@ -517,6 +548,11 @@ async fn handle(
     // ── Message loop ───────────────────────────────────────────────────
     let counters = Counters::default();
     let signals_announced = hello.signals;
+    let agent_boot_id = Uuid::from_slice(&hello.agent_id).ok();
+    let agent_instance_id = format!("agent/{}", hello.hostname);
+    let owner_token = Uuid::now_v7();
+    let mut last_status_sequence = None;
+    let mut graceful_goodbye = false;
 
     // Per-connection private scratch builders for the decode-out-of-lock
     // ingest path. Lazily initialised on the first batch of each signal:
@@ -1011,6 +1047,64 @@ async fn handle(
                 wr.flush().await?;
             }
 
+            FrameMsg::AgentStatus(status) => {
+                if status.session_id != session_id {
+                    let _ = write_frame(
+                        &mut wr,
+                        &build::error(ERR_SESSION_MISMATCH, "session_id mismatch"),
+                    )
+                    .await;
+                    let _ = wr.flush().await;
+                    break;
+                }
+                if status.snapshot_json.len() > MAX_AGENT_STATUS_JSON_BYTES {
+                    warn!(%peer, bytes = status.snapshot_json.len(), "agent status snapshot too large");
+                    continue;
+                }
+                if last_status_sequence.is_some_and(|last| status.sequence <= last) {
+                    tracing::debug!(%peer, session_id, sequence = status.sequence, "ignoring stale agent status");
+                    continue;
+                }
+                let Some(boot_id) = agent_boot_id else {
+                    warn!(%peer, "invalid agent id in Hello; ignoring agent status");
+                    continue;
+                };
+                let Some(relay) = remote_status.as_ref() else {
+                    continue;
+                };
+                match serde_json::from_str::<crate::StatusSnapshot>(&status.snapshot_json) {
+                    Ok(mut snapshot) => {
+                        snapshot.role = "agent".into();
+                        snapshot.instance_id = agent_instance_id.clone();
+                        snapshot.addr = hello.hostname.clone();
+                        snapshot.now_unix_ms = crate::stats::unix_ms_now();
+                        if !snapshot.data.is_object() {
+                            snapshot.data = serde_json::json!({});
+                        }
+                        let data = snapshot
+                            .data
+                            .as_object_mut()
+                            .expect("object assigned above");
+                        data.insert(
+                            "boot_id".into(),
+                            serde_json::Value::String(boot_id.to_string()),
+                        );
+                        data.insert(
+                            "version".into(),
+                            serde_json::Value::String(hello.agent_version.clone()),
+                        );
+                        relay.report(RemoteAgentStatus {
+                            instance_id: agent_instance_id.clone(),
+                            owner_token,
+                            sequence: status.sequence,
+                            snapshot,
+                        });
+                        last_status_sequence = Some(status.sequence);
+                    }
+                    Err(e) => warn!(%peer, error = %e, "invalid agent status snapshot"),
+                }
+            }
+
             FrameMsg::Ping(p) => {
                 write_frame(&mut wr, &build::pong(p.nonce)).await?;
                 wr.flush().await?;
@@ -1021,6 +1115,7 @@ async fn handle(
                 // Echo a Goodbye back for symmetry, then close.
                 let _ = write_frame(&mut wr, &build::goodbye(GOODBYE_NORMAL, "")).await;
                 let _ = wr.flush().await;
+                graceful_goodbye = true;
                 break;
             }
 
@@ -1180,6 +1275,12 @@ async fn handle(
         }
     }
 
+    if graceful_goodbye && last_status_sequence.is_some() {
+        if let Some(relay) = remote_status.as_ref() {
+            relay.remove(&agent_instance_id, owner_token);
+        }
+    }
+
     let summary = format!(
         "session_id={} batches={} samples={} log_entries={} spans={} profiles={} dummy={} \
          bytes_in={} bytes_out={} rejected={}",
@@ -1304,6 +1405,7 @@ fn short_msg_name(m: &FrameMsg) -> &'static str {
         FrameMsg::Batch(_) => "Batch",
         FrameMsg::BatchAck(_) => "BatchAck",
         FrameMsg::FlowControl(_) => "FlowControl",
+        FrameMsg::AgentStatus(_) => "AgentStatus",
         FrameMsg::Ping(_) => "Ping",
         FrameMsg::Pong(_) => "Pong",
         FrameMsg::Goodbye(_) => "Goodbye",

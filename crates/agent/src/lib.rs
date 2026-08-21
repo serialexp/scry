@@ -5,10 +5,10 @@
 //! binschema wire to a scry ingest server. Logs only, ingest only — the
 //! first dogfood signal.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use clap::Parser;
@@ -27,12 +27,22 @@ mod cri;
 mod discovery;
 mod promparse;
 mod scrape;
+mod status;
 mod stream;
 
 use cri::RawLog;
 use scry_client::Client;
+use status::{AgentRuntimeStats, SnapshotInputs};
 
 const ZSTD_LEVEL: i32 = 3;
+// Scrape results can contain tens of thousands of owned series and samples. Keep
+// only a few waiting behind the batcher so upstream trouble cannot retain a huge
+// number of complete scrapes in memory.
+const METRICS_QUEUE_CAPACITY: usize = 4;
+const METRIC_SAMPLE_WIRE_BYTES: usize = 24;
+const SERIES_WIRE_FIXED_BYTES: usize = 11; // fingerprint + type + label count
+const LABEL_WIRE_FIXED_BYTES: usize = 3; // key length + value length
+const STATUS_INTERVAL: Duration = Duration::from_secs(5);
 
 /// CLI arguments for the `scry agent` subcommand.
 #[derive(Parser, Debug)]
@@ -166,7 +176,8 @@ pub async fn run(args: Args) -> Result<()> {
     let target_registry = discovery::new_target_registry();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (log_tx, mut log_rx) = mpsc::channel::<RawLog>(8192);
-    let (metrics_tx, mut metrics_rx) = mpsc::channel::<scrape::ScrapeResult>(1024);
+    let (metrics_tx, mut metrics_rx) =
+        mpsc::channel::<scrape::ScrapeResult>(METRICS_QUEUE_CAPACITY);
 
     // Config-driven pod-label SD jobs + kubelet scraping (shared by the
     // enable-decision, the pod watch, and the scheduler).
@@ -262,7 +273,7 @@ pub async fn run(args: Args) -> Result<()> {
     let mut conn = Client::connect(
         &args.server_addr,
         agent_id,
-        &hostname,
+        &node,
         signals,
         vec![
             LabelPair {
@@ -308,8 +319,12 @@ pub async fn run(args: Args) -> Result<()> {
     let mut metrics_dropped: u64 = 0;
     let mut batch_id: u64 = 0;
     let mut metrics_batch_id: u64 = 0;
+    let mut runtime_stats = AgentRuntimeStats::default();
+    let mut status_sequence = 0_u64;
     let mut flush_timer = tokio::time::interval(args.flush_interval);
     flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut status_timer = tokio::time::interval(STATUS_INTERVAL);
+    status_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let mut shutting_down = false;
     while !shutting_down {
@@ -321,7 +336,7 @@ pub async fn run(args: Args) -> Result<()> {
                         if pending.record_count >= args.batch_max_lines
                             || pending.approx_bytes >= args.batch_max_bytes
                         {
-                            flush(&mut conn, &mut pending, &mut batch_id, &mut flush_sig).await?;
+                            flush(&mut conn, &mut pending, &mut batch_id, &mut runtime_stats, &mut flush_sig).await?;
                         }
                     }
                     None => {
@@ -333,12 +348,19 @@ pub async fn run(args: Args) -> Result<()> {
             maybe = metrics_rx.recv(), if metrics_enabled => {
                 match maybe {
                     Some(result) => {
-                        ingest_metrics(&mut metrics_pending, result, &metric_pipeline.keep, &mut metrics_keep_cache, &mut metrics_dropped);
-                        if metrics_pending.record_count >= args.batch_max_lines
-                            || metrics_pending.approx_bytes >= args.batch_max_bytes
-                        {
-                            flush_metrics(&mut conn, &mut metrics_pending, &mut metrics_batch_id, &mut flush_sig).await?;
-                        }
+                        ingest_metrics(
+                            &mut conn,
+                            &mut metrics_pending,
+                            result,
+                            &metric_pipeline.keep,
+                            &mut metrics_keep_cache,
+                            &mut metrics_dropped,
+                            args.batch_max_lines,
+                            args.batch_max_bytes,
+                            &mut metrics_batch_id,
+                            &mut runtime_stats,
+                            &mut flush_sig,
+                        ).await?;
                     }
                     None => {
                         // Scheduler gone; disable the arm so we don't spin.
@@ -347,8 +369,29 @@ pub async fn run(args: Args) -> Result<()> {
                 }
             }
             _ = flush_timer.tick() => {
-                flush(&mut conn, &mut pending, &mut batch_id, &mut flush_sig).await?;
-                flush_metrics(&mut conn, &mut metrics_pending, &mut metrics_batch_id, &mut flush_sig).await?;
+                flush(&mut conn, &mut pending, &mut batch_id, &mut runtime_stats, &mut flush_sig).await?;
+                flush_metrics(&mut conn, &mut metrics_pending, &mut metrics_batch_id, &mut runtime_stats, &mut flush_sig).await?;
+            }
+            _ = status_timer.tick() => {
+                if conn.supports_agent_status() {
+                    status_sequence += 1;
+                    let snapshot = runtime_stats.snapshot(SnapshotInputs {
+                        node: &node,
+                        server_addr: &args.server_addr,
+                        log_pending_records: pending.record_count,
+                        log_pending_bytes: pending.approx_bytes,
+                        metric_pending_samples: metrics_pending.record_count,
+                        metric_pending_bytes: metrics_pending.approx_bytes,
+                        log_queue_remaining: log_rx.capacity(),
+                        metric_queue_remaining: metrics_rx.capacity(),
+                        log_dropped: dropped,
+                        metric_dropped: metrics_dropped,
+                    }).to_string();
+                    if let Err(e) = conn.send_agent_status(status_sequence, &snapshot).await {
+                        runtime_stats.status_send_failures += 1;
+                        warn!(error = %e, "agent status report failed");
+                    }
+                }
             }
             _ = main_sig.changed() => {
                 shutting_down = true;
@@ -373,18 +416,33 @@ pub async fn run(args: Args) -> Result<()> {
     }
     while let Ok(result) = metrics_rx.try_recv() {
         ingest_metrics(
+            &mut conn,
             &mut metrics_pending,
             result,
             &metric_pipeline.keep,
             &mut metrics_keep_cache,
             &mut metrics_dropped,
-        );
+            args.batch_max_lines,
+            args.batch_max_bytes,
+            &mut metrics_batch_id,
+            &mut runtime_stats,
+            &mut flush_sig,
+        )
+        .await?;
     }
-    flush(&mut conn, &mut pending, &mut batch_id, &mut flush_sig).await?;
+    flush(
+        &mut conn,
+        &mut pending,
+        &mut batch_id,
+        &mut runtime_stats,
+        &mut flush_sig,
+    )
+    .await?;
     flush_metrics(
         &mut conn,
         &mut metrics_pending,
         &mut metrics_batch_id,
+        &mut runtime_stats,
         &mut flush_sig,
     )
     .await?;
@@ -567,33 +625,48 @@ async fn ingest(
         .push(entry);
 }
 
-/// Fold one scrape result into the pending metrics batch.
+/// Fold one scrape result into bounded metrics batches.
 ///
-/// Series whose labels don't pass the keep-only allow-list are dropped (along
-/// with their samples) before any batch state is touched. The keep/drop
-/// decision is cached per fingerprint, like the log path.
-fn ingest_metrics(
+/// A single kubelet/cAdvisor scrape can be much larger than the configured batch
+/// limit. Check the limit before every sample and flush between samples, repeating
+/// the referenced series entry in each wire batch as required. Series whose labels
+/// don't pass the keep-only allow-list are dropped before batch state is touched.
+#[allow(clippy::too_many_arguments)]
+async fn ingest_metrics(
+    conn: &mut Client,
     pending: &mut MetricsPending,
     result: scrape::ScrapeResult,
     keep_filter: &scry_match::LabelFilter,
     keep_cache: &mut HashMap<u64, bool>,
     dropped: &mut u64,
-) {
-    // Decide keep/drop per series; insert kept series into the dictionary.
-    let mut kept: HashSet<u64> = HashSet::with_capacity(result.series.len());
-    for s in result.series {
+    max_records: u32,
+    max_bytes: usize,
+    batch_id: &mut u64,
+    runtime_stats: &mut AgentRuntimeStats,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<()> {
+    let mut kept = HashMap::with_capacity(result.series.len());
+    for series in result.series {
         let keep = keep_filter.is_empty()
             || *keep_cache
-                .entry(s.fingerprint)
-                .or_insert_with(|| keep_filter.keeps(&s.labels));
+                .entry(series.fingerprint)
+                .or_insert_with(|| keep_filter.keeps(&series.labels));
         if keep {
-            kept.insert(s.fingerprint);
-            pending.series.entry(s.fingerprint).or_insert(s);
+            kept.insert(series.fingerprint, (series, 0_usize));
         }
     }
 
-    for smp in result.samples {
-        if !kept.contains(&smp.fingerprint) {
+    for sample in &result.samples {
+        if let Some((_, remaining)) = kept.get_mut(&sample.fingerprint) {
+            *remaining += 1;
+        }
+    }
+
+    for sample in result.samples {
+        let Some(series_bytes) = kept
+            .get(&sample.fingerprint)
+            .map(|(series, _)| approx_series_bytes(series))
+        else {
             *dropped += 1;
             if dropped.is_multiple_of(100_000) {
                 info!(
@@ -602,18 +675,76 @@ fn ingest_metrics(
                 );
             }
             continue;
+        };
+
+        let next_bytes = if pending.series.contains_key(&sample.fingerprint) {
+            METRIC_SAMPLE_WIRE_BYTES
+        } else {
+            series_bytes.saturating_add(METRIC_SAMPLE_WIRE_BYTES)
+        };
+        if metrics_batch_would_overflow(pending, next_bytes, max_records, max_bytes) {
+            flush_metrics(conn, pending, batch_id, runtime_stats, shutdown).await?;
+        }
+
+        let uses_left = &mut kept
+            .get_mut(&sample.fingerprint)
+            .expect("kept sample has a remaining-use count")
+            .1;
+        *uses_left -= 1;
+
+        // A flush empties the dictionary, so re-check before accounting/inserting.
+        if !pending.series.contains_key(&sample.fingerprint) {
+            pending.approx_bytes = pending.approx_bytes.saturating_add(series_bytes);
+            let series = if *uses_left == 0 {
+                kept.remove(&sample.fingerprint)
+                    .expect("kept series remains until its final sample")
+                    .0
+            } else {
+                kept.get(&sample.fingerprint)
+                    .expect("kept series remains until its final sample")
+                    .0
+                    .clone()
+            };
+            pending.series.insert(sample.fingerprint, series);
         }
         if pending.record_count == 0 {
-            pending.ts_min = smp.ts_unix_nano;
-            pending.ts_max = smp.ts_unix_nano;
+            pending.ts_min = sample.ts_unix_nano;
+            pending.ts_max = sample.ts_unix_nano;
         } else {
-            pending.ts_min = pending.ts_min.min(smp.ts_unix_nano);
-            pending.ts_max = pending.ts_max.max(smp.ts_unix_nano);
+            pending.ts_min = pending.ts_min.min(sample.ts_unix_nano);
+            pending.ts_max = pending.ts_max.max(sample.ts_unix_nano);
         }
-        pending.approx_bytes += 24; // fingerprint + ts + value, roughly
+        pending.approx_bytes = pending
+            .approx_bytes
+            .saturating_add(METRIC_SAMPLE_WIRE_BYTES);
         pending.record_count += 1;
-        pending.samples.push(smp);
+        pending.samples.push(sample);
     }
+    Ok(())
+}
+
+fn approx_series_bytes(series: &SeriesDictEntry) -> usize {
+    series
+        .labels
+        .iter()
+        .fold(SERIES_WIRE_FIXED_BYTES, |size, label| {
+            size.saturating_add(
+                LABEL_WIRE_FIXED_BYTES
+                    .saturating_add(label.key.len())
+                    .saturating_add(label.value.len()),
+            )
+        })
+}
+
+fn metrics_batch_would_overflow(
+    pending: &MetricsPending,
+    next_bytes: usize,
+    max_records: u32,
+    max_bytes: usize,
+) -> bool {
+    pending.record_count > 0
+        && (pending.record_count >= max_records
+            || pending.approx_bytes.saturating_add(next_bytes) > max_bytes)
 }
 
 /// Encode + compress the pending batch and ship it, reconnecting with capped
@@ -627,6 +758,7 @@ async fn flush(
     conn: &mut Client,
     pending: &mut Pending,
     batch_id: &mut u64,
+    runtime_stats: &mut AgentRuntimeStats,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<()> {
     if pending.record_count == 0 {
@@ -642,6 +774,7 @@ async fn flush(
     let uncompressed_size = payload.len() as u32;
     let compressed = zstd::encode_all(payload.as_slice(), ZSTD_LEVEL)
         .expect("zstd encode_all is infallible on Vec input");
+    let compressed_size = compressed.len();
 
     // The session id changes on every reconnect, so `send_batch_stamped`
     // stamps the live one into the frame on each attempt — build a placeholder.
@@ -657,7 +790,8 @@ async fn flush(
         payload: compressed,
     });
 
-    if ship_frame(conn, &mut frame, shutdown).await? {
+    if ship_frame(conn, &mut frame, runtime_stats, shutdown).await? {
+        runtime_stats.record_log_batch(record_count, uncompressed_size, compressed_size);
         info!(
             batch_id = *batch_id,
             records = record_count,
@@ -675,6 +809,7 @@ async fn flush_metrics(
     conn: &mut Client,
     pending: &mut MetricsPending,
     batch_id: &mut u64,
+    runtime_stats: &mut AgentRuntimeStats,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<()> {
     if pending.record_count == 0 {
@@ -685,12 +820,16 @@ async fn flush_metrics(
     let record_count = pending.record_count;
     let (ts_min, ts_max) = (pending.ts_min, pending.ts_max);
 
+    let series_count = series.len();
+    let encode_started = Instant::now();
     let payload = MetricsBatch { series, samples }
         .encode()
         .expect("MetricsBatch encode is infallible for well-formed inputs");
     let uncompressed_size = payload.len() as u32;
     let compressed = zstd::encode_all(payload.as_slice(), ZSTD_LEVEL)
         .expect("zstd encode_all is infallible on Vec input");
+    let compressed_size = compressed.len();
+    let encode_elapsed = encode_started.elapsed();
 
     let mut frame = build::batch(build::BatchArgs {
         session_id: 0,
@@ -704,10 +843,17 @@ async fn flush_metrics(
         payload: compressed,
     });
 
-    if ship_frame(conn, &mut frame, shutdown).await? {
+    let send_started = Instant::now();
+    if ship_frame(conn, &mut frame, runtime_stats, shutdown).await? {
+        runtime_stats.record_metric_batch(record_count, uncompressed_size, compressed_size);
         info!(
             batch_id = *batch_id,
+            series = series_count,
             samples = record_count,
+            uncompressed_bytes = uncompressed_size,
+            compressed_bytes = compressed_size,
+            encode_ms = encode_elapsed.as_millis(),
+            send_ms = send_started.elapsed().as_millis(),
             "shipped metrics batch"
         );
         *batch_id += 1;
@@ -724,6 +870,7 @@ async fn flush_metrics(
 async fn ship_frame(
     conn: &mut Client,
     frame: &mut scry_proto::Frame,
+    runtime_stats: &mut AgentRuntimeStats,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<bool> {
     let mut backoff = Duration::from_millis(200);
@@ -741,8 +888,10 @@ async fn ship_frame(
                 warn!("shutdown during reconnect; dropping in-flight batch");
                 return Ok(false);
             }
+            runtime_stats.reconnect_attempts += 1;
             match conn.reconnect().await {
                 Ok(()) => {
+                    runtime_stats.reconnect_successes += 1;
                     info!("reconnected to ingest server");
                     break;
                 }
@@ -947,6 +1096,64 @@ mod tests {
             .iter()
             .find(|p| p.key == key)
             .map(|p| p.value.clone())
+    }
+
+    #[test]
+    fn metrics_byte_estimate_includes_series_labels() {
+        let series = SeriesDictEntry {
+            fingerprint: 1,
+            metric_type: 0,
+            labels: vec![
+                LabelPair {
+                    key: "__name__".into(),
+                    value: "container_cpu_usage_seconds_total".into(),
+                },
+                LabelPair {
+                    key: "container".into(),
+                    value: "api".into(),
+                },
+            ],
+        };
+
+        let expected = SERIES_WIRE_FIXED_BYTES
+            + LABEL_WIRE_FIXED_BYTES
+            + "__name__".len()
+            + "container_cpu_usage_seconds_total".len()
+            + LABEL_WIRE_FIXED_BYTES
+            + "container".len()
+            + "api".len();
+        assert_eq!(approx_series_bytes(&series), expected);
+    }
+
+    #[test]
+    fn metrics_batch_limits_are_checked_before_adding_a_sample() {
+        let pending = MetricsPending {
+            record_count: 5_000,
+            approx_bytes: 120_000,
+            ..MetricsPending::default()
+        };
+        assert!(metrics_batch_would_overflow(
+            &pending,
+            METRIC_SAMPLE_WIRE_BYTES,
+            5_000,
+            usize::MAX
+        ));
+
+        let pending = MetricsPending {
+            record_count: 1,
+            approx_bytes: 100,
+            ..MetricsPending::default()
+        };
+        assert!(metrics_batch_would_overflow(&pending, 51, 5_000, 150));
+        assert!(!metrics_batch_would_overflow(&pending, 50, 5_000, 150));
+    }
+
+    #[test]
+    fn one_oversized_metric_is_allowed_into_an_empty_batch() {
+        let pending = MetricsPending::default();
+        assert!(!metrics_batch_would_overflow(
+            &pending, 10_000, 5_000, 1_000
+        ));
     }
 
     #[test]

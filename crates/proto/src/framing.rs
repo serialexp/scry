@@ -128,6 +128,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn roundtrip_agent_status() {
+        let mut buf = Vec::new();
+        let frame = build::agent_status(build::AgentStatusArgs {
+            session_id: 42,
+            sequence: 7,
+            snapshot_json: r#"{"role":"agent"}"#,
+        });
+        write_frame(&mut buf, &frame).await.unwrap();
+        assert_eq!(buf[4], 0x21, "AgentStatus keeps its assigned wire tag");
+
+        let mut cursor = std::io::Cursor::new(buf);
+        let back: Frame = read_frame(&mut cursor).await.unwrap();
+        match back.msg {
+            FrameMsg::AgentStatus(s) => {
+                assert_eq!(s.session_id, 42);
+                assert_eq!(s.sequence, 7);
+                assert_eq!(s.snapshot_json, r#"{"role":"agent"}"#);
+            }
+            other => panic!("expected AgentStatus, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
     async fn rejects_oversized_frame() {
         let mut buf = Vec::new();
         // u32 length = MAX_FRAME_BYTES + 1, no body

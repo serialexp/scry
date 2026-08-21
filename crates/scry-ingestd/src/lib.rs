@@ -13,6 +13,8 @@
 //!   source docker/garage/.env
 //!   scry-ingestd --listen 127.0.0.1:4000 --storage --wal-dir ./wal
 
+mod agent_status;
+
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use object_store::ObjectStore;
@@ -31,36 +33,19 @@ use scry_server::{
     ShardedPipeline, TracesShards, INGEST_SHARDS,
 };
 use scry_valkey::{
-    discover_status_blobs, parse_envelope, subscribe_blocks, StatusRegistration, TailRegistration,
-    ValkeyClient, ValkeyLeaseProvider, ValkeySink, STATUS_TTL, VALKEY_URL_ENV,
+    parse_envelope, subscribe_blocks, StatusRegistration, TailRegistration, ValkeyClient,
+    ValkeyLeaseProvider, ValkeySink, STATUS_TTL, VALKEY_URL_ENV,
 };
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use agent_status::{AgentStatusRelay, MergedFleetSource};
+
 /// The convergence/maintenance channels cover every signal that has a
 /// pipeline (Dummy included — the smoke harness exercises it).
 const ALL_SIGNALS: [&str; 5] = ["dummy", "metrics", "logs", "traces", "profiles"];
-
-/// Valkey-backed [`FleetSource`] for the status page (D-057): enumerates every
-/// live instance's published snapshot with one Lua `SCAN`. Keeps `scry-server`
-/// Valkey-agnostic (it takes a `&dyn FleetSource`).
-struct ValkeyFleetSource {
-    valkey: ValkeyClient,
-}
-
-#[async_trait::async_trait]
-impl FleetSource for ValkeyFleetSource {
-    async fn blobs(&self) -> Vec<String> {
-        discover_status_blobs(self.valkey.inner())
-            .await
-            .unwrap_or_else(|e| {
-                warn!(error = %e, "status fleet discovery failed");
-                Vec::new()
-            })
-    }
-}
 
 /// CLI arguments for the `scry ingest` subcommand.
 #[derive(Parser, Debug)]
@@ -622,6 +607,8 @@ pub async fn run(args: Args) -> Result<()> {
     if let Some(m) = stats_metrics.as_ref() {
         server = server.with_metrics(m.clone());
     }
+    let (agent_status_relay, local_agents) = AgentStatusRelay::new(valkey.clone());
+    server = server.with_remote_status_relay(agent_status_relay);
     // Time-based block flush: seal idle/low-volume blocks so they become
     // queryable promptly (0 = disabled). Only relevant when storage is on
     // — with no pipelines there's nothing to flush.
@@ -671,9 +658,10 @@ pub async fn run(args: Args) -> Result<()> {
                 }
                 None => None,
             };
-            let fleet: Option<Arc<dyn FleetSource>> = valkey
-                .as_ref()
-                .map(|c| Arc::new(ValkeyFleetSource { valkey: c.clone() }) as Arc<dyn FleetSource>);
+            let fleet: Option<Arc<dyn FleetSource>> = Some(Arc::new(MergedFleetSource {
+                valkey: valkey.clone(),
+                local: local_agents.clone(),
+            }));
             let local: Arc<dyn LocalStatus> = metrics;
             let self_id = writer_uuid.to_string();
             let task = tokio::spawn(async move {

@@ -35,13 +35,13 @@ pub mod framing;
 pub mod streaming;
 
 pub use generated::{
-    Batch, BatchAck, BatchAckInput, BatchAckOutput, BatchInput, BatchOutput, DummyBatch,
-    DummyRecord, Error as ErrorMsg, ErrorInput, ErrorOutput, FlowControl, FlowControlInput,
-    FlowControlOutput, Frame, FrameMsg, Goodbye, GoodbyeInput, GoodbyeOutput, Hello, HelloAck,
-    HelloAckInput, HelloAckOutput, HelloInput, HelloOutput, LabelPair, LogEntry, LogStream,
-    LogsBatch, MetricSample, MetricsBatch, Ping, PingInput, PingOutput, Pong, PongInput,
-    PongOutput, ProfileBlob, ProfilesBatch, ResourceEntry, ScopeEntry, SeriesDictEntry, Span,
-    SpanEvent, SpanLink, TracesBatch,
+    AgentStatus, AgentStatusInput, AgentStatusOutput, Batch, BatchAck, BatchAckInput,
+    BatchAckOutput, BatchInput, BatchOutput, DummyBatch, DummyRecord, Error as ErrorMsg,
+    ErrorInput, ErrorOutput, FlowControl, FlowControlInput, FlowControlOutput, Frame, FrameMsg,
+    Goodbye, GoodbyeInput, GoodbyeOutput, Hello, HelloAck, HelloAckInput, HelloAckOutput,
+    HelloInput, HelloOutput, LabelPair, LogEntry, LogStream, LogsBatch, MetricSample, MetricsBatch,
+    Ping, PingInput, PingOutput, Pong, PongInput, PongOutput, ProfileBlob, ProfilesBatch,
+    ResourceEntry, ScopeEntry, SeriesDictEntry, Span, SpanEvent, SpanLink, TracesBatch,
 };
 
 pub use generated_query::{

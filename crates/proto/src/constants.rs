@@ -7,6 +7,10 @@
 /// Wire-format version. `(major << 8) | minor`.
 pub const PROTOCOL_VERSION_V0: u16 = 0x0001;
 
+// ── Hello/HelloAck.capabilities bitmask ────────────────────────────────
+/// Server accepts best-effort `AgentStatus` control frames after handshake.
+pub const CAP_AGENT_STATUS: u32 = 0x0000_0001;
+
 // ── Hello.signals bitmask ──────────────────────────────────────────────
 pub const SIGNAL_BIT_METRICS: u8 = 0x01;
 pub const SIGNAL_BIT_LOGS: u8 = 0x02;

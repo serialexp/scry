@@ -3012,3 +3012,43 @@ flags.
 **Deferred:** a per-query cost budget / admission control (hard row/byte cap that
 aborts a scan mid-flight); a `slow query` log keyed on elapsed time; surfacing the
 default-applied fact to the client (it's server-log-only today).
+
+## D-060 — Agents relay stateless host status through ingestd (2026-08-20)
+
+**Decision:** Scry agents report current operational status over their existing native
+TCP ingest session. Agents do not connect to Valkey and do not persist an identity.
+The logical fleet identity is `agent/<node>` where `node` is `--node-name`/`NODE_NAME`
+when configured and otherwise the machine hostname. The UUIDv7 generated at process
+startup remains a boot identity used to distinguish and fence restarts, not a fleet
+key.
+
+A new best-effort `AgentStatus` frame contains the live session id, a monotonically
+increasing sequence, and an existing `StatusSnapshot` JSON document. It is negotiated
+with `CAP_AGENT_STATUS` in `HelloAck`; an agent sends no such frames to an older ingest
+server or gateway that does not advertise the bit. This keeps protocol v0.1 and permits
+a server-first rolling upgrade despite old decoders rejecting unknown frame tags.
+Status frames receive no acknowledgement and consume no batch inflight credit.
+
+The agent sends an initial report and refreshes it every five seconds. Reports cover
+accurately available runtime state: queues and pending batches, successful batches,
+records and wire sizes, filter drops, reconnects, RSS and uptime. Prometheus-scrapable
+`scry_*` metrics remain separate future work: status is current internal accounting,
+not a historical telemetry transport.
+
+The ingest connection authenticates the report's host/version/boot identity through
+`Hello`, validates its session and sequence, canonicalizes the envelope, and hands it
+to a non-blocking relay. ingestd retains a local copy so its status endpoint shows
+connected agents without Valkey. When Valkey is configured it also publishes the
+snapshot under the existing `scry/status/*` discovery prefix with a server-controlled
+20-second TTL. Updates and deletion are fenced by a random per-connection owner token
+stored in a second expiring owner key, so a late old connection cannot overwrite or
+delete its replacement.
+
+A graceful protocol `Goodbye` immediately removes the report if that connection still
+owns it. EOF, process death, network partition, and ingestd death do not actively
+delete it; the TTL removes it within 20 seconds. ingestd never renews an agent report
+without receiving a fresh frame. Status/Valkey failures never block or fail data
+ingestion.
+
+The standalone `/stats.json`/HTML status surface includes agents. Forwarding this fleet
+through queryd into the SolidJS Fleet screen remains the separate D-057 Phase-2 work.

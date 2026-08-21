@@ -12,7 +12,7 @@
 use anyhow::{bail, Context, Result};
 use scry_proto::{
     build,
-    constants::{ACK_ACCEPTED, GOODBYE_NORMAL, PROTOCOL_VERSION_V0},
+    constants::{ACK_ACCEPTED, CAP_AGENT_STATUS, GOODBYE_NORMAL, PROTOCOL_VERSION_V0},
     framing::{read_frame, write_frame},
     generated::FrameMsg,
     Frame, LabelPair,
@@ -45,6 +45,7 @@ struct Established {
     ack_rx: mpsc::Receiver<()>,
     max_inflight: usize,
     session_id: u64,
+    capabilities: u32,
     reader: JoinHandle<()>,
 }
 
@@ -63,6 +64,7 @@ pub struct Client {
     max_inflight: usize,
     inflight: usize,
     session_id: u64,
+    capabilities: u32,
     reader: JoinHandle<()>,
 }
 
@@ -92,6 +94,7 @@ impl Client {
             max_inflight: est.max_inflight,
             inflight: 0,
             session_id: est.session_id,
+            capabilities: est.capabilities,
             reader: est.reader,
         })
     }
@@ -154,6 +157,7 @@ impl Client {
             ack_rx,
             max_inflight,
             session_id,
+            capabilities: hello_ack.capabilities,
             reader,
         })
     }
@@ -172,6 +176,7 @@ impl Client {
         self.ack_rx = est.ack_rx;
         self.max_inflight = est.max_inflight;
         self.session_id = est.session_id;
+        self.capabilities = est.capabilities;
         self.reader = est.reader;
         self.inflight = 0;
         Ok(())
@@ -181,6 +186,26 @@ impl Client {
     /// `BatchArgs.session_id`.
     pub fn session_id(&self) -> u64 {
         self.session_id
+    }
+
+    pub fn supports_agent_status(&self) -> bool {
+        self.capabilities & CAP_AGENT_STATUS != 0
+    }
+
+    /// Send one best-effort agent status report when the server negotiated support.
+    /// Control frames do not consume batch inflight credit and receive no ack.
+    pub async fn send_agent_status(&mut self, sequence: u64, snapshot_json: &str) -> Result<bool> {
+        if !self.supports_agent_status() {
+            return Ok(false);
+        }
+        let frame = build::agent_status(build::AgentStatusArgs {
+            session_id: self.session_id,
+            sequence,
+            snapshot_json,
+        });
+        write_frame(&mut self.wr, &frame).await?;
+        self.wr.flush().await?;
+        Ok(true)
     }
 
     /// Stamp the current session id into a built Batch frame and send it.

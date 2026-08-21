@@ -24,6 +24,7 @@
             { "type": "Batch",       "when": "value === 0x10" },
             { "type": "BatchAck",    "when": "value === 0x11" },
             { "type": "FlowControl", "when": "value === 0x20" },
+            { "type": "AgentStatus",  "when": "value === 0x21" },
             { "type": "Ping",        "when": "value === 0x30" },
             { "type": "Pong",        "when": "value === 0x31" },
             { "type": "Goodbye",     "when": "value === 0x40" },
@@ -103,6 +104,16 @@
         { "name": "max_bytes_per_sec", "type": "uint32" },
         { "name": "max_batches_inflight", "type": "uint16" },
         { "name": "valid_for_ms", "type": "uint32" }
+      ]
+    },
+
+    "AgentStatus": {
+      "description": "Best-effort agent-to-ingester operational status. Sent only when HelloAck advertises CAP_AGENT_STATUS. The server validates the live session, canonicalizes the JSON StatusSnapshot against Hello identity, and relays it to the fleet registry without acknowledging it.",
+      "sequence": [
+        { "name": "tag", "type": "uint8", "const": 33 },
+        { "name": "session_id", "type": "uint64" },
+        { "name": "sequence", "type": "uint64" },
+        { "name": "snapshot_json", "type": "string", "kind": "length_prefixed", "length_type": "uint32", "encoding": "utf8" }
       ]
     },
 

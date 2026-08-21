@@ -14,6 +14,7 @@ pub enum FrameMsg {
     Batch(BatchOutput),
     BatchAck(BatchAckOutput),
     FlowControl(FlowControlOutput),
+    AgentStatus(AgentStatusOutput),
     Ping(PingOutput),
     Pong(PongOutput),
     Goodbye(GoodbyeOutput),
@@ -106,6 +107,16 @@ impl FrameMsg {
                 encoder.write_uint16(v.max_batches_inflight, Endianness::BigEndian);
                 encoder.write_uint32(v.valid_for_ms, Endianness::BigEndian);
             }
+            FrameMsg::AgentStatus(v) => {
+                encoder.write_uint8(33);
+                encoder.write_uint64(v.session_id, Endianness::BigEndian);
+                encoder.write_uint64(v.sequence, Endianness::BigEndian);
+                encoder.write_uint32(v.snapshot_json.len() as u32, Endianness::BigEndian);
+                let string_bytes: &[u8] = v.snapshot_json.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+            }
             FrameMsg::Ping(v) => {
                 encoder.write_uint8(48);
                 encoder.write_uint64(v.nonce, Endianness::BigEndian);
@@ -195,6 +206,7 @@ impl FrameMsg {
             FrameMsg::Batch(_) => "Batch",
             FrameMsg::BatchAck(_) => "BatchAck",
             FrameMsg::FlowControl(_) => "FlowControl",
+            FrameMsg::AgentStatus(_) => "AgentStatus",
             FrameMsg::Ping(_) => "Ping",
             FrameMsg::Pong(_) => "Pong",
             FrameMsg::Goodbye(_) => "Goodbye",
@@ -232,6 +244,10 @@ impl FrameMsg {
         decoder.seek(start_pos)?;
         if let Ok(v) = FlowControlOutput::decode_with_decoder(decoder) {
             return Ok(FrameMsg::FlowControl(v));
+        }
+        decoder.seek(start_pos)?;
+        if let Ok(v) = AgentStatusOutput::decode_with_decoder(decoder) {
+            return Ok(FrameMsg::AgentStatus(v));
         }
         decoder.seek(start_pos)?;
         if let Ok(v) = PingOutput::decode_with_decoder(decoder) {
@@ -894,6 +910,96 @@ impl From<FlowControlInput> for FlowControlOutput {
             max_bytes_per_sec: i.max_bytes_per_sec,
             max_batches_inflight: i.max_batches_inflight,
             valid_for_ms: i.valid_for_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentStatusInput {
+    pub session_id: u64,
+    pub sequence: u64,
+    pub snapshot_json: std::string::String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentStatusOutput {
+    pub tag: u8,
+    pub session_id: u64,
+    pub sequence: u64,
+    pub snapshot_json: std::string::String,
+}
+
+pub type AgentStatus = AgentStatusOutput;
+
+impl AgentStatusInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(33);
+        encoder.write_u64_be(self.session_id);
+        encoder.write_u64_be(self.sequence);
+        encoder.write_u32_be(self.snapshot_json.len() as u32);
+        let string_bytes: &[u8] = self.snapshot_json.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        Ok(())
+    }
+
+}
+
+impl AgentStatusOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let tag = decoder.read_byte()?;
+        if tag != 33u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 33, got {}", tag)));
+        }
+        let session_id = decoder.read_u64_be()?;
+        let sequence = decoder.read_u64_be()?;
+        let length = decoder.read_u32_be()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let snapshot_json = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        Ok(Self {
+            tag,
+            session_id,
+            sequence,
+            snapshot_json,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        AgentStatusInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        AgentStatusInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<AgentStatusOutput> for AgentStatusInput {
+    fn from(o: AgentStatusOutput) -> Self {
+        Self {
+            session_id: o.session_id,
+            sequence: o.sequence,
+            snapshot_json: o.snapshot_json,
+        }
+    }
+}
+
+impl From<AgentStatusInput> for AgentStatusOutput {
+    fn from(i: AgentStatusInput) -> Self {
+        Self {
+            tag: 33u8,
+            session_id: i.session_id,
+            sequence: i.sequence,
+            snapshot_json: i.snapshot_json,
         }
     }
 }

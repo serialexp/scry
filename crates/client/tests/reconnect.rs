@@ -10,7 +10,7 @@
 use scry_client::Client;
 use scry_proto::{
     build,
-    constants::{ACK_ACCEPTED, PROTOCOL_VERSION_V0, SIGNAL_BIT_LOGS},
+    constants::{ACK_ACCEPTED, CAP_AGENT_STATUS, PROTOCOL_VERSION_V0, SIGNAL_BIT_LOGS},
     framing::{read_frame, write_frame},
     generated::FrameMsg,
     Frame,
@@ -91,6 +91,48 @@ fn test_batch(batch_id: u64) -> Frame {
         uncompressed_size: 0,
         payload: Vec::new(),
     })
+}
+
+#[tokio::test]
+async fn agent_status_is_capability_gated_and_session_stamped() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (rd, wr) = stream.into_split();
+        let mut rd = BufReader::new(rd);
+        let mut wr = BufWriter::new(wr);
+        let _ = read_frame::<Frame, _>(&mut rd).await.unwrap();
+        write_frame(
+            &mut wr,
+            &build::hello_ack(build::HelloAckArgs {
+                protocol_version: PROTOCOL_VERSION_V0,
+                writer_id: "test",
+                session_id: 333,
+                capabilities: CAP_AGENT_STATUS,
+                suggested_batch_bytes: 0,
+                max_batch_bytes: 0,
+                max_inflight_batches: 1,
+            }),
+        )
+        .await
+        .unwrap();
+        wr.flush().await.unwrap();
+        match read_frame::<Frame, _>(&mut rd).await.unwrap().msg {
+            FrameMsg::AgentStatus(status) => {
+                assert_eq!(status.session_id, 333);
+                assert_eq!(status.sequence, 9);
+            }
+            other => panic!("expected AgentStatus, got {other:?}"),
+        }
+    });
+
+    let mut client = Client::connect(&addr, [0; 16], "node", SIGNAL_BIT_LOGS, vec![])
+        .await
+        .unwrap();
+    assert!(client.supports_agent_status());
+    assert!(client.send_agent_status(9, "{}").await.unwrap());
+    server.await.unwrap();
 }
 
 #[tokio::test]

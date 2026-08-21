@@ -351,6 +351,7 @@ fn short_msg_name(m: &FrameMsg) -> &'static str {
         FrameMsg::Batch(_) => "Batch",
         FrameMsg::BatchAck(_) => "BatchAck",
         FrameMsg::FlowControl(_) => "FlowControl",
+        FrameMsg::AgentStatus(_) => "AgentStatus",
         FrameMsg::Ping(_) => "Ping",
         FrameMsg::Pong(_) => "Pong",
         FrameMsg::Goodbye(_) => "Goodbye",
