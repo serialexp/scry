@@ -80,9 +80,12 @@ function toPlot(vd: VolumeData): { data: uPlot.AlignedData; opts: Partial<uPlot.
       scales: { x: { time: true }, y: { range: (_u, _min, max) => [0, max] } },
       legend: { show: true, live: true },
       axes: [
-        {},
+        { stroke: "#9a9385", grid: { stroke: "#2b2822" }, ticks: { stroke: "#38342b" } },
         {
           size: 44,
+          stroke: "#9a9385",
+          grid: { stroke: "#2b2822" },
+          ticks: { stroke: "#38342b" },
           values: (_u, splits) => splits.map((v) => (v >= 1000 ? `${Math.round(v / 1000)}k` : String(v))),
         },
       ],

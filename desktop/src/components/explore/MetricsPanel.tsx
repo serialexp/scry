@@ -14,6 +14,8 @@ import {
   For,
   Show,
   createEffect,
+  createMemo,
+  createSignal,
   onCleanup,
   onMount,
   type Component,
@@ -66,35 +68,61 @@ function toPlot(mc: MetricsChartData): {
       cursor: { drag: { x: true, y: false, setScale: false } },
       scales: { x: { time: true } },
       legend: { show: true, live: true },
-      axes: [{}, { size: 52 }],
+      axes: [
+        { stroke: "#9a9385", grid: { stroke: "#2b2822" }, ticks: { stroke: "#38342b" } },
+        {
+          size: 52,
+          stroke: "#9a9385",
+          grid: { stroke: "#2b2822" },
+          ticks: { stroke: "#38342b" },
+        },
+      ],
     },
   };
 }
 
 const MetricsPanel: Component = () => {
   let host!: HTMLDivElement;
-  let metricSel: HTMLSelectElement | undefined;
+  let metricInput!: HTMLInputElement;
   let plot: uPlot | null = null;
   let ro: ResizeObserver | null = null;
 
+  const [metricSearch, setMetricSearch] = createSignal("");
+  const [metricPickerOpen, setMetricPickerOpen] = createSignal(false);
   const width = () => Math.max(320, host?.clientWidth ?? 640);
   const metricNames = () => labelValues()["__name__"] ?? [];
+  const filteredMetricNames = createMemo(() => {
+    const q = metricSearch().trim().toLowerCase();
+    return q === ""
+      ? metricNames()
+      : metricNames().filter((name) => name.toLowerCase().includes(q));
+  });
 
   // Populate the metric picker whenever we're on the Metrics signal.
   createEffect(() => {
     if (state.signal === "Metrics") void ensureLabelValues("__name__");
   });
 
-  // Re-apply the selected metric whenever the option list changes. A label
-  // refresh (on a scope change) repopulates the <option>s; a native <select>
-  // whose `value` was set before its options existed silently resets to the
-  // placeholder, so without this the picker would show "— select a metric —"
-  // while the matcher (and the chart) still target the chosen metric.
+  // Keep the search input aligned when another control changes the __name__
+  // matcher. While the picker is open, preserve what the user is typing.
   createEffect(() => {
-    metricNames(); // track: re-run when the options list changes
-    const m = selectedMetric();
-    if (metricSel && metricSel.value !== m) metricSel.value = m;
+    const metric = selectedMetric();
+    if (!metricPickerOpen()) setMetricSearch(metric);
   });
+
+  function chooseMetric(name: string): void {
+    setMetricSearch(name);
+    setMetricPickerOpen(false);
+    if (name !== selectedMetric()) setMetricName(name);
+  }
+
+  function closeMetricPickerSoon(): void {
+    // Let an option's pointer event run before blur closes the popup.
+    window.setTimeout(() => {
+      setMetricPickerOpen(false);
+      setMetricSearch(selectedMetric());
+    });
+  }
 
   // Handle a completed drag-select: brushed pixel span → time range → re-run.
   function onSelect(u: uPlot): void {
@@ -154,17 +182,67 @@ const MetricsPanel: Component = () => {
         <div class="metrics-controls">
           <label class="metric-field">
             <span>metric</span>
-            <select
-              ref={metricSel}
-              class="metric-select"
-              value={selectedMetric()}
-              onChange={(e) => setMetricName(e.currentTarget.value)}
-            >
-              <option value="">— select a metric —</option>
-              <For each={metricNames()}>
-                {(n) => <option value={n}>{n}</option>}
-              </For>
-            </select>
+            <div class="metric-combobox">
+              <input
+                ref={metricInput}
+                class="metric-search"
+                type="search"
+                role="combobox"
+                aria-label="metric"
+                aria-autocomplete="list"
+                aria-expanded={metricPickerOpen()}
+                aria-controls="metric-options"
+                autocomplete="off"
+                placeholder="Search metrics…"
+                value={metricSearch()}
+                onFocus={() => setMetricPickerOpen(true)}
+                onInput={(e) => {
+                  setMetricSearch(e.currentTarget.value);
+                  setMetricPickerOpen(true);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Escape") {
+                    setMetricPickerOpen(false);
+                    setMetricSearch(selectedMetric());
+                    metricInput.blur();
+                  } else if (e.key === "Enter") {
+                    e.preventDefault();
+                    const exact = metricNames().find(
+                      (name) => name.toLowerCase() === metricSearch().trim().toLowerCase(),
+                    );
+                    const match = exact ?? filteredMetricNames()[0];
+                    if (match) chooseMetric(match);
+                  }
+                }}
+                onBlur={closeMetricPickerSoon}
+              />
+              <Show when={metricPickerOpen()}>
+                <div id="metric-options" class="metric-options" role="listbox">
+                  <Show
+                    when={filteredMetricNames().length > 0}
+                    fallback={<div class="metric-option-empty">No matching metrics</div>}
+                  >
+                    <For each={filteredMetricNames()}>
+                      {(name) => (
+                        <button
+                          type="button"
+                          class="metric-option"
+                          classList={{ selected: name === selectedMetric() }}
+                          role="option"
+                          aria-selected={name === selectedMetric()}
+                          onPointerDown={(e) => {
+                            e.preventDefault();
+                            chooseMetric(name);
+                          }}
+                        >
+                          {name}
+                        </button>
+                      )}
+                    </For>
+                  </Show>
+                </div>
+              </Show>
+            </div>
           </label>
 
           <label class="metric-field">
@@ -208,8 +286,8 @@ const MetricsPanel: Component = () => {
               ? "Loading chart…"
               : metricsChartStatus() === "error"
                 ? "Chart query failed."
-                : metricsChartStatus() === "empty"
-                  ? "Pick a metric and a time range to chart it."
+                : metricsChartStatus() === "no-data"
+                  ? "No data found for this metric in the selected time range."
                   : "Pick a metric and a time range to chart it."}
           </div>
         </Show>

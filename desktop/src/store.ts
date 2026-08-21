@@ -775,7 +775,8 @@ function decodeVolume(table: Table, stepMs: number): VolumeData {
 const [metricAgg, setMetricAggSig] = createSignal<AggFn>("avg");
 const [metricGrouped, setMetricGroupedSig] = createSignal(false);
 const [metricsChartData, setMetricsChartData] = createSignal<MetricsChartData | null>(null);
-const [metricsChartStatus, setMetricsChartStatus] = createSignal<VolumeStatus>("idle");
+type MetricsChartStatus = VolumeStatus | "no-data";
+const [metricsChartStatus, setMetricsChartStatus] = createSignal<MetricsChartStatus>("idle");
 export { metricAgg, metricGrouped, metricsChartData, metricsChartStatus };
 
 /** The metric currently charted — the value of the `__name__` matcher, or ""
@@ -926,7 +927,7 @@ export async function runMetricsChart(): Promise<void> {
 
     const decoded = decodeMetricsChart(res.table, stepMs, grouped, names);
     setMetricsChartData(decoded);
-    setMetricsChartStatus(decoded.buckets.length === 0 ? "empty" : "ready");
+    setMetricsChartStatus(decoded.buckets.length === 0 ? "no-data" : "ready");
   } catch (e) {
     if (seq !== metricsChartSeq) return;
     if (e instanceof UnauthorizedError) {
