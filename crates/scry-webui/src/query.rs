@@ -1,26 +1,20 @@
-//! `POST /api/query` — the dumb byte-pipe to `scry-queryd` + `GET /api/targets`.
+//! `POST /api/query` — the dumb streaming byte-pipe to `scry-queryd` +
+//! `GET /api/targets`.
 //!
-//! The whole query wire protocol (binschema framing, the `QueryFrame` union,
-//! Arrow IPC decoding) lives in the TypeScript frontend. This handler has *zero*
-//! protocol knowledge: it dials one of the server's configured upstream
-//! `scry-queryd` targets, writes the already-framed request bytes, reads the
-//! response to EOF, and hands the raw bytes back — exactly what the Tauri
-//! `run_query` command does.
-//!
-//! Which upstream is dialed comes from the `X-Scry-Target` header — but only as
-//! a target **id** the server resolves against its `--queryd` allowlist; a
-//! client can never supply a raw address, so the relay stays SSRF-safe.
-//! `scry-queryd` answers one request per connection and closes its write half,
-//! which is what lets `read_to_end` terminate.
+//! The query protocol remains entirely in the TypeScript client. This handler
+//! connects and writes the already-framed request, then exposes queryd's TCP read
+//! half as a backpressured HTTP body. It never accumulates a complete response.
 
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::Response;
 use axum::Json;
 use axum_extra::extract::cookie::SignedCookieJar;
 use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::OwnedSemaphorePermit;
 use tracing::warn;
 
 use crate::auth::session_valid;
@@ -29,6 +23,7 @@ use crate::{AppState, Target};
 /// Header carrying the selected target **id** (from `/api/targets`). Never a
 /// raw address — the server resolves it against the allowlist.
 const TARGET_HEADER: &str = "x-scry-target";
+const RELAY_CHUNK_BYTES: usize = 64 * 1024;
 
 /// `GET /api/targets` response: the selectable upstreams + the default id.
 /// `Target`'s `addr` is `#[serde(skip)]`, so only `id` + `label` reach the
@@ -54,15 +49,17 @@ pub async fn targets(
     }))
 }
 
-/// Relay a framed query to the selected upstream daemon. 401 if unauthenticated,
-/// 400 if the requested target id is unknown, 502 if the upstream can't be
-/// reached or errors mid-exchange.
+/// Relay a framed query to the selected upstream daemon.
+///
+/// Setup failures are representable as HTTP statuses because they happen before
+/// response headers are returned. Once streaming starts, an idle/read failure is
+/// an HTTP body error; we never return a valid-looking truncated protocol stream.
 pub async fn query(
     State(state): State<AppState>,
     jar: SignedCookieJar,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Vec<u8>, StatusCode> {
+) -> Result<Response, StatusCode> {
     if !session_valid(&jar) {
         return Err(StatusCode::UNAUTHORIZED);
     }
@@ -71,30 +68,76 @@ pub async fn query(
         warn!(target = ?requested, "query for unknown target id");
         return Err(StatusCode::BAD_REQUEST);
     };
-    // Own the addr and timeout before the await.
     let addr = addr.to_string();
-    let timeout = state.relay_timeout();
-    match tokio::time::timeout(timeout, relay(&addr, &body)).await {
-        Ok(Ok(resp)) => Ok(resp),
+
+    // Never queue HTTP requests behind active relays: queued request bodies and
+    // sockets are another unbounded working set. The body stream owns the permit
+    // until EOF, error, or browser cancellation drops it.
+    let permit = state
+        .relay_permits()
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+
+    let setup_timeout = state.relay_timeout();
+    let idle_timeout = state.relay_idle_timeout();
+    let setup = tokio::time::timeout(setup_timeout, connect_and_write(&addr, &body)).await;
+    let stream = match setup {
+        Ok(Ok(stream)) => stream,
         Ok(Err(e)) => {
-            warn!(queryd = %addr, error = %e, "query relay to scry-queryd failed");
-            Err(StatusCode::BAD_GATEWAY)
+            warn!(queryd = %addr, error = %e, "query relay setup failed");
+            return Err(StatusCode::BAD_GATEWAY);
         }
-        Err(_elapsed) => {
-            warn!(queryd = %addr, timeout_secs = timeout.as_secs(), "query relay to scry-queryd timed out");
-            Err(StatusCode::GATEWAY_TIMEOUT)
+        Err(_) => {
+            warn!(queryd = %addr, timeout_secs = setup_timeout.as_secs(), "query relay setup timed out");
+            return Err(StatusCode::GATEWAY_TIMEOUT);
         }
-    }
+    };
+
+    let response_stream = relay_stream(stream, idle_timeout, permit, addr);
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from_stream(response_stream))
+        .expect("static relay response is valid"))
 }
 
-/// Open a connection to `addr`, write the whole request, read the whole
-/// response. Mirrors the desktop shell's `run_query` byte-pipe one-for-one.
-async fn relay(addr: &str, request: &[u8]) -> std::io::Result<Vec<u8>> {
+async fn connect_and_write(addr: &str, request: &[u8]) -> std::io::Result<TcpStream> {
     let mut stream = TcpStream::connect(addr).await?;
     stream.set_nodelay(true).ok();
     stream.write_all(request).await?;
     stream.flush().await?;
-    let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).await?;
-    Ok(buf)
+    Ok(stream)
+}
+
+fn relay_stream(
+    mut upstream: TcpStream,
+    idle_timeout: std::time::Duration,
+    permit: OwnedSemaphorePermit,
+    addr: String,
+) -> impl futures::Stream<Item = std::io::Result<Bytes>> + Send + 'static {
+    async_stream::try_stream! {
+        // Moving the permit into this generator ties admission exactly to body
+        // lifetime. Dropping the HTTP body drops both permit and upstream socket.
+        let _permit = permit;
+        let mut buf = vec![0u8; RELAY_CHUNK_BYTES];
+        loop {
+            let read = tokio::time::timeout(idle_timeout, upstream.read(&mut buf)).await;
+            match read {
+                Ok(Ok(0)) => break,
+                Ok(Ok(n)) => yield Bytes::copy_from_slice(&buf[..n]),
+                Ok(Err(e)) => {
+                    warn!(queryd = %addr, error = %e, "query relay response read failed");
+                    Err(e)?;
+                }
+                Err(_) => {
+                    warn!(queryd = %addr, timeout_secs = idle_timeout.as_secs(), "query relay response idle timeout");
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "queryd response idle timeout",
+                    ))?;
+                }
+            }
+        }
+    }
 }

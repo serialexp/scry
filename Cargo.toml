@@ -86,6 +86,7 @@ scry-replay-opensearch = { path = "crates/replay-opensearch" }
 anyhow    = "1"
 arrow     = "58"
 async-trait = "0.1"
+async-stream = "0.3"
 axum      = { version = "0.8", features = ["multipart"] }
 axum-extra = { version = "0.10", features = ["cookie", "cookie-signed"] }
 datafusion = "53"

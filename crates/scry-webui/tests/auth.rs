@@ -32,6 +32,8 @@ fn state_with_secure(secure: bool) -> AppState {
         3600,
         secure,
         Duration::from_secs(30),
+        Duration::from_secs(30),
+        32,
     )
 }
 

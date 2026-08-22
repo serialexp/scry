@@ -1654,7 +1654,9 @@ password.
 the SolidJS bundle (embedded via `rust-embed`, so the binary is self-contained)
 and (b) exposes `POST /api/query` as the same dumb byte-pipe the Tauri shell
 implements — dial the server's *own configured* `--queryd`, write the framed
-request, read to EOF, return the bytes. Auth is a single shared password
+request, and stream bytes to EOF with HTTP backpressure. The relay has bounded
+concurrency plus setup and response-idle timeouts, so it neither materializes a
+whole query response nor queues an unbounded outage backlog. Auth is a single shared password
 (`SCRY_WEBUI_PASSWORD`, never argv) → a signed session cookie (`axum-extra`
 `SignedCookieJar`, key HKDF-derived from the password so sessions survive a
 restart and a password change invalidates them). The frontend stays

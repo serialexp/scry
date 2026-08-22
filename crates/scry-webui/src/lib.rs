@@ -5,9 +5,9 @@
 //! It is the browser counterpart to the Tauri desktop shell (`desktop/`): the
 //! whole query wire protocol lives in TypeScript, and the server is a **dumb
 //! byte-pipe** — `POST /api/query` writes the already-framed request bytes to
-//! the configured upstream `scry-queryd`, reads the response to EOF, and hands
-//! the raw bytes back. The server has zero protocol knowledge, exactly like the
-//! Tauri `run_query` command it replaces.
+//! the configured upstream `scry-queryd` and streams the raw response to EOF
+//! with HTTP backpressure. The server has zero protocol knowledge, exactly like
+//! the Tauri `run_query` command it replaces.
 //!
 //! `POST /api/query` is the byte-pipe relay; see `query`.
 
@@ -17,6 +17,8 @@ pub mod query;
 
 use std::sync::Arc;
 use std::time::Duration;
+
+use tokio::sync::Semaphore;
 
 use anyhow::{bail, Context, Result};
 use axum::extract::{DefaultBodyLimit, FromRef};
@@ -65,11 +67,21 @@ pub struct Args {
     )]
     pub secure_cookie: bool,
 
-    /// Timeout for the TCP relay to `scry-queryd`, in seconds. Covers the
-    /// entire exchange (connect + write + read). Requests that exceed this
-    /// return **504 Gateway Timeout** instead of hanging indefinitely.
-    #[arg(long, default_value_t = 30)]
+    /// Deadline for connecting to queryd and writing the request, in seconds.
+    /// A failure before response streaming starts returns 504.
+    #[arg(long, default_value_t = 10)]
     pub relay_timeout: u64,
+
+    /// Maximum idle interval between response bytes from queryd, in seconds.
+    /// This is not a total response deadline: a large response may continue as
+    /// long as it keeps making progress.
+    #[arg(long, default_value_t = 30)]
+    pub relay_idle_timeout: u64,
+
+    /// Maximum query relays active at once. Excess requests return 503 rather
+    /// than queueing sockets and response buffers without bound.
+    #[arg(long, default_value_t = 32)]
+    pub max_relays: usize,
 }
 
 /// Serve the browser query UI and relay queries to the query daemon.
@@ -78,6 +90,9 @@ pub async fn run(args: Args) -> Result<()> {
         std::env::var(PASSWORD_ENV).map_err(|_| anyhow::anyhow!("{PASSWORD_ENV} must be set"))?;
     if password.is_empty() {
         bail!("{PASSWORD_ENV} must not be empty");
+    }
+    if args.max_relays == 0 {
+        bail!("--max-relays must be at least 1");
     }
 
     // Derive a stable cookie-signing key from the password: sessions survive a
@@ -100,6 +115,8 @@ pub async fn run(args: Args) -> Result<()> {
         args.session_ttl,
         args.secure_cookie,
         Duration::from_secs(args.relay_timeout),
+        Duration::from_secs(args.relay_idle_timeout),
+        args.max_relays,
     );
     let app = router(state);
 
@@ -111,13 +128,14 @@ pub async fn run(args: Args) -> Result<()> {
         targets = %targets_desc,
         default = %default_target,
         session_ttl = args.session_ttl,
+        relay_setup_timeout_secs = args.relay_timeout,
+        relay_idle_timeout_secs = args.relay_idle_timeout,
+        max_relays = args.max_relays,
         "scry-webui ready"
     );
 
     axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
+        .with_graceful_shutdown(scry_server::shutdown::wait(scry_server::shutdown::channel()))
         .await
         .context("serving HTTP")?;
 
@@ -233,8 +251,13 @@ struct Inner {
     /// browser reaches scry-webui over HTTPS (e.g. behind a TLS reverse proxy);
     /// a `Secure` cookie is dropped by the browser over plain `http://`.
     secure_cookie: bool,
-    /// Timeout for the entire TCP relay exchange to `scry-queryd`.
+    /// Deadline for connecting and writing the request to queryd.
     relay_timeout: Duration,
+    /// Maximum silence between response chunks from queryd.
+    relay_idle_timeout: Duration,
+    /// Process-wide relay admission. A body stream owns its permit until EOF or
+    /// client cancellation drops the body.
+    relay_permits: Arc<Semaphore>,
 }
 
 impl AppState {
@@ -246,6 +269,8 @@ impl AppState {
         session_ttl: i64,
         secure_cookie: bool,
         relay_timeout: Duration,
+        relay_idle_timeout: Duration,
+        max_relays: usize,
     ) -> Self {
         Self(Arc::new(Inner {
             targets,
@@ -255,6 +280,8 @@ impl AppState {
             session_ttl,
             secure_cookie,
             relay_timeout,
+            relay_idle_timeout,
+            relay_permits: Arc::new(Semaphore::new(max_relays.max(1))),
         }))
     }
 
@@ -294,6 +321,14 @@ impl AppState {
 
     pub fn relay_timeout(&self) -> Duration {
         self.0.relay_timeout
+    }
+
+    pub fn relay_idle_timeout(&self) -> Duration {
+        self.0.relay_idle_timeout
+    }
+
+    pub fn relay_permits(&self) -> &Arc<Semaphore> {
+        &self.0.relay_permits
     }
 }
 
@@ -390,6 +425,8 @@ mod tests {
             60,
             false,
             Duration::from_secs(30),
+            Duration::from_secs(30),
+            32,
         );
         assert_eq!(state.resolve_target(Some("gothab")), Some("127.0.0.1:4100"));
         assert_eq!(state.resolve_target(Some("local")), Some("127.0.0.1:4101"));

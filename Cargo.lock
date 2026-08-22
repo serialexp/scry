@@ -4840,15 +4840,18 @@ name = "scry-webui"
 version = "0.16.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "axum",
  "axum-extra",
  "bytes",
  "chrono",
  "clap",
  "cookie",
+ "futures",
  "http-body-util",
  "mime_guess",
  "rust-embed",
+ "scry-server",
  "serde",
  "serde_json",
  "time",

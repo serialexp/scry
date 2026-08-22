@@ -33,6 +33,15 @@ fn app_targets(raw: &[String]) -> Router {
 
 /// Build a router with an explicit relay timeout (used by the 504 test).
 fn app_targets_timeout(raw: &[String], relay_timeout: Duration) -> Router {
+    app_targets_limits(raw, relay_timeout, relay_timeout, 32)
+}
+
+fn app_targets_limits(
+    raw: &[String],
+    setup_timeout: Duration,
+    idle_timeout: Duration,
+    max_relays: usize,
+) -> Router {
     let (targets, default) = parse_targets(raw).unwrap();
     let state = AppState::new(
         targets,
@@ -41,7 +50,9 @@ fn app_targets_timeout(raw: &[String], relay_timeout: Duration) -> Router {
         Key::from(&[9u8; 64]),
         3600,
         false,
-        relay_timeout,
+        setup_timeout,
+        idle_timeout,
+        max_relays,
     );
     router(state)
 }
@@ -125,6 +136,10 @@ async fn query_pipes_bytes_through() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        res.headers().get(header::CONTENT_TYPE).unwrap(),
+        "application/octet-stream"
+    );
     let got = to_bytes(res.into_body(), usize::MAX).await.unwrap();
     assert_eq!(got.as_ref(), response.as_slice());
 }
@@ -279,23 +294,86 @@ async fn query_unknown_target_is_400() {
 }
 
 #[tokio::test]
-async fn query_returns_504_on_timeout() {
-    // Bind a listener that accepts the connection but never sends a byte,
-    // simulating a hung upstream. The relay timeout fires and produces 504.
+async fn response_streams_before_upstream_eof() {
+    use http_body_util::BodyExt;
+
+    let request = b"stream-me".to_vec();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut got = vec![0; request.len()];
+        sock.read_exact(&mut got).await.unwrap();
+        sock.write_all(b"first").await.unwrap();
+        finish_rx.await.unwrap();
+        sock.write_all(b"second").await.unwrap();
+    });
+
+    let app = app(&addr);
+    let cookie = login_cookie(&app).await;
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/query")
+                .header(header::COOKIE, cookie)
+                .body(Body::from(b"stream-me".to_vec()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut body = res.into_body();
+    let first = tokio::time::timeout(Duration::from_secs(1), body.frame())
+        .await
+        .expect("first chunk arrived before upstream EOF")
+        .unwrap()
+        .unwrap()
+        .into_data()
+        .unwrap();
+    assert_eq!(first.as_ref(), b"first");
+    finish_tx.send(()).unwrap();
+    let rest = to_bytes(body, usize::MAX).await.unwrap();
+    assert_eq!(rest.as_ref(), b"second");
+}
+
+#[tokio::test]
+async fn idle_timeout_fails_stream_and_releases_permit() {
+    let request = vec![0u8; 8];
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     tokio::spawn(async move {
-        // Accept and hold the connection open indefinitely.
-        let (_sock, _) = listener.accept().await.unwrap();
-        // Keep _sock alive so the relay doesn't see a connection reset.
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut got = vec![0; request.len()];
+        sock.read_exact(&mut got).await.unwrap();
         tokio::time::sleep(Duration::from_secs(60)).await;
     });
 
-    let app = app_targets_timeout(&[addr.clone().into()], Duration::from_secs(1));
+    let app = app_targets_limits(
+        &[addr],
+        Duration::from_secs(1),
+        Duration::from_millis(50),
+        1,
+    );
     let cookie = login_cookie(&app).await;
-
     let res = app
         .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/query")
+                .header(header::COOKIE, &cookie)
+                .body(Body::from(vec![0u8; 8]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(to_bytes(res.into_body(), usize::MAX).await.is_err());
+
+    // The timed-out body released the sole permit; setup now reaches the dead
+    // upstream and returns 502 rather than being rejected as saturated.
+    let res = app
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -306,5 +384,67 @@ async fn query_returns_504_on_timeout() {
         )
         .await
         .unwrap();
-    assert_eq!(res.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_ne!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn saturated_relay_returns_503_and_body_drop_releases_permit() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        loop {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut request = [0u8; 1];
+                sock.read_exact(&mut request).await.unwrap();
+                sock.write_all(b"held").await.unwrap();
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            });
+        }
+    });
+
+    let app = app_targets_limits(&[addr], Duration::from_secs(1), Duration::from_secs(30), 1);
+    let cookie = login_cookie(&app).await;
+    let first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/query")
+                .header(header::COOKIE, &cookie)
+                .body(Body::from(vec![1u8]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let saturated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/query")
+                .header(header::COOKIE, &cookie)
+                .body(Body::from(vec![2u8]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(saturated.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    drop(first);
+    tokio::task::yield_now().await;
+    let admitted = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/query")
+                .header(header::COOKIE, cookie)
+                .body(Body::from(vec![3u8]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(admitted.status(), StatusCode::OK);
 }
