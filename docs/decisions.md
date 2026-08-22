@@ -2688,9 +2688,12 @@ regress.
 - **Query daemon merge + dedup** (`scry query`): on `live && logs`, plan blocks
   as usual (EvictOnNotFound one-replan preserved), then — **no Valkey ⇒ reply
   `QUERY_ERR_LIVE_UNAVAILABLE` (0x0005) and close** (refuse, not silently degrade)
-  — discover ingesters via Valkey, fan out `LiveQuery` with a short deadline
-  (dead/slow ingester skipped + logged), dedup survivors with
-  `live_record_is_durable`, build a logs `RecordBatch` schema-identical to the
+  — discover ingesters via Valkey, fan out `LiveQuery` with a short deadline and
+  bounded parallelism (dead/slow ingester skipped + logged), convert each reply
+  immediately, and enforce per-peer plus aggregate row/byte limits before dedup
+  survivors with `live_record_is_durable`. Resource-limit breaches return
+  `QUERY_ERR_RESOURCES` rather than silently truncating. Build a logs
+  `RecordBatch` schema-identical to the
   block-backed table, register it as a `MemTable` (`logs_live`), and expose a
   `CREATE VIEW logs AS SELECT * FROM __logs_blocks UNION ALL SELECT * FROM
   logs_live` so both the default `SELECT * FROM logs` **and** any user SQL

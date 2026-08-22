@@ -47,7 +47,7 @@ pub use live_merge::{fetch_live_from_ingester, LiveDiscovery};
 pub use live_ring::{LiveLogRecord, LiveRing, RetainingLogsAppender};
 pub use memory_guard::{CgroupMemoryGuard, QueryMemoryGuard, QUERY_TOO_LARGE_MESSAGE};
 pub use pipeline::{DecodeFn, Pipeline, ShardedPipeline, INGEST_SHARDS};
-pub use query_service::QueryService;
+pub use query_service::{LiveFetchLimits, QueryService};
 pub use scry_block::BlockBuilderConfig;
 pub use server::{
     DummyPipeline, DummyShards, LogsPipeline, LogsShards, MetricsPipeline, MetricsShards,

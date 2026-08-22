@@ -35,13 +35,14 @@ use scry_tail::dial_subscribe;
 use scry_valkey::{discover_tail_endpoints, ValkeyClient};
 use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tracing::{debug, info, warn};
 
 /// Bound on records buffered from all upstreams toward one client. Full ⇒ the
 /// upstream `dial_subscribe` sender blocks briefly; a slow client can't grow
 /// memory unbounded (best-effort — the ingester tap already drops on its side).
 const RELAY_CHANNEL_CAP: usize = 8192;
+const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Accept tail-client connections on `listen` and serve each until it hangs up
 /// or `shutdown` fires. `valkey` is cloned per connection for discovery; `None`
@@ -50,12 +51,14 @@ pub async fn serve_tail_relay(
     listen: SocketAddr,
     valkey: Option<ValkeyClient>,
     rediscover: Duration,
+    max_connections: usize,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
     let listener = TcpListener::bind(listen)
         .await
         .with_context(|| format!("binding tail-relay listener on {listen}"))?;
-    info!(%listen, "live-tail front-door ready");
+    info!(%listen, max_connections = max_connections.max(1), "live-tail front-door ready");
+    let permits = Arc::new(Semaphore::new(max_connections.max(1)));
 
     tokio::pin!(shutdown);
     loop {
@@ -69,8 +72,16 @@ pub async fn serve_tail_relay(
                     Ok(x) => x,
                     Err(e) => { warn!(error = %e, "tail-relay accept failed"); continue; }
                 };
+                let permit = match permits.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        tokio::spawn(reject_overloaded_tail(stream));
+                        continue;
+                    }
+                };
                 let valkey = valkey.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     if let Err(e) = serve_conn(stream, peer, valkey, rediscover).await {
                         warn!(%peer, error = %format!("{e:#}"), "tail-relay connection ended with error");
                     }
@@ -78,6 +89,20 @@ pub async fn serve_tail_relay(
             }
         }
     }
+}
+
+async fn reject_overloaded_tail(stream: TcpStream) {
+    let (_rd, wr) = stream.into_split();
+    let mut wr = BufWriter::new(wr);
+    let _ = write_frame(
+        &mut wr,
+        &build::error(
+            scry_proto::constants::ERR_OVERLOADED,
+            "tail relay is saturated; retry",
+        ),
+    )
+    .await;
+    let _ = wr.flush().await;
 }
 
 /// One tail-client connection: handshake, read the `Subscribe`, then either
@@ -94,8 +119,9 @@ async fn serve_conn(
     let mut wr = BufWriter::new(wr);
 
     // ── Handshake: expect Hello, reply HelloAck (mirrors scry-server). ──
-    let first = read_frame::<Frame, _>(&mut rd)
+    let first = tokio::time::timeout(HANDSHAKE_DEADLINE, read_frame::<Frame, _>(&mut rd))
         .await
+        .context("timed out reading Hello")?
         .context("reading Hello")?;
     let hello = match first.msg {
         FrameMsg::Hello(h) => h,

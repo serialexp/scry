@@ -82,6 +82,7 @@ use crate::memory_guard::{QueryMemoryGuard, QUERY_TOO_LARGE_MESSAGE};
 use crate::stats::QueryMetrics;
 use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tracing::{info, info_span, warn, Instrument, Span};
 use uuid::Uuid;
 
@@ -89,6 +90,27 @@ use uuid::Uuid;
 /// is skipped after this so one straggler can't stall the merged query; the
 /// stored (block) half always returns regardless.
 const LIVE_FETCH_DEADLINE: Duration = Duration::from_secs(2);
+const QUERY_REQUEST_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Memory and concurrency limits for the live half of a merged logs query.
+#[derive(Debug, Clone, Copy)]
+pub struct LiveFetchLimits {
+    pub concurrency: usize,
+    pub max_peer_bytes: usize,
+    pub max_total_bytes: usize,
+    pub max_total_rows: usize,
+}
+
+impl Default for LiveFetchLimits {
+    fn default() -> Self {
+        Self {
+            concurrency: 8,
+            max_peer_bytes: 16 * 1024 * 1024,
+            max_total_bytes: 128 * 1024 * 1024,
+            max_total_rows: 1_000_000,
+        }
+    }
+}
 
 /// Per-query start snapshots of the two sidecar caches, bundled so the
 /// many `emit_scan_complete` call sites can pass one `cache_start` value
@@ -175,6 +197,13 @@ pub struct QueryService {
     /// reaches its cgroup safety threshold, new work is refused and running
     /// planning/streaming work is cancelled with QUERY_ERR_RESOURCES.
     memory_guard: Option<Arc<dyn QueryMemoryGuard>>,
+    /// Bounded-parallel fan-in and retained-row limits for merged live logs.
+    live_fetch_limits: LiveFetchLimits,
+    /// Active query handlers. Connections may wait only while holding one of
+    /// `query_wait_permits`; beyond that they receive an immediate overload.
+    query_active_permits: Arc<Semaphore>,
+    query_wait_permits: Arc<Semaphore>,
+    query_queue_timeout: Duration,
 }
 
 impl QueryService {
@@ -206,6 +235,10 @@ impl QueryService {
             fleet: None,
             default_query_window_nanos: scry_query::DEFAULT_QUERY_WINDOW_SECS * 1_000_000_000,
             memory_guard: None,
+            live_fetch_limits: LiveFetchLimits::default(),
+            query_active_permits: Arc::new(Semaphore::new(32)),
+            query_wait_permits: Arc::new(Semaphore::new(64)),
+            query_queue_timeout: Duration::from_secs(5),
         }
     }
 
@@ -234,6 +267,26 @@ impl QueryService {
 
     pub fn with_memory_guard(mut self, guard: Option<Arc<dyn QueryMemoryGuard>>) -> Self {
         self.memory_guard = guard;
+        self
+    }
+
+    pub fn with_live_fetch_limits(mut self, limits: LiveFetchLimits) -> Self {
+        self.live_fetch_limits = LiveFetchLimits {
+            concurrency: limits.concurrency.max(1),
+            ..limits
+        };
+        self
+    }
+
+    pub fn with_query_admission(
+        mut self,
+        active: usize,
+        waiting: usize,
+        queue_timeout: Duration,
+    ) -> Self {
+        self.query_active_permits = Arc::new(Semaphore::new(active.max(1)));
+        self.query_wait_permits = Arc::new(Semaphore::new(waiting));
+        self.query_queue_timeout = queue_timeout;
         self
     }
 
@@ -310,11 +363,45 @@ impl QueryService {
             loop {
                 let (sock, peer) = listener.accept().await?;
                 let svc = self.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = svc.handle_connection(sock, peer).await {
-                        warn!(%peer, error = %e, "connection ended with error");
+                let active = svc.query_active_permits.clone().try_acquire_owned();
+                match active {
+                    Ok(permit) => {
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            if let Err(e) = svc.handle_connection(sock, peer).await {
+                                warn!(%peer, error = %e, "connection ended with error");
+                            }
+                        });
                     }
-                });
+                    Err(_) => {
+                        let waiting = svc.query_wait_permits.clone().try_acquire_owned();
+                        match waiting {
+                            Ok(wait_permit) => tokio::spawn(async move {
+                                let active = tokio::time::timeout(
+                                    svc.query_queue_timeout,
+                                    svc.query_active_permits.clone().acquire_owned(),
+                                )
+                                .await;
+                                drop(wait_permit);
+                                match active {
+                                    Ok(Ok(permit)) => {
+                                        let _permit = permit;
+                                        if let Err(e) = svc.handle_connection(sock, peer).await {
+                                            warn!(%peer, error = %e, "queued connection ended with error");
+                                        }
+                                    }
+                                    _ => {
+                                        send_query_overload(sock, "query queue wait timed out")
+                                            .await;
+                                    }
+                                }
+                            }),
+                            Err(_) => tokio::spawn(async move {
+                                send_query_overload(sock, "query service is saturated").await;
+                            }),
+                        };
+                    }
+                }
             }
             #[allow(unreachable_code)]
             Ok::<(), anyhow::Error>(())
@@ -340,13 +427,18 @@ impl QueryService {
         let mut wr = BufWriter::new(wr);
 
         // ── Read the request frame ───────────────────────────────────
-        let req_frame: QueryFrame = match read_frame(&mut rd).await {
-            Ok(f) => f,
-            Err(e) => {
-                warn!(%peer, error = %e, "no QueryRequest frame from client");
-                return Ok(());
-            }
-        };
+        let req_frame: QueryFrame =
+            match tokio::time::timeout(QUERY_REQUEST_DEADLINE, read_frame(&mut rd)).await {
+                Ok(Ok(f)) => f,
+                Ok(Err(e)) => {
+                    warn!(%peer, error = %e, "no QueryRequest frame from client");
+                    return Ok(());
+                }
+                Err(_) => {
+                    warn!(%peer, "timed out waiting for QueryRequest frame");
+                    return Ok(());
+                }
+            };
         if let Some(guard) = &self.memory_guard {
             if let Err(e) = guard.check() {
                 warn!(%peer, error = %e, "refusing query at process memory safety threshold");
@@ -604,19 +696,30 @@ impl QueryService {
         let body_contains = req.query.body_contains.clone().unwrap_or_default();
         let signal = Signal::Logs as u8;
 
-        // Fan out to every ingester, best-effort with a short per-peer deadline.
-        let mut batches: Vec<scry_proto::generated::LiveBatchOutput> = Vec::new();
-        for addr in &endpoints {
-            let fut =
-                fetch_live_from_ingester(addr, signal, &matchers, ts_min, ts_max, &body_contains);
-            match tokio::time::timeout(LIVE_FETCH_DEADLINE, fut).await {
-                Ok(Ok(batch)) => batches.push(batch),
-                Ok(Err(e)) => {
-                    warn!(%addr, error = %format!("{e:#}"), "live fetch from ingester failed; skipping")
-                }
-                Err(_) => warn!(%addr, "live fetch from ingester timed out; skipping"),
+        // Fetch peers concurrently in a fixed-width window. `buffer_unordered`
+        // holds at most N wire responses/futures, and each completed response is
+        // converted immediately rather than accumulating a second fleet-sized
+        // `Vec<LiveBatchOutput>`.
+        let mut fetches = futures::stream::iter(endpoints.into_iter().map(|addr| {
+            let matchers = matchers.clone();
+            let body_contains = body_contains.clone();
+            async move {
+                let result = tokio::time::timeout(
+                    LIVE_FETCH_DEADLINE,
+                    fetch_live_from_ingester(
+                        &addr,
+                        signal,
+                        &matchers,
+                        ts_min,
+                        ts_max,
+                        &body_contains,
+                    ),
+                )
+                .await;
+                (addr, result)
             }
-        }
+        }))
+        .buffer_unordered(self.live_fetch_limits.concurrency);
 
         // Dedup each record against the durable WAL high-water for its
         // (writer, "logs", shard). Keep iff `wal_seg > H` (absent ⇒ 0). Cache
@@ -631,7 +734,29 @@ impl QueryService {
         let mut wm_cache: std::collections::HashMap<(Uuid, u32), Option<u64>> =
             std::collections::HashMap::new();
         let mut rows: Vec<LiveLogRow> = Vec::new();
-        for batch in batches {
+        let mut retained_bytes = 0usize;
+        while let Some((addr, result)) = fetches.next().await {
+            let batch = match result {
+                Ok(Ok(batch)) => batch,
+                Ok(Err(e)) => {
+                    warn!(%addr, error = %format!("{e:#}"), "live fetch from ingester failed; skipping");
+                    continue;
+                }
+                Err(_) => {
+                    warn!(%addr, "live fetch from ingester timed out; skipping");
+                    continue;
+                }
+            };
+            let peer_bytes: usize = batch.records.iter().map(live_record_owned_bytes).sum();
+            if peer_bytes > self.live_fetch_limits.max_peer_bytes {
+                return Err((
+                    QUERY_ERR_RESOURCES,
+                    format!(
+                        "live response from {addr} is {peer_bytes} bytes; per-peer limit is {}",
+                        self.live_fetch_limits.max_peer_bytes
+                    ),
+                ));
+            }
             let writer = match Uuid::from_slice(&batch.writer_uuid) {
                 Ok(u) => u,
                 Err(e) => {
@@ -658,12 +783,24 @@ impl QueryService {
                         h
                     }
                 };
-                // Records at or below the high-water are already durable in a
-                // block — drop them here so they aren't double-counted. An
-                // absent watermark covers nothing, so nothing is dropped.
                 if live_record_is_durable(r.wal_seg, hw) {
                     continue;
                 }
+                let row_bytes = live_record_owned_bytes(&r);
+                let next_bytes = retained_bytes.saturating_add(row_bytes);
+                if rows.len() >= self.live_fetch_limits.max_total_rows
+                    || next_bytes > self.live_fetch_limits.max_total_bytes
+                {
+                    return Err((
+                        QUERY_ERR_RESOURCES,
+                        format!(
+                            "live query exceeds aggregate limit (rows max {}, bytes max {})",
+                            self.live_fetch_limits.max_total_rows,
+                            self.live_fetch_limits.max_total_bytes
+                        ),
+                    ));
+                }
+                retained_bytes = next_bytes;
                 rows.push(LiveLogRow {
                     ts_unix_nano: r.ts_unix_nano,
                     severity: r.severity,
@@ -671,6 +808,14 @@ impl QueryService {
                     labels: r.labels.into_iter().map(|p| (p.key, p.value)).collect(),
                     attributes: r.attributes.into_iter().map(|p| (p.key, p.value)).collect(),
                 });
+            }
+            if let Some(guard) = self.memory_guard.as_ref() {
+                guard.check().map_err(|e| {
+                    (
+                        QUERY_ERR_RESOURCES,
+                        format!("{QUERY_TOO_LARGE_MESSAGE} {e:#}"),
+                    )
+                })?;
             }
         }
         Ok(rows)
@@ -1732,6 +1877,13 @@ fn data_query_cache_key(signal: Signal, req: &QueryRequest, candidates: &[Catalo
     hash128(&buf)
 }
 
+async fn send_query_overload(sock: TcpStream, message: &'static str) {
+    let (_rd, wr) = sock.into_split();
+    let mut wr = BufWriter::new(wr);
+    let _ = emit_stream_error(&mut wr, QUERY_ERR_RESOURCES, message).await;
+    let _ = wr.flush().await;
+}
+
 /// Build + transmit one [`QueryFrameMsg::StreamError`] frame. Errors
 /// from `write_frame` itself are swallowed by the caller (they
 /// usually mean the client already dropped the socket); the scan
@@ -1825,6 +1977,25 @@ fn summarise_metrics(metrics: &MetricsSet) -> (usize, usize, usize, usize) {
     )
 }
 
+/// Conservative owned-memory estimate for one converted live row. String heap
+/// contents and pair/vector structural storage dominate; allocator rounding is
+/// intentionally left to the aggregate headroom configured by the daemon.
+fn live_record_owned_bytes(r: &scry_proto::generated::LiveRecord) -> usize {
+    const ROW_OVERHEAD: usize = std::mem::size_of::<LiveLogRow>();
+    const PAIR_OVERHEAD: usize = std::mem::size_of::<(String, String)>();
+    ROW_OVERHEAD.saturating_add(r.body.len()).saturating_add(
+        r.labels
+            .iter()
+            .chain(r.attributes.iter())
+            .map(|p| {
+                PAIR_OVERHEAD
+                    .saturating_add(p.key.len())
+                    .saturating_add(p.value.len())
+            })
+            .sum::<usize>(),
+    )
+}
+
 /// The merged history+live dedup selector (D-054). A live record tagged with
 /// `wal_seg` is *durable* — already committed to a block and therefore must be
 /// dropped from the live half to avoid a double across the block-commit seam —
@@ -1862,7 +2033,8 @@ fn canonical_fleet_json(blobs: Vec<String>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{canonical_fleet_json, live_record_is_durable};
+    use super::{canonical_fleet_json, live_record_is_durable, live_record_owned_bytes};
+    use scry_proto::{generated::LiveRecord, LabelPair};
 
     #[test]
     fn fleet_json_drops_invalid_records_and_sorts_stably() {
@@ -1893,6 +2065,31 @@ mod tests {
             })
             .collect();
         assert_eq!(ids, ["a-1", "q-1", "q-2"]);
+    }
+
+    #[test]
+    fn live_record_memory_estimate_counts_owned_strings_and_pairs() {
+        let record = LiveRecord {
+            wal_shard: 0,
+            wal_seg: 0,
+            ts_unix_nano: 1,
+            severity: 2,
+            labels: vec![LabelPair {
+                key: "service".into(),
+                value: "api".into(),
+            }],
+            body: "hello".into(),
+            attributes: vec![LabelPair {
+                key: "zone".into(),
+                value: "west".into(),
+            }],
+        };
+        let base = std::mem::size_of::<scry_query::logs::LiveLogRow>();
+        let pairs = 2 * std::mem::size_of::<(String, String)>();
+        assert_eq!(
+            live_record_owned_bytes(&record),
+            base + pairs + "serviceapihellozonewest".len()
+        );
     }
 
     #[test]

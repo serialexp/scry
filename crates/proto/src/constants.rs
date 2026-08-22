@@ -116,6 +116,9 @@ pub const ERR_BAD_MATCHER: u16 = 8;
 /// no Valkey to discover ingesters through (see D-053). A direct `--ingest`
 /// tail does not hit this — only the queryd relay refuses.
 pub const ERR_TAIL_UNAVAILABLE: u16 = 9;
+/// The listener is at its configured active/waiting capacity. Clients should
+/// reconnect with backoff; the request/session was not accepted.
+pub const ERR_OVERLOADED: u16 = 10;
 pub const ERR_INTERNAL: u16 = 255;
 
 // ── Goodbye.reason_code ────────────────────────────────────────────────

@@ -44,6 +44,11 @@ pub struct Args {
     #[arg(long)]
     listen_wire: Option<String>,
 
+    /// Maximum simultaneous native-wire ingest sessions. Excess sessions are
+    /// rejected immediately and should reconnect with backoff.
+    #[arg(long, default_value_t = 256)]
+    wire_max_connections: usize,
+
     /// Upstream scry ingest server address (the scry sink). Opt-in: when unset,
     /// no scry sink is built and the gateway forwards only to Loki/OpenSearch.
     /// At least one sink (this, `--loki-url`, or `--opensearch-url`) is required.
@@ -283,7 +288,7 @@ pub async fn run(args: Args) -> Result<()> {
     match args.listen_wire.clone() {
         Some(addr) => {
             let mut rx = shutdown_rx.clone();
-            let wire_fut = serve_wire(addr, state.clone(), async move {
+            let wire_fut = serve_wire(addr, state.clone(), args.wire_max_connections, async move {
                 let _ = rx.changed().await;
             });
             tokio::try_join!(http_fut, wire_fut)?;

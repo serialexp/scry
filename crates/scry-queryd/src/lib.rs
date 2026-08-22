@@ -53,8 +53,8 @@ use scry_query::{
     BloomCache, BloomCacheConfig, PostingsCache, PostingsCacheConfig, QueryResultCache,
 };
 use scry_server::{
-    serve_status, CgroupMemoryGuard, FleetSource, LiveDiscovery, LocalStatus, QueryMemoryGuard,
-    QueryMetrics, QueryService,
+    serve_status, CgroupMemoryGuard, FleetSource, LiveDiscovery, LiveFetchLimits, LocalStatus,
+    QueryMemoryGuard, QueryMetrics, QueryService,
 };
 use scry_valkey::{
     discover_status_blobs, discover_tail_endpoints, parse_envelope, subscribe_blocks,
@@ -233,6 +233,34 @@ pub struct Args {
     #[arg(long, default_value_t = 256)]
     query_memory_reserve_mib: u64,
 
+    /// Ingester live-window requests in flight per merged live query.
+    #[arg(long, default_value_t = 8)]
+    live_fetch_concurrency: usize,
+
+    /// Maximum estimated MiB accepted from one ingester's live response.
+    #[arg(long, default_value_t = 16)]
+    live_fetch_peer_max_mib: usize,
+
+    /// Maximum estimated MiB retained across the live half of one query.
+    #[arg(long, default_value_t = 128)]
+    live_fetch_max_mib: usize,
+
+    /// Maximum retained live rows in one merged query.
+    #[arg(long, default_value_t = 1_000_000)]
+    live_fetch_max_rows: usize,
+
+    /// Query requests executing concurrently.
+    #[arg(long, default_value_t = 32)]
+    query_max_active: usize,
+
+    /// Accepted query sockets allowed to wait for an active slot.
+    #[arg(long, default_value_t = 64)]
+    query_max_waiting: usize,
+
+    /// Maximum seconds an accepted query may wait for an active slot.
+    #[arg(long, default_value_t = 5)]
+    query_queue_timeout: u64,
+
     // ── Multi-instance convergence (v0.9) ─────────────────────────
     /// Valkey URL for pub/sub catalog convergence. Falls back to
     /// `$SCRY_VALKEY_URL`. The query daemon is **query-only**: it never
@@ -266,6 +294,10 @@ pub struct Args {
     /// ones dropped).
     #[arg(long, default_value_t = 5)]
     tail_rediscover_interval: u64,
+
+    /// Maximum simultaneous long-lived tail subscriptions.
+    #[arg(long, default_value_t = 128)]
+    tail_max_connections: usize,
 
     // ── Status page (D-057) ───────────────────────────────────────
     /// Live status HTTP endpoint (the fleet dashboard, D-057). A bare
@@ -546,6 +578,23 @@ pub async fn run(args: Args) -> Result<()> {
         .with_fleet_source(fleet_source.clone())
         .with_metrics(Some(query_metrics.clone()))
         .with_default_window(args.default_query_window_secs)
+        .with_live_fetch_limits(LiveFetchLimits {
+            concurrency: args.live_fetch_concurrency,
+            max_peer_bytes: args
+                .live_fetch_peer_max_mib
+                .checked_mul(1024 * 1024)
+                .context("--live-fetch-peer-max-mib overflows usize")?,
+            max_total_bytes: args
+                .live_fetch_max_mib
+                .checked_mul(1024 * 1024)
+                .context("--live-fetch-max-mib overflows usize")?,
+            max_total_rows: args.live_fetch_max_rows,
+        })
+        .with_query_admission(
+            args.query_max_active,
+            args.query_max_waiting,
+            Duration::from_secs(args.query_queue_timeout),
+        )
         .with_memory_guard(memory_guard),
     );
 
@@ -564,6 +613,13 @@ pub async fn run(args: Args) -> Result<()> {
         query_cache_budget_bytes    = result_cache.budget_bytes(),
         query_cache_entry_bytes     = args.query_cache_entry_bytes,
         query_memory_budget_bytes   = memory_budget_bytes,
+        live_fetch_concurrency      = args.live_fetch_concurrency.max(1),
+        live_fetch_peer_max_mib     = args.live_fetch_peer_max_mib,
+        live_fetch_max_mib          = args.live_fetch_max_mib,
+        live_fetch_max_rows         = args.live_fetch_max_rows,
+        query_max_active            = args.query_max_active.max(1),
+        query_max_waiting           = args.query_max_waiting,
+        query_queue_timeout_secs    = args.query_queue_timeout,
         "query daemon ready"
     );
 
@@ -672,12 +728,14 @@ pub async fn run(args: Args) -> Result<()> {
     if let Some(tail_listen) = args.tail_listen {
         let valkey = valkey.clone();
         let rediscover = Duration::from_secs(args.tail_rediscover_interval.max(1));
+        let max_connections = args.tail_max_connections;
         let tail_shutdown = shutdown.clone();
         bg_tasks.push(tokio::spawn(async move {
             if let Err(e) = tail_relay::serve_tail_relay(
                 tail_listen,
                 valkey,
                 rediscover,
+                max_connections,
                 scry_server::shutdown::wait(tail_shutdown),
             )
             .await

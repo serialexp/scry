@@ -40,6 +40,7 @@ use scry_proto::{
 use tokio::{
     io::{AsyncWriteExt, BufReader, BufWriter},
     net::{TcpListener, TcpStream},
+    sync::Semaphore,
 };
 use tracing::{info, warn};
 
@@ -48,10 +49,16 @@ use crate::sink::AppState;
 /// The `writer_id` announced to native clients in `HelloAck`. Human-readable,
 /// not parsed.
 const WRITER_ID: &str = "scry-gateway";
+const HANDSHAKE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Bind `listen_addr`, accept native binschema connections until `shutdown`
 /// completes, fanning each accepted batch into `state`.
-pub async fn serve_wire<F>(listen_addr: String, state: AppState, shutdown: F) -> Result<()>
+pub async fn serve_wire<F>(
+    listen_addr: String,
+    state: AppState,
+    max_connections: usize,
+    shutdown: F,
+) -> Result<()>
 where
     F: Future<Output = ()>,
 {
@@ -61,13 +68,22 @@ where
     info!(addr = %listen_addr, "scry-gateway native wire listener ready");
 
     let next_session_id = Arc::new(AtomicU64::new(1));
+    let permits = Arc::new(Semaphore::new(max_connections.max(1)));
 
     let accept_loop = async {
         loop {
             let (sock, peer) = listener.accept().await?;
+            let permit = match permits.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    tokio::spawn(reject_overloaded(sock));
+                    continue;
+                }
+            };
             let session_id = next_session_id.fetch_add(1, Ordering::Relaxed);
             let state = state.clone();
             tokio::spawn(async move {
+                let _permit = permit;
                 if let Err(e) = handle_conn(sock, peer, session_id, state).await {
                     warn!(%peer, error = %e, "wire connection ended with error");
                 }
@@ -84,6 +100,20 @@ where
     Ok(())
 }
 
+async fn reject_overloaded(sock: TcpStream) {
+    let (_rd, wr) = sock.into_split();
+    let mut wr = BufWriter::new(wr);
+    let _ = write_frame(
+        &mut wr,
+        &build::error(
+            scry_proto::constants::ERR_OVERLOADED,
+            "gateway is saturated; retry",
+        ),
+    )
+    .await;
+    let _ = wr.flush().await;
+}
+
 async fn handle_conn(
     sock: TcpStream,
     peer: SocketAddr,
@@ -96,10 +126,19 @@ async fn handle_conn(
     let mut wr = BufWriter::new(wr);
 
     // ── Handshake ──────────────────────────────────────────────────────
-    let first = match read_frame::<scry_proto::Frame, _>(&mut rd).await {
-        Ok(f) => f,
-        Err(e) => {
+    let first = match tokio::time::timeout(
+        HANDSHAKE_DEADLINE,
+        read_frame::<scry_proto::Frame, _>(&mut rd),
+    )
+    .await
+    {
+        Ok(Ok(f)) => f,
+        Ok(Err(e)) => {
             warn!(%peer, error = %e, "no frame before handshake");
+            return Ok(());
+        }
+        Err(_) => {
+            warn!(%peer, "gateway handshake timed out");
             return Ok(());
         }
     };

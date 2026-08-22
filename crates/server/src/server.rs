@@ -34,6 +34,7 @@ use std::{
 use tokio::{
     io::{AsyncWriteExt, BufReader, BufWriter},
     net::{TcpListener, TcpStream},
+    sync::Semaphore,
 };
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -99,6 +100,7 @@ pub trait RemoteStatusRelay: Send + Sync + 'static {
 }
 
 const MAX_AGENT_STATUS_JSON_BYTES: usize = 64 * 1024;
+const INGEST_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Static configuration for a [`Server`]. Cheap to construct, cloned
 /// into each spawned connection task.
@@ -154,6 +156,8 @@ pub struct Server {
     /// (byte-identical to pre-D-054). Only the logs signal feeds it.
     live_ring: Option<Arc<LiveRing>>,
     remote_status: Option<Arc<dyn RemoteStatusRelay>>,
+    /// Long-lived ingest sessions shed immediately when this limit is reached.
+    max_connections: usize,
 }
 
 impl Server {
@@ -178,6 +182,7 @@ impl Server {
             tail: SubscriptionRegistry::new(),
             live_ring: None,
             remote_status: None,
+            max_connections: 256,
         }
     }
 
@@ -208,6 +213,11 @@ impl Server {
 
     pub fn with_remote_status_relay(mut self, relay: Arc<dyn RemoteStatusRelay>) -> Self {
         self.remote_status = Some(relay);
+        self
+    }
+
+    pub fn with_max_connections(mut self, max_connections: usize) -> Self {
+        self.max_connections = max_connections.max(1);
         self
     }
 
@@ -270,10 +280,18 @@ impl Server {
 
         let next_session_id = Arc::new(AtomicU64::new(1));
         let config = Arc::new(self.config);
+        let connection_permits = Arc::new(Semaphore::new(self.max_connections));
 
         let accept_loop = async {
             loop {
                 let (sock, peer) = listener.accept().await?;
+                let permit = match connection_permits.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        tokio::spawn(reject_overloaded_ingest(sock));
+                        continue;
+                    }
+                };
                 let session_id = next_session_id.fetch_add(1, Ordering::Relaxed);
                 let config = config.clone();
                 let dummy_pipeline = self.dummy_pipeline.clone();
@@ -286,6 +304,7 @@ impl Server {
                 let live_ring = self.live_ring.clone();
                 let remote_status = self.remote_status.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     if let Err(e) = handle(
                         sock,
                         peer,
@@ -430,6 +449,20 @@ struct Counters {
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn reject_overloaded_ingest(sock: TcpStream) {
+    let (_rd, wr) = sock.into_split();
+    let mut wr = BufWriter::new(wr);
+    let _ = write_frame(
+        &mut wr,
+        &build::error(
+            scry_proto::constants::ERR_OVERLOADED,
+            "ingest service is saturated; retry",
+        ),
+    )
+    .await;
+    let _ = wr.flush().await;
+}
+
 async fn handle(
     sock: TcpStream,
     peer: SocketAddr,
@@ -478,10 +511,19 @@ async fn handle(
     info!(%peer, session_id, writer_uuid = %config.writer_uuid, "accept");
 
     // ── Handshake ──────────────────────────────────────────────────────
-    let first = match read_frame::<scry_proto::Frame, _>(&mut rd).await {
-        Ok(f) => f,
-        Err(e) => {
+    let first = match tokio::time::timeout(
+        INGEST_HANDSHAKE_DEADLINE,
+        read_frame::<scry_proto::Frame, _>(&mut rd),
+    )
+    .await
+    {
+        Ok(Ok(f)) => f,
+        Ok(Err(e)) => {
             warn!(%peer, error = %e, "no frame before handshake");
+            return Ok(());
+        }
+        Err(_) => {
+            warn!(%peer, "ingest handshake timed out");
             return Ok(());
         }
     };

@@ -59,6 +59,11 @@ pub struct Args {
     #[arg(long, default_value = "127.0.0.1:4000")]
     listen: String,
 
+    /// Maximum simultaneous long-lived ingest sessions. Additional sessions
+    /// receive a retryable connection-level error immediately.
+    #[arg(long, default_value_t = 256)]
+    max_connections: usize,
+
     /// writer_id reported in HelloAck. Default: random per-process.
     #[arg(long)]
     writer_id: Option<String>,
@@ -612,7 +617,8 @@ pub async fn run(args: Args) -> Result<()> {
         logs_pipeline,
         traces_pipeline,
         profiles_pipeline,
-    );
+    )
+    .with_max_connections(args.max_connections);
     if let Some(m) = stats_metrics.as_ref() {
         server = server.with_metrics(m.clone());
     }
