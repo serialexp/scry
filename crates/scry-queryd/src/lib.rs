@@ -13,7 +13,7 @@
 //! 3. Open the SQLite catalog (read-only from the daemon's perspective;
 //!    concurrent ingest writers update it via separate processes — the
 //!    SQLite WAL handles cross-process visibility).
-//! 4. Construct a [`QueryService`] and serve until ctrl-c.
+//! 4. Construct a [`QueryService`] and serve until SIGINT or SIGTERM.
 //!
 //! The daemon's job is to amortise the cold-start cost — DataFusion
 //! init, ZSTD work areas, glibc → mimalloc reservations, and pool
@@ -64,6 +64,10 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 mod tail_relay;
+
+/// Fleet deregistration is advisory; a degraded Valkey must not hold a pod in
+/// Terminating until Kubernetes resorts to SIGKILL. TTLs clean up missed exits.
+const SHUTDOWN_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Valkey-backed [`LiveDiscovery`] for the D-054 merged history+live query.
 /// `scry-server` is Valkey-agnostic (it takes a `&dyn LiveDiscovery`); this is
@@ -281,7 +285,7 @@ pub struct Args {
     stats_log_interval: u64,
 }
 
-/// Run the query daemon until ctrl-c.
+/// Run the query daemon until SIGINT or SIGTERM.
 pub async fn run(args: Args) -> Result<()> {
     let cfg = ObjStoreConfig::from_env()
         .context("loading SCRY_OBJSTORE_* env (try `source docker/garage/.env`)")?;
@@ -433,6 +437,11 @@ pub async fn run(args: Args) -> Result<()> {
                 Arc::new(guard) as Arc<dyn QueryMemoryGuard>
             })
     };
+
+    // Install handlers before the Valkey connection and listener setup. As PID 1
+    // in a container, queryd must explicitly catch Kubernetes SIGTERM. The watch
+    // value also prevents later listeners from missing an earlier signal.
+    let shutdown = scry_server::shutdown::channel();
 
     // Clones for the convergence loops, captured before `catalog`/`store` are
     // moved into the service. The daemon and the loops share one catalog
@@ -635,12 +644,13 @@ pub async fn run(args: Args) -> Result<()> {
     if let Some(tail_listen) = args.tail_listen {
         let valkey = valkey.clone();
         let rediscover = Duration::from_secs(args.tail_rediscover_interval.max(1));
+        let tail_shutdown = shutdown.clone();
         bg_tasks.push(tokio::spawn(async move {
             if let Err(e) = tail_relay::serve_tail_relay(
                 tail_listen,
                 valkey,
                 rediscover,
-                std::future::pending::<()>(),
+                scry_server::shutdown::wait(tail_shutdown),
             )
             .await
             {
@@ -676,10 +686,15 @@ pub async fn run(args: Args) -> Result<()> {
             let fleet = fleet_source.clone();
             let local: Arc<dyn LocalStatus> = metrics;
             let self_id = instance_uuid.to_string();
+            let status_shutdown = shutdown.clone();
             bg_tasks.push(tokio::spawn(async move {
-                if let Err(e) = serve_status(addr, local, fleet, self_id, async {
-                    let _ = tokio::signal::ctrl_c().await;
-                })
+                if let Err(e) = serve_status(
+                    addr,
+                    local,
+                    fleet,
+                    self_id,
+                    scry_server::shutdown::wait(status_shutdown),
+                )
                 .await
                 {
                     warn!(error = %e, "status endpoint failed");
@@ -691,21 +706,30 @@ pub async fn run(args: Args) -> Result<()> {
     };
 
     let serve_result = service
-        .serve_with_shutdown(args.listen, async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
+        .serve_with_shutdown(args.listen, scry_server::shutdown::wait(shutdown.clone()))
         .await;
 
     // Process is exiting — stop the convergence loops and close Valkey.
     for t in &bg_tasks {
         t.abort();
     }
-    // Remove our status-registry entry promptly (else it lingers until TTL).
+    // Best-effort prompt cleanup. Registry TTLs are the correctness backstop;
+    // never let a degraded Valkey consume the pod's whole termination grace.
     if let Some(reg) = status_registration {
-        reg.deregister().await;
+        if tokio::time::timeout(SHUTDOWN_CLEANUP_TIMEOUT, reg.deregister())
+            .await
+            .is_err()
+        {
+            warn!("timed out deregistering query status during shutdown");
+        }
     }
     if let Some(c) = valkey {
-        c.quit().await;
+        if tokio::time::timeout(SHUTDOWN_CLEANUP_TIMEOUT, c.quit())
+            .await
+            .is_err()
+        {
+            warn!("timed out closing Valkey during shutdown");
+        }
     }
     serve_result
 }

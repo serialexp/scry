@@ -61,14 +61,16 @@ fn embed_requested() -> bool {
     }
 }
 
-/// Run `bun install` then `bun run build` in `desktop/`, panicking on failure.
+/// Run `bun install --frozen-lockfile` then `bun run build` in `desktop/`,
+/// panicking on failure. Frozen installation keeps a local Web UI rebuild from
+/// rewriting the committed lockfile just because the installed Bun is newer.
 fn build_frontend(desktop: &Path) {
     let bun = env::var("BUN").unwrap_or_else(|_| "bun".to_string());
     println!(
         "cargo:warning=SCRY_EMBED_WEBUI set — building frontend bundle with `{bun}` in {}",
         desktop.display()
     );
-    run(&bun, &["install"], desktop);
+    run(&bun, &["install", "--frozen-lockfile"], desktop);
     run(&bun, &["run", "build"], desktop);
 }
 

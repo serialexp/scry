@@ -39,6 +39,7 @@ pub mod memory_guard;
 mod pipeline;
 pub mod query_service;
 mod server;
+pub mod shutdown;
 pub mod stats;
 pub mod tail;
 

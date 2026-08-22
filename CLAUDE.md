@@ -52,6 +52,14 @@ Smoke-test the browser web UI end-to-end (builds the bundle + release `scry`, st
 scripts/smoke-webui.sh             # asserts SPA serve + auth + /api/query relay + logout
 ```
 
+Update this machine's installed Web UI after frontend or version changes:
+
+```bash
+just recompile-webui               # build + embed, install ~/.cargo/bin/scry, restart user service
+```
+
+This recipe sets `SCRY_EMBED_WEBUI=1`; a plain `cargo install` can otherwise embed a stale or empty `desktop/dist`. It restarts `scry-webui.service` and verifies both the installed version and service state.
+
 Run it for real against a live daemon:
 
 ```bash
@@ -133,6 +141,7 @@ The eleven operator roles are now a **single multicall binary `scry`** (crate `c
 - `scripts/smoke.sh` — the v0.1 scripted exit criterion; see Commands. Dispatches to `scripts/smoke-multi.sh` when `MULTI=1`.
 - `scripts/smoke-multi.sh` — the v0.9 two-instance exit criterion; see Commands.
 - `scripts/smoke-webui.sh` — the `scry web` exit criterion: builds the SolidJS bundle + release binary, stands up a stub `scry query` daemon, and asserts the full web surface (SPA served, `/api/me` 401→204, wrong/right login, `/api/query` auth gate + byte-pipe relay, logout). Self-contained — no Garage/Valkey needed. Needs `bun`, `python3`, `curl`.
+- `just recompile-webui` — the home-machine update path after frontend/version changes: builds the current SolidJS bundle with `SCRY_EMBED_WEBUI=1`, installs the release `scry` to `~/.cargo/bin`, restarts `scry-webui.service`, and prints the installed version + service state. Use this instead of plain `cargo install`, which can embed stale `desktop/dist` assets.
 - `scripts/smoke-agent-metrics.sh` — the scry-agent metrics-scraping exit criterion (D-045): a python stub `/metrics` → `scry agent --no-discovery --scrape-target` → `scry ingest --storage` → bucket → `scry list`/`scry get`, asserting exactly 5 metric rows land (3 exposed + synthesized `up`/`scrape_duration_seconds`) with a postings sidecar and query back loss-free. Needs Garage (`docker/garage/.env`), `aws`, `sqlite3`, `python3`.
 - `scripts/smoke-agent-config.sh` — the scry-agent TOML-config pipeline exit criterion (D-047): a CRI log fixture + stub `/metrics` + `--config agent.toml` → agent → `scry ingest --storage` → bucket → `scry list`/`scry get`, 10 assertions covering `static_labels` (logs+metrics), `json.labels`/`json.metadata`/`message_field` (logs), and metric `label_map` rename + old-key suppression (metrics). Needs same prerequisites.
 - `scripts/smoke-agent-kubelet.sh` — the scry-agent kubelet-scraping exit criterion (D-048): a self-signed HTTPS + `Bearer`-gated stub serving `/metrics/cadvisor` + `/metrics` → `scry agent --no-discovery --config` with a `[metrics.kubelet]` block (skip-verify TLS + file bearer) → `scry ingest --storage` → bucket → `scry list`/`scry get`, asserting 6 rows land, `job=cadvisor`/`job=kubelet` each select 3, `__name__=up` selects 2 (both scrapes auth'd over TLS), and a `cluster` static label rides all rows. Proves the kubelet HTTPS + skip-verify + rotating-bearer-file path e2e; pod-label SD is covered by unit tests. Needs Garage (`docker/garage/.env`), `aws`, `sqlite3`, `python3`, `openssl`.

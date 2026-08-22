@@ -27,6 +27,9 @@ spec:
       labels:
         app: scry-query
     spec:
+      # Give queryd time to stop accepting work and finish bounded cleanup after
+      # Kubernetes sends SIGTERM. The daemon handles both SIGTERM and SIGINT.
+      terminationGracePeriodSeconds: 30
       # The image runs as UID 65532 (distroless :nonroot). fsGroup makes the
       # kubelet chown the emptyDir to that group on mount so the non-root
       # process can write the SQLite catalog + WAL.

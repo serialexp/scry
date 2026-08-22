@@ -47,6 +47,10 @@ use agent_status::{AgentStatusRelay, MergedFleetSource};
 /// pipeline (Dummy included — the smoke harness exercises it).
 const ALL_SIGNALS: [&str; 5] = ["dummy", "metrics", "logs", "traces", "profiles"];
 
+/// Registry cleanup is advisory; TTLs remove stale entries after a crash. Keep
+/// a degraded Valkey from consuming the pod's full termination grace period.
+const SHUTDOWN_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// CLI arguments for the `scry ingest` subcommand.
 #[derive(Parser, Debug)]
 #[command(about = "Ingest server daemon (native wire; optional storage + multi-instance)")]
@@ -334,6 +338,11 @@ pub async fn run(args: Args) -> Result<()> {
     // absent everything degrades to a correct single-instance path: no sink,
     // no lease (maintenance pauses unless `--allow-unfenced-maintenance`),
     // convergence falls back to polling + full-walk against the bucket.
+    // Install handlers before the Valkey connection and listener setup. As PID 1
+    // in a container, ingestd must explicitly catch Kubernetes SIGTERM. The
+    // watch value also lets ingest and status share one reliable notification.
+    let shutdown = scry_server::shutdown::channel();
+
     let valkey_url = args
         .valkey_url
         .clone()
@@ -630,12 +639,9 @@ pub async fn run(args: Args) -> Result<()> {
     });
     server = server.with_live_ring(live_ring);
 
-    // Optional status HTTP endpoint (D-057). Shares its shutdown signal with
-    // the ingest server: both listen for Ctrl-C independently (tokio's
-    // `ctrl_c()` resolves every pending future on SIGINT), so a single Ctrl-C
-    // drains the ingest pipeline *and* stops the status server. With Valkey
-    // present it publishes this instance's snapshot into the fleet registry and
-    // renders the whole fleet; without it, just this instance.
+    // Optional status HTTP endpoint (D-057). With Valkey present it publishes
+    // this instance's snapshot into the fleet registry and renders the whole
+    // fleet; without it, just this instance.
     let (stats_task, status_registration) = match (args.stats_listen.clone(), stats_metrics.clone())
     {
         (Some(addr), Some(metrics)) => {
@@ -664,10 +670,15 @@ pub async fn run(args: Args) -> Result<()> {
             }));
             let local: Arc<dyn LocalStatus> = metrics;
             let self_id = writer_uuid.to_string();
+            let status_shutdown = shutdown.clone();
             let task = tokio::spawn(async move {
-                if let Err(e) = serve_status(addr, local, fleet, self_id, async {
-                    let _ = tokio::signal::ctrl_c().await;
-                })
+                if let Err(e) = serve_status(
+                    addr,
+                    local,
+                    fleet,
+                    self_id,
+                    scry_server::shutdown::wait(status_shutdown),
+                )
                 .await
                 {
                     warn!(error = %e, "status endpoint failed");
@@ -852,9 +863,7 @@ pub async fn run(args: Args) -> Result<()> {
     }
 
     let serve_result = server
-        .serve_with_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
+        .serve_with_shutdown(scry_server::shutdown::wait(shutdown.clone()))
         .await;
 
     // Stop the convergence/maintenance loops and the pub/sub publisher; the
@@ -865,16 +874,31 @@ pub async fn run(args: Args) -> Result<()> {
     if let Some(t) = &sink_task {
         t.abort();
     }
-    // Remove our tail-registry entry promptly (else it lingers until TTL).
+    // Prompt registry cleanup is best-effort; TTLs are the correctness backstop.
+    // Bound each Valkey operation so shutdown still completes during an outage.
     if let Some(reg) = tail_registration {
-        reg.deregister().await;
+        if tokio::time::timeout(SHUTDOWN_CLEANUP_TIMEOUT, reg.deregister())
+            .await
+            .is_err()
+        {
+            warn!("timed out deregistering tail endpoint during shutdown");
+        }
     }
-    // Remove our status-registry entry promptly (else it lingers until TTL).
     if let Some(reg) = status_registration {
-        reg.deregister().await;
+        if tokio::time::timeout(SHUTDOWN_CLEANUP_TIMEOUT, reg.deregister())
+            .await
+            .is_err()
+        {
+            warn!("timed out deregistering ingest status during shutdown");
+        }
     }
     if let Some(c) = valkey {
-        c.quit().await;
+        if tokio::time::timeout(SHUTDOWN_CLEANUP_TIMEOUT, c.quit())
+            .await
+            .is_err()
+        {
+            warn!("timed out closing Valkey during shutdown");
+        }
     }
     if let Some(task) = stats_task {
         let _ = task.await;
