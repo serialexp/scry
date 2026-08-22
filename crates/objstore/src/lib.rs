@@ -32,7 +32,8 @@ mod store;
 
 pub use pool::{
     BufPool, BufPoolConfig, PoolStats, PooledBuf, DEFAULT_POOL_AUTOSCALE_HEADROOM,
-    DEFAULT_POOL_CAPACITY, DEFAULT_POOL_MAX_CAPACITY, DEFAULT_POOL_WARMUP_SIZE,
+    DEFAULT_POOL_CAPACITY, DEFAULT_POOL_MAX_CAPACITY, DEFAULT_POOL_MAX_RETAINED_BYTES,
+    DEFAULT_POOL_WARMUP_SIZE,
 };
 pub use store::PooledStore;
 
@@ -94,6 +95,7 @@ impl BufPoolConfig {
     /// - `SCRY_OBJSTORE_POOL_WARMUP_SIZE_MIB` (default 10)
     /// - `SCRY_OBJSTORE_POOL_INITIAL_CAPACITY` (default 16)
     /// - `SCRY_OBJSTORE_POOL_MAX_CAPACITY` (default 128)
+    /// - `SCRY_OBJSTORE_POOL_MAX_RETAINED_MIB` (default 256)
     /// - `SCRY_OBJSTORE_POOL_AUTOSCALE_HEADROOM` (default 4)
     pub fn from_env() -> Result<Self> {
         fn parse<T: std::str::FromStr>(key: &str, default: T) -> Result<T>
@@ -111,9 +113,16 @@ impl BufPoolConfig {
             "SCRY_OBJSTORE_POOL_WARMUP_SIZE_MIB",
             DEFAULT_POOL_WARMUP_SIZE / (1024 * 1024),
         )?;
+        let max_retained_mib: usize = parse(
+            "SCRY_OBJSTORE_POOL_MAX_RETAINED_MIB",
+            DEFAULT_POOL_MAX_RETAINED_BYTES / (1024 * 1024),
+        )?;
         Ok(Self {
             initial_capacity: parse("SCRY_OBJSTORE_POOL_INITIAL_CAPACITY", DEFAULT_POOL_CAPACITY)?,
             max_capacity: parse("SCRY_OBJSTORE_POOL_MAX_CAPACITY", DEFAULT_POOL_MAX_CAPACITY)?,
+            max_retained_bytes: max_retained_mib.checked_mul(1024 * 1024).context(
+                "SCRY_OBJSTORE_POOL_MAX_RETAINED_MIB overflows usize when converted to bytes",
+            )?,
             warmup_count: parse("SCRY_OBJSTORE_POOL_WARMUP_COUNT", 0)?,
             warmup_size: warmup_size_mib * 1024 * 1024,
             autoscale_headroom: parse(

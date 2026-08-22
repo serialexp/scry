@@ -152,6 +152,11 @@ pub struct Args {
     #[arg(long)]
     pool_max_capacity: Option<usize>,
 
+    /// Aggregate MiB retained by idle object-store buffers. This byte budget is
+    /// enforced in addition to the buffer-count cap; 0 disables retention.
+    #[arg(long)]
+    pool_max_retained_mib: Option<usize>,
+
     /// Autoscale grows capacity by this many slots when peak in-flight
     /// exceeds current capacity. 0 disables autoscale.
     #[arg(long)]
@@ -167,6 +172,10 @@ pub struct Args {
     #[arg(long)]
     postings_cache_bytes: Option<usize>,
 
+    /// Maximum distinct postings sidecars fetched/decoded concurrently.
+    #[arg(long)]
+    postings_cache_max_fills: Option<usize>,
+
     /// Body-bloom sidecar cache byte budget for the logs full-text
     /// path. Overrides `SCRY_BLOOM_CACHE_BYTES` if both are set. Blooms
     /// run ~2% of body size (tens to hundreds of KB per block), so the
@@ -175,6 +184,10 @@ pub struct Args {
     /// bloom; correctness is unaffected, it's a pure accelerator).
     #[arg(long)]
     bloom_cache_bytes: Option<usize>,
+
+    /// Maximum distinct body-bloom sidecars fetched/decoded concurrently.
+    #[arg(long)]
+    bloom_cache_max_fills: Option<usize>,
 
     /// Query-result cache byte budget (default 256 MiB; `0` disables).
     /// Caches the exact framed response bytes of *data* queries keyed by
@@ -305,6 +318,11 @@ pub async fn run(args: Args) -> Result<()> {
     if let Some(v) = args.pool_max_capacity {
         pool_cfg.max_capacity = v;
     }
+    if let Some(v) = args.pool_max_retained_mib {
+        pool_cfg.max_retained_bytes = v
+            .checked_mul(1024 * 1024)
+            .context("--pool-max-retained-mib overflows usize when converted to bytes")?;
+    }
     if let Some(v) = args.pool_autoscale_headroom {
         pool_cfg.autoscale_headroom = v;
     }
@@ -385,6 +403,9 @@ pub async fn run(args: Args) -> Result<()> {
     if let Some(v) = args.postings_cache_bytes {
         cache_cfg.budget_bytes = v;
     }
+    if let Some(v) = args.postings_cache_max_fills {
+        cache_cfg.max_concurrent_fills = v.max(1);
+    }
     let postings_cache = Arc::new(PostingsCache::new(cache_cfg));
 
     // Bloom cache: env defaults, overridden by --bloom-cache-bytes.
@@ -392,6 +413,9 @@ pub async fn run(args: Args) -> Result<()> {
         BloomCacheConfig::from_env().context("parsing SCRY_BLOOM_CACHE_BYTES env var")?;
     if let Some(v) = args.bloom_cache_bytes {
         bloom_cache_cfg.budget_bytes = v;
+    }
+    if let Some(v) = args.bloom_cache_max_fills {
+        bloom_cache_cfg.max_concurrent_fills = v.max(1);
     }
     let bloom_cache = Arc::new(BloomCache::new(bloom_cache_cfg));
 
@@ -530,9 +554,13 @@ pub async fn run(args: Args) -> Result<()> {
         catalog = %args.catalog.display(),
         bucket  = %cfg.bucket,
         pool_warmup_parked          = pool.free_count(),
+        pool_retained_bytes         = pool.free_bytes(),
+        pool_max_retained_bytes     = pool.max_retained_bytes(),
         pool_capacity               = pool.capacity(),
         postings_cache_budget_bytes = cache_cfg.budget_bytes,
+        postings_cache_max_fills    = cache_cfg.max_concurrent_fills,
         bloom_cache_budget_bytes    = bloom_cache_cfg.budget_bytes,
+        bloom_cache_max_fills       = bloom_cache_cfg.max_concurrent_fills,
         query_cache_budget_bytes    = result_cache.budget_bytes(),
         query_cache_entry_bytes     = args.query_cache_entry_bytes,
         query_memory_budget_bytes   = memory_budget_bytes,

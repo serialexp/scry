@@ -37,8 +37,8 @@ use anyhow::{Context, Result};
 use hashlink::LinkedHashMap;
 use object_store::ObjectStore;
 use scry_block::{BlockMeta, BodyBloom};
-use tokio::sync::OnceCell;
-use tracing::warn;
+use tokio::sync::{OnceCell, Semaphore};
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::body_bloom::fetch_body_bloom;
@@ -48,21 +48,25 @@ use crate::body_bloom::fetch_body_bloom;
 /// holds hundreds of blocks comfortably — far more than postings' 256 MiB
 /// needs to for its larger sidecars.
 pub const DEFAULT_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum distinct bloom sidecars fetched/decoded concurrently.
+pub const DEFAULT_MAX_CONCURRENT_FILLS: usize = 8;
 
 /// Bloom cache configuration. Read from env via
 /// [`BloomCacheConfig::from_env`] or built directly.
 #[derive(Debug, Clone, Copy)]
 pub struct BloomCacheConfig {
-    /// Byte budget; entries beyond this evict LRU-first. A single entry
-    /// larger than the budget is accepted anyway (zero caching is worse
-    /// than zero eviction) and a warning is logged.
+    /// Byte budget; entries beyond this evict LRU-first. Entries larger
+    /// than the entire budget are returned to the caller but not retained.
     pub budget_bytes: usize,
+    /// Maximum distinct cold fills executing concurrently.
+    pub max_concurrent_fills: usize,
 }
 
 impl Default for BloomCacheConfig {
     fn default() -> Self {
         Self {
             budget_bytes: DEFAULT_BUDGET_BYTES,
+            max_concurrent_fills: DEFAULT_MAX_CONCURRENT_FILLS,
         }
     }
 }
@@ -77,6 +81,15 @@ impl BloomCacheConfig {
                 cfg.budget_bytes = v
                     .parse()
                     .with_context(|| format!("SCRY_BLOOM_CACHE_BYTES={v}"))?;
+            }
+        }
+        if let Ok(v) = std::env::var("SCRY_BLOOM_CACHE_MAX_FILLS") {
+            let v = v.trim();
+            if !v.is_empty() {
+                cfg.max_concurrent_fills = v
+                    .parse::<usize>()
+                    .with_context(|| format!("SCRY_BLOOM_CACHE_MAX_FILLS={v}"))?
+                    .max(1);
             }
         }
         Ok(cfg)
@@ -149,6 +162,7 @@ pub struct BloomCache {
     misses: AtomicU64,
     evictions: AtomicU64,
     fetch_errors: AtomicU64,
+    fill_permits: Arc<Semaphore>,
 }
 
 /// Per-slot weight estimate. A loaded bloom weighs its byte length plus a
@@ -173,12 +187,16 @@ impl BloomCache {
             misses: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
             fetch_errors: AtomicU64::new(0),
+            fill_permits: Arc::new(Semaphore::new(cfg.max_concurrent_fills.max(1))),
         }
     }
 
     /// Convenience for the common shape.
     pub fn with_budget_bytes(budget_bytes: usize) -> Self {
-        Self::new(BloomCacheConfig { budget_bytes })
+        Self::new(BloomCacheConfig {
+            budget_bytes,
+            ..Default::default()
+        })
     }
 
     /// Take a snapshot for telemetry.
@@ -263,8 +281,13 @@ impl BloomCache {
         // ── Phase 2: initialize (or await existing initialization) ──
         let store_for_fetch = store.clone();
         let meta_for_fetch = meta.clone();
+        let permits = self.fill_permits.clone();
         let init_result = cell
             .get_or_try_init(|| async move {
+                let _permit = permits
+                    .acquire_owned()
+                    .await
+                    .expect("bloom fill semaphore is never closed");
                 fetch_body_bloom(store_for_fetch, &meta_for_fetch)
                     .await
                     .map(Arc::new)
@@ -287,17 +310,19 @@ impl BloomCache {
         let new_weight = slot_weight(&value);
         let prev = weight.swap(new_weight, Ordering::AcqRel);
         if prev == 0 {
+            let mut state = self.state.lock().expect("bloom cache mutex poisoned");
             if new_weight > self.budget_bytes {
-                warn!(
+                state.map.remove(&uuid);
+                debug!(
                     block_uuid = %uuid,
                     weight_bytes = new_weight,
                     budget_bytes = self.budget_bytes,
-                    "bloom cache entry exceeds total budget; accepted anyway"
+                    "bloom entry exceeds cache budget; returning without caching"
                 );
+            } else {
+                state.bytes_in = state.bytes_in.saturating_add(new_weight);
+                self.evict_to_budget(&mut state, /* protect_uuid */ uuid);
             }
-            let mut state = self.state.lock().expect("bloom cache mutex poisoned");
-            state.bytes_in = state.bytes_in.saturating_add(new_weight);
-            self.evict_to_budget(&mut state, /* protect_uuid */ uuid);
         }
         Ok(value)
     }
@@ -389,8 +414,12 @@ mod tests {
         let prev = weight.swap(new_weight, Ordering::AcqRel);
         if prev == 0 {
             let mut state = cache.state.lock().unwrap();
-            state.bytes_in += new_weight;
-            cache.evict_to_budget(&mut state, uuid);
+            if new_weight > cache.budget_bytes {
+                state.map.remove(&uuid);
+            } else {
+                state.bytes_in += new_weight;
+                cache.evict_to_budget(&mut state, uuid);
+            }
         }
     }
 
@@ -427,6 +456,34 @@ mod tests {
         assert!(state.map.contains_key(&c));
         assert!(!state.map.contains_key(&a));
         assert!(!state.map.contains_key(&b));
+    }
+
+    #[tokio::test]
+    async fn oversized_single_entry_is_not_retained() {
+        let cache = BloomCache::with_budget_bytes(1);
+        install(
+            &cache,
+            Uuid::new_v4(),
+            bloom_for(&["a body long enough to bloom"]),
+        )
+        .await;
+        let state = cache.state.lock().unwrap();
+        assert!(state.map.is_empty());
+        assert_eq!(state.bytes_in, 0);
+    }
+
+    #[test]
+    fn fill_concurrency_is_configurable_and_never_zero() {
+        let one = BloomCache::new(BloomCacheConfig {
+            budget_bytes: 1024,
+            max_concurrent_fills: 0,
+        });
+        assert_eq!(one.fill_permits.available_permits(), 1);
+        let many = BloomCache::new(BloomCacheConfig {
+            budget_bytes: 1024,
+            max_concurrent_fills: 3,
+        });
+        assert_eq!(many.fill_permits.available_permits(), 3);
     }
 
     #[tokio::test]

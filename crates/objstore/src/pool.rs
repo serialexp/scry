@@ -58,6 +58,11 @@ pub const DEFAULT_POOL_CAPACITY: usize = 16;
 /// normal use.
 pub const DEFAULT_POOL_MAX_CAPACITY: usize = 128;
 
+/// Default aggregate capacity retained by idle pool buffers. This is the real
+/// RSS backstop: count limits alone let a few unusually large range reads pin
+/// their allocations indefinitely.
+pub const DEFAULT_POOL_MAX_RETAINED_BYTES: usize = 256 * 1024 * 1024;
+
 /// Default per-buffer warmup size. Matches the rough working-set
 /// size of a single block fetch on the smoke bucket (≈10 MiB of
 /// coalesced parquet ranges).
@@ -82,9 +87,12 @@ pub struct BufPoolConfig {
     /// Starting cap on the free list. Buffers returned after the cap
     /// is reached either evict a smaller one or get dropped.
     pub initial_capacity: usize,
-    /// Hard ceiling autoscale will never cross. Bound on RSS the pool
-    /// can hold.
+    /// Hard ceiling autoscale will never cross. Bounds retained buffer count.
     pub max_capacity: usize,
+    /// Hard aggregate byte ceiling over the capacities of idle buffers. A
+    /// returned allocation larger than this is dropped. `0` retains no idle
+    /// buffers while preserving correct uncached reads.
+    pub max_retained_bytes: usize,
     /// At construction, allocate this many buffers of `warmup_size`
     /// bytes, force-fault their pages, and park them in the free list.
     /// 0 = no synchronous warmup (cold start).
@@ -109,7 +117,9 @@ pub struct PoolStats {
     pub peak_in_flight: usize,
     pub grows: usize,
     pub free_count: usize,
+    pub free_bytes: usize,
     pub capacity: usize,
+    pub max_retained_bytes: usize,
 }
 
 impl PoolStats {
@@ -126,7 +136,9 @@ impl PoolStats {
             in_flight: self.in_flight,
             peak_in_flight: self.peak_in_flight,
             free_count: self.free_count,
+            free_bytes: self.free_bytes,
             capacity: self.capacity,
+            max_retained_bytes: self.max_retained_bytes,
         }
     }
 }
@@ -136,6 +148,7 @@ impl Default for BufPoolConfig {
         Self {
             initial_capacity: DEFAULT_POOL_CAPACITY,
             max_capacity: DEFAULT_POOL_MAX_CAPACITY,
+            max_retained_bytes: DEFAULT_POOL_MAX_RETAINED_BYTES,
             warmup_count: 0,
             warmup_size: DEFAULT_POOL_WARMUP_SIZE,
             autoscale_headroom: DEFAULT_POOL_AUTOSCALE_HEADROOM,
@@ -154,14 +167,17 @@ pub struct BufPool {
 }
 
 struct Inner {
-    free: Mutex<Vec<Vec<u8>>>,
-    /// Cap on `free.len()`. `Mutex`-guarded together with `free` so
+    /// Idle buffers and the sum of their capacities. Keeping both behind one
+    /// mutex makes the aggregate-byte invariant atomic with eviction/reuse.
+    free: Mutex<FreeBuffers>,
+    /// Cap on `free.buffers.len()`. `Mutex`-guarded together with `free` so
     /// autoscale can grow it without racing on the eviction decision.
     /// (Stored separately from `free` capacity for explicit semantics
     /// — `free.capacity()` is just a Vec implementation detail.)
     capacity: Mutex<usize>,
     /// Hard ceiling autoscale won't cross.
     max_capacity: usize,
+    max_retained_bytes: usize,
     autoscale_headroom: usize,
 
     // ── Diagnostic counters ──────────────────────────────────────
@@ -175,6 +191,12 @@ struct Inner {
     in_flight: AtomicUsize,
     peak_in_flight: AtomicUsize,
     grows: AtomicUsize,
+}
+
+#[derive(Default)]
+struct FreeBuffers {
+    buffers: Vec<Vec<u8>>,
+    bytes: usize,
 }
 
 impl BufPool {
@@ -191,6 +213,7 @@ impl BufPool {
         Self::with_config(BufPoolConfig {
             initial_capacity: capacity,
             max_capacity: capacity,
+            max_retained_bytes: usize::MAX,
             warmup_count: 0,
             warmup_size: 0,
             autoscale_headroom: 0,
@@ -211,11 +234,22 @@ impl BufPool {
     pub fn with_config(cfg: BufPoolConfig) -> Self {
         let initial = cfg.initial_capacity.max(1);
         let max = cfg.max_capacity.max(initial);
-        let mut free: Vec<Vec<u8>> = Vec::with_capacity(initial.max(cfg.warmup_count));
+        let mut free = FreeBuffers {
+            buffers: Vec::with_capacity(initial.max(cfg.warmup_count)),
+            bytes: 0,
+        };
 
         if cfg.warmup_count > 0 && cfg.warmup_size > 0 {
-            for _ in 0..cfg.warmup_count {
+            for _ in 0..cfg.warmup_count.min(max) {
+                if free.bytes.saturating_add(cfg.warmup_size) > cfg.max_retained_bytes {
+                    break;
+                }
                 let mut buf: Vec<u8> = Vec::with_capacity(cfg.warmup_size);
+                // Allocators may round capacity up. Check the actual capacity so
+                // warmup cannot overshoot the aggregate invariant.
+                if free.bytes.saturating_add(buf.capacity()) > cfg.max_retained_bytes {
+                    break;
+                }
                 // Touch every page. `resize` writes 0 across the
                 // length, which forces the kernel to back each 4 KiB
                 // page with a physical frame and zero it once. Without
@@ -223,19 +257,21 @@ impl BufPool {
                 // — which defeats the purpose of warmup.
                 buf.resize(cfg.warmup_size, 0);
                 buf.clear();
-                free.push(buf);
+                free.bytes = free.bytes.saturating_add(buf.capacity());
+                free.buffers.push(buf);
             }
         }
 
-        // If warmup overshot initial_capacity, raise it to fit; we
-        // never want to immediately drop pages we just paid to fault.
-        let capacity = initial.max(free.len()).min(max);
+        // If warmup overshot initial_capacity, raise it to fit, while still
+        // respecting both the count and aggregate-byte ceilings.
+        let capacity = initial.max(free.buffers.len()).min(max);
 
         Self {
             inner: Arc::new(Inner {
                 free: Mutex::new(free),
                 capacity: Mutex::new(capacity),
                 max_capacity: max,
+                max_retained_bytes: cfg.max_retained_bytes,
                 autoscale_headroom: cfg.autoscale_headroom,
                 allocs: AtomicUsize::new(0),
                 reuses: AtomicUsize::new(0),
@@ -249,7 +285,17 @@ impl BufPool {
 
     /// Number of free buffers currently parked in the pool.
     pub fn free_count(&self) -> usize {
-        self.inner.free.lock().unwrap().len()
+        self.inner.free.lock().unwrap().buffers.len()
+    }
+
+    /// Aggregate capacity of idle buffers currently retained by the pool.
+    pub fn free_bytes(&self) -> usize {
+        self.inner.free.lock().unwrap().bytes
+    }
+
+    /// Aggregate idle-buffer byte ceiling.
+    pub fn max_retained_bytes(&self) -> usize {
+        self.inner.max_retained_bytes
     }
 
     /// Current free-list capacity (may have grown past
@@ -310,7 +356,9 @@ impl BufPool {
             peak_in_flight: self.peak_in_flight(),
             grows: self.grows(),
             free_count: self.free_count(),
+            free_bytes: self.free_bytes(),
             capacity: self.capacity(),
+            max_retained_bytes: self.max_retained_bytes(),
         }
     }
 
@@ -364,8 +412,9 @@ impl BufPool {
 
         // ── Free-list scan ────────────────────────────────────────
         let mut guard = self.inner.free.lock().unwrap();
-        if let Some(idx) = guard.iter().rposition(|v| v.capacity() >= min_cap) {
-            let buf = guard.swap_remove(idx);
+        if let Some(idx) = guard.buffers.iter().rposition(|v| v.capacity() >= min_cap) {
+            let buf = guard.buffers.swap_remove(idx);
+            guard.bytes = guard.bytes.saturating_sub(buf.capacity());
             drop(guard);
             self.inner.reuses.fetch_add(1, Ordering::Relaxed);
             return buf;
@@ -389,28 +438,44 @@ impl BufPool {
         self.inner.in_flight.fetch_sub(1, Ordering::Relaxed);
 
         buf.clear();
-        let cap = *self.inner.capacity.lock().unwrap();
-        let mut guard = self.inner.free.lock().unwrap();
-        if guard.len() < cap {
-            guard.push(buf);
+        let returning_cap = buf.capacity();
+        if returning_cap > self.inner.max_retained_bytes {
+            self.inner.misses.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        // Pool is at capacity. Find the smallest buffer; if ours is
-        // bigger, evict it. Otherwise drop ours.
-        let (min_idx, min_cap) = guard
-            .iter()
-            .enumerate()
-            .map(|(i, v)| (i, v.capacity()))
-            .min_by_key(|&(_, c)| c)
-            .expect("pool capacity > 0 implies guard non-empty here");
-        if min_cap < buf.capacity() {
-            guard.swap_remove(min_idx);
-            guard.push(buf);
-        } else {
-            // Drop `buf` — pool already holds bigger buffers.
-            drop(guard);
-            self.inner.misses.fetch_add(1, Ordering::Relaxed);
+
+        let count_cap = *self.inner.capacity.lock().unwrap();
+        let mut guard = self.inner.free.lock().unwrap();
+
+        // Prefer retaining larger buffers, but satisfy both dimensions. Evict
+        // the smallest existing allocation while adding this one would exceed
+        // either the count cap or aggregate byte cap. If the returning buffer
+        // is not larger than the smallest victim, keeping the existing set is
+        // at least as useful and avoids churn.
+        while guard.buffers.len() >= count_cap
+            || guard.bytes.saturating_add(returning_cap) > self.inner.max_retained_bytes
+        {
+            let Some((min_idx, min_cap)) = guard
+                .buffers
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (i, v.capacity()))
+                .min_by_key(|&(_, c)| c)
+            else {
+                self.inner.misses.fetch_add(1, Ordering::Relaxed);
+                return;
+            };
+            if min_cap >= returning_cap {
+                drop(guard);
+                self.inner.misses.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            let evicted = guard.buffers.swap_remove(min_idx);
+            guard.bytes = guard.bytes.saturating_sub(evicted.capacity());
         }
+
+        guard.bytes = guard.bytes.saturating_add(returning_cap);
+        guard.buffers.push(buf);
     }
 }
 
@@ -422,12 +487,17 @@ impl Default for BufPool {
 
 impl std::fmt::Debug for BufPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let free_count = self.inner.free.lock().unwrap().len();
+        let free = self.inner.free.lock().unwrap();
+        let free_count = free.buffers.len();
+        let free_bytes = free.bytes;
+        drop(free);
         let cap = *self.inner.capacity.lock().unwrap();
         f.debug_struct("BufPool")
             .field("free_count", &free_count)
+            .field("free_bytes", &free_bytes)
             .field("capacity", &cap)
             .field("max_capacity", &self.inner.max_capacity)
+            .field("max_retained_bytes", &self.inner.max_retained_bytes)
             .field("in_flight", &self.in_flight())
             .field("peak_in_flight", &self.peak_in_flight())
             .finish()
@@ -641,6 +711,7 @@ mod tests {
         let pool = BufPool::with_config(BufPoolConfig {
             initial_capacity: 4,
             max_capacity: 4,
+            max_retained_bytes: usize::MAX,
             warmup_count: 4,
             warmup_size: 64 * 1024,
             autoscale_headroom: 0,
@@ -661,6 +732,7 @@ mod tests {
         let pool = BufPool::with_config(BufPoolConfig {
             initial_capacity: 2,
             max_capacity: 8,
+            max_retained_bytes: usize::MAX,
             warmup_count: 5,
             warmup_size: 1024,
             autoscale_headroom: 0,
@@ -671,20 +743,85 @@ mod tests {
 
     #[test]
     fn warmup_capped_at_max_capacity() {
-        // warmup_count exceeds max_capacity — capacity caps at max,
-        // and the extras still get parked (we don't refuse to warm).
-        // The cap takes effect on the *next* checkin instead.
+        // Never allocate warm buffers that cannot be retained under the count
+        // cap; warmup itself must obey the same resident-memory invariants.
         let pool = BufPool::with_config(BufPoolConfig {
             initial_capacity: 2,
             max_capacity: 3,
+            max_retained_bytes: usize::MAX,
             warmup_count: 5,
             warmup_size: 1024,
             autoscale_headroom: 0,
         });
-        // All five buffers are parked (we already paid to fault them).
-        assert_eq!(pool.free_count(), 5);
-        // Capacity is clamped to max_capacity, NOT raised past it.
+        assert_eq!(pool.free_count(), 3);
         assert_eq!(pool.capacity(), 3);
+    }
+
+    #[test]
+    fn byte_budget_drops_individually_oversized_buffer() {
+        let pool = BufPool::with_config(BufPoolConfig {
+            initial_capacity: 4,
+            max_capacity: 4,
+            max_retained_bytes: 1024,
+            warmup_count: 0,
+            warmup_size: 0,
+            autoscale_headroom: 0,
+        });
+        drop(PooledBuf::checkout(&pool, 2048));
+        assert_eq!(pool.free_count(), 0);
+        assert_eq!(pool.free_bytes(), 0);
+        assert_eq!(pool.misses(), 1);
+    }
+
+    #[test]
+    fn byte_budget_evicts_smaller_buffers_to_fit() {
+        let pool = BufPool::with_config(BufPoolConfig {
+            initial_capacity: 8,
+            max_capacity: 8,
+            max_retained_bytes: 4096,
+            warmup_count: 0,
+            warmup_size: 0,
+            autoscale_headroom: 0,
+        });
+        let small: Vec<_> = (0..3).map(|_| PooledBuf::checkout(&pool, 1024)).collect();
+        drop(small);
+        assert_eq!(pool.free_bytes(), 3072);
+
+        drop(PooledBuf::checkout(&pool, 3072));
+        assert!(pool.free_bytes() <= 4096);
+        assert!(pool.free_count() <= 2);
+        let reused = PooledBuf::checkout(&pool, 3072);
+        assert!(reused.capacity() >= 3072);
+    }
+
+    #[test]
+    fn warmup_obeys_aggregate_byte_budget() {
+        let pool = BufPool::with_config(BufPoolConfig {
+            initial_capacity: 8,
+            max_capacity: 8,
+            max_retained_bytes: 2500,
+            warmup_count: 8,
+            warmup_size: 1024,
+            autoscale_headroom: 0,
+        });
+        assert_eq!(pool.free_count(), 2);
+        assert_eq!(pool.free_bytes(), 2048);
+    }
+
+    #[test]
+    fn zero_byte_budget_disables_retention() {
+        let pool = BufPool::with_config(BufPoolConfig {
+            initial_capacity: 4,
+            max_capacity: 4,
+            max_retained_bytes: 0,
+            warmup_count: 4,
+            warmup_size: 1024,
+            autoscale_headroom: 0,
+        });
+        assert_eq!(pool.free_count(), 0);
+        drop(PooledBuf::checkout(&pool, 128));
+        assert_eq!(pool.free_count(), 0);
+        assert_eq!(pool.in_flight(), 0);
     }
 
     #[test]
@@ -692,6 +829,7 @@ mod tests {
         let pool = BufPool::with_config(BufPoolConfig {
             initial_capacity: 2,
             max_capacity: 16,
+            max_retained_bytes: usize::MAX,
             warmup_count: 0,
             warmup_size: 0,
             autoscale_headroom: 4,
@@ -718,6 +856,7 @@ mod tests {
         let pool = BufPool::with_config(BufPoolConfig {
             initial_capacity: 2,
             max_capacity: 4,
+            max_retained_bytes: usize::MAX,
             warmup_count: 0,
             warmup_size: 0,
             autoscale_headroom: 100,
@@ -739,6 +878,7 @@ mod tests {
         let pool = BufPool::with_config(BufPoolConfig {
             initial_capacity: 2,
             max_capacity: 16,
+            max_retained_bytes: usize::MAX,
             warmup_count: 0,
             warmup_size: 0,
             autoscale_headroom: 0,

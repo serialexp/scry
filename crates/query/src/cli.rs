@@ -205,9 +205,14 @@ pub struct Args {
     #[arg(long)]
     pool_initial_capacity: Option<usize>,
 
-    /// Hard ceiling that autoscale won't cross. Caps pool RSS.
+    /// Hard ceiling that autoscale won't cross. Caps retained buffer count.
     #[arg(long)]
     pool_max_capacity: Option<usize>,
+
+    /// Aggregate MiB retained by idle object-store buffers. This is the pool's
+    /// RSS backstop; 0 disables retention while preserving uncached reads.
+    #[arg(long)]
+    pool_max_retained_mib: Option<usize>,
 
     /// Autoscale grows capacity by this many slots when peak in-flight
     /// exceeds current capacity. 0 disables autoscale.
@@ -375,6 +380,11 @@ pub async fn run(args: Args) -> Result<()> {
     }
     if let Some(v) = args.pool_max_capacity {
         pool_cfg.max_capacity = v;
+    }
+    if let Some(v) = args.pool_max_retained_mib {
+        pool_cfg.max_retained_bytes = v
+            .checked_mul(1024 * 1024)
+            .context("--pool-max-retained-mib overflows usize when converted to bytes")?;
     }
     if let Some(v) = args.pool_autoscale_headroom {
         pool_cfg.autoscale_headroom = v;
@@ -767,11 +777,13 @@ fn print_plan_metrics(plan: &dyn ExecutionPlan, total_rows: usize) {
 /// then `reuses` dominates and `peak ≤ cap`."
 fn print_pool_stats(pool: &BufPool) {
     eprintln!(
-        "# pool: {} reuses / {} allocs / {} drops | parked: {} | peak in-flight: {} | cap: {} (grew {}× toward max {})",
+        "# pool: {} reuses / {} allocs / {} drops | parked: {} buffers / {} bytes (max {}) | peak in-flight: {} | cap: {} (grew {}× toward max {})",
         pool.reuses(),
         pool.allocs(),
         pool.misses(),
         pool.free_count(),
+        pool.free_bytes(),
+        pool.max_retained_bytes(),
         pool.peak_in_flight(),
         pool.capacity(),
         pool.grows(),
