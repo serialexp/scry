@@ -60,8 +60,9 @@ spec:
               containerPort: 4100
           # The listener only opens after the one-object catalog snapshot restore
           # finishes. Until then the pod is Running but unready, and startup logs
-          # remain visible from the main container. The daemon's background
-          # convergence fills any snapshot delta after the listener is up.
+          # remain visible from the main container. A TCP probe intentionally
+          # connects and closes without speaking QueryFrame; queryd treats that
+          # clean EOF as debug-level probe traffic, not a warning.
           readinessProbe:
             tcpSocket:
               port: 4100

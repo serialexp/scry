@@ -427,18 +427,31 @@ impl QueryService {
         let mut wr = BufWriter::new(wr);
 
         // ── Read the request frame ───────────────────────────────────
-        let req_frame: QueryFrame =
-            match tokio::time::timeout(QUERY_REQUEST_DEADLINE, read_frame(&mut rd)).await {
-                Ok(Ok(f)) => f,
-                Ok(Err(e)) => {
-                    warn!(%peer, error = %e, "no QueryRequest frame from client");
-                    return Ok(());
-                }
-                Err(_) => {
-                    warn!(%peer, "timed out waiting for QueryRequest frame");
-                    return Ok(());
-                }
-            };
+        let req_frame: QueryFrame = match tokio::time::timeout(
+            QUERY_REQUEST_DEADLINE,
+            read_frame(&mut rd),
+        )
+        .await
+        {
+            Ok(Ok(f)) => f,
+            Ok(Err(scry_proto::framing::FrameError::Io(e)))
+                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                // TCP readiness/liveness probes connect and close without
+                // sending a frame. That proves the listener is accepting;
+                // it is not an operator-actionable protocol failure.
+                tracing::debug!(%peer, "connection closed before QueryRequest (likely TCP probe)");
+                return Ok(());
+            }
+            Ok(Err(e)) => {
+                warn!(%peer, error = %e, "no QueryRequest frame from client");
+                return Ok(());
+            }
+            Err(_) => {
+                warn!(%peer, "timed out waiting for QueryRequest frame");
+                return Ok(());
+            }
+        };
         if let Some(guard) = &self.memory_guard {
             if let Err(e) = guard.check() {
                 warn!(%peer, error = %e, "refusing query at process memory safety threshold");
