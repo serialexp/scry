@@ -204,7 +204,9 @@ pub async fn run(args: Args) -> Result<()> {
     };
 
     // ── Fetcher task: PIT + search_after → pages of _source ─────────────
-    let (tx, rx) = mpsc::channel::<Vec<Value>>(4);
+    // A page contains fully owned JSON documents and can be large. One queued
+    // page still overlaps fetch and send while avoiding four-page retention.
+    let (tx, rx) = mpsc::channel::<Vec<Value>>(1);
     let fetch_os = os.clone();
     let ts_field = args.timestamp_field.clone();
     let page_size = args.page_size;

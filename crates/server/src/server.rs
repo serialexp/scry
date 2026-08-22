@@ -14,15 +14,15 @@ use scry_block::{
 use scry_proto::{
     build,
     constants::{
-        Signal, ACK_ACCEPTED, ACK_REJECTED, COMPRESSION_NONE, COMPRESSION_ZSTD,
-        DEFAULT_MAX_BATCH_BYTES, DEFAULT_MAX_INFLIGHT_BATCHES, DEFAULT_SUGGESTED_BATCH_BYTES,
-        ERR_BAD_MATCHER, ERR_HELLO_REQUIRED, ERR_PROTOCOL_VERSION, ERR_SESSION_MISMATCH,
-        GOODBYE_NORMAL, PROTOCOL_VERSION_V0, REJECT_BAD_SCHEMA, REJECT_BATCH_TOO_LARGE,
-        REJECT_SIGNAL_NOT_ANNOUNCED, SIGNAL_BIT_LOGS, SIGNAL_BIT_METRICS, SIGNAL_BIT_PROFILES,
-        SIGNAL_BIT_TRACES,
+        Signal, ACK_ACCEPTED, ACK_REJECTED, DEFAULT_MAX_BATCH_BYTES, DEFAULT_MAX_INFLIGHT_BATCHES,
+        DEFAULT_SUGGESTED_BATCH_BYTES, ERR_BAD_MATCHER, ERR_HELLO_REQUIRED, ERR_PROTOCOL_VERSION,
+        ERR_SESSION_MISMATCH, GOODBYE_NORMAL, PROTOCOL_VERSION_V0, REJECT_BAD_SCHEMA,
+        REJECT_BATCH_TOO_LARGE, REJECT_SIGNAL_NOT_ANNOUNCED, SIGNAL_BIT_LOGS, SIGNAL_BIT_METRICS,
+        SIGNAL_BIT_PROFILES, SIGNAL_BIT_TRACES,
     },
     framing::{read_frame, write_frame, FrameError},
     generated::{FrameMsg, HelloOutput, LiveRecord},
+    payload::{decode_batch_payload, PayloadDecodeError},
 };
 use std::{
     future::Future,
@@ -654,38 +654,26 @@ async fn handle(
                     m.add_batch(b.payload.len() as u64);
                 }
 
-                let decompressed = match b.compression {
-                    COMPRESSION_NONE => b.payload.clone(),
-                    COMPRESSION_ZSTD => match zstd::decode_all(b.payload.as_slice()) {
-                        Ok(d) => d,
-                        Err(e) => {
-                            counters.rejected.fetch_add(1, Ordering::Relaxed);
-                            if let Some(m) = metrics.as_ref() {
-                                m.add_rejected();
-                            }
-                            warn!(%peer, batch_id = b.batch_id, error = %e, "zstd decompress failed");
-                            write_frame(
-                                &mut wr,
-                                &build::batch_ack(
-                                    session_id,
-                                    b.batch_id,
-                                    ACK_REJECTED,
-                                    0,
-                                    REJECT_BAD_SCHEMA,
-                                    "zstd decompress failed",
-                                ),
-                            )
-                            .await?;
-                            wr.flush().await?;
-                            continue;
-                        }
-                    },
-                    other => {
-                        warn!(%peer, batch_id = b.batch_id, compression = other, "unknown compression");
+                let decompressed = match decode_batch_payload(
+                    &b.payload,
+                    b.compression,
+                    b.uncompressed_size,
+                    DEFAULT_MAX_BATCH_BYTES as usize,
+                ) {
+                    Ok(decoded) => decoded,
+                    Err(e) => {
                         counters.rejected.fetch_add(1, Ordering::Relaxed);
                         if let Some(m) = metrics.as_ref() {
                             m.add_rejected();
                         }
+                        let (code, message) = match &e {
+                            PayloadDecodeError::TooLarge { .. } => (
+                                REJECT_BATCH_TOO_LARGE,
+                                "decoded payload exceeds max_batch_bytes",
+                            ),
+                            _ => (REJECT_BAD_SCHEMA, "invalid compressed payload"),
+                        };
+                        warn!(%peer, batch_id = b.batch_id, error = %e, "payload decompression rejected");
                         write_frame(
                             &mut wr,
                             &build::batch_ack(
@@ -693,8 +681,8 @@ async fn handle(
                                 b.batch_id,
                                 ACK_REJECTED,
                                 0,
-                                REJECT_BAD_SCHEMA,
-                                "unknown compression codec",
+                                code,
+                                message,
                             ),
                         )
                         .await?;
@@ -702,16 +690,6 @@ async fn handle(
                         continue;
                     }
                 };
-
-                if decompressed.len() != b.uncompressed_size as usize {
-                    warn!(
-                        %peer,
-                        batch_id = b.batch_id,
-                        claimed = b.uncompressed_size,
-                        actual = decompressed.len(),
-                        "uncompressed_size mismatch"
-                    );
-                }
                 counters
                     .payload_bytes_out
                     .fetch_add(decompressed.len() as u64, Ordering::Relaxed);

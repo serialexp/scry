@@ -27,15 +27,15 @@ use anyhow::{Context, Result};
 use scry_proto::{
     build,
     constants::{
-        Signal, ACK_ACCEPTED, ACK_REJECTED, COMPRESSION_NONE, COMPRESSION_ZSTD,
-        DEFAULT_MAX_BATCH_BYTES, DEFAULT_MAX_INFLIGHT_BATCHES, DEFAULT_SUGGESTED_BATCH_BYTES,
-        ERR_HELLO_REQUIRED, ERR_PROTOCOL_VERSION, ERR_SESSION_MISMATCH, GOODBYE_NORMAL,
-        PROTOCOL_VERSION_V0, REJECT_BAD_SCHEMA, REJECT_BATCH_TOO_LARGE,
-        REJECT_SIGNAL_NOT_ANNOUNCED, SIGNAL_BIT_LOGS, SIGNAL_BIT_METRICS, SIGNAL_BIT_PROFILES,
-        SIGNAL_BIT_TRACES,
+        Signal, ACK_ACCEPTED, ACK_REJECTED, DEFAULT_MAX_BATCH_BYTES, DEFAULT_MAX_INFLIGHT_BATCHES,
+        DEFAULT_SUGGESTED_BATCH_BYTES, ERR_HELLO_REQUIRED, ERR_PROTOCOL_VERSION,
+        ERR_SESSION_MISMATCH, GOODBYE_NORMAL, PROTOCOL_VERSION_V0, REJECT_BAD_SCHEMA,
+        REJECT_BATCH_TOO_LARGE, REJECT_SIGNAL_NOT_ANNOUNCED, SIGNAL_BIT_LOGS, SIGNAL_BIT_METRICS,
+        SIGNAL_BIT_PROFILES, SIGNAL_BIT_TRACES,
     },
     framing::{read_frame, write_frame, FrameError},
     generated::{FrameMsg, HelloOutput, LogsBatch, MetricsBatch, ProfilesBatch, TracesBatch},
+    payload::{decode_batch_payload, PayloadDecodeError},
 };
 use tokio::{
     io::{AsyncWriteExt, BufReader, BufWriter},
@@ -214,33 +214,23 @@ async fn handle_conn(
                     continue;
                 }
 
-                let decompressed = match b.compression {
-                    COMPRESSION_NONE => b.payload.clone(),
-                    COMPRESSION_ZSTD => match zstd::decode_all(b.payload.as_slice()) {
-                        Ok(d) => d,
-                        Err(e) => {
-                            warn!(%peer, batch_id = b.batch_id, error = %e, "zstd decompress failed");
-                            reject(
-                                &mut wr,
-                                session_id,
-                                b.batch_id,
-                                REJECT_BAD_SCHEMA,
-                                "zstd decompress failed",
-                            )
-                            .await?;
-                            continue;
-                        }
-                    },
-                    other => {
-                        warn!(%peer, batch_id = b.batch_id, compression = other, "unknown compression");
-                        reject(
-                            &mut wr,
-                            session_id,
-                            b.batch_id,
-                            REJECT_BAD_SCHEMA,
-                            "unknown compression codec",
-                        )
-                        .await?;
+                let decompressed = match decode_batch_payload(
+                    &b.payload,
+                    b.compression,
+                    b.uncompressed_size,
+                    DEFAULT_MAX_BATCH_BYTES as usize,
+                ) {
+                    Ok(decoded) => decoded,
+                    Err(e) => {
+                        let (code, message) = match &e {
+                            PayloadDecodeError::TooLarge { .. } => (
+                                REJECT_BATCH_TOO_LARGE,
+                                "decoded payload exceeds max_batch_bytes",
+                            ),
+                            _ => (REJECT_BAD_SCHEMA, "invalid compressed payload"),
+                        };
+                        warn!(%peer, batch_id = b.batch_id, error = %e, "payload decompression rejected");
+                        reject(&mut wr, session_id, b.batch_id, code, message).await?;
                         continue;
                     }
                 };

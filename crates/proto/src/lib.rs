@@ -32,6 +32,7 @@ pub mod build;
 pub mod constants;
 pub mod fingerprint;
 pub mod framing;
+pub mod payload;
 pub mod streaming;
 
 pub use generated::{

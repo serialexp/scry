@@ -121,10 +121,10 @@ pub struct Args {
     #[arg(long)]
     ca_cert: Option<PathBuf>,
 
-    /// Per-sink queue depth. Each sink drains its own bounded queue; on overflow
-    /// it drops + counts (best-effort), so this bounds buffering during a
-    /// downstream outage.
-    #[arg(long, default_value_t = 1024)]
+    /// Per-sink queue depth. Each item can contain a complete decoded batch, so
+    /// keep this deliberately small; on overflow the sink drops + counts rather
+    /// than retaining an outage-sized memory backlog.
+    #[arg(long, default_value_t = 16)]
     sink_queue_cap: usize,
 
     /// HTTP client timeout for the Loki/OpenSearch/Mimir sinks.

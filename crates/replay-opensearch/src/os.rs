@@ -12,8 +12,31 @@
 
 use anyhow::{bail, Context, Result};
 use scry_httpsig::SigV4Signer;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
+
+#[derive(Deserialize)]
+struct SearchResponse {
+    hits: SearchHits,
+}
+
+#[derive(Deserialize)]
+struct SearchHits {
+    hits: Vec<SearchHit>,
+}
+
+#[derive(Deserialize)]
+struct SearchHit {
+    #[serde(rename = "_source", default = "empty_object")]
+    source: Value,
+    #[serde(default)]
+    sort: Option<Vec<Value>>,
+}
+
+fn empty_object() -> Value {
+    json!({})
+}
 
 /// How to authenticate each request.
 pub enum Auth {
@@ -166,34 +189,21 @@ impl OsClient {
         // With a PIT the index is carried by the PIT, so search hits `/_search`.
         let resp = self.send(self.post("/_search", &body)?).await?;
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
             bail!("_search failed: HTTP {status}: {text}");
         }
-        let v: Value = serde_json::from_str(&text).context("parsing _search response")?;
-        let hits = v
-            .get("hits")
-            .and_then(|h| h.get("hits"))
-            .and_then(|h| h.as_array())
-            .context("_search response missing hits.hits")?;
 
-        let mut sources = Vec::with_capacity(hits.len());
-        let mut last_sort: Option<Vec<Value>> = None;
-        for hit in hits {
-            if let Some(src) = hit.get("_source") {
-                sources.push(src.clone());
-            } else {
-                // A hit without _source (e.g. stored-fields-only) still counts;
-                // emit an empty object so it maps to a carry-forward record.
-                sources.push(json!({}));
-            }
-            if let Some(sort) = hit.get("sort").and_then(|s| s.as_array()) {
-                last_sort = Some(sort.clone());
-            }
-        }
+        // Deserialize directly into owned hits. The previous generic-Value path
+        // retained the complete response tree and then cloned every `_source`,
+        // roughly doubling a page's peak JSON memory.
+        let parsed: SearchResponse = resp.json().await.context("parsing _search response")?;
+        let mut hits = parsed.hits.hits;
+        let next_after = hits.last_mut().and_then(|hit| hit.sort.take());
+        let sources = hits.into_iter().map(|hit| hit.source).collect();
         Ok(Page {
             sources,
-            next_after: if hits.is_empty() { None } else { last_sort },
+            next_after,
         })
     }
 
