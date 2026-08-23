@@ -2911,9 +2911,11 @@ instance's endpoint separately, and query instances had no endpoint at all.
 `--stats-listen` (a bare flag defaults to `127.0.0.1:4098`; pass `host:port` to
 override). Opt-in preserves the ingest hot-path: with the flag absent, no
 `ServerMetrics` is built and the ingest path pays zero metrics cost — byte-for-byte
-the pre-D-057 behaviour. When both an ingest and a query instance share a Valkey,
-**each heartbeats its full status snapshot into Valkey**, and **either page renders
-the whole fleet from Redis** — every ingest and query instance — marking which entry
+the pre-D-057 behaviour. Query metrics are always built, and a Valkey-connected
+queryd always heartbeats its snapshot regardless of whether its optional HTTP page
+is enabled. When both an ingest and a query instance publish into Valkey, **each
+heartbeats its full status snapshot**, and **either page renders the whole fleet from
+Redis** — every ingest and query instance — marking which entry
 is the local reporter. Per the design call: *no privileged local rendering path when
 Valkey is present* — every field that could come from the local instance is also in
 Redis, so the page is a pure function of the fleet snapshot set (self included via
@@ -3004,8 +3006,9 @@ flag). Both `info!` when a default is applied.
 query) and an `activity_snapshot() -> (queries_total, in_flight, blocks_scanned)`.
 Crucially, `QueryMetrics` is now **always built** in `scry query` (previously
 D-057-gated on `--stats-listen`): the lightweight query atomics are a few `Relaxed`
-ops, so this narrows D-057's opt-in to just the HTTP status page + Valkey fleet
-heartbeat. A background task (`tokio::time::interval` + `MissedTickBehavior::Skip`,
+ops. The HTTP page remains opt-in, while the Valkey fleet heartbeat is always enabled
+when queryd is connected to Valkey so `FleetStatusRequest` includes queryd itself. A
+background task (`tokio::time::interval` + `MissedTickBehavior::Skip`,
 like the convergence loops) logs the per-interval delta every
 `--stats-log-interval` secs (default 30; `0` disables): `queries_in_flight`,
 `queries_started`, `blocks_scanned`, so a runaway query is visible in `kubectl logs`.

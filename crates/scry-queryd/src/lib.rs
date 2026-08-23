@@ -745,51 +745,45 @@ pub async fn run(args: Args) -> Result<()> {
         }));
     }
 
-    // ── Status page (D-057) ───────────────────────────────────────
-    // Optional HTTP status server. With Valkey it heartbeats this instance's
-    // snapshot into the fleet registry and renders the whole fleet from Redis;
-    // without Valkey it serves just this instance (`source: "local"`).
-    let status_registration = match (args.stats_listen.clone(), Some(query_metrics.clone())) {
-        (Some(addr), Some(metrics)) => {
-            let status_registration = match valkey.as_ref() {
-                Some(c) => {
-                    let m = metrics.clone();
-                    let producer: scry_valkey::StatusProducer =
-                        Arc::new(move || serde_json::to_string(&m.snapshot()).unwrap_or_default());
-                    Some(
-                        StatusRegistration::spawn(
-                            c.inner().clone(),
-                            instance_uuid,
-                            STATUS_TTL,
-                            producer,
-                        )
-                        .await
-                        .context("registering status in Valkey")?,
-                    )
-                }
-                None => None,
-            };
-            let fleet = fleet_source.clone();
-            let local: Arc<dyn LocalStatus> = metrics;
-            let self_id = instance_uuid.to_string();
-            let status_shutdown = shutdown.clone();
-            bg_tasks.push(tokio::spawn(async move {
-                if let Err(e) = serve_status(
-                    addr,
-                    local,
-                    fleet,
-                    self_id,
-                    scry_server::shutdown::wait(status_shutdown),
-                )
-                .await
-                {
-                    warn!(error = %e, "status endpoint failed");
-                }
-            }));
-            status_registration
+    // ── Fleet status publication + optional HTTP page (D-057) ─────
+    // A Valkey-connected queryd always publishes its snapshot. Fleet status is
+    // part of the query protocol, so publication must not depend on whether the
+    // standalone HTTP dashboard is enabled.
+    let status_registration = match valkey.as_ref() {
+        Some(c) => {
+            let metrics = query_metrics.clone();
+            let producer: scry_valkey::StatusProducer =
+                Arc::new(move || serde_json::to_string(&metrics.snapshot()).unwrap_or_default());
+            Some(
+                StatusRegistration::spawn(c.inner().clone(), instance_uuid, STATUS_TTL, producer)
+                    .await
+                    .context("registering status in Valkey")?,
+            )
         }
-        _ => None,
+        None => None,
     };
+
+    // The HTTP status page remains opt-in. With Valkey it renders the whole
+    // fleet; without Valkey it serves just this instance (`source: "local"`).
+    if let Some(addr) = args.stats_listen.clone() {
+        let fleet = fleet_source.clone();
+        let local: Arc<dyn LocalStatus> = query_metrics.clone();
+        let self_id = instance_uuid.to_string();
+        let status_shutdown = shutdown.clone();
+        bg_tasks.push(tokio::spawn(async move {
+            if let Err(e) = serve_status(
+                addr,
+                local,
+                fleet,
+                self_id,
+                scry_server::shutdown::wait(status_shutdown),
+            )
+            .await
+            {
+                warn!(error = %e, "status endpoint failed");
+            }
+        }));
+    }
 
     let serve_result = service
         .serve_with_shutdown(args.listen, scry_server::shutdown::wait(shutdown.clone()))
