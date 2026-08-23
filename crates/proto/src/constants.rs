@@ -137,6 +137,15 @@ pub const DEFAULT_MAX_INFLIGHT_BATCHES: u16 = 64;
 // StreamError before closing the connection on the failure paths
 // below; clients should treat receipt as terminal.
 
+/// Request capability: the client understands attempt reset frames and
+/// strictly discards all provisional state from a superseded attempt.
+pub const QUERY_CAP_ATTEMPT_SUPERSESSION: u32 = 0x0000_0001;
+
+/// `ResponseSuperseded.reason` values.
+pub const QUERY_SUPERSEDED_REASON_UNKNOWN: u8 = 0;
+pub const QUERY_SUPERSEDED_REASON_SUPERSEDED_BLOCK_DISAPPEARED: u8 = 1;
+pub const QUERY_SUPERSEDED_REASON_RETIRED_BLOCK_DISAPPEARED: u8 = 2;
+
 /// Decoding the client's `QueryRequest` frame failed, or the request
 /// fields are invalid (e.g. a matcher with empty name).
 pub const QUERY_ERR_BAD_REQUEST: u16 = 0x0001;

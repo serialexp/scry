@@ -16,7 +16,10 @@
 //! have to change.
 
 use crate::Query;
-use scry_proto::{constants::Signal, Matcher, QueryRequestInput, QueryRequestOutput};
+use scry_proto::{
+    constants::{Signal, QUERY_CAP_ATTEMPT_SUPERSESSION},
+    Matcher, QueryRequestInput, QueryRequestOutput,
+};
 use serde::{Deserialize, Serialize};
 
 /// What the query client sends at the start of every query connection.
@@ -123,6 +126,7 @@ impl QueryRequest {
             body_contains: self.query.body_contains.clone().unwrap_or_default(),
             live: u8::from(self.live),
             with_labels: u8::from(self.query.with_labels),
+            capabilities: QUERY_CAP_ATTEMPT_SUPERSESSION,
         }
     }
 
@@ -198,6 +202,7 @@ mod tests {
             body_contains: wire.body_contains,
             live: wire.live,
             with_labels: wire.with_labels,
+            capabilities: wire.capabilities,
         };
         let back = QueryRequest::from_wire(out);
         assert_eq!(back.signal, req.signal);

@@ -798,12 +798,18 @@ pub async fn run(args: Args) -> Result<()> {
             // Grace defaults: 0 single-instance (list_blocks already filters
             // superseded/deleted), 600s with a lease provider (peers may hold
             // stale catalog rows until their next poll).
-            let grace_default = if valkey.is_some() { 600 } else { 0 };
+            let compact_grace_default = if valkey.is_some() { 600 } else { 0 };
+            let retention_grace_default = if valkey.is_some() { 600 } else { 0 };
             let compact_cfg = CompactConfig {
                 fanout: args.compact_fanout,
-                grace: Duration::from_secs(args.compact_grace.unwrap_or(grace_default)),
+                // Compaction interprets this as a deferred reap eligibility
+                // timestamp; it never sleeps the merge pass.
+                grace: Duration::from_secs(args.compact_grace.unwrap_or(compact_grace_default)),
                 ..Default::default()
             };
+            compact_cfg
+                .validate()
+                .context("invalid compaction policy")?;
             let mut overrides = BTreeMap::new();
             if let Some(d) = args.ttl_metrics {
                 overrides.insert("metrics".to_string(), d);
@@ -820,7 +826,7 @@ pub async fn run(args: Args) -> Result<()> {
             let retention_cfg = RetentionConfig {
                 default_ttl: args.ttl,
                 overrides,
-                grace: Duration::from_secs(args.retention_grace.unwrap_or(grace_default)),
+                grace: Duration::from_secs(args.retention_grace.unwrap_or(retention_grace_default)),
                 apply: args.retention_apply,
             };
             let lease_ttl = Duration::from_secs(args.lease_ttl.max(1));
@@ -989,9 +995,12 @@ async fn run_maintenance_loop<L: LeaseProvider>(
                     &provider, store.clone(), catalog.as_ref(), &bucket,
                     &compact_cfg, &block_cfg, sink_ref, lease_ttl,
                 ).await {
-                    Ok(r) if r.merges > 0 => info!(
+                    Ok(r) if r.merges > 0 || r.partition_failed > 0 || r.reap_failed > 0 => info!(
                         merges = r.merges, blocks_in = r.blocks_in,
-                        blocks_out = r.blocks_out, "compaction pass merged partitions"
+                        blocks_out = r.blocks_out, reaped = r.reaped,
+                        reap_failed = r.reap_failed,
+                        partition_failed = r.partition_failed,
+                        "compaction pass completed"
                     ),
                     Ok(_) => {}
                     Err(e) => warn!(error = %e, "compaction pass failed"),

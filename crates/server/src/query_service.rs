@@ -32,6 +32,7 @@
 //! pathological one returns [`QUERY_ERR_RESOURCES`](scry_proto::constants::QUERY_ERR_RESOURCES)
 //! rather than OOM-ing the daemon.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -47,19 +48,21 @@ use datafusion::physical_plan::metrics::{MetricValue, MetricsSet};
 use datafusion::physical_plan::{execute_stream, ExecutionPlan, SendableRecordBatchStream};
 use datafusion::prelude::SessionConfig;
 use futures::StreamExt;
-use object_store::ObjectStore;
-use scry_catalog::Catalog;
-use scry_catalog::CatalogEntry;
+use object_store::{path::Path as ObjPath, ObjectMeta, ObjectStore, ObjectStoreExt};
+use scry_block::BlockMeta;
+use scry_catalog::{Catalog, CatalogEntry, TerminalResolution};
 use scry_objstore::{BufPool, PoolStats};
 use scry_proto::{
     constants::{
-        Signal, QUERY_ERR_BAD_REQUEST, QUERY_ERR_FLEET_UNAVAILABLE, QUERY_ERR_INTERNAL,
-        QUERY_ERR_LIVE_UNAVAILABLE, QUERY_ERR_PLAN, QUERY_ERR_RESOURCES, QUERY_ERR_SQL_PARSE,
+        Signal, QUERY_CAP_ATTEMPT_SUPERSESSION, QUERY_ERR_BAD_REQUEST, QUERY_ERR_FLEET_UNAVAILABLE,
+        QUERY_ERR_INTERNAL, QUERY_ERR_LIVE_UNAVAILABLE, QUERY_ERR_PLAN, QUERY_ERR_RESOURCES,
+        QUERY_ERR_SQL_PARSE, QUERY_SUPERSEDED_REASON_RETIRED_BLOCK_DISAPPEARED,
+        QUERY_SUPERSEDED_REASON_SUPERSEDED_BLOCK_DISAPPEARED,
     },
     framing::{read_frame, write_frame, Framed, MAX_FRAME_BYTES},
     BatchMsgInput, EndOfStreamInput, FleetStatusResponseInput, LabelNamesRequestOutput,
     LabelNamesResponseInput, LabelValuesRequestOutput, LabelValuesResponseInput, QueryFrame,
-    QueryFrameMsg, SchemaMsgInput, StreamErrorInput,
+    QueryFrameMsg, ResponseSupersededInput, SchemaMsgInput, StreamErrorInput,
 };
 use scry_query::{
     collect_label_names, collect_label_values, hash128, list_metrics_candidates,
@@ -82,7 +85,7 @@ use crate::memory_guard::{QueryMemoryGuard, QUERY_TOO_LARGE_MESSAGE};
 use crate::stats::QueryMetrics;
 use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{OnceCell, Semaphore};
 use tracing::{info, info_span, warn, Instrument, Span};
 use uuid::Uuid;
 
@@ -110,6 +113,49 @@ impl Default for LiveFetchLimits {
             max_total_rows: 1_000_000,
         }
     }
+}
+
+/// Process-wide bounds for authoritative partition repair after a block 404.
+#[derive(Debug, Clone, Copy)]
+pub struct TargetedRepairLimits {
+    pub get_concurrency: usize,
+    pub deadline: Duration,
+    pub cache_ttl: Duration,
+    pub stable_attempts: usize,
+}
+
+impl Default for TargetedRepairLimits {
+    fn default() -> Self {
+        Self {
+            get_concurrency: 8,
+            deadline: Duration::from_secs(10),
+            cache_ttl: Duration::from_secs(2),
+            stable_attempts: 3,
+        }
+    }
+}
+
+type RepairPartition = (String, String);
+
+#[derive(Debug)]
+struct PartitionRepair {
+    loaded_at: Instant,
+    metas: Arc<[BlockMeta]>,
+}
+
+#[derive(Debug)]
+struct ReconciledRepair {
+    metas: Vec<BlockMeta>,
+    /// Missing UUIDs whose stable partition snapshot either omitted the old
+    /// sidecar (retired) or contained a descendant that durably claims it
+    /// (superseded while the old sidecar remains during grace).
+    authoritatively_resolved: std::collections::HashSet<Uuid>,
+    confirmed_absent: std::collections::HashSet<Uuid>,
+}
+
+#[derive(Debug, Default)]
+struct RepairSlot {
+    cell: OnceCell<Arc<PartitionRepair>>,
 }
 
 /// Per-query start snapshots of the two sidecar caches, bundled so the
@@ -204,6 +250,9 @@ pub struct QueryService {
     query_active_permits: Arc<Semaphore>,
     query_wait_permits: Arc<Semaphore>,
     query_queue_timeout: Duration,
+    targeted_repair_limits: TargetedRepairLimits,
+    targeted_repair_get_permits: Arc<Semaphore>,
+    targeted_repair_slots: Arc<Mutex<HashMap<RepairPartition, Arc<RepairSlot>>>>,
 }
 
 impl QueryService {
@@ -239,6 +288,11 @@ impl QueryService {
             query_active_permits: Arc::new(Semaphore::new(32)),
             query_wait_permits: Arc::new(Semaphore::new(64)),
             query_queue_timeout: Duration::from_secs(5),
+            targeted_repair_limits: TargetedRepairLimits::default(),
+            targeted_repair_get_permits: Arc::new(Semaphore::new(
+                TargetedRepairLimits::default().get_concurrency,
+            )),
+            targeted_repair_slots: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -275,6 +329,17 @@ impl QueryService {
             concurrency: limits.concurrency.max(1),
             ..limits
         };
+        self
+    }
+
+    pub fn with_targeted_repair_limits(mut self, limits: TargetedRepairLimits) -> Self {
+        self.targeted_repair_limits = TargetedRepairLimits {
+            get_concurrency: limits.get_concurrency.max(1),
+            stable_attempts: limits.stable_attempts.max(1),
+            ..limits
+        };
+        self.targeted_repair_get_permits =
+            Arc::new(Semaphore::new(self.targeted_repair_limits.get_concurrency));
         self
     }
 
@@ -479,6 +544,7 @@ impl QueryService {
                 let name = match other {
                     QueryFrameMsg::SchemaMsg(_) => "SchemaMsg",
                     QueryFrameMsg::BatchMsg(_) => "BatchMsg",
+                    QueryFrameMsg::ResponseSuperseded(_) => "ResponseSuperseded",
                     QueryFrameMsg::EndOfStream(_) => "EndOfStream",
                     QueryFrameMsg::LabelNamesResponse(_) => "LabelNamesResponse",
                     QueryFrameMsg::LabelValuesResponse(_) => "LabelValuesResponse",
@@ -500,6 +566,19 @@ impl QueryService {
                 return Ok(());
             }
         };
+        // Attempt resets are required for correctness once compaction can reap
+        // an input immediately. Reject legacy clients before any response bytes
+        // (and, in particular, before an Arrow schema makes an attempt visible).
+        if wire_req.capabilities & QUERY_CAP_ATTEMPT_SUPERSESSION == 0 {
+            let _ = emit_stream_error(
+                &mut wr,
+                QUERY_ERR_BAD_REQUEST,
+                "QueryRequest lacks required attempt-supersession capability",
+            )
+            .await;
+            let _ = wr.flush().await;
+            return Ok(());
+        }
         let mut req = QueryRequest::from_wire(wire_req);
 
         let request_id = req.request_id.clone().unwrap_or_else(|| {
@@ -687,6 +766,7 @@ impl QueryService {
         &self,
         discovery: &Arc<dyn LiveDiscovery>,
         req: &QueryRequest,
+        candidates: &[CatalogEntry],
     ) -> std::result::Result<Vec<LiveLogRow>, (u16, String)> {
         // Discovery failure = the live half can't be served → refuse.
         let endpoints = discovery.discover().await.map_err(|e| {
@@ -744,8 +824,22 @@ impl QueryService {
         // `unwrap_or(0)` here would wrongly treat the first segment as
         // already-durable and drop it before the first flush). `Some(h)` =
         // segments `≤ h` are durable in a block.
+        // Dedup against the exact block candidate snapshot for this attempt,
+        // not a later catalog read. This prevents a concurrent block commit from
+        // being included in the block half while its WAL rows were retained
+        // against an older watermark.
         let mut wm_cache: std::collections::HashMap<(Uuid, u32), Option<u64>> =
             std::collections::HashMap::new();
+        for entry in candidates {
+            if let (Some(segment), Some(shard)) = (entry.meta.wal_seg_max, entry.meta.wal_shard) {
+                wm_cache
+                    .entry((entry.meta.writer_id, shard))
+                    .and_modify(|current| {
+                        *current = Some(current.unwrap_or(0).max(segment));
+                    })
+                    .or_insert(Some(segment));
+            }
+        }
         let mut rows: Vec<LiveLogRow> = Vec::new();
         let mut retained_bytes = 0usize;
         while let Some((addr, result)) = fetches.next().await {
@@ -782,18 +876,8 @@ impl QueryService {
                 let hw = match wm_cache.get(&key) {
                     Some(&h) => h,
                     None => {
-                        let h = {
-                            let guard = self.catalog.lock().map_err(|e| {
-                                (QUERY_ERR_INTERNAL, format!("catalog mutex poisoned: {e}"))
-                            })?;
-                            guard
-                                .get_watermark(writer, "logs", r.wal_shard)
-                                .map_err(|e| {
-                                    (QUERY_ERR_INTERNAL, format!("get_watermark: {e:#}"))
-                                })?
-                        };
-                        wm_cache.insert(key, h);
-                        h
+                        wm_cache.insert(key, None);
+                        None
                     }
                 };
                 if live_record_is_durable(r.wal_seg, hw) {
@@ -946,18 +1030,272 @@ impl QueryService {
         Ok((stream, physical))
     }
 
-    /// Best-effort delete of stale catalog rows after their objects 404'd.
-    /// The bucket is the source of truth, so dropping a row we just proved is
-    /// gone is always safe; convergence would remove it anyway.
-    fn evict_rows(&self, uuids: &[Uuid]) {
-        match self.catalog.lock() {
-            Ok(guard) => {
-                if let Err(e) = guard.delete_blocks(uuids) {
-                    warn!(error = %e, "evicting stale catalog rows after 404 failed (bucket is truth; convergence will retry)");
+    async fn list_partition_meta_objects(
+        &self,
+        partition: &RepairPartition,
+    ) -> std::result::Result<Vec<ObjectMeta>, String> {
+        let (signal, date) = partition;
+        let prefix = ObjPath::from(format!("{signal}/{}/", date.replace('-', "/")));
+        let mut stream = self.store.list(Some(&prefix));
+        let mut objects = Vec::new();
+        while let Some(item) = stream.next().await {
+            let object = item.map_err(|e| format!("targeted list {signal}/{date}: {e}"))?;
+            if object.location.as_ref().ends_with(".meta.json") {
+                objects.push(object);
+            }
+        }
+        objects.sort_by(|a, b| a.location.cmp(&b.location));
+        Ok(objects)
+    }
+
+    fn partition_token(
+        objects: &[ObjectMeta],
+    ) -> Vec<(String, u64, Option<String>, Option<String>)> {
+        objects
+            .iter()
+            .map(|object| {
+                (
+                    object.location.to_string(),
+                    object.size,
+                    object.e_tag.clone(),
+                    object.version.clone(),
+                )
+            })
+            .collect()
+    }
+
+    async fn fetch_partition_metas(
+        &self,
+        objects: Vec<ObjectMeta>,
+    ) -> std::result::Result<Vec<BlockMeta>, String> {
+        let store = self.store.clone();
+        let permits = self.targeted_repair_get_permits.clone();
+        let concurrency = self.targeted_repair_limits.get_concurrency;
+        let mut fetched = futures::stream::iter(objects.into_iter().map(move |object| {
+            let store = store.clone();
+            let permits = permits.clone();
+            async move {
+                let _permit = permits
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| "targeted repair GET semaphore closed".to_string())?;
+                let result = store
+                    .get(&object.location)
+                    .await
+                    .map_err(|e| format!("targeted fetch {}: {e}", object.location))?;
+                let bytes = result
+                    .bytes()
+                    .await
+                    .map_err(|e| format!("targeted fetch {}: {e}", object.location))?;
+                serde_json::from_slice::<BlockMeta>(&bytes)
+                    .map_err(|e| format!("targeted parse {}: {e}", object.location))
+            }
+        }))
+        .buffer_unordered(concurrency);
+
+        let mut metas = Vec::new();
+        while let Some(meta) = fetched.next().await {
+            metas.push(meta?);
+        }
+        metas.sort_by_key(|meta| meta.uuid);
+        Ok(metas)
+    }
+
+    async fn load_stable_partition(
+        &self,
+        partition: &RepairPartition,
+    ) -> std::result::Result<Arc<PartitionRepair>, String> {
+        for _ in 0..self.targeted_repair_limits.stable_attempts {
+            let before = self.list_partition_meta_objects(partition).await?;
+            let before_token = Self::partition_token(&before);
+            let metas = self.fetch_partition_metas(before).await?;
+            let after = self.list_partition_meta_objects(partition).await?;
+            if before_token == Self::partition_token(&after) {
+                return Ok(Arc::new(PartitionRepair {
+                    loaded_at: Instant::now(),
+                    metas: metas.into(),
+                }));
+            }
+        }
+        Err(format!(
+            "targeted repair partition {}/{} remained unstable after {} attempts",
+            partition.0, partition.1, self.targeted_repair_limits.stable_attempts
+        ))
+    }
+
+    async fn get_or_load_partition(
+        &self,
+        partition: RepairPartition,
+    ) -> std::result::Result<Arc<PartitionRepair>, String> {
+        let slot = {
+            let mut slots = self
+                .targeted_repair_slots
+                .lock()
+                .map_err(|e| format!("targeted repair slot mutex poisoned: {e}"))?;
+            if let Some(slot) = slots.get(&partition) {
+                if slot.cell.get().is_none_or(|result| {
+                    result.loaded_at.elapsed() <= self.targeted_repair_limits.cache_ttl
+                }) {
+                    slot.clone()
+                } else {
+                    let slot = Arc::new(RepairSlot::default());
+                    slots.insert(partition.clone(), slot.clone());
+                    slot
+                }
+            } else {
+                let slot = Arc::new(RepairSlot::default());
+                slots.insert(partition.clone(), slot.clone());
+                slot
+            }
+        };
+
+        let loaded = slot
+            .cell
+            .get_or_try_init(|| async {
+                tokio::time::timeout(
+                    self.targeted_repair_limits.deadline,
+                    self.load_stable_partition(&partition),
+                )
+                .await
+                .map_err(|_| {
+                    format!(
+                        "targeted repair timed out reconciling {}/{}",
+                        partition.0, partition.1
+                    )
+                })?
+            })
+            .await
+            .cloned();
+        if loaded.is_err() {
+            if let Ok(mut slots) = self.targeted_repair_slots.lock() {
+                if slots
+                    .get(&partition)
+                    .is_some_and(|current| Arc::ptr_eq(current, &slot))
+                {
+                    slots.remove(&partition);
                 }
             }
-            Err(e) => warn!(error = %e, "catalog mutex poisoned while evicting stale rows"),
         }
+        loaded
+    }
+
+    /// Load stable authoritative snapshots for every affected partition. The
+    /// returned metadata is applied with stale-row resolution under one catalog
+    /// lock by [`Self::apply_reconciled_repair`].
+    async fn reconcile_missing_partitions(
+        &self,
+        missing: &[(Uuid, String, String)],
+    ) -> std::result::Result<ReconciledRepair, String> {
+        if missing.is_empty() {
+            return Err("targeted repair has no authoritative partition context".into());
+        }
+        let mut partitions: Vec<RepairPartition> = missing
+            .iter()
+            .map(|(_, signal, date)| (signal.clone(), date.clone()))
+            .collect();
+        partitions.sort();
+        partitions.dedup();
+        let operation_deadline = tokio::time::Instant::now() + self.targeted_repair_limits.deadline;
+        let mut metas = Vec::new();
+        for partition in partitions {
+            let loaded = tokio::time::timeout_at(
+                operation_deadline,
+                self.get_or_load_partition(partition.clone()),
+            )
+            .await
+            .map_err(|_| {
+                format!(
+                    "targeted repair whole-operation deadline exceeded at {}/{}",
+                    partition.0, partition.1
+                )
+            })??;
+            metas.extend_from_slice(&loaded.metas);
+        }
+        metas.sort_by_key(|meta| meta.uuid);
+        metas.dedup_by_key(|meta| meta.uuid);
+        let present: std::collections::HashSet<_> = metas.iter().map(|meta| meta.uuid).collect();
+        let represented: std::collections::HashSet<_> = metas
+            .iter()
+            .flat_map(|meta| meta.compacted_from.iter().copied())
+            .collect();
+        let confirmed_absent: std::collections::HashSet<_> = missing
+            .iter()
+            .filter_map(|(uuid, _, _)| (!present.contains(uuid)).then_some(*uuid))
+            .collect();
+        let authoritatively_resolved = missing
+            .iter()
+            .filter_map(|(uuid, _, _)| {
+                (confirmed_absent.contains(uuid) || represented.contains(uuid)).then_some(*uuid)
+            })
+            .collect();
+        Ok(ReconciledRepair {
+            metas,
+            authoritatively_resolved,
+            confirmed_absent,
+        })
+    }
+
+    fn apply_reconciled_repair(
+        &self,
+        uuids: &[Uuid],
+        reconciled: &ReconciledRepair,
+    ) -> std::result::Result<u8, String> {
+        let guard = self
+            .catalog
+            .lock()
+            .map_err(|e| format!("catalog mutex poisoned while repairing 404: {e}"))?;
+        for meta in &reconciled.metas {
+            guard
+                .insert_block(meta)
+                .map_err(|e| format!("targeted repair insert {}: {e:#}", meta.uuid))?;
+        }
+        if let Some(unproven) = uuids
+            .iter()
+            .find(|uuid| !reconciled.authoritatively_resolved.contains(uuid))
+        {
+            return Err(format!(
+                "missing block {unproven} had no authoritative stable-partition absence proof"
+            ));
+        }
+        // Lineage pruning is intentionally disabled during the initial rollout.
+        // A stable pair of LIST results cannot exclude a commit immediately after
+        // the second LIST; retaining this rebuildable index is safer than racing
+        // a newly learned descendant claim.
+        let mut superseded = false;
+        for &uuid in uuids {
+            match guard
+                .resolve_terminal(uuid)
+                .map_err(|e| format!("resolve_terminal({uuid}): {e:#}"))?
+            {
+                TerminalResolution::Unique(replacement) if replacement != uuid => {
+                    superseded = true;
+                }
+                TerminalResolution::None => {}
+                TerminalResolution::Unique(_) if reconciled.confirmed_absent.contains(&uuid) => {
+                    // The stable authoritative partition snapshot omitted this
+                    // UUID, so its stale local live row is a confirmed
+                    // retention/deletion outcome rather than unexplained loss.
+                }
+                TerminalResolution::Unique(_) => {
+                    return Err(format!(
+                        "missing block {uuid} is still authoritative-live with no known replacement; refusing a lossy re-plan"
+                    ));
+                }
+                TerminalResolution::Fork(terminals) => {
+                    return Err(format!(
+                        "lineage fork resolving missing block {uuid}: {terminals:?}"
+                    ));
+                }
+            }
+        }
+        guard
+            .delete_blocks(uuids)
+            .map_err(|e| format!("delete repaired catalog rows: {e:#}"))?;
+        Ok(if superseded {
+            QUERY_SUPERSEDED_REASON_SUPERSEDED_BLOCK_DISAPPEARED
+        } else {
+            QUERY_SUPERSEDED_REASON_RETIRED_BLOCK_DISAPPEARED
+        })
     }
 
     // ── Label metadata (discoverability) ─────────────────────────────────
@@ -1129,15 +1467,53 @@ impl QueryService {
         signal: Signal,
         q: &Query,
     ) -> std::result::Result<Vec<String>, (u16, String)> {
-        collect_label_names(
-            &self.catalog,
-            self.store.clone(),
-            self.postings_cache.as_ref(),
-            self.runtime_env.clone(),
-            signal,
-            q,
-        )
-        .await
+        for _ in 0..=3 {
+            let candidates = self.list_candidates(signal, q)?;
+            let context: Vec<_> = candidates
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.meta.uuid,
+                        entry.meta.signal.clone(),
+                        entry.date.clone(),
+                    )
+                })
+                .collect();
+            let evict = Arc::new(EvictOnNotFound::new(self.store.clone()));
+            match collect_label_names(
+                &self.catalog,
+                evict.clone(),
+                self.postings_cache.as_ref(),
+                self.runtime_env.clone(),
+                signal,
+                q,
+            )
+            .await
+            {
+                Ok(names) => return Ok(names),
+                Err(error) => {
+                    let missing = evict.take_evicted();
+                    if missing.is_empty() {
+                        return Err(error);
+                    }
+                    let affected: Vec<_> = context
+                        .iter()
+                        .filter(|(uuid, _, _)| missing.contains(uuid))
+                        .cloned()
+                        .collect();
+                    let metas = self
+                        .reconcile_missing_partitions(&affected)
+                        .await
+                        .map_err(|message| (QUERY_ERR_INTERNAL, message))?;
+                    self.apply_reconciled_repair(&missing, &metas)
+                        .map_err(|message| (QUERY_ERR_INTERNAL, message))?;
+                }
+            }
+        }
+        Err((
+            QUERY_ERR_INTERNAL,
+            "label-names repair limit exhausted".to_string(),
+        ))
     }
 
     /// Distinct, sorted values for one label name over a signal + time window.
@@ -1148,16 +1524,54 @@ impl QueryService {
         name: &str,
         q: &Query,
     ) -> std::result::Result<Vec<String>, (u16, String)> {
-        collect_label_values(
-            &self.catalog,
-            self.store.clone(),
-            self.postings_cache.as_ref(),
-            self.runtime_env.clone(),
-            signal,
-            name,
-            q,
-        )
-        .await
+        for _ in 0..=3 {
+            let candidates = self.list_candidates(signal, q)?;
+            let context: Vec<_> = candidates
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.meta.uuid,
+                        entry.meta.signal.clone(),
+                        entry.date.clone(),
+                    )
+                })
+                .collect();
+            let evict = Arc::new(EvictOnNotFound::new(self.store.clone()));
+            match collect_label_values(
+                &self.catalog,
+                evict.clone(),
+                self.postings_cache.as_ref(),
+                self.runtime_env.clone(),
+                signal,
+                name,
+                q,
+            )
+            .await
+            {
+                Ok(values) => return Ok(values),
+                Err(error) => {
+                    let missing = evict.take_evicted();
+                    if missing.is_empty() {
+                        return Err(error);
+                    }
+                    let affected: Vec<_> = context
+                        .iter()
+                        .filter(|(uuid, _, _)| missing.contains(uuid))
+                        .cloned()
+                        .collect();
+                    let metas = self
+                        .reconcile_missing_partitions(&affected)
+                        .await
+                        .map_err(|message| (QUERY_ERR_INTERNAL, message))?;
+                    self.apply_reconciled_repair(&missing, &metas)
+                        .map_err(|message| (QUERY_ERR_INTERNAL, message))?;
+                }
+            }
+        }
+        Err((
+            QUERY_ERR_INTERNAL,
+            "label-values repair limit exhausted".to_string(),
+        ))
     }
 
     /// The actual query execution. Split out from `handle_connection`
@@ -1213,57 +1627,6 @@ impl QueryService {
             }
         }
 
-        // ── Live fan-in (D-054) ──────────────────────────────────────────
-        //
-        // For a `live` logs query, fan in the ingesters' retained recent
-        // records and dedup them against the catalog watermark *once*, up
-        // front — the live half is independent of the block candidate set,
-        // so it survives the transparent re-plan below unchanged. No Valkey
-        // discovery ⇒ refuse (decision 3); non-logs `live` is ignored.
-        let live_rows: Option<Vec<LiveLogRow>> = if req.live && signal == Signal::Logs {
-            match self.live_discovery.clone() {
-                Some(disco) => match self.fetch_live_logs(&disco, &req).await {
-                    Ok(rows) => Some(rows),
-                    Err((code, msg)) => {
-                        let _ = emit_stream_error(&mut wr, code, msg).await;
-                        let _ = wr.flush().await;
-                        self.emit_scan_complete(
-                            signal,
-                            None,
-                            rows_total,
-                            pool_start,
-                            cache_start,
-                            "miss",
-                            t0.elapsed(),
-                        );
-                        return Ok(());
-                    }
-                },
-                None => {
-                    let _ = emit_stream_error(
-                        &mut wr,
-                        QUERY_ERR_LIVE_UNAVAILABLE,
-                        "live query requires Valkey ingester discovery; this server has none"
-                            .to_string(),
-                    )
-                    .await;
-                    let _ = wr.flush().await;
-                    self.emit_scan_complete(
-                        signal,
-                        None,
-                        rows_total,
-                        pool_start,
-                        cache_start,
-                        "miss",
-                        t0.elapsed(),
-                    );
-                    return Ok(());
-                }
-            }
-        } else {
-            None
-        };
-
         // ── Result-cache lookup + plan/execute, with one transparent
         //    re-plan on a peer's deletion ───────────────────────────────
         //
@@ -1281,194 +1644,178 @@ impl QueryService {
         // cache key) — fully transparent, the client never saw a byte.
         // (Traces/profiles resolve no sidecar at plan time, so their 404 only
         // surfaces mid-scan, below.)
-        let evict = Arc::new(EvictOnNotFound::new(self.store.clone()));
-        let store: Arc<dyn ObjectStore> = evict.clone();
-        let mut replanned = false;
-        let (mut stream, physical, cache_key) = loop {
-            // (1) Candidate blocks for this request.
-            let candidates = match self.list_candidates(signal, &req.query) {
-                Ok(c) => c,
-                Err((code, msg)) => {
-                    let _ = emit_stream_error(&mut wr, code, msg).await;
-                    let _ = wr.flush().await;
-                    self.emit_scan_complete(
-                        signal,
-                        None,
-                        rows_total,
-                        pool_start,
-                        cache_start,
-                        "miss",
-                        t0.elapsed(),
-                    );
-                    return Ok(());
-                }
-            };
-
-            // Record the candidate count (pre-pruning) so the periodic activity
-            // log surfaces query fan-out — exactly what explodes on an unbounded
-            // query. See D-059.
-            if let Some(m) = self.metrics.as_ref() {
-                m.record_candidates(candidates.len() as u64);
+        let mut active_attempt = 0u32;
+        'attempt: loop {
+            // Object-store misses, live rows, and Arrow dictionary state are
+            // attempt-local: a reset must not inherit any provisional state.
+            rows_total = 0;
+            if req.live && signal == Signal::Logs && self.live_discovery.is_none() {
+                let _ = emit_stream_error(
+                    &mut wr,
+                    QUERY_ERR_LIVE_UNAVAILABLE,
+                    "live query requires Valkey ingester discovery; this server has none"
+                        .to_string(),
+                )
+                .await;
+                let _ = wr.flush().await;
+                return Ok(());
             }
+            let evict = Arc::new(EvictOnNotFound::new(self.store.clone()));
+            let store: Arc<dyn ObjectStore> = evict.clone();
+            let mut repair_rounds = 0u8;
+            let (mut stream, physical, cache_key, candidate_context) = loop {
+                // (1) Candidate blocks for this request.
+                let candidates = match self.list_candidates(signal, &req.query) {
+                    Ok(c) => c,
+                    Err((code, msg)) => {
+                        let _ = emit_stream_error(&mut wr, code, msg).await;
+                        let _ = wr.flush().await;
+                        self.emit_scan_complete(
+                            signal,
+                            None,
+                            rows_total,
+                            pool_start,
+                            cache_start,
+                            "miss",
+                            t0.elapsed(),
+                        );
+                        return Ok(());
+                    }
+                };
 
-            // (2) Cache key + hit short-circuit. The cached value is the exact
-            // concatenation of the SchemaMsg + BatchMsg… + EndOfStream frames,
-            // so a hit is a single write_all. A `live` query is time-varying
-            // (fresh in-flight records every instant), so it never consults or
-            // populates the result cache.
-            let key = data_query_cache_key(signal, &req, &candidates);
-            if !req.live {
-                if let Some(bytes) = self.result_cache.get(key) {
-                    if let Some(g) = inflight.as_mut() {
-                        g.mark_ok();
+                let candidate_context: Vec<(Uuid, String, String)> = candidates
+                    .iter()
+                    .map(|c| (c.meta.uuid, c.meta.signal.clone(), c.date.clone()))
+                    .collect();
+                let live_rows = if req.live && signal == Signal::Logs {
+                    match self
+                        .fetch_live_logs(
+                            self.live_discovery.as_ref().expect("checked above"),
+                            &req,
+                            &candidates,
+                        )
+                        .await
+                    {
+                        Ok(rows) => Some(rows),
+                        Err((code, msg)) => {
+                            let _ = emit_stream_error(&mut wr, code, msg).await;
+                            let _ = wr.flush().await;
+                            return Ok(());
+                        }
                     }
-                    if let Err(e) = wr.write_all(&bytes).await {
-                        warn!(error = %e, "client disconnected while writing cached response");
-                    }
-                    let _ = wr.flush().await;
-                    // total_rows is not recomputed on a hit (the count rides inside
-                    // the cached EndOfStream frame the client parses); `cache=hit`
-                    // marks the fast path in telemetry.
-                    self.emit_scan_complete(
-                        signal,
-                        None,
-                        rows_total,
-                        pool_start,
-                        cache_start,
-                        "hit",
-                        t0.elapsed(),
-                    );
-                    return Ok(());
+                } else {
+                    None
+                };
+
+                // Record the candidate count (pre-pruning) so the periodic activity
+                // log surfaces query fan-out — exactly what explodes on an unbounded
+                // query. See D-059.
+                if let Some(m) = self.metrics.as_ref() {
+                    m.record_candidates(candidates.len() as u64);
                 }
-            }
 
-            // (3) Miss → plan + execute against the candidate set. Planning
-            // resolves postings and may build DataFusion state, so race it
-            // against the process-level guard as well as guarding the stream.
-            let planned = if let Some(guard) = &self.memory_guard {
-                tokio::select! {
-                    result = self.plan_and_execute(
+                // (2) Cache key + hit short-circuit. The cached value is the exact
+                // concatenation of the SchemaMsg + BatchMsg… + EndOfStream frames,
+                // so a hit is a single write_all. A `live` query is time-varying
+                // (fresh in-flight records every instant), so it never consults or
+                // populates the result cache.
+                let key = data_query_cache_key(signal, &req, &candidates);
+                if !req.live {
+                    if let Some(bytes) = self.result_cache.get(key) {
+                        if let Some(g) = inflight.as_mut() {
+                            g.mark_ok();
+                        }
+                        if let Err(e) = wr.write_all(&bytes).await {
+                            warn!(error = %e, "client disconnected while writing cached response");
+                        }
+                        let _ = wr.flush().await;
+                        // total_rows is not recomputed on a hit (the count rides inside
+                        // the cached EndOfStream frame the client parses); `cache=hit`
+                        // marks the fast path in telemetry.
+                        self.emit_scan_complete(
+                            signal,
+                            None,
+                            rows_total,
+                            pool_start,
+                            cache_start,
+                            "hit",
+                            t0.elapsed(),
+                        );
+                        return Ok(());
+                    }
+                }
+
+                // (3) Miss → plan + execute against the candidate set. Planning
+                // resolves postings and may build DataFusion state, so race it
+                // against the process-level guard as well as guarding the stream.
+                let planned = if let Some(guard) = &self.memory_guard {
+                    tokio::select! {
+                        result = self.plan_and_execute(
+                            signal,
+                            &req,
+                            store.clone(),
+                            candidates,
+                            live_rows.clone(),
+                        ) => result,
+                        _ = guard.wait_until_exhausted() => {
+                            Err((QUERY_ERR_RESOURCES, QUERY_TOO_LARGE_MESSAGE.to_string()))
+                        }
+                    }
+                } else {
+                    self.plan_and_execute(
                         signal,
                         &req,
                         store.clone(),
                         candidates,
                         live_rows.clone(),
-                    ) => result,
-                    _ = guard.wait_until_exhausted() => {
-                        Err((QUERY_ERR_RESOURCES, QUERY_TOO_LARGE_MESSAGE.to_string()))
-                    }
-                }
-            } else {
-                self.plan_and_execute(signal, &req, store.clone(), candidates, live_rows.clone())
+                    )
                     .await
-            };
-            match planned {
-                Ok((stream, physical)) => break (stream, physical, key),
-                Err((code, msg)) => {
-                    let evicted = evict.take_evicted();
-                    if !replanned && !evicted.is_empty() {
-                        replanned = true;
-                        self.evict_rows(&evicted);
-                        info!(
-                            signal = signal_name(signal),
-                            evicted = evicted.len(),
-                            "block(s) 404'd during planning; evicted stale catalog rows and re-planning once"
-                        );
-                        continue;
-                    }
-                    let _ = emit_stream_error(&mut wr, code, msg).await;
-                    let _ = wr.flush().await;
-                    self.emit_scan_complete(
-                        signal,
-                        None,
-                        rows_total,
-                        pool_start,
-                        cache_start,
-                        "miss",
-                        t0.elapsed(),
-                    );
-                    return Ok(());
-                }
-            }
-        };
-        let schema = stream.schema();
-
-        // Buffer the response for the cache while it streams (dropped past the
-        // per-entry cap → response still streams, just isn't cached). Skipped
-        // entirely when the cache is disabled or the query is `live` (whose
-        // result is time-varying and must never be cached).
-        let mut tee = if self.result_cache.enabled() && !req.live {
-            ResponseTee::new(self.result_cache_entry_bytes)
-        } else {
-            ResponseTee::disabled()
-        };
-
-        let data_gen = IpcDataGenerator::default();
-        let mut dict_tracker = DictionaryTracker::new(false);
-        let options = IpcWriteOptions::default();
-
-        // Schema message: one SchemaMsg before any BatchMsg.
-        let schema_enc =
-            data_gen.schema_to_bytes_with_dictionary_tracker(&schema, &mut dict_tracker, &options);
-        let mut schema_bytes = Vec::new();
-        if let Err(e) = write_message(&mut schema_bytes, schema_enc, &options) {
-            let _ = emit_stream_error(
-                &mut wr,
-                QUERY_ERR_INTERNAL,
-                format!("write_message(schema): {e}"),
-            )
-            .await;
-            let _ = wr.flush().await;
-            self.emit_scan_complete(
-                signal,
-                Some(physical.as_ref()),
-                rows_total,
-                pool_start,
-                cache_start,
-                "miss",
-                t0.elapsed(),
-            );
-            return Ok(());
-        }
-        let schema_frame = QueryFrame {
-            msg: QueryFrameMsg::SchemaMsg(
-                SchemaMsgInput {
-                    ipc_bytes: schema_bytes,
-                }
-                .into(),
-            ),
-        };
-        if let Err(e) = write_and_tee(&mut wr, &schema_frame, &mut tee).await {
-            warn!(error = %e, "client disconnected while writing SchemaMsg");
-            self.emit_scan_complete(
-                signal,
-                Some(physical.as_ref()),
-                rows_total,
-                pool_start,
-                cache_start,
-                "miss",
-                t0.elapsed(),
-            );
-            return Ok(());
-        }
-
-        // Stream batches. Race each await against the process-level memory
-        // guard so work outside DataFusion's reservation accounting cannot run
-        // all the way into the cgroup OOM killer.
-        loop {
-            let next = if let Some(guard) = &self.memory_guard {
-                tokio::select! {
-                    batch = stream.next() => batch,
-                    _ = guard.wait_until_exhausted() => {
-                        let _ = emit_stream_error(
-                            &mut wr,
-                            QUERY_ERR_RESOURCES,
-                            QUERY_TOO_LARGE_MESSAGE,
-                        ).await;
+                };
+                match planned {
+                    Ok((stream, physical)) => break (stream, physical, key, candidate_context),
+                    Err((code, msg)) => {
+                        let evicted = evict.take_evicted();
+                        if repair_rounds < 3 && !evicted.is_empty() {
+                            repair_rounds += 1;
+                            let missing_context: Vec<_> = candidate_context
+                                .iter()
+                                .filter(|(uuid, _, _)| evicted.contains(uuid))
+                                .cloned()
+                                .collect();
+                            let reconciled =
+                                match self.reconcile_missing_partitions(&missing_context).await {
+                                    Ok(metas) => metas,
+                                    Err(repair) => {
+                                        let _ =
+                                            emit_stream_error(&mut wr, QUERY_ERR_INTERNAL, repair)
+                                                .await;
+                                        let _ = wr.flush().await;
+                                        return Ok(());
+                                    }
+                                };
+                            match self.apply_reconciled_repair(&evicted, &reconciled) {
+                                Ok(_) => {
+                                    info!(
+                                    signal = signal_name(signal),
+                                    evicted = evicted.len(),
+                                    repair_rounds,
+                                    "block(s) 404'd during planning; repaired catalog and re-planning transparently"
+                                );
+                                    continue;
+                                }
+                                Err(repair) => {
+                                    let _ = emit_stream_error(&mut wr, QUERY_ERR_INTERNAL, repair)
+                                        .await;
+                                    let _ = wr.flush().await;
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        let _ = emit_stream_error(&mut wr, code, msg).await;
                         let _ = wr.flush().await;
                         self.emit_scan_complete(
                             signal,
-                            Some(physical.as_ref()),
+                            None,
                             rows_total,
                             pool_start,
                             cache_start,
@@ -1478,64 +1825,178 @@ impl QueryService {
                         return Ok(());
                     }
                 }
-            } else {
-                stream.next().await
             };
-            let Some(batch_res) = next else { break };
-            let batch = match batch_res {
-                Ok(b) => b,
-                Err(e) => {
-                    // A peer may have deleted a block mid-scan (404 from the
-                    // parquet GET). We can't re-plan now — the schema and
-                    // earlier batches are already on the wire — but we evict
-                    // the stale catalog row so the caller's retry (and every
-                    // future query) is clean. This is the only recovery path
-                    // for traces/profiles, which resolve no sidecar at plan
-                    // time and so never trip the transparent re-plan above.
-                    let evicted = evict.take_evicted();
-                    if !evicted.is_empty() {
-                        self.evict_rows(&evicted);
-                        info!(
-                            signal = signal_name(signal),
-                            evicted = evicted.len(),
-                            "block(s) 404'd mid-scan; evicted stale catalog rows (caller should retry)"
-                        );
-                    }
-                    let code = if matches!(e.find_root(), DataFusionError::ResourcesExhausted(_)) {
-                        QUERY_ERR_RESOURCES
-                    } else {
-                        QUERY_ERR_INTERNAL
-                    };
-                    let _ = emit_stream_error(&mut wr, code, format!("DataFusion: {e}")).await;
-                    let _ = wr.flush().await;
-                    self.emit_scan_complete(
-                        signal,
-                        Some(physical.as_ref()),
-                        rows_total,
-                        pool_start,
-                        cache_start,
-                        "miss",
-                        t0.elapsed(),
-                    );
-                    return Ok(());
-                }
+            // Planning-time observations belong only to the transparent planning
+            // repair loop. A successful plan starts the emitted attempt with a
+            // clean eviction set so an unrelated stream error cannot consume a
+            // stale planning miss and trigger a spurious reset.
+            let _ = evict.take_evicted();
+            let schema = stream.schema();
+
+            // Buffer the response for the cache while it streams (dropped past the
+            // per-entry cap → response still streams, just isn't cached). Skipped
+            // entirely when the cache is disabled or the query is `live` (whose
+            // result is time-varying and must never be cached).
+            let mut tee = if self.result_cache.enabled() && !req.live {
+                ResponseTee::new(self.result_cache_entry_bytes)
+            } else {
+                ResponseTee::disabled()
             };
 
-            // encoded_batch returns (dictionary batches, record batch).
-            // Each is one IPC message — we frame each as its own
-            // BatchMsg so a single batch with new dictionaries lands
-            // as N+1 BatchMsg frames in order.
-            #[allow(deprecated)]
-            let (dict_batches, batch_enc) =
-                match data_gen.encoded_batch(&batch, &mut dict_tracker, &options) {
-                    Ok(v) => v,
+            let data_gen = IpcDataGenerator::default();
+            let mut dict_tracker = DictionaryTracker::new(false);
+            let options = IpcWriteOptions::default();
+
+            // Schema message: one SchemaMsg before any BatchMsg.
+            let schema_enc = data_gen.schema_to_bytes_with_dictionary_tracker(
+                &schema,
+                &mut dict_tracker,
+                &options,
+            );
+            let mut schema_bytes = Vec::new();
+            if let Err(e) = write_message(&mut schema_bytes, schema_enc, &options) {
+                let _ = emit_stream_error(
+                    &mut wr,
+                    QUERY_ERR_INTERNAL,
+                    format!("write_message(schema): {e}"),
+                )
+                .await;
+                let _ = wr.flush().await;
+                self.emit_scan_complete(
+                    signal,
+                    Some(physical.as_ref()),
+                    rows_total,
+                    pool_start,
+                    cache_start,
+                    "miss",
+                    t0.elapsed(),
+                );
+                return Ok(());
+            }
+            let schema_frame = QueryFrame {
+                msg: QueryFrameMsg::SchemaMsg(
+                    SchemaMsgInput {
+                        ipc_bytes: schema_bytes,
+                    }
+                    .into(),
+                ),
+            };
+            if let Err(e) = write_and_tee(&mut wr, &schema_frame, &mut tee).await {
+                warn!(error = %e, "client disconnected while writing SchemaMsg");
+                self.emit_scan_complete(
+                    signal,
+                    Some(physical.as_ref()),
+                    rows_total,
+                    pool_start,
+                    cache_start,
+                    "miss",
+                    t0.elapsed(),
+                );
+                return Ok(());
+            }
+
+            // Stream batches. Race each await against the process-level memory
+            // guard so work outside DataFusion's reservation accounting cannot run
+            // all the way into the cgroup OOM killer.
+            loop {
+                let next = if let Some(guard) = &self.memory_guard {
+                    tokio::select! {
+                        batch = stream.next() => batch,
+                        _ = guard.wait_until_exhausted() => {
+                            let _ = emit_stream_error(
+                                &mut wr,
+                                QUERY_ERR_RESOURCES,
+                                QUERY_TOO_LARGE_MESSAGE,
+                            ).await;
+                            let _ = wr.flush().await;
+                            self.emit_scan_complete(
+                                signal,
+                                Some(physical.as_ref()),
+                                rows_total,
+                                pool_start,
+                                cache_start,
+                                "miss",
+                                t0.elapsed(),
+                            );
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    stream.next().await
+                };
+                let Some(batch_res) = next else { break };
+                let batch = match batch_res {
+                    Ok(b) => b,
                     Err(e) => {
-                        let _ = emit_stream_error(
-                            &mut wr,
-                            QUERY_ERR_INTERNAL,
-                            format!("encoded_batch: {e}"),
-                        )
-                        .await;
+                        // A recorded parquet 404 after SchemaMsg makes this attempt
+                        // provisional. Resolve lineage and atomically repair the
+                        // local catalog, then tell the capable client to retract the
+                        // attempt and restart the same request from a fresh listing.
+                        let evicted = evict.take_evicted();
+                        if !evicted.is_empty() && active_attempt < 2 {
+                            let missing_context: Vec<_> = candidate_context
+                                .iter()
+                                .filter(|(uuid, _, _)| evicted.contains(uuid))
+                                .cloned()
+                                .collect();
+                            let reconciled =
+                                match self.reconcile_missing_partitions(&missing_context).await {
+                                    Ok(metas) => metas,
+                                    Err(repair) => {
+                                        let _ =
+                                            emit_stream_error(&mut wr, QUERY_ERR_INTERNAL, repair)
+                                                .await;
+                                        let _ = wr.flush().await;
+                                        return Ok(());
+                                    }
+                                };
+                            match self.apply_reconciled_repair(&evicted, &reconciled) {
+                                Ok(reason) => {
+                                    let reset = QueryFrame {
+                                        msg: QueryFrameMsg::ResponseSuperseded(
+                                            ResponseSupersededInput {
+                                                superseded_attempt: active_attempt,
+                                                next_attempt: active_attempt + 1,
+                                                reason,
+                                            }
+                                            .into(),
+                                        ),
+                                    };
+                                    if write_frame(&mut wr, &reset).await.is_err()
+                                        || wr.flush().await.is_err()
+                                    {
+                                        return Ok(());
+                                    }
+                                    info!(
+                                        signal = signal_name(signal),
+                                        evicted = evicted.len(),
+                                        superseded_attempt = active_attempt,
+                                        next_attempt = active_attempt + 1,
+                                        "block(s) 404'd mid-scan; restarting response attempt"
+                                    );
+                                    active_attempt += 1;
+                                    continue 'attempt;
+                                }
+                                Err(repair) => {
+                                    let _ = emit_stream_error(&mut wr, QUERY_ERR_INTERNAL, repair)
+                                        .await;
+                                    let _ = wr.flush().await;
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        let code =
+                            if matches!(e.find_root(), DataFusionError::ResourcesExhausted(_)) {
+                                QUERY_ERR_RESOURCES
+                            } else {
+                                QUERY_ERR_INTERNAL
+                            };
+                        let message = if !evicted.is_empty() {
+                            format!("query attempt supersession limit exhausted: DataFusion: {e}")
+                        } else {
+                            format!("DataFusion: {e}")
+                        };
+                        let _ = emit_stream_error(&mut wr, code, message).await;
                         let _ = wr.flush().await;
                         self.emit_scan_complete(
                             signal,
@@ -1550,9 +2011,52 @@ impl QueryService {
                     }
                 };
 
-            for d in dict_batches {
-                if let Err(e) = write_one_batch(&mut wr, d, &options, &mut tee).await {
-                    warn!(error = %e, "client disconnected while writing BatchMsg (dict)");
+                // encoded_batch returns (dictionary batches, record batch).
+                // Each is one IPC message — we frame each as its own
+                // BatchMsg so a single batch with new dictionaries lands
+                // as N+1 BatchMsg frames in order.
+                #[allow(deprecated)]
+                let (dict_batches, batch_enc) =
+                    match data_gen.encoded_batch(&batch, &mut dict_tracker, &options) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let _ = emit_stream_error(
+                                &mut wr,
+                                QUERY_ERR_INTERNAL,
+                                format!("encoded_batch: {e}"),
+                            )
+                            .await;
+                            let _ = wr.flush().await;
+                            self.emit_scan_complete(
+                                signal,
+                                Some(physical.as_ref()),
+                                rows_total,
+                                pool_start,
+                                cache_start,
+                                "miss",
+                                t0.elapsed(),
+                            );
+                            return Ok(());
+                        }
+                    };
+
+                for d in dict_batches {
+                    if let Err(e) = write_one_batch(&mut wr, d, &options, &mut tee).await {
+                        warn!(error = %e, "client disconnected while writing BatchMsg (dict)");
+                        self.emit_scan_complete(
+                            signal,
+                            Some(physical.as_ref()),
+                            rows_total,
+                            pool_start,
+                            cache_start,
+                            "miss",
+                            t0.elapsed(),
+                        );
+                        return Ok(());
+                    }
+                }
+                if let Err(e) = write_one_batch(&mut wr, batch_enc, &options, &mut tee).await {
+                    warn!(error = %e, "client disconnected while writing BatchMsg");
                     self.emit_scan_complete(
                         signal,
                         Some(physical.as_ref()),
@@ -1564,58 +2068,49 @@ impl QueryService {
                     );
                     return Ok(());
                 }
+
+                rows_total = rows_total.saturating_add(batch.num_rows() as u64);
             }
-            if let Err(e) = write_one_batch(&mut wr, batch_enc, &options, &mut tee).await {
-                warn!(error = %e, "client disconnected while writing BatchMsg");
-                self.emit_scan_complete(
-                    signal,
-                    Some(physical.as_ref()),
-                    rows_total,
-                    pool_start,
-                    cache_start,
-                    "miss",
-                    t0.elapsed(),
-                );
+
+            // Normal completion: EndOfStream terminator. The attempt is final only
+            // once both the frame write and the buffered socket flush succeed.
+            let end_frame = QueryFrame {
+                msg: QueryFrameMsg::EndOfStream(
+                    EndOfStreamInput {
+                        total_rows: rows_total,
+                    }
+                    .into(),
+                ),
+            };
+            if let Err(e) = write_and_tee(&mut wr, &end_frame, &mut tee).await {
+                warn!(error = %e, "client disconnected while writing EndOfStream");
                 return Ok(());
             }
+            if let Err(e) = wr.flush().await {
+                warn!(error = %e, "client disconnected while flushing EndOfStream");
+                return Ok(());
+            }
+            if let Some(g) = inflight.as_mut() {
+                g.mark_ok();
+            }
 
-            rows_total = rows_total.saturating_add(batch.num_rows() as u64);
-        }
+            // Admit only this final, cleanly-completed attempt after EOS is known to
+            // have reached the socket. Provisional attempt bytes never enter `tee`.
+            if let Some(bytes) = tee.take() {
+                self.result_cache.insert(cache_key, bytes.into());
+            }
 
-        // Normal completion: EndOfStream terminator.
-        if let Some(g) = inflight.as_mut() {
-            g.mark_ok();
+            self.emit_scan_complete(
+                signal,
+                Some(physical.as_ref()),
+                rows_total,
+                pool_start,
+                cache_start,
+                "miss",
+                t0.elapsed(),
+            );
+            return Ok(());
         }
-        let end_frame = QueryFrame {
-            msg: QueryFrameMsg::EndOfStream(
-                EndOfStreamInput {
-                    total_rows: rows_total,
-                }
-                .into(),
-            ),
-        };
-        if let Err(e) = write_and_tee(&mut wr, &end_frame, &mut tee).await {
-            warn!(error = %e, "client disconnected while writing EndOfStream");
-        }
-        let _ = wr.flush().await;
-
-        // Admit the full, cleanly-completed response to the result cache. `tee`
-        // is `None` if the response outgrew the per-entry cap (large log dump)
-        // or the cache is disabled — in either case this is a no-op.
-        if let Some(bytes) = tee.take() {
-            self.result_cache.insert(cache_key, bytes.into());
-        }
-
-        self.emit_scan_complete(
-            signal,
-            Some(physical.as_ref()),
-            rows_total,
-            pool_start,
-            cache_start,
-            "miss",
-            t0.elapsed(),
-        );
-        Ok(())
     }
 
     /// Emit the per-query `scan_complete` event with the same field
@@ -2046,8 +2541,265 @@ fn canonical_fleet_json(blobs: Vec<String>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{canonical_fleet_json, live_record_is_durable, live_record_owned_bytes};
+    use std::ops::Range;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use datafusion::execution::memory_pool::GreedyMemoryPool;
+    use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+    use futures::stream::BoxStream;
+    use object_store::memory::InMemory;
+    use object_store::path::Path;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
+        Result as OsResult,
+    };
+    use scry_block::BlockMeta;
+    use scry_catalog::Catalog;
+    use scry_objstore::BufPool;
     use scry_proto::{generated::LiveRecord, LabelPair};
+    use scry_query::{BloomCache, PostingsCache, QueryResultCache};
+    use tempfile::TempDir;
+    use tokio::time::Duration;
+    use uuid::Uuid;
+
+    use super::{
+        canonical_fleet_json, live_record_is_durable, live_record_owned_bytes, QueryService,
+        TargetedRepairLimits,
+    };
+
+    #[derive(Debug)]
+    struct CountingStore {
+        inner: InMemory,
+        lists: AtomicUsize,
+        gets: AtomicUsize,
+        active_gets: AtomicUsize,
+        max_active_gets: AtomicUsize,
+        get_delay: Duration,
+    }
+
+    impl std::fmt::Display for CountingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("CountingStore")
+        }
+    }
+
+    impl CountingStore {
+        fn new(get_delay: Duration) -> Self {
+            Self {
+                inner: InMemory::new(),
+                lists: AtomicUsize::new(0),
+                gets: AtomicUsize::new(0),
+                active_gets: AtomicUsize::new(0),
+                max_active_gets: AtomicUsize::new(0),
+                get_delay,
+            }
+        }
+
+        async fn seed(&self, path: Path, bytes: Vec<u8>) {
+            self.inner.put(&path, bytes.into()).await.unwrap();
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for CountingStore {
+        async fn put_opts(&self, p: &Path, v: PutPayload, o: PutOptions) -> OsResult<PutResult> {
+            self.inner.put_opts(p, v, o).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            p: &Path,
+            o: PutMultipartOptions,
+        ) -> OsResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(p, o).await
+        }
+
+        async fn get_opts(&self, p: &Path, o: GetOptions) -> OsResult<GetResult> {
+            self.gets.fetch_add(1, Ordering::SeqCst);
+            let active = self.active_gets.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active_gets.fetch_max(active, Ordering::SeqCst);
+            tokio::time::sleep(self.get_delay).await;
+            let result = self.inner.get_opts(p, o).await;
+            self.active_gets.fetch_sub(1, Ordering::SeqCst);
+            result
+        }
+
+        async fn get_ranges(&self, p: &Path, r: &[Range<u64>]) -> OsResult<Vec<Bytes>> {
+            self.inner.get_ranges(p, r).await
+        }
+
+        fn delete_stream(
+            &self,
+            paths: BoxStream<'static, OsResult<Path>>,
+        ) -> BoxStream<'static, OsResult<Path>> {
+            self.inner.delete_stream(paths)
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OsResult<ObjectMeta>> {
+            self.lists.fetch_add(1, Ordering::SeqCst);
+            self.inner.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, OsResult<ObjectMeta>> {
+            self.inner.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OsResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(&self, from: &Path, to: &Path, o: CopyOptions) -> OsResult<()> {
+            self.inner.copy_opts(from, to, o).await
+        }
+
+        async fn rename_opts(&self, from: &Path, to: &Path, o: RenameOptions) -> OsResult<()> {
+            self.inner.rename_opts(from, to, o).await
+        }
+    }
+
+    fn repair_meta(uuid: Uuid, writer_id: Uuid) -> BlockMeta {
+        BlockMeta {
+            uuid,
+            signal: "logs".into(),
+            writer_id,
+            ts_min_unix_nano: 1,
+            ts_max_unix_nano: 2,
+            row_count: 1,
+            byte_size: 1,
+            schema_version: 1,
+            level: 0,
+            compacted_from: Vec::new(),
+            producer_version: "test".into(),
+            label_fingerprint_bloom: None,
+            has_postings: false,
+            postings_size_bytes: None,
+            series_types: None,
+            all_fingerprints: None,
+            has_body_bloom: false,
+            body_bloom_size_bytes: None,
+            wal_seg_max: None,
+            wal_shard: None,
+        }
+    }
+
+    fn repair_service(store: Arc<dyn ObjectStore>, limits: TargetedRepairLimits) -> QueryService {
+        let tmp = TempDir::new().unwrap();
+        let catalog = Catalog::open(&tmp.path().join("catalog.sqlite"), "test").unwrap();
+        let memory_pool = Arc::new(GreedyMemoryPool::new(64 * 1024 * 1024));
+        let runtime_env = Arc::new(
+            RuntimeEnvBuilder::new()
+                .with_memory_pool(memory_pool.clone())
+                .build()
+                .unwrap(),
+        );
+        QueryService::new(
+            Arc::new(Mutex::new(catalog)),
+            store,
+            BufPool::new(),
+            Arc::new(PostingsCache::with_budget_bytes(0)),
+            Arc::new(BloomCache::with_budget_bytes(0)),
+            runtime_env,
+            memory_pool,
+            Arc::new(QueryResultCache::with_budget_bytes(0)),
+            0,
+        )
+        .with_targeted_repair_limits(limits)
+    }
+
+    #[tokio::test]
+    async fn targeted_repair_single_flights_and_caches_partition() {
+        let store = Arc::new(CountingStore::new(Duration::from_millis(20)));
+        let writer = Uuid::now_v7();
+        let meta = repair_meta(Uuid::now_v7(), writer);
+        let path = Path::from(format!("logs/2026/08/23/{writer}/{}.meta.json", meta.uuid));
+        store.seed(path, serde_json::to_vec(&meta).unwrap()).await;
+        let service = Arc::new(repair_service(
+            store.clone(),
+            TargetedRepairLimits {
+                get_concurrency: 2,
+                deadline: Duration::from_secs(2),
+                cache_ttl: Duration::from_secs(1),
+                stable_attempts: 2,
+            },
+        ));
+        let partition = ("logs".to_string(), "2026-08-23".to_string());
+
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let service = service.clone();
+            let partition = partition.clone();
+            tasks.push(tokio::spawn(async move {
+                service.get_or_load_partition(partition).await.unwrap()
+            }));
+        }
+        for task in tasks {
+            assert_eq!(task.await.unwrap().metas.len(), 1);
+        }
+        assert_eq!(store.lists.load(Ordering::SeqCst), 2);
+        assert_eq!(store.gets.load(Ordering::SeqCst), 1);
+
+        service.get_or_load_partition(partition).await.unwrap();
+        assert_eq!(store.lists.load(Ordering::SeqCst), 2, "TTL cache hit");
+        assert_eq!(store.gets.load(Ordering::SeqCst), 1, "TTL cache hit");
+    }
+
+    #[tokio::test]
+    async fn targeted_repair_bounds_gets_process_wide() {
+        let store = Arc::new(CountingStore::new(Duration::from_millis(30)));
+        for day in ["23", "24"] {
+            let writer = Uuid::now_v7();
+            for _ in 0..4 {
+                let meta = repair_meta(Uuid::now_v7(), writer);
+                let path = Path::from(format!(
+                    "logs/2026/08/{day}/{writer}/{}.meta.json",
+                    meta.uuid
+                ));
+                store.seed(path, serde_json::to_vec(&meta).unwrap()).await;
+            }
+        }
+        let service = Arc::new(repair_service(
+            store.clone(),
+            TargetedRepairLimits {
+                get_concurrency: 2,
+                deadline: Duration::from_secs(3),
+                cache_ttl: Duration::ZERO,
+                stable_attempts: 1,
+            },
+        ));
+        let a = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                service
+                    .get_or_load_partition(("logs".into(), "2026-08-23".into()))
+                    .await
+                    .unwrap()
+            })
+        };
+        let b = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                service
+                    .get_or_load_partition(("logs".into(), "2026-08-24".into()))
+                    .await
+                    .unwrap()
+            })
+        };
+        assert_eq!(a.await.unwrap().metas.len(), 4);
+        assert_eq!(b.await.unwrap().metas.len(), 4);
+        assert_eq!(store.gets.load(Ordering::SeqCst), 8);
+        assert!(
+            store.max_active_gets.load(Ordering::SeqCst) <= 2,
+            "global repair GET semaphore was exceeded"
+        );
+    }
 
     #[test]
     fn fleet_json_drops_invalid_records_and_sorts_stably() {

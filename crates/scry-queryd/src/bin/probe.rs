@@ -139,11 +139,22 @@ async fn main() -> Result<()> {
 
     // Drain the response: SchemaMsg + BatchMsg… + EndOfStream (or StreamError).
     // Arrow payloads are ignored — only the terminal row count is reported.
+    let mut active_attempt = 0;
+    let mut saw_schema = false;
     let total_rows: u64 = loop {
         let frame: QueryFrame = read_frame(&mut r).await.context("read response frame")?;
         match frame.msg {
-            QueryFrameMsg::SchemaMsg(_) | QueryFrameMsg::BatchMsg(_) => continue,
-            QueryFrameMsg::EndOfStream(end) => break end.total_rows,
+            QueryFrameMsg::SchemaMsg(_) if !saw_schema => saw_schema = true,
+            QueryFrameMsg::BatchMsg(_) if saw_schema => {}
+            QueryFrameMsg::ResponseSuperseded(reset)
+                if saw_schema
+                    && reset.superseded_attempt == active_attempt
+                    && reset.next_attempt == active_attempt + 1 =>
+            {
+                active_attempt = reset.next_attempt;
+                saw_schema = false;
+            }
+            QueryFrameMsg::EndOfStream(end) if saw_schema => break end.total_rows,
             QueryFrameMsg::StreamError(err) => {
                 bail!(
                     "server StreamError code={:#06x} message={}",

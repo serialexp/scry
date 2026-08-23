@@ -17,7 +17,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use object_store::{memory::InMemory, ObjectStore};
+use object_store::{memory::InMemory, ObjectStore, ObjectStoreExt};
 use scry_block::{
     BlockBuilder, BlockBuilderConfig, BlockEvent, BlockMeta, LogsBlockBuilder, NoopSink,
 };
@@ -99,6 +99,7 @@ fn fake_meta(signal: &str, writer: Uuid, ts: u64) -> BlockMeta {
         body_bloom_size_bytes: None,
         wal_seg_max: None,
         wal_shard: None,
+        compacted_from: Vec::new(),
     }
 }
 
@@ -148,6 +149,7 @@ fn superseded_before_created_satisfies_foreign_key() {
         inputs: vec![in1.uuid, in2.uuid],
         by: merged.uuid,
         by_meta: merged.clone(),
+        reap_eligible_at_unix_nano: NOW + 600,
     };
     apply_event(&catalog, &ev).unwrap();
 
@@ -156,8 +158,21 @@ fn superseded_before_created_satisfies_foreign_key() {
     assert_eq!(live.len(), 1, "only the merged block is live");
     assert_eq!(live[0].meta.uuid, merged.uuid);
 
-    // Re-applying is a harmless no-op (idempotent).
-    apply_event(&catalog, &ev).unwrap();
+    assert!(
+        catalog.list_pending_reaps(NOW + 599).unwrap().is_empty(),
+        "peer event must preserve the committing compactor's grace"
+    );
+    assert_eq!(catalog.list_pending_reaps(NOW + 600).unwrap().len(), 2);
+
+    // Re-applying an older/self-delivered event cannot shorten eligibility.
+    let immediate = BlockEvent::Superseded {
+        inputs: vec![in1.uuid, in2.uuid],
+        by: merged.uuid,
+        by_meta: merged.clone(),
+        reap_eligible_at_unix_nano: 0,
+    };
+    apply_event(&catalog, &immediate).unwrap();
+    assert!(catalog.list_pending_reaps(NOW + 599).unwrap().is_empty());
     assert_eq!(catalog.list_blocks().unwrap().len(), 1);
 }
 
@@ -238,6 +253,96 @@ async fn full_walk_discovers_untracked_prefixes() {
         catalog.get_cursor("logs", writer, &date).unwrap(),
         Some(b2.uuid)
     );
+}
+
+#[tokio::test]
+async fn lease_holder_reconciles_prior_committed_output_before_remerging_inputs() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let writer = Uuid::now_v7();
+    let mut inputs = Vec::new();
+    for (i, fp) in [0xA001u64, 0xB001, 0xC001].into_iter().enumerate() {
+        inputs.push(build_logs_block(&store, writer, fp, NOW + (i as u64) * 100, 50).await);
+    }
+
+    // Simulate holder A reaching the meta.json commit point and crashing before
+    // applying output/lineage to this stale peer's catalog.
+    let (source_catalog, _source_tmp) = open_catalog();
+    for meta in &inputs {
+        source_catalog.insert_block(meta).unwrap();
+    }
+    let source_plan = scry_compact::plan_merges(
+        &source_catalog.list_blocks().unwrap(),
+        &CompactConfig {
+            fanout: 3,
+            max_level: 3,
+            grace: Duration::ZERO,
+            signal_filter: Some("logs".into()),
+        },
+    )
+    .pop()
+    .unwrap();
+    let committed = scry_compact::merge_blocks(
+        store.clone(),
+        BUCKET,
+        &source_plan.signal,
+        &source_plan.inputs,
+        source_plan.output_level(),
+        Uuid::now_v7(),
+        &test_cfg(),
+        &scry_block::AlwaysValid,
+    )
+    .await
+    .unwrap()
+    .expect("prior holder committed output meta.json");
+
+    let (stale_catalog, _stale_tmp) = open_catalog();
+    for meta in &inputs {
+        stale_catalog.insert_block(meta).unwrap();
+    }
+    let stale_catalog = Arc::new(Mutex::new(stale_catalog));
+    let report = run_compaction_pass(
+        &LocalLeaseProvider::new(),
+        store.clone(),
+        stale_catalog.as_ref(),
+        BUCKET,
+        &CompactConfig {
+            fanout: 3,
+            max_level: 3,
+            grace: Duration::ZERO,
+            signal_filter: Some("logs".into()),
+        },
+        &test_cfg(),
+        &NoopSink,
+        Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.merges, 0, "stale inputs must not be re-merged");
+    let live = stale_catalog.lock().unwrap().list_blocks().unwrap();
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].meta.uuid, committed.uuid);
+    assert_eq!(live[0].meta.row_count, 150);
+
+    let mut metas = store.list(None);
+    let mut committed_outputs = 0;
+    while let Some(object) = futures::StreamExt::next(&mut metas).await {
+        let object = object.unwrap();
+        if object.location.as_ref().ends_with(".meta.json") {
+            let bytes = store
+                .get(&object.location)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            let meta: BlockMeta = serde_json::from_slice(&bytes).unwrap();
+            if meta.level == 1 {
+                committed_outputs += 1;
+            }
+        }
+    }
+    assert_eq!(committed_outputs, 1, "no duplicate committed output");
 }
 
 #[tokio::test]

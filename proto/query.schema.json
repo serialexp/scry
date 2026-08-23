@@ -2,7 +2,7 @@
   "meta": {
     "title": "scry query wire protocol",
     "description": "Client to query-daemon wire protocol for issuing DataFusion-backed metrics queries against a scry deployment. Long-lived TCP stream, length-framed messages, one request frame from client triggers a stream of response frames (schema + zero or more batches + end-of-stream). Arrow IPC payload carried verbatim inside the binschema envelope — binschema is purely the framing/control plane.",
-    "version": "0.1.0"
+    "version": "0.2.0"
   },
 
   "config": {
@@ -25,6 +25,7 @@
             { "type": "FleetStatusRequest", "when": "value === 0x04" },
             { "type": "SchemaMsg",          "when": "value === 0x10" },
             { "type": "BatchMsg",           "when": "value === 0x11" },
+            { "type": "ResponseSuperseded", "when": "value === 0x12" },
             { "type": "EndOfStream",        "when": "value === 0x1F" },
             { "type": "LabelNamesResponse", "when": "value === 0x20" },
             { "type": "LabelValuesResponse","when": "value === 0x21" },
@@ -51,7 +52,8 @@
         { "name": "trace_id",   "type": "bytes",  "kind": "length_prefixed", "length_type": "uint16" },
         { "name": "body_contains", "type": "string", "kind": "length_prefixed", "length_type": "uint32", "encoding": "utf8" },
         { "name": "live", "type": "uint8" },
-        { "name": "with_labels", "type": "uint8" }
+        { "name": "with_labels", "type": "uint8" },
+        { "name": "capabilities", "type": "uint32" }
       ]
     },
 
@@ -71,7 +73,8 @@
         { "name": "ts_min_present", "type": "uint8" },
         { "name": "ts_min",         "type": "uint64" },
         { "name": "ts_max_present", "type": "uint8" },
-        { "name": "ts_max",         "type": "uint64" }
+        { "name": "ts_max",         "type": "uint64" },
+        { "name": "capabilities",   "type": "uint32" }
       ]
     },
 
@@ -84,7 +87,8 @@
         { "name": "ts_min_present", "type": "uint8" },
         { "name": "ts_min",         "type": "uint64" },
         { "name": "ts_max_present", "type": "uint8" },
-        { "name": "ts_max",         "type": "uint64" }
+        { "name": "ts_max",         "type": "uint64" },
+        { "name": "capabilities",   "type": "uint32" }
       ]
     },
 
@@ -135,6 +139,16 @@
       "sequence": [
         { "name": "tag",       "type": "uint8", "const": 17 },
         { "name": "ipc_bytes", "type": "bytes", "kind": "length_prefixed", "length_type": "uint32" }
+      ]
+    },
+
+    "ResponseSuperseded": {
+      "description": "Server → client. Non-terminal reset: all schema, dictionaries, batches, rows, and counts from superseded_attempt are invalid. The next frame must be a fresh SchemaMsg for next_attempt.",
+      "sequence": [
+        { "name": "tag",                "type": "uint8", "const": 18 },
+        { "name": "superseded_attempt", "type": "uint32" },
+        { "name": "next_attempt",       "type": "uint32" },
+        { "name": "reason",             "type": "uint8" }
       ]
     },
 

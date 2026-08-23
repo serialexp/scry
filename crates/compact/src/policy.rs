@@ -49,6 +49,42 @@ impl Default for CompactConfig {
     }
 }
 
+impl CompactConfig {
+    /// Validate that this policy can encode every output's complete ancestry.
+    ///
+    /// A block at level `max_level` represents `fanout + fanout² + …`
+    /// ancestors. Sidecars deliberately cap that closure, so rejecting an
+    /// incompatible policy at startup avoids a compactor that only fails after
+    /// it has already built a deep merge tree.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.fanout >= 2, "compaction fanout must be at least 2");
+        anyhow::ensure!(
+            self.max_level >= 1,
+            "compaction max level must be at least 1"
+        );
+
+        let mut represented = 0usize;
+        let mut width = 1usize;
+        for _ in 0..self.max_level {
+            width = width.checked_mul(self.fanout).ok_or_else(|| {
+                anyhow::anyhow!("compaction fanout/level ancestry size overflows usize")
+            })?;
+            represented = represented.checked_add(width).ok_or_else(|| {
+                anyhow::anyhow!("compaction fanout/level ancestry size overflows usize")
+            })?;
+            anyhow::ensure!(
+                represented <= scry_block::MAX_COMPACTED_ANCESTORS,
+                "compaction fanout {} through level {} requires {} ancestors, exceeding the sidecar limit of {}",
+                self.fanout,
+                self.max_level,
+                represented,
+                scry_block::MAX_COMPACTED_ANCESTORS
+            );
+        }
+        Ok(())
+    }
+}
+
 /// One planned merge: the inputs (already chosen, the `fanout` smallest
 /// in their partition) and the level their merged output lands at.
 #[derive(Debug, Clone)]
@@ -127,6 +163,7 @@ mod tests {
                 byte_size: bytes,
                 schema_version: 1,
                 level,
+                compacted_from: Vec::new(),
                 producer_version: String::new(),
                 label_fingerprint_bloom: None,
                 has_postings: false,
@@ -196,5 +233,30 @@ mod tests {
         assert_eq!(plans.len(), 1, "only the level-0 logs partition qualifies");
         assert_eq!(plans[0].signal, "logs");
         assert_eq!(plans[0].input_level, 0);
+    }
+
+    #[test]
+    fn validates_ancestry_capacity_and_basic_bounds() {
+        CompactConfig::default().validate().unwrap();
+
+        let too_shallow = CompactConfig {
+            max_level: 0,
+            ..Default::default()
+        };
+        assert!(too_shallow.validate().is_err());
+
+        let no_reduction = CompactConfig {
+            fanout: 1,
+            ..Default::default()
+        };
+        assert!(no_reduction.validate().is_err());
+
+        let oversized = CompactConfig {
+            fanout: 9,
+            max_level: 3,
+            ..Default::default()
+        };
+        let error = oversized.validate().unwrap_err().to_string();
+        assert!(error.contains("exceeding the sidecar limit"), "{error}");
     }
 }

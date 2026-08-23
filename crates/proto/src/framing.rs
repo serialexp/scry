@@ -193,6 +193,7 @@ mod tests {
             live: 0,
             // 0 = fingerprint-only (no opt-in metrics label join).
             with_labels: 0,
+            capabilities: crate::constants::QUERY_CAP_ATTEMPT_SUPERSESSION,
         };
         let frame = QueryFrame {
             msg: QueryFrameMsg::QueryRequest(req.clone().into()),
@@ -214,6 +215,32 @@ mod tests {
                 assert_eq!(q.limit, 0);
             }
             other => panic!("expected QueryRequest, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn query_superseded_frame_round_trips_with_assigned_tag() {
+        let frame = QueryFrame {
+            msg: QueryFrameMsg::ResponseSuperseded(
+                crate::ResponseSupersededInput {
+                    superseded_attempt: 3,
+                    next_attempt: 4,
+                    reason: crate::constants::QUERY_SUPERSEDED_REASON_SUPERSEDED_BLOCK_DISAPPEARED,
+                }
+                .into(),
+            ),
+        };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &frame).await.unwrap();
+        assert_eq!(buf[4], 0x12);
+        let mut cursor = std::io::Cursor::new(buf);
+        match read_frame::<QueryFrame, _>(&mut cursor).await.unwrap().msg {
+            QueryFrameMsg::ResponseSuperseded(reset) => {
+                assert_eq!(reset.superseded_attempt, 3);
+                assert_eq!(reset.next_attempt, 4);
+                assert_eq!(reset.reason, 1);
+            }
+            other => panic!("expected ResponseSuperseded, got {other:?}"),
         }
     }
 

@@ -18,6 +18,9 @@ export type SignalByte = (typeof Signal)[SignalName];
 
 export const SIGNAL_NAMES = Object.keys(Signal) as SignalName[];
 
+/** Client supports strict reset-and-restart query response attempts. */
+export const QUERY_CAP_ATTEMPT_SUPERSESSION = 0x0000_0001;
+
 /** QUERY_ERR_* codes carried by a `StreamError` frame. */
 export const QueryErrCode = {
   BAD_REQUEST: 0x0001,

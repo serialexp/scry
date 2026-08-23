@@ -30,7 +30,9 @@ pub use dummy::DummyBlockBuilder;
 pub use events::{BlockEvent, BlockEventSink, Envelope, NoopSink};
 pub use fence::{AlwaysValid, Fence};
 pub use logs::LogsBlockBuilder;
-pub use meta::BlockMeta;
+pub use meta::{
+    compacted_ancestor_closure, BlockMeta, MAX_COMPACTED_ANCESTORS, MAX_COMPACTED_ANCESTRY_BYTES,
+};
 pub use metrics::MetricsBlockBuilder;
 pub use profiles::ProfilesBlockBuilder;
 pub use traces::TracesBlockBuilder;
@@ -299,13 +301,17 @@ pub async fn delete_block_objects(store: &dyn ObjectStore, meta: &BlockMeta) -> 
     use anyhow::Context as _;
     use object_store::ObjectStoreExt as _;
 
-    let mut kinds: Vec<&str> = vec!["parquet", "meta.json"];
+    // The sidecar is the commit marker seen by reconciliation, so remove it
+    // last. A crash during a partial reap therefore leaves a discoverable block
+    // whose remaining deletion can be retried idempotently.
+    let mut kinds: Vec<&str> = vec!["parquet"];
     if meta.has_postings {
         kinds.push("postings.parquet");
     }
     if meta.has_body_bloom {
         kinds.push("body.bloom");
     }
+    kinds.push("meta.json");
     for kind in kinds {
         let path = Path::from(block_path(
             &meta.signal,

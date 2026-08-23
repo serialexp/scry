@@ -219,7 +219,7 @@ async fn fence_lost_before_meta_commit_aborts_with_inputs_intact() {
 }
 
 #[tokio::test]
-async fn fence_lost_after_commit_before_supersede_aborts_inputs_live() {
+async fn fence_lost_after_commit_still_publishes_output_and_defers_reap() {
     let (store, catalog, _tmp, metas) = three_logs_blocks().await;
     let plan = one_logs_plan(&catalog);
 
@@ -245,31 +245,27 @@ async fn fence_lost_after_commit_before_supersede_aborts_inputs_live() {
     .await
     .unwrap();
 
-    assert!(matches!(outcome, PartitionOutcome::Aborted));
+    assert!(matches!(outcome, PartitionOutcome::Merged { .. }));
 
-    // The merge DID commit its meta.json (the fence was valid at the commit
-    // point), so a 4th, leaked, meta.json exists on the bucket — but it was
-    // never inserted into the catalog.
+    // The merge committed its meta.json, which is the logical commit point.
+    // Losing the fence afterwards cannot leave the output invisible.
     assert_eq!(
         count_meta_json(&store).await,
         4,
         "merge committed before the post-merge fence tripped"
     );
 
-    // The local catalog is clean: only the three live inputs, none superseded,
-    // and the merged block was not inserted.
+    // The output is the sole logical live block. Inputs remain as durable
+    // pending-reap rows because the post-commit fence no longer authorizes
+    // physical deletion.
     let live = catalog.list_blocks().unwrap();
-    assert_eq!(
-        live.len(),
-        3,
-        "inputs stay live; merged block not cataloged"
-    );
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].level, 1);
     for m in &metas {
         assert!(catalog.get_block(m.uuid).unwrap().is_some());
     }
-
-    // No events — Created is only emitted after the post-merge fence passes.
-    assert!(sink.events.lock().unwrap().is_empty());
+    assert_eq!(catalog.list_pending_reaps(u64::MAX).unwrap().len(), 3);
+    assert_eq!(sink.events.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -311,9 +307,10 @@ async fn valid_fence_merges_reaps_inputs_and_emits_events() {
         assert!(catalog.get_block(m.uuid).unwrap().is_none());
     }
 
-    // Exactly the Created → Superseded → Deleted sequence, in order.
+    // Created → Superseded, followed by one independently retryable Deleted
+    // event per input.
     let events = sink.events.lock().unwrap();
-    assert_eq!(events.len(), 3, "one event per lifecycle point");
+    assert_eq!(events.len(), 5, "logical events plus one delete per input");
     let merged_uuid = live[0].meta.uuid;
     match &events[0] {
         BlockEvent::Created { meta } => {
@@ -327,6 +324,7 @@ async fn valid_fence_merges_reaps_inputs_and_emits_events() {
             inputs,
             by,
             by_meta,
+            reap_eligible_at_unix_nano: _,
         } => {
             assert_eq!(*by, merged_uuid);
             assert_eq!(by_meta.uuid, merged_uuid);
@@ -338,15 +336,19 @@ async fn valid_fence_merges_reaps_inputs_and_emits_events() {
         }
         other => panic!("second event should be Superseded, got {other:?}"),
     }
-    match &events[2] {
-        BlockEvent::Deleted { signal, uuids } => {
-            assert_eq!(signal, "logs");
-            let mut got = uuids.clone();
-            let mut want = input_uuids.clone();
-            got.sort();
-            want.sort();
-            assert_eq!(got, want, "all inputs deleted");
+    let mut deleted: Vec<Uuid> = Vec::new();
+    for event in &events[2..] {
+        match event {
+            BlockEvent::Deleted { signal, uuids } => {
+                assert_eq!(signal, "logs");
+                assert_eq!(uuids.len(), 1);
+                deleted.extend(uuids);
+            }
+            other => panic!("remaining events should be Deleted, got {other:?}"),
         }
-        other => panic!("third event should be Deleted, got {other:?}"),
     }
+    deleted.sort();
+    let mut want = input_uuids;
+    want.sort();
+    assert_eq!(deleted, want, "all inputs deleted independently");
 }

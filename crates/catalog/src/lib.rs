@@ -69,6 +69,25 @@ pub struct ReconcileReport {
     pub failed: usize,
 }
 
+/// Result of resolving a block UUID through durable compaction ancestry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalResolution {
+    /// The UUID itself, or exactly one known descendant, is currently live.
+    Unique(Uuid),
+    /// No live block currently claims to represent this UUID.
+    None,
+    /// Contradictory compactions produced incomparable live descendants.
+    Fork(Vec<Uuid>),
+}
+
+/// A superseded input whose immutable objects still need physical deletion.
+#[derive(Debug, Clone)]
+pub struct PendingReap {
+    pub entry: CatalogEntry,
+    pub output_uuid: Uuid,
+    pub eligible_at_unix_nano: u64,
+}
+
 pub struct Catalog {
     conn: Connection,
     bucket: String,
@@ -109,11 +128,16 @@ impl Catalog {
         // D-054 added per-block WAL watermark columns after catalogs already
         // existed in production. `CREATE TABLE IF NOT EXISTS` does not evolve an
         // existing `blocks` table, so migrate that v1 shape before any query or
-        // insert can reference the new columns. The guards make repeated opens
-        // idempotent and also repair the old ingest PVC before it writes a v2
-        // snapshot for queryd.
+        // insert can reference the new columns. D-061 adds pointer-independent
+        // logical liveness and persistent pending-reap state. These additive
+        // columns are safe on old local catalogs; the obsolete superseded_by FK
+        // is removed by `migrate_blocks_v3` below.
         self.add_column_if_missing("blocks", "wal_seg_max", "INTEGER")?;
         self.add_column_if_missing("blocks", "wal_shard", "INTEGER")?;
+        self.add_column_if_missing("blocks", "superseded", "INTEGER NOT NULL DEFAULT 0")?;
+        self.add_column_if_missing("blocks", "reap_output_uuid", "TEXT")?;
+        self.add_column_if_missing("blocks", "reap_eligible_at", "INTEGER")?;
+        self.migrate_blocks_v3()?;
 
         // The DDL matches ARCHITECTURE.md § The catalog § Schema with
         // the `buckets` table omitted (one bucket in v0.1) and the
@@ -140,8 +164,14 @@ impl Catalog {
               has_body_bloom      INTEGER NOT NULL DEFAULT 0,
               schema_version      INTEGER NOT NULL,
               fingerprint         BLOB,
-              superseded_by       TEXT REFERENCES blocks(uuid),
+              -- Legacy diagnostic pointer. Logical liveness is the independent
+              -- `superseded` bit so deleting an intermediate output cannot trip
+              -- a foreign key or resurrect its ancestors.
+              superseded_by       TEXT,
+              superseded          INTEGER NOT NULL DEFAULT 0,
               deleted_at          INTEGER,
+              reap_output_uuid    TEXT,
+              reap_eligible_at    INTEGER,
               -- D-054 dedup watermark: highest WAL segment this block
               -- durably contains, and the ingest shard that wrote it. NULL
               -- for pre-D-054 / compacted blocks (round-trips the sidecar
@@ -153,11 +183,30 @@ impl Catalog {
 
             CREATE INDEX IF NOT EXISTS idx_blocks_query
               ON blocks(signal, date, ts_min, ts_max)
-              WHERE deleted_at IS NULL;
+              WHERE deleted_at IS NULL AND superseded = 0;
 
             CREATE INDEX IF NOT EXISTS idx_blocks_compact
               ON blocks(bucket, signal, date, level)
-              WHERE deleted_at IS NULL;
+              WHERE deleted_at IS NULL AND superseded = 0;
+
+            -- Durable, order-independent compaction claims. No foreign keys:
+            -- both ancestors and intermediate descendants are intentionally
+            -- removable while the claim remains useful for stale-peer repair.
+            CREATE TABLE IF NOT EXISTS block_lineage (
+              ancestor_uuid   TEXT NOT NULL,
+              descendant_uuid TEXT NOT NULL,
+              signal          TEXT NOT NULL,
+              date            TEXT NOT NULL,
+              observed_at     INTEGER NOT NULL,
+              PRIMARY KEY (ancestor_uuid, descendant_uuid)
+            ) WITHOUT ROWID;
+
+            CREATE INDEX IF NOT EXISTS idx_block_lineage_descendant
+              ON block_lineage(descendant_uuid);
+
+            CREATE INDEX IF NOT EXISTS idx_blocks_pending_reap
+              ON blocks(reap_eligible_at)
+              WHERE superseded = 1 AND reap_eligible_at IS NOT NULL;
 
             -- Per-(signal, writer, date) high-water mark for incremental
             -- ListObjects polling (ARCHITECTURE.md § Cursor-driven polling).
@@ -244,6 +293,72 @@ impl Catalog {
         Ok(())
     }
 
+    /// Rebuild pre-D-061 `blocks` tables to remove the self-referential
+    /// `superseded_by` foreign key. An intermediate output is itself deleted by
+    /// a later compaction while older peers may still retain rows pointing at
+    /// it; liveness therefore cannot depend on that row's lifetime.
+    fn migrate_blocks_v3(&self) -> Result<()> {
+        let has_blocks: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='blocks')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !has_blocks {
+            return Ok(());
+        }
+        let has_fk = self
+            .conn
+            .prepare("PRAGMA foreign_key_list(blocks)")?
+            .query([])?
+            .next()?
+            .is_some();
+        if !has_fk {
+            return Ok(());
+        }
+
+        self.conn.pragma_update(None, "foreign_keys", "OFF")?;
+        let result = self.conn.execute_batch(
+            r#"
+            BEGIN IMMEDIATE;
+            CREATE TABLE blocks_v3 (
+              uuid TEXT PRIMARY KEY, bucket TEXT NOT NULL, signal TEXT NOT NULL,
+              date TEXT NOT NULL, writer_id TEXT NOT NULL, level INTEGER NOT NULL DEFAULT 0,
+              ts_min INTEGER NOT NULL, ts_max INTEGER NOT NULL, row_count INTEGER NOT NULL,
+              byte_size INTEGER NOT NULL, postings_size_bytes INTEGER,
+              has_postings INTEGER NOT NULL DEFAULT 0, body_bloom_size_bytes INTEGER,
+              has_body_bloom INTEGER NOT NULL DEFAULT 0, schema_version INTEGER NOT NULL,
+              fingerprint BLOB, superseded_by TEXT, superseded INTEGER NOT NULL DEFAULT 0,
+              deleted_at INTEGER, reap_output_uuid TEXT, reap_eligible_at INTEGER,
+              wal_seg_max INTEGER, wal_shard INTEGER
+            );
+            INSERT INTO blocks_v3 SELECT
+              uuid, bucket, signal, date, writer_id, level, ts_min, ts_max,
+              row_count, byte_size, postings_size_bytes, has_postings,
+              body_bloom_size_bytes, has_body_bloom, schema_version, fingerprint,
+              superseded_by, CASE WHEN superseded_by IS NULL THEN superseded ELSE 1 END,
+              deleted_at,
+              COALESCE(reap_output_uuid, superseded_by),
+              CASE WHEN superseded_by IS NOT NULL AND deleted_at IS NULL
+                   THEN COALESCE(reap_eligible_at, 0)
+                   ELSE reap_eligible_at END,
+              wal_seg_max, wal_shard
+            FROM blocks;
+            DROP TABLE blocks;
+            ALTER TABLE blocks_v3 RENAME TO blocks;
+            COMMIT;
+            "#,
+        );
+        if result.is_err() {
+            // `execute_batch` can stop after BEGIN. Roll back before restoring
+            // FK enforcement so a failed startup never returns a connection in
+            // a half-migrated transaction.
+            let _ = self.conn.execute_batch("ROLLBACK");
+        }
+        self.conn.pragma_update(None, "foreign_keys", "ON")?;
+        result.context("migrating blocks table to pointer-independent liveness")?;
+        Ok(())
+    }
+
     /// Insert a block sidecar into the catalog. Idempotent: if the
     /// UUID is already present (e.g. a writer's online insert raced
     /// with the reconcile loop), the existing row is preserved
@@ -272,15 +387,21 @@ impl Catalog {
               ts_min, ts_max, row_count, byte_size,
               postings_size_bytes, has_postings,
               body_bloom_size_bytes, has_body_bloom,
-              schema_version, fingerprint, superseded_by, deleted_at,
-              wal_seg_max, wal_shard
+              schema_version, fingerprint, superseded_by, superseded, deleted_at,
+              reap_output_uuid, reap_eligible_at, wal_seg_max, wal_shard
             ) VALUES (
               ?1, ?2, ?3, ?4, ?5, ?16,
               ?6, ?7, ?8, ?9,
               ?10, ?11,
               ?12, ?13,
-              ?14, ?15, NULL, NULL,
-              ?17, ?18
+              ?14, ?15, NULL,
+              CASE WHEN EXISTS (
+                SELECT 1 FROM block_lineage l
+                JOIN blocks d ON d.uuid = l.descendant_uuid
+                WHERE l.ancestor_uuid = ?1
+                  AND d.deleted_at IS NULL AND d.superseded = 0
+              ) THEN 1 ELSE 0 END,
+              NULL, NULL, NULL, ?17, ?18
             )
             "#,
                 params![
@@ -315,6 +436,7 @@ impl Catalog {
         if let (Some(seg), Some(shard)) = (meta.wal_seg_max, meta.wal_shard) {
             advance_watermark_in(&tx, &meta.writer_id.to_string(), &meta.signal, shard, seg)?;
         }
+        apply_lineage_in(&tx, meta, &date)?;
         tx.commit().context("commit insert_block transaction")?;
         Ok(rows > 0)
     }
@@ -372,7 +494,7 @@ impl Catalog {
                    has_body_bloom, body_bloom_size_bytes,
                    wal_seg_max, wal_shard
             FROM blocks
-            WHERE deleted_at IS NULL AND superseded_by IS NULL
+            WHERE deleted_at IS NULL AND superseded = 0
             ORDER BY date, ts_min, uuid
             "#,
         )?;
@@ -404,26 +526,78 @@ impl Catalog {
         Ok(res)
     }
 
-    /// Count of non-deleted blocks. Cheap; uses the partial index.
+    /// Count of logical live blocks (queryable, neither retained nor superseded).
     pub fn block_count(&self) -> Result<usize> {
         let n: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM blocks WHERE deleted_at IS NULL",
+            "SELECT COUNT(*) FROM blocks WHERE deleted_at IS NULL AND superseded = 0",
             [],
             |r| r.get(0),
         )?;
         Ok(n as usize)
     }
 
-    /// Total live-block row count (Σ `row_count` over non-deleted blocks). One
-    /// indexed aggregate; used by the query daemon's status page to report how
-    /// many records are currently queryable.
+    /// Total logical-live row count. Uses the same predicate as `list_blocks` so
+    /// status reporting cannot double-count inputs pending physical reaping.
     pub fn live_row_count(&self) -> Result<u64> {
         let n: i64 = self.conn.query_row(
-            "SELECT COALESCE(SUM(row_count), 0) FROM blocks WHERE deleted_at IS NULL",
+            "SELECT COALESCE(SUM(row_count), 0) FROM blocks \
+             WHERE deleted_at IS NULL AND superseded = 0",
             [],
             |r| r.get(0),
         )?;
         Ok(n as u64)
+    }
+
+    /// Number of durable ancestry claims retained in the rebuildable lineage
+    /// index. Exposed for growth monitoring while pruning policy is staged.
+    pub fn lineage_row_count(&self) -> Result<u64> {
+        let n: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM block_lineage", [], |r| r.get(0))?;
+        Ok(n as u64)
+    }
+
+    /// Prune rebuildable lineage claims for one authoritatively reconciled
+    /// partition. A caller must only invoke this after a stable object-store
+    /// listing: every UUID in `present_descendants` has a committed `meta.json`,
+    /// and any omitted descendant is no longer durable bucket truth.
+    ///
+    /// Current compacted sidecars contain their full transitive closure, so an
+    /// extant terminal directly claims every represented ancestor. Removing
+    /// edges to absent intermediate outputs therefore cannot break resolution.
+    pub fn prune_lineage_partition(
+        &self,
+        signal: &str,
+        date: &str,
+        present_descendants: &[Uuid],
+    ) -> Result<usize> {
+        let present: std::collections::HashSet<String> =
+            present_descendants.iter().map(Uuid::to_string).collect();
+        let tx = self.conn.unchecked_transaction()?;
+        let stale = {
+            let mut stmt = tx.prepare(
+                "SELECT ancestor_uuid, descendant_uuid FROM block_lineage \
+                 WHERE signal = ?1 AND date = ?2",
+            )?;
+            let rows = stmt.query_map(params![signal, date], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+                .into_iter()
+                .filter(|(_, descendant)| !present.contains(descendant))
+                .collect::<Vec<_>>()
+        };
+        let mut deleted = 0usize;
+        {
+            let mut stmt = tx.prepare_cached(
+                "DELETE FROM block_lineage WHERE ancestor_uuid = ?1 AND descendant_uuid = ?2",
+            )?;
+            for (ancestor, descendant) in stale {
+                deleted += stmt.execute(params![ancestor, descendant])?;
+            }
+        }
+        tx.commit().context("commit partition lineage pruning")?;
+        Ok(deleted)
     }
 
     /// Mark a set of input blocks as superseded by a freshly-written
@@ -436,19 +610,135 @@ impl Catalog {
     /// block before calling this. Runs in a single transaction so the
     /// supersede flips atomically — a query either sees all inputs or
     /// none of them, never a half-merged partition.
+    /// Atomically from a shared-catalog caller's point of view, publish a
+    /// replacement and stage its direct inputs for physical cleanup. The method
+    /// is invoked inside one `CatalogHandle::with` closure, so peers cannot list
+    /// between output insertion and logical supersession.
+    pub fn apply_compaction(
+        &self,
+        output: &BlockMeta,
+        direct_inputs: &[Uuid],
+        reap_eligible_at_unix_nano: u64,
+    ) -> Result<bool> {
+        let inserted = self.insert_block(output)?;
+        self.stage_superseded(direct_inputs, output.uuid, reap_eligible_at_unix_nano)?;
+        Ok(inserted)
+    }
+
     pub fn mark_superseded(&self, inputs: &[Uuid], merged: Uuid) -> Result<()> {
+        self.stage_superseded(inputs, merged, 0)
+    }
+
+    /// Mark inputs logically superseded and persist their physical-reap work.
+    /// Pointer-independent `superseded` is authoritative; `superseded_by` is
+    /// retained only for operator diagnostics and old catalog readers.
+    pub fn stage_superseded(
+        &self,
+        inputs: &[Uuid],
+        merged: Uuid,
+        eligible_at_unix_nano: u64,
+    ) -> Result<()> {
         let merged_str = merged.to_string();
         let tx = self.conn.unchecked_transaction()?;
         {
-            let mut stmt =
-                tx.prepare_cached("UPDATE blocks SET superseded_by = ?1 WHERE uuid = ?2")?;
+            let mut stmt = tx.prepare_cached(
+                "UPDATE blocks SET superseded_by = ?1, superseded = 1, \
+                 reap_output_uuid = ?1, reap_eligible_at = \
+                   MAX(COALESCE(reap_eligible_at, ?2), ?2) WHERE uuid = ?3",
+            )?;
             for input in inputs {
-                stmt.execute(params![merged_str, input.to_string()])
-                    .context("UPDATE superseded_by")?;
+                stmt.execute(params![
+                    merged_str,
+                    eligible_at_unix_nano.min(i64::MAX as u64) as i64,
+                    input.to_string()
+                ])
+                .context("stage superseded input")?;
             }
         }
-        tx.commit().context("commit mark_superseded")?;
+        tx.commit().context("commit stage_superseded")?;
         Ok(())
+    }
+
+    /// Superseded inputs whose deferred grace has elapsed. Their full catalog
+    /// metadata remains available until object deletion has completed.
+    pub fn list_pending_reaps(&self, now_unix_nano: u64) -> Result<Vec<PendingReap>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT uuid, bucket, signal, date, writer_id, level,
+                   ts_min, ts_max, row_count, byte_size,
+                   schema_version, fingerprint,
+                   has_postings, postings_size_bytes,
+                   has_body_bloom, body_bloom_size_bytes,
+                   wal_seg_max, wal_shard,
+                   reap_output_uuid, reap_eligible_at
+            FROM blocks
+            WHERE superseded = 1 AND reap_eligible_at IS NOT NULL
+              AND reap_eligible_at <= ?1
+            ORDER BY reap_eligible_at, date, uuid
+            "#,
+        )?;
+        let rows = stmt.query_map(params![now_unix_nano.min(i64::MAX as u64) as i64], |row| {
+            let entry = row_to_entry(row)?;
+            let output: String = row.get(18)?;
+            let eligible: i64 = row.get(19)?;
+            let output_uuid = Uuid::parse_str(&output).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    18,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
+            Ok(PendingReap {
+                entry,
+                output_uuid,
+                eligible_at_unix_nano: eligible as u64,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("list pending reaps")
+    }
+
+    /// Resolve `uuid` to the unique maximal live descendant represented by the
+    /// lineage graph. Multiple incomparable terminals are a corruption/fork and
+    /// must never be guessed between.
+    pub fn resolve_terminal(&self, uuid: Uuid) -> Result<TerminalResolution> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            WITH RECURSIVE descendants(uuid) AS (
+              SELECT descendant_uuid FROM block_lineage WHERE ancestor_uuid = ?1
+              UNION
+              SELECT l.descendant_uuid FROM block_lineage l
+              JOIN descendants d ON l.ancestor_uuid = d.uuid
+            )
+            SELECT DISTINCT b.uuid
+            FROM descendants d JOIN blocks b ON b.uuid = d.uuid
+            WHERE b.deleted_at IS NULL AND b.superseded = 0
+            ORDER BY b.uuid
+            "#,
+        )?;
+        let ids = stmt
+            .query_map(params![uuid.to_string()], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .map(|s| Uuid::parse_str(&s).context("parse resolved descendant UUID"))
+            .collect::<Result<Vec<_>>>()?;
+        match ids.as_slice() {
+            [] => {
+                let live: bool = self.conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM blocks WHERE uuid=?1 \
+                     AND deleted_at IS NULL AND superseded=0)",
+                    params![uuid.to_string()],
+                    |r| r.get(0),
+                )?;
+                Ok(if live {
+                    TerminalResolution::Unique(uuid)
+                } else {
+                    TerminalResolution::None
+                })
+            }
+            [only] => Ok(TerminalResolution::Unique(*only)),
+            _ => Ok(TerminalResolution::Fork(ids)),
+        }
     }
 
     /// Drop a set of block rows from the catalog. Called by the
@@ -788,6 +1078,28 @@ fn format_date(ts_unix_nano: u64) -> String {
         .to_string()
 }
 
+fn apply_lineage_in(conn: &Connection, meta: &BlockMeta, date: &str) -> Result<()> {
+    if meta.compacted_from.is_empty() {
+        return Ok(());
+    }
+    let descendant = meta.uuid.to_string();
+    let observed_at = Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    for ancestor in &meta.compacted_from {
+        let ancestor = ancestor.to_string();
+        conn.execute(
+            "INSERT OR IGNORE INTO block_lineage \
+             (ancestor_uuid, descendant_uuid, signal, date, observed_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![ancestor, descendant, meta.signal, date, observed_at],
+        )?;
+        conn.execute(
+            "UPDATE blocks SET superseded = 1 WHERE uuid = ?1 AND uuid <> ?2",
+            params![ancestor, descendant],
+        )?;
+    }
+    Ok(())
+}
+
 /// Monotonic-max UPSERT into `wal_watermarks`, shared by the `&self`
 /// [`Catalog::advance_watermark`] and the transactional `insert_block`
 /// path. Generic over anything that derefs to a `Connection` (a
@@ -872,6 +1184,7 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<CatalogEntry> {
             body_bloom_size_bytes: body_bloom_size_bytes.map(|v| v as u64),
             wal_seg_max: wal_seg_max.map(|v| v as u64),
             wal_shard: wal_shard.map(|v| v as u32),
+            compacted_from: Vec::new(),
         },
         bucket,
         date,

@@ -32,6 +32,7 @@ fn meta(uuid: Uuid, writer: Uuid, ts_min: u64, rows: u64) -> BlockMeta {
         body_bloom_size_bytes: None,
         wal_seg_max: None,
         wal_shard: None,
+        compacted_from: Vec::new(),
     }
 }
 
@@ -110,12 +111,17 @@ fn open_creates_schema_and_is_empty() {
 }
 
 #[test]
-fn open_upgrades_v1_blocks_table_before_stamping_v2() {
+fn open_upgrades_v1_blocks_table_before_stamping_current_version() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("cat.sqlite");
     let conn = Connection::open(&path).unwrap();
-    conn.execute_batch(
+    let live = Uuid::now_v7();
+    let input = Uuid::now_v7();
+    let output = Uuid::now_v7();
+    let writer = Uuid::now_v7();
+    conn.execute_batch(&format!(
         r#"
+        PRAGMA foreign_keys = ON;
         CREATE TABLE blocks (
           uuid TEXT PRIMARY KEY, bucket TEXT NOT NULL, signal TEXT NOT NULL,
           date TEXT NOT NULL, writer_id TEXT NOT NULL, level INTEGER NOT NULL DEFAULT 0,
@@ -125,14 +131,26 @@ fn open_upgrades_v1_blocks_table_before_stamping_v2() {
           has_body_bloom INTEGER NOT NULL DEFAULT 0, schema_version INTEGER NOT NULL,
           fingerprint BLOB, superseded_by TEXT REFERENCES blocks(uuid), deleted_at INTEGER
         );
+        INSERT INTO blocks VALUES
+          ('{live}', 'scry-dev', 'logs', '2023-11-14', '{writer}', 0,
+           1, 2, 10, 100, NULL, 0, NULL, 0, 1, NULL, NULL, NULL),
+          ('{output}', 'scry-dev', 'logs', '2023-11-14', '{writer}', 1,
+           1, 2, 10, 100, NULL, 0, NULL, 0, 1, NULL, NULL, NULL),
+          ('{input}', 'scry-dev', 'logs', '2023-11-14', '{writer}', 0,
+           1, 2, 10, 100, NULL, 0, NULL, 0, 1, NULL, '{output}', NULL);
         PRAGMA user_version = 1;
-        "#,
-    )
+        "#
+    ))
     .unwrap();
     drop(conn);
 
     let cat = Catalog::open(&path, "scry-dev").unwrap();
-    assert!(cat.list_blocks().unwrap().is_empty());
+    let live_rows = cat.list_blocks().unwrap();
+    assert_eq!(live_rows.len(), 2);
+    assert!(live_rows.iter().any(|entry| entry.meta.uuid == live));
+    assert!(live_rows.iter().any(|entry| entry.meta.uuid == output));
+    assert_eq!(cat.list_pending_reaps(0).unwrap().len(), 1);
+    assert_eq!(cat.list_pending_reaps(0).unwrap()[0].entry.meta.uuid, input);
     drop(cat);
 
     let conn = Connection::open(path).unwrap();
@@ -145,6 +163,14 @@ fn open_upgrades_v1_blocks_table_before_stamping_v2() {
         .unwrap();
     assert!(columns.iter().any(|name| name == "wal_seg_max"));
     assert!(columns.iter().any(|name| name == "wal_shard"));
+    assert!(columns.iter().any(|name| name == "superseded"));
+    let foreign_keys: usize = conn
+        .prepare("PRAGMA foreign_key_list(blocks)")
+        .unwrap()
+        .query_map([], |_| Ok(()))
+        .unwrap()
+        .count();
+    assert_eq!(foreign_keys, 0, "v3 removes the self-referential FK");
     let version: u32 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
@@ -234,6 +260,99 @@ fn insert_honours_meta_level() {
 }
 
 #[test]
+fn lineage_replay_is_order_independent_and_resolves_intermediate() {
+    let tmp = TempDir::new().unwrap();
+    let cat = Catalog::open(&tmp.path().join("cat.sqlite"), "scry-dev").unwrap();
+    let writer = Uuid::now_v7();
+    let ts = 1_700_000_000_000_000_000;
+    let leaf = Uuid::now_v7();
+    let intermediate = Uuid::now_v7();
+    let terminal = Uuid::now_v7();
+
+    let mut b17 = meta(terminal, writer, ts, 10);
+    b17.level = 2;
+    b17.compacted_from = vec![leaf, intermediate];
+    b17.compacted_from.sort_unstable();
+    cat.insert_block(&b17).unwrap();
+
+    let mut b9 = meta(intermediate, writer, ts, 10);
+    b9.level = 1;
+    b9.compacted_from = vec![leaf];
+    cat.insert_block(&b9).unwrap();
+    cat.insert_block(&meta(leaf, writer, ts, 10)).unwrap();
+
+    assert_eq!(
+        cat.resolve_terminal(leaf).unwrap(),
+        scry_catalog::TerminalResolution::Unique(terminal)
+    );
+    assert_eq!(
+        cat.resolve_terminal(intermediate).unwrap(),
+        scry_catalog::TerminalResolution::Unique(terminal)
+    );
+    let live = cat.list_blocks().unwrap();
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].meta.uuid, terminal);
+}
+
+#[test]
+fn incomparable_lineage_claims_fail_closed_as_fork() {
+    let tmp = TempDir::new().unwrap();
+    let cat = Catalog::open(&tmp.path().join("cat.sqlite"), "scry-dev").unwrap();
+    let writer = Uuid::now_v7();
+    let ts = 1_700_000_000_000_000_000;
+    let leaf = Uuid::now_v7();
+    for _ in 0..2 {
+        let mut output = meta(Uuid::now_v7(), writer, ts, 10);
+        output.level = 1;
+        output.compacted_from = vec![leaf];
+        cat.insert_block(&output).unwrap();
+    }
+    assert!(matches!(
+        cat.resolve_terminal(leaf).unwrap(),
+        scry_catalog::TerminalResolution::Fork(ids) if ids.len() == 2
+    ));
+}
+
+#[test]
+fn stable_partition_pruning_keeps_extant_terminal_claims_only() {
+    let tmp = TempDir::new().unwrap();
+    let cat = Catalog::open(&tmp.path().join("cat.sqlite"), "scry-dev").unwrap();
+    let writer = Uuid::now_v7();
+    let ts = 1_700_000_000_000_000_000;
+    let leaf = Uuid::now_v7();
+    let intermediate = Uuid::now_v7();
+    let terminal = Uuid::now_v7();
+
+    let mut middle = meta(intermediate, writer, ts, 1);
+    middle.level = 1;
+    middle.compacted_from = vec![leaf];
+    cat.insert_block(&middle).unwrap();
+
+    let mut top = meta(terminal, writer, ts, 1);
+    top.level = 2;
+    top.compacted_from = vec![leaf, intermediate];
+    cat.insert_block(&top).unwrap();
+    assert_eq!(cat.lineage_row_count().unwrap(), 3);
+
+    let date = scry_catalog::date_dir(ts);
+    assert_eq!(
+        cat.prune_lineage_partition("dummy", &date, &[terminal])
+            .unwrap(),
+        1,
+        "only the edge whose descendant sidecar disappeared is stale"
+    );
+    assert_eq!(cat.lineage_row_count().unwrap(), 2);
+    assert_eq!(
+        cat.resolve_terminal(leaf).unwrap(),
+        scry_catalog::TerminalResolution::Unique(terminal)
+    );
+    assert_eq!(
+        cat.resolve_terminal(intermediate).unwrap(),
+        scry_catalog::TerminalResolution::Unique(terminal)
+    );
+}
+
+#[test]
 fn superseded_blocks_drop_out_of_list_blocks() {
     // The compaction supersede → delete lifecycle: once inputs point at
     // their merged replacement they must vanish from the query set, and
@@ -254,6 +373,8 @@ fn superseded_blocks_drop_out_of_list_blocks() {
     merged_meta.level = 1;
     cat.insert_block(&merged_meta).unwrap();
     cat.mark_superseded(&[in_a, in_b], merged).unwrap();
+    let pending = cat.list_pending_reaps(0).unwrap();
+    assert_eq!(pending.len(), 2, "both inputs are durable pending reaps");
 
     // Queries now see only the merged block; the inputs are hidden but
     // their rows still exist (grace window) — block_count counts them.

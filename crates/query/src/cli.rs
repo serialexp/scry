@@ -647,11 +647,17 @@ async fn run_remote(
     // + body), so no client-side reframing is needed.
     let mut decoder = StreamDecoder::new();
     let mut total_rows: usize = 0;
+    let mut active_attempt: u32 = 0;
+    let mut awaiting_schema = true;
 
     let server_total_rows: u64 = loop {
         let frame: QueryFrame = read_frame(&mut r).await.context("reading response frame")?;
         match frame.msg {
             QueryFrameMsg::SchemaMsg(s) => {
+                if !awaiting_schema {
+                    anyhow::bail!("server sent duplicate schema in query attempt");
+                }
+                awaiting_schema = false;
                 let mut buf = Buffer::from(s.ipc_bytes);
                 // Schema messages don't yield a RecordBatch but they
                 // do populate `decoder.schema()`. Calling `decode`
@@ -666,6 +672,9 @@ async fn run_remote(
                 }
             }
             QueryFrameMsg::BatchMsg(b) => {
+                if awaiting_schema {
+                    anyhow::bail!("server sent batch before schema");
+                }
                 let mut buf = Buffer::from(b.ipc_bytes);
                 while !buf.is_empty() {
                     let maybe = decoder
@@ -676,7 +685,24 @@ async fn run_remote(
                     }
                 }
             }
-            QueryFrameMsg::EndOfStream(end) => break end.total_rows,
+            QueryFrameMsg::ResponseSuperseded(reset) => {
+                if awaiting_schema
+                    || reset.superseded_attempt != active_attempt
+                    || reset.next_attempt != active_attempt + 1
+                {
+                    anyhow::bail!("invalid ResponseSuperseded attempt transition");
+                }
+                active_attempt = reset.next_attempt;
+                decoder = StreamDecoder::new();
+                total_rows = 0;
+                awaiting_schema = true;
+            }
+            QueryFrameMsg::EndOfStream(end) => {
+                if awaiting_schema {
+                    anyhow::bail!("server sent EndOfStream before schema");
+                }
+                break end.total_rows;
+            }
             QueryFrameMsg::StreamError(err) => {
                 anyhow::bail!(
                     "server returned {} (code={:#06x}): {}",

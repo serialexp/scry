@@ -34,17 +34,26 @@
 //! - The mid-stream `StreamError(QUERY_ERR_RESOURCES)` path. That's
 //!   verified by the manual budget-bust smoke in step 5's plan.
 
+use std::ops::Range;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arrow::array::{Array, FixedSizeBinaryArray, Int64Array, UInt64Array};
 use arrow::buffer::Buffer;
 use arrow::record_batch::RecordBatch;
 use arrow_ipc::reader::StreamDecoder;
+use async_trait::async_trait;
 use datafusion::execution::memory_pool::GreedyMemoryPool;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
-use object_store::{memory::InMemory, ObjectStore};
+use futures::stream::BoxStream;
+use object_store::{
+    memory::InMemory, path::Path as ObjectPath, CopyOptions, GetOptions, GetResult, ListResult,
+    MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt, PutMultipartOptions, PutOptions,
+    PutPayload, PutResult, RenameOptions, Result as ObjectStoreResult,
+};
 use scry_block::{
-    BlockBuilder, BlockBuilderConfig, LogsBlockBuilder, MetricsBlockBuilder, TracesBlockBuilder,
+    block_path, BlockBuilder, BlockBuilderConfig, LogsBlockBuilder, MetricsBlockBuilder,
+    TracesBlockBuilder,
 };
 use scry_catalog::Catalog;
 use scry_objstore::BufPool;
@@ -59,6 +68,123 @@ use tokio::io::{AsyncWriteExt, BufReader as TokioBufReader, BufWriter as TokioBu
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 use uuid::Uuid;
+
+#[derive(Debug)]
+struct OneShotParquetNotFound {
+    inner: Arc<InMemory>,
+    target_uuid: Uuid,
+    fired: AtomicBool,
+}
+
+impl std::fmt::Display for OneShotParquetNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OneShotParquetNotFound")
+    }
+}
+
+impl OneShotParquetNotFound {
+    fn should_fail(&self, path: &ObjectPath) -> bool {
+        path.as_ref()
+            .ends_with(&format!("{}.parquet", self.target_uuid))
+            && !path.as_ref().ends_with(".postings.parquet")
+            && !self.fired.swap(true, Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for OneShotParquetNotFound {
+    async fn put_opts(
+        &self,
+        path: &ObjectPath,
+        payload: PutPayload,
+        options: PutOptions,
+    ) -> ObjectStoreResult<PutResult> {
+        self.inner.put_opts(path, payload, options).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        path: &ObjectPath,
+        options: PutMultipartOptions,
+    ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(path, options).await
+    }
+
+    async fn get_opts(
+        &self,
+        path: &ObjectPath,
+        options: GetOptions,
+    ) -> ObjectStoreResult<GetResult> {
+        if self.should_fail(path) {
+            return Err(object_store::Error::NotFound {
+                path: path.to_string(),
+                source: "injected mid-scan parquet disappearance".into(),
+            });
+        }
+        self.inner.get_opts(path, options).await
+    }
+
+    async fn get_ranges(
+        &self,
+        path: &ObjectPath,
+        ranges: &[Range<u64>],
+    ) -> ObjectStoreResult<Vec<bytes::Bytes>> {
+        if self.should_fail(path) {
+            return Err(object_store::Error::NotFound {
+                path: path.to_string(),
+                source: "injected mid-scan parquet disappearance".into(),
+            });
+        }
+        self.inner.get_ranges(path, ranges).await
+    }
+
+    fn delete_stream(
+        &self,
+        paths: BoxStream<'static, ObjectStoreResult<ObjectPath>>,
+    ) -> BoxStream<'static, ObjectStoreResult<ObjectPath>> {
+        self.inner.delete_stream(paths)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&ObjectPath>,
+    ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&ObjectPath>,
+        offset: &ObjectPath,
+    ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+        self.inner.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&ObjectPath>,
+    ) -> ObjectStoreResult<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &ObjectPath,
+        to: &ObjectPath,
+        options: CopyOptions,
+    ) -> ObjectStoreResult<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+
+    async fn rename_opts(
+        &self,
+        from: &ObjectPath,
+        to: &ObjectPath,
+        options: RenameOptions,
+    ) -> ObjectStoreResult<()> {
+        self.inner.rename_opts(from, to, options).await
+    }
+}
 
 const METRIC_TYPE_COUNTER: u8 = 1;
 const BUCKET: &str = "test";
@@ -154,6 +280,77 @@ async fn run_query(addr: std::net::SocketAddr, req: QueryRequest) -> QueryResult
     }
 }
 
+async fn run_query_with_supersession(
+    addr: std::net::SocketAddr,
+    req: QueryRequest,
+) -> (Vec<(u32, u32, u8)>, QueryResult) {
+    let sock = TcpStream::connect(addr).await.expect("connect");
+    let (r, w) = sock.into_split();
+    let mut r = TokioBufReader::new(r);
+    let mut w = TokioBufWriter::new(w);
+    write_frame(
+        &mut w,
+        &QueryFrame {
+            msg: QueryFrameMsg::QueryRequest(req.to_wire().into()),
+        },
+    )
+    .await
+    .unwrap();
+    w.flush().await.unwrap();
+
+    let mut decoder = StreamDecoder::new();
+    let mut batches = Vec::new();
+    let mut resets = Vec::new();
+    let mut awaiting_schema = true;
+    let server_total_rows = loop {
+        let frame: QueryFrame = read_frame(&mut r).await.expect("read frame");
+        match frame.msg {
+            QueryFrameMsg::SchemaMsg(schema) => {
+                assert!(awaiting_schema, "duplicate schema in one attempt");
+                awaiting_schema = false;
+                let mut buf = Buffer::from(schema.ipc_bytes);
+                while !buf.is_empty() {
+                    if let Some(batch) = decoder.decode(&mut buf).unwrap() {
+                        batches.push(batch);
+                    }
+                }
+            }
+            QueryFrameMsg::BatchMsg(batch) => {
+                assert!(!awaiting_schema, "batch before attempt schema");
+                let mut buf = Buffer::from(batch.ipc_bytes);
+                while !buf.is_empty() {
+                    if let Some(batch) = decoder.decode(&mut buf).unwrap() {
+                        batches.push(batch);
+                    }
+                }
+            }
+            QueryFrameMsg::ResponseSuperseded(reset) => {
+                assert!(!awaiting_schema, "reset before provisional schema");
+                resets.push((reset.superseded_attempt, reset.next_attempt, reset.reason));
+                batches.clear();
+                decoder = StreamDecoder::new();
+                awaiting_schema = true;
+            }
+            QueryFrameMsg::EndOfStream(end) => {
+                assert!(!awaiting_schema, "EOS before final schema");
+                break end.total_rows;
+            }
+            QueryFrameMsg::StreamError(err) => panic!(
+                "server returned StreamError code={:#06x} message={}",
+                err.code, err.message
+            ),
+            other => panic!("unexpected query response: {other:?}"),
+        }
+    };
+    (
+        resets,
+        QueryResult {
+            batches,
+            server_total_rows,
+        },
+    )
+}
+
 /// Send a `LabelNamesRequest` for `signal` (unbounded time window) and
 /// return the sorted names from the single terminal `LabelNamesResponse`.
 async fn fetch_label_names(addr: std::net::SocketAddr, signal: Signal) -> Vec<String> {
@@ -169,6 +366,7 @@ async fn fetch_label_names(addr: std::net::SocketAddr, signal: Signal) -> Vec<St
                 ts_min: 0,
                 ts_max_present: 0,
                 ts_max: 0,
+                capabilities: scry_proto::constants::QUERY_CAP_ATTEMPT_SUPERSESSION,
             }
             .into(),
         ),
@@ -201,6 +399,7 @@ async fn fetch_label_values(addr: std::net::SocketAddr, signal: Signal, name: &s
                 ts_min: 0,
                 ts_max_present: 0,
                 ts_max: 0,
+                capabilities: scry_proto::constants::QUERY_CAP_ATTEMPT_SUPERSESSION,
             }
             .into(),
         ),
@@ -789,6 +988,251 @@ fn append_test_span(
         links: &[],
     };
     b.append_span(&span);
+}
+
+#[tokio::test]
+async fn mid_scan_superseded_input_replans_to_replacement_without_row_loss() {
+    let inner = Arc::new(InMemory::new());
+    let writer = Uuid::now_v7();
+    let trace_id = [0xDD; 16];
+    let mut old = <TracesBlockBuilder as BlockBuilder>::new(writer, test_cfg());
+    for index in 0..250u64 {
+        append_test_span(
+            &mut old,
+            &trace_id,
+            &(index + 1).to_be_bytes(),
+            "api",
+            6_000_000 + index * 100,
+        );
+    }
+    let old_meta = old
+        .finish_and_upload(inner.as_ref())
+        .await
+        .unwrap()
+        .expect("old traces block");
+
+    // A separately built block represents the exact same logical rows and
+    // durably claims the old block. Queryd initially knows only the old row;
+    // targeted repair discovers this replacement after the injected 404.
+    let replacement_writer = Uuid::now_v7();
+    let mut replacement = <TracesBlockBuilder as BlockBuilder>::new(replacement_writer, test_cfg());
+    for index in 0..250u64 {
+        append_test_span(
+            &mut replacement,
+            &trace_id,
+            &(index + 1).to_be_bytes(),
+            "api",
+            6_000_000 + index * 100,
+        );
+    }
+    let mut replacement_meta = replacement
+        .finish_and_upload(inner.as_ref())
+        .await
+        .unwrap()
+        .expect("replacement traces block");
+    replacement_meta.level = 1;
+    replacement_meta.compacted_from = vec![old_meta.uuid];
+    let replacement_meta_path = ObjectPath::from(block_path(
+        &replacement_meta.signal,
+        replacement_meta.ts_min_unix_nano,
+        replacement_meta.writer_id,
+        replacement_meta.uuid,
+        "meta.json",
+    ));
+    inner
+        .put(
+            &replacement_meta_path,
+            serde_json::to_vec(&replacement_meta).unwrap().into(),
+        )
+        .await
+        .unwrap();
+
+    let fault_store = Arc::new(OneShotParquetNotFound {
+        inner,
+        target_uuid: old_meta.uuid,
+        fired: AtomicBool::new(false),
+    });
+    let store: Arc<dyn ObjectStore> = fault_store.clone();
+    let tmp = TempDir::new().unwrap();
+    let catalog = Catalog::open(&tmp.path().join("cat.sqlite"), BUCKET).unwrap();
+    catalog.insert_block(&old_meta).unwrap();
+    let catalog = Arc::new(Mutex::new(catalog));
+    let memory_pool = Arc::new(GreedyMemoryPool::new(256 * 1024 * 1024));
+    let runtime_env = Arc::new(
+        RuntimeEnvBuilder::new()
+            .with_memory_pool(memory_pool.clone())
+            .build()
+            .unwrap(),
+    );
+    let service = Arc::new(
+        QueryService::new(
+            catalog.clone(),
+            store,
+            BufPool::new(),
+            Arc::new(PostingsCache::with_budget_bytes(0)),
+            Arc::new(BloomCache::with_budget_bytes(0)),
+            runtime_env,
+            memory_pool,
+            Arc::new(scry_query::QueryResultCache::with_budget_bytes(0)),
+            0,
+        )
+        .with_default_window(0),
+    );
+    let probe = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let listen_addr = probe.local_addr().unwrap();
+    drop(probe);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let serve = tokio::spawn(async move {
+        service
+            .serve_with_shutdown(listen_addr, async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let (resets, result) = run_query_with_supersession(
+        listen_addr,
+        QueryRequest {
+            signal: Signal::Traces as u8,
+            query: Query::default(),
+            sql: None,
+            limit: None,
+            request_id: Some("mid-scan-replacement".into()),
+            live: false,
+        },
+    )
+    .await;
+    assert_eq!(
+        resets,
+        vec![(
+            0,
+            1,
+            scry_proto::constants::QUERY_SUPERSEDED_REASON_SUPERSEDED_BLOCK_DISAPPEARED,
+        )]
+    );
+    assert_eq!(total_rows(&result.batches), 250);
+    assert_eq!(result.server_total_rows, 250);
+    let cat = catalog.lock().unwrap();
+    assert!(cat.get_block(old_meta.uuid).unwrap().is_none());
+    assert!(cat.get_block(replacement_meta.uuid).unwrap().is_some());
+    drop(cat);
+
+    let _ = shutdown_tx.send(());
+    serve.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn mid_scan_parquet_disappearance_resets_and_replans() {
+    let inner = Arc::new(InMemory::new());
+    let writer = Uuid::now_v7();
+    let trace_id = [0xCC; 16];
+    let mut block = <TracesBlockBuilder as BlockBuilder>::new(writer, test_cfg());
+    for index in 0..250u64 {
+        append_test_span(
+            &mut block,
+            &trace_id,
+            &(index + 1).to_be_bytes(),
+            "api",
+            5_000_000 + index * 100,
+        );
+    }
+    let meta = block
+        .finish_and_upload(inner.as_ref())
+        .await
+        .unwrap()
+        .expect("non-empty traces block");
+    let meta_path = ObjectPath::from(block_path(
+        &meta.signal,
+        meta.ts_min_unix_nano,
+        meta.writer_id,
+        meta.uuid,
+        "meta.json",
+    ));
+    inner.delete(&meta_path).await.unwrap();
+    let fault_store = Arc::new(OneShotParquetNotFound {
+        inner,
+        target_uuid: meta.uuid,
+        fired: AtomicBool::new(false),
+    });
+    let store: Arc<dyn ObjectStore> = fault_store.clone();
+
+    let tmp = TempDir::new().unwrap();
+    let catalog = Catalog::open(&tmp.path().join("cat.sqlite"), BUCKET).unwrap();
+    catalog.insert_block(&meta).unwrap();
+    let catalog = Arc::new(Mutex::new(catalog));
+    let memory_pool = Arc::new(GreedyMemoryPool::new(256 * 1024 * 1024));
+    let runtime_env = Arc::new(
+        RuntimeEnvBuilder::new()
+            .with_memory_pool(memory_pool.clone())
+            .build()
+            .unwrap(),
+    );
+    let service = Arc::new(
+        QueryService::new(
+            catalog.clone(),
+            store,
+            BufPool::new(),
+            Arc::new(PostingsCache::with_budget_bytes(0)),
+            Arc::new(BloomCache::with_budget_bytes(0)),
+            runtime_env,
+            memory_pool,
+            Arc::new(scry_query::QueryResultCache::with_budget_bytes(0)),
+            0,
+        )
+        .with_default_window(0),
+    );
+
+    let probe = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let listen_addr = probe.local_addr().unwrap();
+    drop(probe);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let serve = tokio::spawn(async move {
+        service
+            .serve_with_shutdown(listen_addr, async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let (resets, result) = run_query_with_supersession(
+        listen_addr,
+        QueryRequest {
+            signal: Signal::Traces as u8,
+            query: Query::default(),
+            sql: None,
+            limit: None,
+            request_id: Some("mid-scan-reset".into()),
+            live: false,
+        },
+    )
+    .await;
+
+    assert!(fault_store.fired.load(Ordering::SeqCst));
+    assert_eq!(
+        resets,
+        vec![(
+            0,
+            1,
+            scry_proto::constants::QUERY_SUPERSEDED_REASON_RETIRED_BLOCK_DISAPPEARED,
+        )]
+    );
+    assert_eq!(total_rows(&result.batches), 0);
+    assert_eq!(result.server_total_rows, 0);
+    assert!(catalog
+        .lock()
+        .unwrap()
+        .get_block(meta.uuid)
+        .unwrap()
+        .is_none());
+
+    let _ = shutdown_tx.send(());
+    serve.await.unwrap().unwrap();
 }
 
 #[tokio::test]

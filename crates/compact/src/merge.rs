@@ -32,7 +32,9 @@ use futures::StreamExt;
 use object_store::{path::Path as ObjPath, ObjectStore, ObjectStoreExt};
 use parquet::arrow::ArrowWriter;
 use scry_block::postings::{decode_postings, encode_postings, merge_postings};
-use scry_block::{block_path, BlockBuilderConfig, BlockMeta, BodyBloomBuilder, Fence};
+use scry_block::{
+    block_path, compacted_ancestor_closure, BlockBuilderConfig, BlockMeta, BodyBloomBuilder, Fence,
+};
 use scry_catalog::CatalogEntry;
 use uuid::Uuid;
 
@@ -118,6 +120,35 @@ pub async fn merge_blocks(
 ) -> Result<Option<BlockMeta>> {
     anyhow::ensure!(!inputs.is_empty(), "merge_blocks called with no inputs");
     let spec = spec_for(signal)?;
+
+    // Catalog entries intentionally omit sidecar-only fields. Fetch every
+    // durable input meta exactly once for all signals, validate that it is the
+    // sidecar requested by the catalog entry, and reuse it for every metadata
+    // concern below (series types and ancestry).
+    let mut input_metas = Vec::with_capacity(inputs.len());
+    for entry in inputs {
+        let fetched = fetch_meta(&store, &entry.meta).await?;
+        anyhow::ensure!(
+            fetched.uuid == entry.meta.uuid,
+            "input meta UUID mismatch: requested {}, fetched {}",
+            entry.meta.uuid,
+            fetched.uuid
+        );
+        anyhow::ensure!(
+            fetched.signal == signal,
+            "input {} has signal {:?}, expected {signal:?}",
+            fetched.uuid,
+            fetched.signal
+        );
+        input_metas.push(fetched);
+    }
+    anyhow::ensure!(
+        input_metas.len() == inputs.len(),
+        "not all input metadata sidecars were loaded"
+    );
+    let block_uuid = Uuid::now_v7();
+    let compacted_from = compacted_ancestor_closure(block_uuid, &input_metas)
+        .context("validate compacted ancestry")?;
 
     // Time bounds and schema version come straight from the inputs — the
     // merge is lossless, so min/max ts and the schema version are exact.
@@ -232,7 +263,6 @@ pub async fn merge_blocks(
     let main_bytes = Bytes::from(main_buf);
     let byte_size = main_bytes.len() as u64;
 
-    let block_uuid = Uuid::now_v7();
     let mut puts: Vec<(ObjPath, Bytes)> = Vec::new();
     puts.push((
         ObjPath::from(block_path(signal, ts_min, writer_id, block_uuid, "parquet")),
@@ -304,10 +334,9 @@ pub async fn merge_blocks(
     // ── series_types (metrics): union from input sidecars. ───────────
     let series_types = if spec.has_series_types {
         let mut map: HashMap<u64, u8> = HashMap::new();
-        for e in inputs {
-            let meta = fetch_meta(&store, &e.meta).await?;
-            if let Some(types) = meta.series_types {
-                for (fp, t) in types {
+        for meta in &input_metas {
+            if let Some(types) = &meta.series_types {
+                for &(fp, t) in types {
                     map.entry(fp).or_insert(t);
                 }
             }
@@ -335,6 +364,7 @@ pub async fn merge_blocks(
         byte_size,
         schema_version,
         level: out_level,
+        compacted_from,
         producer_version: env!("CARGO_PKG_VERSION").to_string(),
         label_fingerprint_bloom: None,
         has_postings,

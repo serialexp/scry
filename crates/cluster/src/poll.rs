@@ -106,6 +106,28 @@ where
     Ok(report)
 }
 
+/// Reconcile one `(signal, date)` compaction partition from bucket truth.
+/// Called only after taking that partition's lease, before validating a plan,
+/// so a prior holder that committed `meta.json` but crashed before publishing
+/// cannot cause the same inputs to be merged into a duplicate output.
+pub async fn reconcile_partition<C, S>(
+    store: &S,
+    catalog: &C,
+    bucket: &str,
+    signal: &str,
+    date: &str,
+) -> Result<PollReport>
+where
+    C: CatalogHandle,
+    S: ObjectStore + ?Sized,
+{
+    let prefix = ObjPath::from(format!("{signal}/{}/", date.replace('-', "/")));
+    let locations = collect_meta_locations(store, Some(&prefix)).await?;
+    let mut report = PollReport::default();
+    fetch_and_apply(store, catalog, bucket, locations, &mut report).await?;
+    Ok(report)
+}
+
 /// List a prefix and return the locations of every `*.meta.json` object.
 async fn collect_meta_locations<S>(store: &S, prefix: Option<&ObjPath>) -> Result<Vec<ObjPath>>
 where

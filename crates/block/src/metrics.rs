@@ -369,6 +369,7 @@ impl MetricsBlockBuilder {
             byte_size,
             schema_version: SCHEMA_VERSION,
             level: 0,
+            compacted_from: Vec::new(),
             producer_version: env!("CARGO_PKG_VERSION").to_string(),
             label_fingerprint_bloom: None,
             has_postings: true,

@@ -29,8 +29,8 @@
 //! is `!Sync`; callers wrap it in a `std::sync::Mutex`. The catalog lock is
 //! never held across an `.await`: [`warm_label_cache`] locks to list candidates
 //! + read the warmed set, then for each cold block projects only
-//! `(label_name,label_value)` from its postings sidecar without the lock and
-//! briefly re-locks to persist that block before moving to the next.
+//!   `(label_name,label_value)` from its postings sidecar without the lock and
+//!   briefly re-locks to persist that block before moving to the next.
 
 use std::sync::{Arc, Mutex};
 
@@ -121,9 +121,10 @@ pub async fn collect_label_values(
 
 /// Ensure the label cache is warm for every candidate block of a metrics/logs
 /// metadata query, returning the candidate block UUIDs (the set the answer is
-/// unioned over). Cold blocks are fetched, enumerated, and upserted; a block
-/// whose postings can't be fetched (a peer deleted it) is skipped this round —
-/// not marked warmed — so a later request retries it.
+/// unioned over). Cold blocks are fetched, enumerated, and upserted. A fetch
+/// failure fails the whole provisional metadata attempt: returning a partial
+/// union would silently hide labels, while the daemon can repair a peer deletion
+/// and retry from a fresh candidate listing.
 async fn warm_label_cache(
     catalog: &Mutex<Catalog>,
     store: Arc<dyn ObjectStore>,
@@ -163,14 +164,14 @@ async fn warm_label_cache(
             continue;
         }
         let pairs = if entry.meta.has_postings {
-            match fetch_label_pairs(store.clone(), &entry.meta).await {
-                Ok(pairs) => pairs,
-                Err(e) => {
-                    tracing::warn!(uuid = %entry.meta.uuid, error = %e,
-                        "metadata: postings fetch failed; skipping block this round");
-                    continue;
-                }
-            }
+            fetch_label_pairs(store.clone(), &entry.meta)
+                .await
+                .map_err(|e| {
+                    (
+                        QUERY_ERR_INTERNAL,
+                        format!("metadata postings {}: {e:#}", entry.meta.uuid),
+                    )
+                })?
         } else {
             // No postings ⇒ nothing enumerable; still mark warmed (empty) so
             // it isn't refetched every request.

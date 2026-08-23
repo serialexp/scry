@@ -25,11 +25,12 @@ import {
   type FleetStatusResponseOutput,
   type SchemaMsgOutput,
   type BatchMsgOutput,
+  type ResponseSupersededOutput,
   type EndOfStreamOutput,
   type StreamErrorOutput,
 } from "../proto/generated";
 import { frame, deframe } from "./framing";
-import { queryErrName } from "./constants";
+import { QUERY_CAP_ATTEMPT_SUPERSESSION, queryErrName } from "./constants";
 import type { Transport } from "./transport";
 
 // ── Generator-bug bridge ─────────────────────────────────────────────
@@ -47,6 +48,7 @@ type TaggedFrame =
   | { type: "QueryRequest"; value: QueryRequestOutput }
   | { type: "SchemaMsg"; value: SchemaMsgOutput }
   | { type: "BatchMsg"; value: BatchMsgOutput }
+  | { type: "ResponseSuperseded"; value: ResponseSupersededOutput }
   | { type: "EndOfStream"; value: EndOfStreamOutput }
   | { type: "LabelNamesResponse"; value: LabelNamesResponseOutput }
   | { type: "LabelValuesResponse"; value: LabelValuesResponseOutput }
@@ -119,6 +121,7 @@ function buildRequestFrame(spec: QuerySpec): Uint8Array {
     body_contains: spec.bodyContains ?? "",
     live: spec.live ? 1 : 0,
     with_labels: spec.withLabels ? 1 : 0,
+    capabilities: QUERY_CAP_ATTEMPT_SUPERSESSION,
   };
   // Cast: the runtime encoder wants the tagged `{ type, value }` shape
   // (see TaggedFrame note above), which the declared `QueryFrameInput`
@@ -157,30 +160,51 @@ export async function runQuery(
 
   // Schema first, then any batch/dictionary messages — concatenated they
   // form a single Arrow IPC stream we can hand to `tableFromIPC`.
-  const ipcChunks: Uint8Array[] = [];
+  let ipcChunks: Uint8Array[] = [];
   let totalRows = 0n;
   let sawTerminator = false;
+  let activeAttempt = 0;
+  let awaitingSchema = true;
 
   for (const body of deframe(responseBytes)) {
+    if (sawTerminator) throw new Error("server sent a frame after EndOfStream");
     const decoded = new QueryFrameDecoder(body).decode();
     // Cast: the decoder returns the tagged `{ type, value }` runtime
     // shape, not the bare union the type declares (see TaggedFrame note).
     const msg = (decoded as unknown as { msg: TaggedFrame }).msg;
     switch (msg.type) {
       case "SchemaMsg":
+        if (!awaitingSchema) throw new Error("duplicate schema in query attempt");
+        ipcChunks.push(Uint8Array.from(msg.value.ipc_bytes));
+        awaitingSchema = false;
+        break;
       case "BatchMsg":
+        if (awaitingSchema) throw new Error("batch received before schema");
         ipcChunks.push(Uint8Array.from(msg.value.ipc_bytes));
         break;
+      case "ResponseSuperseded":
+        if (
+          awaitingSchema ||
+          msg.value.superseded_attempt !== activeAttempt ||
+          msg.value.next_attempt !== activeAttempt + 1
+        ) {
+          throw new Error("invalid ResponseSuperseded attempt transition");
+        }
+        // Strict reset: no Arrow bytes (including dictionaries) from the old
+        // attempt survive, and the next frame is required to be a schema.
+        ipcChunks = [];
+        activeAttempt = msg.value.next_attempt;
+        awaitingSchema = true;
+        break;
       case "EndOfStream":
+        if (awaitingSchema) throw new Error("EndOfStream received before schema");
         totalRows = msg.value.total_rows;
         sawTerminator = true;
         break;
       case "StreamError":
         throw new QueryError(msg.value.code, msg.value.message);
       default:
-        // A `QueryRequest` from the server would be a protocol violation;
-        // ignore anything unexpected rather than mis-decode.
-        break;
+        throw new Error(`unexpected ${msg.type} frame in data-query response`);
     }
   }
 
@@ -236,6 +260,7 @@ export async function fetchLabelNames(
     ts_min: scope.tsMin ?? 0n,
     ts_max_present: scope.tsMax !== undefined ? 1 : 0,
     ts_max: scope.tsMax ?? 0n,
+    capabilities: QUERY_CAP_ATTEMPT_SUPERSESSION,
   };
   const frameInput = {
     msg: { type: "LabelNamesRequest", value },
@@ -262,6 +287,7 @@ export async function fetchLabelValues(
     ts_min: scope.tsMin ?? 0n,
     ts_max_present: scope.tsMax !== undefined ? 1 : 0,
     ts_max: scope.tsMax ?? 0n,
+    capabilities: QUERY_CAP_ATTEMPT_SUPERSESSION,
   };
   const frameInput = {
     msg: { type: "LabelValuesRequest", value },

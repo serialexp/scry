@@ -41,7 +41,7 @@ pub const SNAPSHOT_KEY: &str = "_catalog/snapshot.sqlite";
 /// `Catalog::init_schema` changes so a snapshot written by an older binary is
 /// rejected by a newer consumer (which then rebuilds via reconcile) rather than
 /// opened with missing columns.
-pub const CATALOG_SCHEMA_VERSION: u32 = 2;
+pub const CATALOG_SCHEMA_VERSION: u32 = 3;
 
 /// Result of [`save_snapshot`].
 #[derive(Debug, Clone)]
@@ -222,6 +222,7 @@ mod tests {
             body_bloom_size_bytes: None,
             wal_seg_max: Some(7),
             wal_shard: Some(2),
+            compacted_from: Vec::new(),
         }
     }
 

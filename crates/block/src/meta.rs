@@ -7,8 +7,83 @@
 //! min/max) stay in the schema as `Option` so we don't migrate the
 //! sidecar format when real signals land.
 
+use std::collections::HashSet;
+
+use anyhow::{bail, ensure, Result};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+/// Maximum number of UUIDs retained in a compacted block's full ancestor
+/// closure. Fanout 8 through L3 requires 8 + 64 + 512 = 584 entries.
+pub const MAX_COMPACTED_ANCESTORS: usize = 584;
+/// Maximum JSON-encoded size of `compacted_from` (584 UUID strings need
+/// 22,777 bytes, including brackets and separators).
+pub const MAX_COMPACTED_ANCESTRY_BYTES: usize = 24 * 1024;
+
+/// Build and validate an output block's complete transitive ancestor closure.
+///
+/// Every direct input is included along with every UUID in that input's
+/// already-durable closure. Input closures must be canonical (strictly sorted
+/// and deduplicated), and malformed/self-referential lineage is rejected
+/// rather than truncated.
+pub fn compacted_ancestor_closure(output_uuid: Uuid, inputs: &[BlockMeta]) -> Result<Vec<Uuid>> {
+    ensure!(
+        !inputs.is_empty(),
+        "cannot build ancestry without direct inputs"
+    );
+
+    let mut direct = HashSet::with_capacity(inputs.len());
+    let mut closure = HashSet::new();
+    for input in inputs {
+        ensure!(
+            input.uuid != output_uuid,
+            "output block {output_uuid} cannot compact itself"
+        );
+        ensure!(
+            direct.insert(input.uuid),
+            "duplicate direct compaction input {}",
+            input.uuid
+        );
+        ensure!(
+            !input.compacted_from.contains(&input.uuid),
+            "input block {} contains itself in its ancestry",
+            input.uuid
+        );
+        ensure!(
+            !input.compacted_from.contains(&output_uuid),
+            "input block {} contains output {output_uuid} in its ancestry",
+            input.uuid
+        );
+        if input
+            .compacted_from
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        {
+            bail!(
+                "input block {} has unsorted or duplicate ancestry",
+                input.uuid
+            );
+        }
+
+        closure.insert(input.uuid);
+        closure.extend(input.compacted_from.iter().copied());
+        ensure!(
+            closure.len() <= MAX_COMPACTED_ANCESTORS,
+            "compaction ancestry exceeds {} UUIDs",
+            MAX_COMPACTED_ANCESTORS
+        );
+    }
+
+    let mut ancestors: Vec<_> = closure.into_iter().collect();
+    ancestors.sort_unstable();
+    let encoded_len = serde_json::to_vec(&ancestors)?.len();
+    ensure!(
+        encoded_len <= MAX_COMPACTED_ANCESTRY_BYTES,
+        "serialized compaction ancestry exceeds {} bytes",
+        MAX_COMPACTED_ANCESTRY_BYTES
+    );
+    Ok(ancestors)
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BlockMeta {
@@ -32,6 +107,13 @@ pub struct BlockMeta {
     /// field) deserialising to level 0.
     #[serde(default)]
     pub level: u32,
+
+    /// Sorted, deduplicated full transitive closure of blocks replaced by this
+    /// block. This includes every direct compaction input and all of their
+    /// ancestors. Fresh L0 blocks and legacy sidecars have an empty closure.
+    #[serde(default)]
+    pub compacted_from: Vec<Uuid>,
+
     /// Producer software version string (cargo pkg version of the
     /// writer crate). Lets operators correlate a block to a release.
     pub producer_version: String,

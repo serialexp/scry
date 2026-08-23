@@ -63,14 +63,15 @@ pub fn apply_event<C: CatalogHandle>(catalog: &C, event: &BlockEvent) -> Result<
         }
         BlockEvent::Superseded {
             inputs,
-            by,
+            by: _,
             by_meta,
+            reap_eligible_at_unix_nano,
         } => {
-            // Insert the merged block first so the foreign key holds even if
-            // this peer missed its Created. Idempotent.
+            // Apply output + lineage + logical supersession under one catalog
+            // lock so a peer cannot list both representations between calls.
             let inserted = catalog
-                .with(|c| c.insert_block(by_meta))
-                .context("apply Superseded: insert by_meta")?;
+                .with(|c| c.apply_compaction(by_meta, inputs, *reap_eligible_at_unix_nano))
+                .context("apply Superseded atomically")?;
             if inserted {
                 outcome.inserted = 1;
             }
@@ -84,9 +85,6 @@ pub fn apply_event<C: CatalogHandle>(catalog: &C, event: &BlockEvent) -> Result<
                     )
                 })
                 .context("apply Superseded: advance_cursor")?;
-            catalog
-                .with(|c| c.mark_superseded(inputs, *by))
-                .context("apply Superseded: mark_superseded")?;
             // We can't cheaply know how many rows actually transitioned
             // (some inputs may be unknown to this peer); report the intent.
             outcome.superseded = inputs.len();

@@ -23,20 +23,21 @@ export interface QueryFrameInput {
    * @remarks
    *
    * Discriminator: peek uint8
-   * Variants: 11
+   * Variants: 12
    * - QueryRequest (when value === 0x01)
    * - LabelNamesRequest (when value === 0x02)
    * - LabelValuesRequest (when value === 0x03)
    * - FleetStatusRequest (when value === 0x04)
    * - SchemaMsg (when value === 0x10)
    * - BatchMsg (when value === 0x11)
+   * - ResponseSuperseded (when value === 0x12)
    * - EndOfStream (when value === 0x1F)
    * - LabelNamesResponse (when value === 0x20)
    * - LabelValuesResponse (when value === 0x21)
    * - FleetStatusResponse (when value === 0x22)
    * - StreamError (when value === 0xF0)
    */
-  msg: { type: 'QueryRequest'; value: QueryRequestInput } | { type: 'LabelNamesRequest'; value: LabelNamesRequestInput } | { type: 'LabelValuesRequest'; value: LabelValuesRequestInput } | { type: 'FleetStatusRequest'; value: FleetStatusRequestInput } | { type: 'SchemaMsg'; value: SchemaMsgInput } | { type: 'BatchMsg'; value: BatchMsgInput } | { type: 'EndOfStream'; value: EndOfStreamInput } | { type: 'LabelNamesResponse'; value: LabelNamesResponseInput } | { type: 'LabelValuesResponse'; value: LabelValuesResponseInput } | { type: 'FleetStatusResponse'; value: FleetStatusResponseInput } | { type: 'StreamError'; value: StreamErrorInput };
+  msg: { type: 'QueryRequest'; value: QueryRequestInput } | { type: 'LabelNamesRequest'; value: LabelNamesRequestInput } | { type: 'LabelValuesRequest'; value: LabelValuesRequestInput } | { type: 'FleetStatusRequest'; value: FleetStatusRequestInput } | { type: 'SchemaMsg'; value: SchemaMsgInput } | { type: 'BatchMsg'; value: BatchMsgInput } | { type: 'ResponseSuperseded'; value: ResponseSupersededInput } | { type: 'EndOfStream'; value: EndOfStreamInput } | { type: 'LabelNamesResponse'; value: LabelNamesResponseInput } | { type: 'LabelValuesResponse'; value: LabelValuesResponseInput } | { type: 'FleetStatusResponse'; value: FleetStatusResponseInput } | { type: 'StreamError'; value: StreamErrorInput };
 }
 
 /**
@@ -50,20 +51,21 @@ export interface QueryFrameOutput {
    * @remarks
    *
    * Discriminator: peek uint8
-   * Variants: 11
+   * Variants: 12
    * - QueryRequest (when value === 0x01)
    * - LabelNamesRequest (when value === 0x02)
    * - LabelValuesRequest (when value === 0x03)
    * - FleetStatusRequest (when value === 0x04)
    * - SchemaMsg (when value === 0x10)
    * - BatchMsg (when value === 0x11)
+   * - ResponseSuperseded (when value === 0x12)
    * - EndOfStream (when value === 0x1F)
    * - LabelNamesResponse (when value === 0x20)
    * - LabelValuesResponse (when value === 0x21)
    * - FleetStatusResponse (when value === 0x22)
    * - StreamError (when value === 0xF0)
    */
-  msg: { type: 'QueryRequest'; value: QueryRequestOutput } | { type: 'LabelNamesRequest'; value: LabelNamesRequestOutput } | { type: 'LabelValuesRequest'; value: LabelValuesRequestOutput } | { type: 'FleetStatusRequest'; value: FleetStatusRequestOutput } | { type: 'SchemaMsg'; value: SchemaMsgOutput } | { type: 'BatchMsg'; value: BatchMsgOutput } | { type: 'EndOfStream'; value: EndOfStreamOutput } | { type: 'LabelNamesResponse'; value: LabelNamesResponseOutput } | { type: 'LabelValuesResponse'; value: LabelValuesResponseOutput } | { type: 'FleetStatusResponse'; value: FleetStatusResponseOutput } | { type: 'StreamError'; value: StreamErrorOutput };
+  msg: { type: 'QueryRequest'; value: QueryRequestOutput } | { type: 'LabelNamesRequest'; value: LabelNamesRequestOutput } | { type: 'LabelValuesRequest'; value: LabelValuesRequestOutput } | { type: 'FleetStatusRequest'; value: FleetStatusRequestOutput } | { type: 'SchemaMsg'; value: SchemaMsgOutput } | { type: 'BatchMsg'; value: BatchMsgOutput } | { type: 'ResponseSuperseded'; value: ResponseSupersededOutput } | { type: 'EndOfStream'; value: EndOfStreamOutput } | { type: 'LabelNamesResponse'; value: LabelNamesResponseOutput } | { type: 'LabelValuesResponse'; value: LabelValuesResponseOutput } | { type: 'FleetStatusResponse'; value: FleetStatusResponseOutput } | { type: 'StreamError'; value: StreamErrorOutput };
 }
 
 export type QueryFrame = QueryFrameOutput;
@@ -78,6 +80,7 @@ export const enum QueryFrameMsgVariant {
   FleetStatusRequest = 'FleetStatusRequest',
   SchemaMsg = 'SchemaMsg',
   BatchMsg = 'BatchMsg',
+  ResponseSuperseded = 'ResponseSuperseded',
   EndOfStream = 'EndOfStream',
   LabelNamesResponse = 'LabelNamesResponse',
   LabelValuesResponse = 'LabelValuesResponse',
@@ -133,6 +136,13 @@ export class QueryFrameEncoder extends BitStreamEncoder {
     }
     else if (value.msg.type === 'BatchMsg') {
       const encoder_value = new BatchMsgEncoder();
+      const encoded_value = encoder_value.encode(value.msg.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
+    }
+    else if (value.msg.type === 'ResponseSuperseded') {
+      const encoder_value = new ResponseSupersededEncoder();
       const encoded_value = encoder_value.encode(value.msg.value);
       for (const byte of encoded_value) {
         this.writeUint8(byte);
@@ -208,6 +218,10 @@ export class QueryFrameEncoder extends BitStreamEncoder {
       const _enc = new BatchMsgEncoder();
       size += _enc.calculateSize(value.msg.value);
     }
+    else if (value.msg.type === 'ResponseSuperseded') {
+      const _enc = new ResponseSupersededEncoder();
+      size += _enc.calculateSize(value.msg.value);
+    }
     else if (value.msg.type === 'EndOfStream') {
       const _enc = new EndOfStreamEncoder();
       size += _enc.calculateSize(value.msg.value);
@@ -280,6 +294,12 @@ export class QueryFrameDecoder extends SeekableBitStreamDecoder {
       const decodedValue = decoder.decode();
       this.byteOffset += decoder.byteOffset;
       value.msg = { type: 'BatchMsg', value: decodedValue };
+    }
+    else if (discriminator === 0x12) {
+      const decoder = new ResponseSupersededDecoder(this.bytes.slice(this.byteOffset), value);
+      const decodedValue = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.msg = { type: 'ResponseSuperseded', value: decodedValue };
     }
     else if (discriminator === 0x1F) {
       const decoder = new EndOfStreamDecoder(this.bytes.slice(this.byteOffset), value);
@@ -394,6 +414,11 @@ export interface QueryRequestInput {
    * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
    */
   with_labels: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  capabilities: number;
 }
 
 /**
@@ -478,6 +503,11 @@ export interface QueryRequestOutput {
    * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
    */
   with_labels: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  capabilities: number;
 }
 
 export type QueryRequest = QueryRequestOutput;
@@ -531,6 +561,7 @@ export class QueryRequestEncoder extends BitStreamEncoder {
     }
     this.writeUint8(value.live);
     this.writeUint8(value.with_labels);
+    this.writeUint32(value.capabilities, "big_endian");
     return this.finish();
   }
 
@@ -557,7 +588,7 @@ export class QueryRequestEncoder extends BitStreamEncoder {
     size += 2; // length prefix (uint16)
     // body_contains: string (utf8)
     size += new TextEncoder().encode(value.body_contains).length;
-    size += 2; // live + with_labels
+    size += 6; // live + with_labels + capabilities
     return size;
   }
 }
@@ -625,6 +656,7 @@ export class QueryRequestDecoder extends SeekableBitStreamDecoder {
     }
     value.live = this.readUint8();
     value.with_labels = this.readUint8();
+    value.capabilities = this.readUint32("big_endian");
     return value;
   }
 }
@@ -761,6 +793,11 @@ export interface LabelNamesRequestInput {
    * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
    */
   ts_max: bigint;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  capabilities: number;
 }
 
 /**
@@ -797,6 +834,11 @@ export interface LabelNamesRequestOutput {
    * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
    */
   ts_max: bigint;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  capabilities: number;
 }
 
 export type LabelNamesRequest = LabelNamesRequestOutput;
@@ -818,6 +860,7 @@ export class LabelNamesRequestEncoder extends BitStreamEncoder {
     this.writeUint64(value.ts_min, "big_endian");
     this.writeUint8(value.ts_max_present);
     this.writeUint64(value.ts_max, "big_endian");
+    this.writeUint32(value.capabilities, "big_endian");
     return this.finish();
   }
 
@@ -826,7 +869,7 @@ export class LabelNamesRequestEncoder extends BitStreamEncoder {
    * Used for from_after_field computed lengths and buffer pre-allocation.
    */
   calculateSize(value: LabelNamesRequest): number {
-    return 20; // tag (const) + signal + ts_min_present + ts_min + ts_max_present + ts_max
+    return 24; // tag (const) + signal + ts_min_present + ts_min + ts_max_present + ts_max + capabilities
   }
 }
 
@@ -845,6 +888,7 @@ export class LabelNamesRequestDecoder extends SeekableBitStreamDecoder {
     value.ts_min = this.readUint64("big_endian");
     value.ts_max_present = this.readUint8();
     value.ts_max = this.readUint64("big_endian");
+    value.capabilities = this.readUint32("big_endian");
     return value;
   }
 }
@@ -884,6 +928,11 @@ export interface LabelValuesRequestInput {
    * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
    */
   ts_max: bigint;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  capabilities: number;
 }
 
 /**
@@ -926,6 +975,11 @@ export interface LabelValuesRequestOutput {
    * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
    */
   ts_max: bigint;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  capabilities: number;
 }
 
 export type LabelValuesRequest = LabelValuesRequestOutput;
@@ -952,6 +1006,7 @@ export class LabelValuesRequestEncoder extends BitStreamEncoder {
     this.writeUint64(value.ts_min, "big_endian");
     this.writeUint8(value.ts_max_present);
     this.writeUint64(value.ts_max, "big_endian");
+    this.writeUint32(value.capabilities, "big_endian");
     return this.finish();
   }
 
@@ -964,7 +1019,7 @@ export class LabelValuesRequestEncoder extends BitStreamEncoder {
     size += 2; // tag (const) + signal
     // label_name: string (utf8)
     size += new TextEncoder().encode(value.label_name).length;
-    size += 18; // ts_min_present + ts_min + ts_max_present + ts_max
+    size += 22; // ts_min_present + ts_min + ts_max_present + ts_max + capabilities
     return size;
   }
 }
@@ -991,6 +1046,7 @@ export class LabelValuesRequestDecoder extends SeekableBitStreamDecoder {
     value.ts_min = this.readUint64("big_endian");
     value.ts_max_present = this.readUint8();
     value.ts_max = this.readUint64("big_endian");
+    value.capabilities = this.readUint32("big_endian");
     return value;
   }
 }
@@ -1534,6 +1590,99 @@ export class BatchMsgDecoder extends SeekableBitStreamDecoder {
       ipc_bytes__iter = this.readUint8();
       value.ipc_bytes.push(ipc_bytes__iter);
     }
+    return value;
+  }
+}
+
+/**
+ * Server → client. Non-terminal reset: all schema, dictionaries, batches, rows, and counts from superseded_attempt are invalid. The next frame must be a fresh SchemaMsg for next_attempt.
+ */
+export interface ResponseSupersededInput {
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  superseded_attempt: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  next_attempt: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  reason: number;
+}
+
+/**
+ * Server → client. Non-terminal reset: all schema, dictionaries, batches, rows, and counts from superseded_attempt are invalid. The next frame must be a fresh SchemaMsg for next_attempt.
+ */
+export interface ResponseSupersededOutput {
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  tag: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  superseded_attempt: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  next_attempt: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  reason: number;
+}
+
+export type ResponseSuperseded = ResponseSupersededOutput;
+
+export class ResponseSupersededEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("msb_first");
+  }
+
+  encode(value: ResponseSupersededInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint8(18);
+    this.writeUint32(value.superseded_attempt, "big_endian");
+    this.writeUint32(value.next_attempt, "big_endian");
+    this.writeUint8(value.reason);
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a ResponseSuperseded value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: ResponseSuperseded): number {
+    return 10; // tag (const) + superseded_attempt + next_attempt + reason
+  }
+}
+
+export class ResponseSupersededDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "msb_first");
+  }
+
+  decode(): ResponseSupersededOutput {
+    const value: any = {};
+
+    value.tag = this.readUint8();
+    value.superseded_attempt = this.readUint32("big_endian");
+    value.next_attempt = this.readUint32("big_endian");
+    value.reason = this.readUint8();
     return value;
   }
 }

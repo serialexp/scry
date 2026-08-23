@@ -710,12 +710,13 @@ impl QueryMetrics {
         // Catalog: one indexed COUNT/SUM under the brief mutex. On a poisoned
         // lock (a panicked query holder) fall back to zeros rather than panic
         // the status server.
-        let (catalog_blocks, catalog_rows) = match self.catalog.lock() {
+        let (catalog_blocks, catalog_rows, catalog_lineage_rows) = match self.catalog.lock() {
             Ok(cat) => (
                 cat.block_count().unwrap_or(0) as u64,
                 cat.live_row_count().unwrap_or(0),
+                cat.lineage_row_count().unwrap_or(0),
             ),
-            Err(_) => (0, 0),
+            Err(_) => (0, 0, 0),
         };
         let valkey_connected = self.valkey_health.as_ref().map(|rx| *rx.borrow());
         serde_json::json!({
@@ -741,6 +742,7 @@ impl QueryMetrics {
             "memory_reserved_bytes": self.memory_pool.reserved(),
             "catalog_blocks": catalog_blocks,
             "catalog_rows": catalog_rows,
+            "catalog_lineage_rows": catalog_lineage_rows,
             "valkey_connected": valkey_connected,
         })
     }
@@ -929,6 +931,7 @@ function queryCard(s, p, isSelf) {
     ["mem reserved",     mib(d.memory_reserved_bytes)],
     ["catalog blocks",   fmt(d.catalog_blocks)],
     ["catalog rows",     fmt(d.catalog_rows)],
+    ["lineage claims",   fmt(d.catalog_lineage_rows)],
     ["valkey",           vkTxt],
   ]);
   return card(s, isSelf, body);

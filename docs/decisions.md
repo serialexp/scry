@@ -3065,3 +3065,42 @@ independently of the opt-in `--stats-listen` HTTP page; without Valkey queryd re
 `QUERY_ERR_FLEET_UNAVAILABLE`. scry-webui remains a dumb authenticated byte-pipe and
 the SolidJS Fleet screen polls the selected queryd through the shared browser/Tauri
 transport.
+
+## D-061 — Durable compaction lineage and retractable query attempts (2026-08-23)
+
+**Decision:** A compacted block's committed `meta.json` contains the sorted,
+deduplicated full transitive UUID closure it replaces. The closure includes direct
+and intermediate inputs and is bounded to 584 UUIDs / 24 KiB, matching fanout 8
+through L3. Startup rejects a compaction fanout/level policy that cannot fit this
+contract. Local SQLite lineage is a rebuildable index over sidecars, not the source
+of truth; conflicting incomparable terminal descendants are a fork and fail closed.
+
+The output `meta.json` PUT remains the logical commit point. After it succeeds, the
+catalog must atomically publish the output, lineage, superseded inputs, and durable
+physical-reap eligibility even if the lease is subsequently lost. Compaction grace
+is an eligibility timestamp, never an inline sleep. Maintenance retries pending
+input deletion independently and removes data/index objects before `meta.json`, so a
+partial reap remains discoverable and repairable.
+
+The query protocol advertises `QUERY_CAP_ATTEMPT_SUPERSESSION`. If an input disappears
+after response bytes have begun, queryd may send `ResponseSuperseded` naming the old
+and next attempt. The client discards all provisional Arrow schema, dictionaries,
+batches, rows, and counts and requires a fresh schema. Queryd re-lists candidates,
+reacquires live rows, creates fresh eviction/IPC/cache state, and admits only a fully
+flushed final attempt to the result cache. Retries are bounded; incapable clients,
+lineage forks, unresolved live inputs, unstable repair, and exhausted attempts fail
+terminally rather than returning partial data.
+
+Because Valkey convergence is advisory, a 404 triggers authoritative targeted
+signal/day reconciliation. Concurrent repair is single-flight per partition with a
+short TTL, process-wide bounded metadata GET concurrency, one wall-clock deadline,
+and before/after listing stability checks. Reconciled metadata and stale-row
+resolution are applied under one catalog lock. Label metadata requests use the same
+planning-time repair and never return a silently incomplete union.
+
+**Rollout:** First deploy lineage-aware writers/queryd and all capable first-party
+clients while retaining the existing non-zero compaction grace. Bootstrap and verify
+lineage-bearing catalogs, monitor live blocks, pending reaps, lineage claims, repair
+failures, resets, and query errors, and run data/metadata/live-query smokes. Only then
+set compaction grace to zero. Retention grace remains independent. Do not remove the
+compatibility grace path until the fleet has completed this gate.

@@ -15,6 +15,7 @@ pub enum QueryFrameMsg {
     FleetStatusRequest(FleetStatusRequestOutput),
     SchemaMsg(SchemaMsgOutput),
     BatchMsg(BatchMsgOutput),
+    ResponseSuperseded(ResponseSupersededOutput),
     EndOfStream(EndOfStreamOutput),
     LabelNamesResponse(LabelNamesResponseOutput),
     LabelValuesResponse(LabelValuesResponseOutput),
@@ -64,6 +65,7 @@ impl QueryFrameMsg {
                 }
                 encoder.write_uint8(v.live);
                 encoder.write_uint8(v.with_labels);
+                encoder.write_uint32(v.capabilities, Endianness::BigEndian);
             }
             QueryFrameMsg::LabelNamesRequest(v) => {
                 encoder.write_uint8(2);
@@ -72,6 +74,7 @@ impl QueryFrameMsg {
                 encoder.write_uint64(v.ts_min, Endianness::BigEndian);
                 encoder.write_uint8(v.ts_max_present);
                 encoder.write_uint64(v.ts_max, Endianness::BigEndian);
+                encoder.write_uint32(v.capabilities, Endianness::BigEndian);
             }
             QueryFrameMsg::LabelValuesRequest(v) => {
                 encoder.write_uint8(3);
@@ -85,6 +88,7 @@ impl QueryFrameMsg {
                 encoder.write_uint64(v.ts_min, Endianness::BigEndian);
                 encoder.write_uint8(v.ts_max_present);
                 encoder.write_uint64(v.ts_max, Endianness::BigEndian);
+                encoder.write_uint32(v.capabilities, Endianness::BigEndian);
             }
             QueryFrameMsg::FleetStatusRequest(_) => {
                 encoder.write_uint8(4);
@@ -102,6 +106,12 @@ impl QueryFrameMsg {
                 for item in &v.ipc_bytes {
                     encoder.write_uint8(*item);
                 }
+            }
+            QueryFrameMsg::ResponseSuperseded(v) => {
+                encoder.write_uint8(18);
+                encoder.write_uint32(v.superseded_attempt, Endianness::BigEndian);
+                encoder.write_uint32(v.next_attempt, Endianness::BigEndian);
+                encoder.write_uint8(v.reason);
             }
             QueryFrameMsg::EndOfStream(v) => {
                 encoder.write_uint8(31);
@@ -158,6 +168,7 @@ impl QueryFrameMsg {
             QueryFrameMsg::FleetStatusRequest(_) => "FleetStatusRequest",
             QueryFrameMsg::SchemaMsg(_) => "SchemaMsg",
             QueryFrameMsg::BatchMsg(_) => "BatchMsg",
+            QueryFrameMsg::ResponseSuperseded(_) => "ResponseSuperseded",
             QueryFrameMsg::EndOfStream(_) => "EndOfStream",
             QueryFrameMsg::LabelNamesResponse(_) => "LabelNamesResponse",
             QueryFrameMsg::LabelValuesResponse(_) => "LabelValuesResponse",
@@ -196,6 +207,10 @@ impl QueryFrameMsg {
         decoder.seek(start_pos)?;
         if let Ok(v) = BatchMsgOutput::decode_with_decoder(decoder) {
             return Ok(QueryFrameMsg::BatchMsg(v));
+        }
+        decoder.seek(start_pos)?;
+        if let Ok(v) = ResponseSupersededOutput::decode_with_decoder(decoder) {
+            return Ok(QueryFrameMsg::ResponseSuperseded(v));
         }
         decoder.seek(start_pos)?;
         if let Ok(v) = EndOfStreamOutput::decode_with_decoder(decoder) {
@@ -266,6 +281,7 @@ pub struct QueryRequestInput {
     pub body_contains: std::string::String,
     pub live: u8,
     pub with_labels: u8,
+    pub capabilities: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -284,6 +300,7 @@ pub struct QueryRequestOutput {
     pub body_contains: std::string::String,
     pub live: u8,
     pub with_labels: u8,
+    pub capabilities: u32,
 }
 
 pub type QueryRequest = QueryRequestOutput;
@@ -328,6 +345,7 @@ impl QueryRequestInput {
         }
         encoder.write_byte(self.live);
         encoder.write_byte(self.with_labels);
+        encoder.write_u32_be(self.capabilities);
         Ok(())
     }
 
@@ -373,6 +391,7 @@ impl QueryRequestOutput {
         let body_contains = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
         let live = decoder.read_byte()?;
         let with_labels = decoder.read_byte()?;
+        let capabilities = decoder.read_u32_be()?;
         Ok(Self {
             tag,
             signal,
@@ -388,6 +407,7 @@ impl QueryRequestOutput {
             body_contains,
             live,
             with_labels,
+            capabilities,
         })
     }
     pub fn encode(&self) -> Result<Vec<u8>> {
@@ -414,6 +434,7 @@ impl From<QueryRequestOutput> for QueryRequestInput {
             body_contains: o.body_contains,
             live: o.live,
             with_labels: o.with_labels,
+            capabilities: o.capabilities,
         }
     }
 }
@@ -435,6 +456,7 @@ impl From<QueryRequestInput> for QueryRequestOutput {
             body_contains: i.body_contains,
             live: i.live,
             with_labels: i.with_labels,
+            capabilities: i.capabilities,
         }
     }
 }
@@ -492,6 +514,7 @@ pub struct LabelNamesRequestInput {
     pub ts_min: u64,
     pub ts_max_present: u8,
     pub ts_max: u64,
+    pub capabilities: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -502,6 +525,7 @@ pub struct LabelNamesRequestOutput {
     pub ts_min: u64,
     pub ts_max_present: u8,
     pub ts_max: u64,
+    pub capabilities: u32,
 }
 
 pub type LabelNamesRequest = LabelNamesRequestOutput;
@@ -520,6 +544,7 @@ impl LabelNamesRequestInput {
         encoder.write_u64_be(self.ts_min);
         encoder.write_byte(self.ts_max_present);
         encoder.write_u64_be(self.ts_max);
+        encoder.write_u32_be(self.capabilities);
         Ok(())
     }
 
@@ -541,6 +566,7 @@ impl LabelNamesRequestOutput {
         let ts_min = decoder.read_u64_be()?;
         let ts_max_present = decoder.read_byte()?;
         let ts_max = decoder.read_u64_be()?;
+        let capabilities = decoder.read_u32_be()?;
         Ok(Self {
             tag,
             signal,
@@ -548,6 +574,7 @@ impl LabelNamesRequestOutput {
             ts_min,
             ts_max_present,
             ts_max,
+            capabilities,
         })
     }
     pub fn encode(&self) -> Result<Vec<u8>> {
@@ -566,6 +593,7 @@ impl From<LabelNamesRequestOutput> for LabelNamesRequestInput {
             ts_min: o.ts_min,
             ts_max_present: o.ts_max_present,
             ts_max: o.ts_max,
+            capabilities: o.capabilities,
         }
     }
 }
@@ -579,6 +607,7 @@ impl From<LabelNamesRequestInput> for LabelNamesRequestOutput {
             ts_min: i.ts_min,
             ts_max_present: i.ts_max_present,
             ts_max: i.ts_max,
+            capabilities: i.capabilities,
         }
     }
 }
@@ -591,6 +620,7 @@ pub struct LabelValuesRequestInput {
     pub ts_min: u64,
     pub ts_max_present: u8,
     pub ts_max: u64,
+    pub capabilities: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -602,6 +632,7 @@ pub struct LabelValuesRequestOutput {
     pub ts_min: u64,
     pub ts_max_present: u8,
     pub ts_max: u64,
+    pub capabilities: u32,
 }
 
 pub type LabelValuesRequest = LabelValuesRequestOutput;
@@ -625,6 +656,7 @@ impl LabelValuesRequestInput {
         encoder.write_u64_be(self.ts_min);
         encoder.write_byte(self.ts_max_present);
         encoder.write_u64_be(self.ts_max);
+        encoder.write_u32_be(self.capabilities);
         Ok(())
     }
 
@@ -649,6 +681,7 @@ impl LabelValuesRequestOutput {
         let ts_min = decoder.read_u64_be()?;
         let ts_max_present = decoder.read_byte()?;
         let ts_max = decoder.read_u64_be()?;
+        let capabilities = decoder.read_u32_be()?;
         Ok(Self {
             tag,
             signal,
@@ -657,6 +690,7 @@ impl LabelValuesRequestOutput {
             ts_min,
             ts_max_present,
             ts_max,
+            capabilities,
         })
     }
     pub fn encode(&self) -> Result<Vec<u8>> {
@@ -676,6 +710,7 @@ impl From<LabelValuesRequestOutput> for LabelValuesRequestInput {
             ts_min: o.ts_min,
             ts_max_present: o.ts_max_present,
             ts_max: o.ts_max,
+            capabilities: o.capabilities,
         }
     }
 }
@@ -690,6 +725,7 @@ impl From<LabelValuesRequestInput> for LabelValuesRequestOutput {
             ts_min: i.ts_min,
             ts_max_present: i.ts_max_present,
             ts_max: i.ts_max,
+            capabilities: i.capabilities,
         }
     }
 }
@@ -1158,6 +1194,90 @@ impl From<BatchMsgInput> for BatchMsgOutput {
         Self {
             tag: 17u8,
             ipc_bytes: i.ipc_bytes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResponseSupersededInput {
+    pub superseded_attempt: u32,
+    pub next_attempt: u32,
+    pub reason: u8,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResponseSupersededOutput {
+    pub tag: u8,
+    pub superseded_attempt: u32,
+    pub next_attempt: u32,
+    pub reason: u8,
+}
+
+pub type ResponseSuperseded = ResponseSupersededOutput;
+
+impl ResponseSupersededInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(18);
+        encoder.write_u32_be(self.superseded_attempt);
+        encoder.write_u32_be(self.next_attempt);
+        encoder.write_byte(self.reason);
+        Ok(())
+    }
+
+}
+
+impl ResponseSupersededOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let tag = decoder.read_byte()?;
+        if tag != 18u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 18, got {}", tag)));
+        }
+        let superseded_attempt = decoder.read_u32_be()?;
+        let next_attempt = decoder.read_u32_be()?;
+        let reason = decoder.read_byte()?;
+        Ok(Self {
+            tag,
+            superseded_attempt,
+            next_attempt,
+            reason,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        ResponseSupersededInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        ResponseSupersededInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<ResponseSupersededOutput> for ResponseSupersededInput {
+    fn from(o: ResponseSupersededOutput) -> Self {
+        Self {
+            superseded_attempt: o.superseded_attempt,
+            next_attempt: o.next_attempt,
+            reason: o.reason,
+        }
+    }
+}
+
+impl From<ResponseSupersededInput> for ResponseSupersededOutput {
+    fn from(i: ResponseSupersededInput) -> Self {
+        Self {
+            tag: 18u8,
+            superseded_attempt: i.superseded_attempt,
+            next_attempt: i.next_attempt,
+            reason: i.reason,
         }
     }
 }

@@ -54,6 +54,10 @@ pub enum BlockEvent {
         inputs: Vec<Uuid>,
         by: Uuid,
         by_meta: BlockMeta,
+        /// Earliest physical-reap time chosen by the committing compactor.
+        /// Older events omit it and conservatively default to immediate.
+        #[serde(default)]
+        reap_eligible_at_unix_nano: u64,
     },
 
     /// `uuids` were hard-deleted from the bucket (compaction reaping its
@@ -141,6 +145,7 @@ mod tests {
             byte_size: 100,
             schema_version: 1,
             level: 0,
+            compacted_from: Vec::new(),
             producer_version: String::new(),
             label_fingerprint_bloom: None,
             has_postings: false,
@@ -173,6 +178,7 @@ mod tests {
             inputs: vec![Uuid::now_v7(), Uuid::now_v7()],
             by: by.uuid,
             by_meta: by,
+            reap_eligible_at_unix_nano: 123,
         };
         let env = Envelope::new(Uuid::now_v7(), 1, ev);
         let back = Envelope::from_bytes(&env.to_bytes().unwrap()).unwrap();

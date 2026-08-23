@@ -39,7 +39,7 @@ use scry_block::{
     delete_block_objects, AlwaysValid, BlockBuilderConfig, BlockEvent, BlockEventSink, Fence,
     NoopSink,
 };
-use scry_catalog::{Catalog, CatalogHandle};
+use scry_catalog::{Catalog, CatalogHandle, PendingReap};
 use uuid::Uuid;
 
 use crate::merge::merge_blocks;
@@ -56,9 +56,14 @@ pub struct CompactReport {
     pub blocks_out: usize,
     /// On-disk bytes of the merged main parquets produced.
     pub bytes_out: u64,
-    /// Partitions abandoned because the lease was lost mid-merge (the
-    /// commit-point fence, or a fence check before a destructive step).
+    /// Partitions abandoned because the lease was lost before commit.
     pub aborted: usize,
+    /// Previously-superseded input blocks physically reaped this pass.
+    pub reaped: usize,
+    /// Pending inputs whose object deletion failed and will be retried.
+    pub reap_failed: usize,
+    /// Partitions whose merge/reconciliation failed while the pass continued.
+    pub partition_failed: usize,
 }
 
 /// Run a single compaction pass over a privately-owned catalog. Returns a
@@ -77,9 +82,15 @@ pub async fn compact_once(
     cfg: &CompactConfig,
     block_cfg: &BlockBuilderConfig,
 ) -> Result<CompactReport> {
+    cfg.validate().context("invalid compaction policy")?;
     let live = catalog.list_blocks().context("list live blocks")?;
     let plans = plan_merges(&live, cfg);
     let mut report = CompactReport::default();
+    let now = now_unix_nano();
+    let pending = catalog
+        .list_pending_reaps(now)
+        .context("list pending compaction reaps")?;
+    reap_pending(store.clone(), catalog, &pending, &NoopSink, &mut report).await;
 
     // One compactor identity for this pass — block paths are
     // content-addressed under it (`<signal>/.../<writer_id>/<uuid>`).
@@ -195,63 +206,84 @@ pub async fn compact_partition<C: CatalogHandle>(
         None => return Ok(PartitionOutcome::Aborted),
     };
 
-    // 2. Re-check the fence before mutating any catalog state. The merge may
-    //    have run for minutes; if the lease was lost we must not publish the
-    //    merged block or supersede the inputs. The merged objects committed in
-    //    step 1 become a bucket-level leak (reclaimed by a future full
-    //    walk / orphan-GC) — but the local catalog stays clean (just the live
-    //    inputs) and the inputs are left for the rightful holder to re-merge.
-    if fence.check().is_err() {
-        tracing::warn!(signal = %plan.signal, date = %plan.date, "lease lost after merge commit; leaving inputs live");
-        return Ok(PartitionOutcome::Aborted);
-    }
-
-    // 3. Insert the merged block and supersede the inputs back-to-back (two
-    //    quick synchronous catalog calls) so queries switch from the inputs to
-    //    the merged block atomically from a reader's view. Announce both to
-    //    peers.
+    // meta.json is the logical commit point. Once it exists, catalog
+    // publication is mandatory idempotent completion work even if lease renewal
+    // failed immediately afterwards; a later holder will reconcile the same
+    // committed output before planning.
+    let eligible_at = now_unix_nano().saturating_add(cfg.grace.as_nanos() as u64);
     catalog
-        .with(|c| c.insert_block(&merged))
-        .context("insert merged block")?;
+        .with(|c| c.apply_compaction(&merged, &input_uuids, eligible_at))
+        .context("atomically apply committed compaction")?;
     sink.emit(BlockEvent::Created {
         meta: merged.clone(),
     });
-    catalog
-        .with(|c| c.mark_superseded(&input_uuids, merged.uuid))
-        .context("mark inputs superseded")?;
     sink.emit(BlockEvent::Superseded {
-        inputs: input_uuids.clone(),
+        inputs: input_uuids,
         by: merged.uuid,
         by_meta: merged.clone(),
+        reap_eligible_at_unix_nano: eligible_at,
     });
 
-    // 4. Grace period (single-instance default is 0).
-    if !cfg.grace.is_zero() {
-        tokio::time::sleep(cfg.grace).await;
+    // Grace is an eligibility timestamp, never an inline sleep. If immediate
+    // cleanup is allowed and the fence remains valid, try it now; otherwise the
+    // durable pending rows are retried by a later maintenance pass.
+    if cfg.grace.is_zero() && fence.check().is_ok() {
+        let pending = catalog
+            .with(|c| c.list_pending_reaps(now_unix_nano()))
+            .context("list newly pending compaction reaps")?;
+        let mut report = CompactReport::default();
+        reap_pending(store, catalog, &pending, sink, &mut report).await;
     }
-
-    // 5. Delete the input objects from the bucket. Fence once more — the grace
-    //    window may have been long enough to lose the lease.
-    if fence.check().is_err() {
-        tracing::warn!(signal = %plan.signal, date = %plan.date, "lease lost before input delete; inputs remain superseded but not reaped");
-        return Ok(PartitionOutcome::Aborted);
-    }
-    for input in &plan.inputs {
-        delete_block_objects(store.as_ref(), &input.meta)
-            .await
-            .context("delete superseded input objects")?;
-    }
-
-    // 6. Drop the input catalog rows; announce the deletion to peers.
-    catalog
-        .with(|c| c.delete_blocks(&input_uuids))
-        .context("delete superseded input rows")?;
-    sink.emit(BlockEvent::Deleted {
-        signal: plan.signal.clone(),
-        uuids: input_uuids,
-    });
 
     Ok(PartitionOutcome::Merged {
         bytes_out: merged.byte_size,
     })
+}
+
+/// Retry physically deleting superseded inputs whose eligibility deadline has
+/// passed. Each input is independent; failures remain durable pending work and
+/// do not prevent other inputs from progressing.
+pub async fn reap_pending<C: CatalogHandle>(
+    store: Arc<dyn ObjectStore>,
+    catalog: &C,
+    pending: &[PendingReap],
+    sink: &dyn BlockEventSink,
+    report: &mut CompactReport,
+) {
+    for reap in pending {
+        match delete_block_objects(store.as_ref(), &reap.entry.meta).await {
+            Ok(()) => {
+                let uuid = reap.entry.meta.uuid;
+                match catalog.with(|c| c.delete_blocks(&[uuid])) {
+                    Ok(()) => {
+                        report.reaped += 1;
+                        sink.emit(BlockEvent::Deleted {
+                            signal: reap.entry.meta.signal.clone(),
+                            uuids: vec![uuid],
+                        });
+                    }
+                    Err(e) => {
+                        report.reap_failed += 1;
+                        tracing::warn!(%uuid, error = %e, "deleted compacted objects but catalog cleanup failed; retrying later");
+                    }
+                }
+            }
+            Err(e) => {
+                report.reap_failed += 1;
+                tracing::warn!(
+                    uuid = %reap.entry.meta.uuid,
+                    error = %e,
+                    "compaction input reap failed; durable pending row will retry"
+                );
+            }
+        }
+    }
+}
+
+fn now_unix_nano() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
 }

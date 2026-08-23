@@ -1278,6 +1278,19 @@ amplification cost.
 > `scry retention` CLIs still run **unfenced** as the single-instance
 > path. See `docs/decisions.md § D-038` and `§ D-039`.
 
+> **Implementation status (D-061).** Committed compacted sidecars now carry a
+> bounded, sorted full transitive `compacted_from` closure. The catalog applies
+> the output, lineage claims, supersession state, and persistent reap eligibility
+> atomically. Grace is no longer an inline sleep: maintenance can continue
+> merging while eligible input objects are deleted asynchronously and retried,
+> with `meta.json` deleted last. A capable query client may receive
+> `ResponseSuperseded` after an in-flight input disappears; it discards the
+> provisional Arrow attempt, resets schema/dictionaries/rows, and accepts a
+> freshly planned attempt on the same connection. Queryd authoritatively repairs
+> affected signal/day partitions with bounded, single-flight stable listings and
+> fails closed on unresolved lineage or forks. Production keeps non-zero grace
+> until all writers, readers, and clients support this contract.
+
 ### Tiered levels
 
 Blocks live at one of several **levels**, recorded in

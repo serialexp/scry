@@ -29,7 +29,8 @@ pub mod engine;
 pub mod merge;
 pub mod policy;
 
-pub use engine::{compact_once, compact_partition, CompactReport, PartitionOutcome};
+pub use engine::{compact_once, compact_partition, reap_pending, CompactReport, PartitionOutcome};
+pub use merge::merge_blocks;
 pub use policy::{plan_merges, CompactConfig, PlannedMerge};
 
 use std::path::PathBuf;
@@ -102,6 +103,9 @@ pub async fn run(args: Args) -> Result<()> {
         grace: Duration::from_secs(args.grace),
         signal_filter: args.signal.clone(),
     };
+    compact_cfg
+        .validate()
+        .context("invalid compaction policy")?;
     let block_cfg = BlockBuilderConfig::default();
 
     // Bring the catalog in line with the bucket once before compacting,

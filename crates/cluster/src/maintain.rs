@@ -27,12 +27,13 @@ use object_store::ObjectStore;
 use scry_block::{BlockBuilderConfig, BlockEventSink};
 use scry_catalog::CatalogHandle;
 use scry_compact::{
-    compact_partition, plan_merges, CompactConfig, CompactReport, PartitionOutcome,
+    compact_partition, plan_merges, reap_pending, CompactConfig, CompactReport, PartitionOutcome,
 };
 use scry_retention::{plan_reaping, retain_planned, RetentionConfig, RetentionReport};
 use uuid::Uuid;
 
 use crate::lease::{LeaseGuard, LeaseProvider};
+use crate::poll::reconcile_partition;
 
 /// Lease key for a compaction partition.
 fn compaction_lease_key(signal: &str, date: &str, input_level: u32) -> String {
@@ -62,11 +63,24 @@ where
     L: LeaseProvider,
     C: CatalogHandle,
 {
+    cfg.validate().context("invalid compaction policy")?;
     let live = catalog
         .with(|c| c.list_blocks())
         .context("list live blocks")?;
     let plans = plan_merges(&live, cfg);
     let mut report = CompactReport::default();
+
+    // Reaping is durable catalog work, independent of whether this pass finds a
+    // new merge. Partition leases still fence new logical commits; cleanup is
+    // idempotent and only touches inputs already marked non-live.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let pending = catalog
+        .with(|c| c.list_pending_reaps(now))
+        .context("list pending compaction reaps")?;
+    reap_pending(store.clone(), catalog, &pending, sink, &mut report).await;
 
     for plan in plans {
         let key = compaction_lease_key(&plan.signal, &plan.date, plan.input_level);
@@ -84,6 +98,44 @@ where
         };
 
         let fence = guard.fence();
+        if let Err(error) =
+            reconcile_partition(store.as_ref(), catalog, bucket, &plan.signal, &plan.date).await
+        {
+            guard.release().await;
+            report.partition_failed += 1;
+            tracing::warn!(
+                signal = %plan.signal,
+                date = %plan.date,
+                input_level = plan.input_level,
+                error = %format!("{error:#}"),
+                "compaction partition reconcile failed; continuing pass"
+            );
+            continue;
+        }
+
+        // Revalidate the exact inputs after authoritative reconciliation. A
+        // previous lease holder may have committed an output and crashed before
+        // publishing its catalog/event update; its ancestry now hides these rows.
+        let still_live = catalog
+            .with(|c| c.list_blocks())
+            .context("re-list live blocks after partition reconcile")?;
+        let live_ids: std::collections::HashSet<_> =
+            still_live.iter().map(|entry| entry.meta.uuid).collect();
+        if plan
+            .inputs
+            .iter()
+            .any(|input| !live_ids.contains(&input.meta.uuid))
+        {
+            tracing::info!(
+                signal = %plan.signal,
+                date = %plan.date,
+                input_level = plan.input_level,
+                "compaction plan became stale after authoritative reconcile; skipping"
+            );
+            guard.release().await;
+            continue;
+        }
+
         let writer_id = Uuid::now_v7();
         let outcome = compact_partition(
             &plan,
@@ -97,10 +149,23 @@ where
             sink,
         )
         .await;
-        // Release promptly regardless of outcome, then surface any error.
+        // Release promptly regardless of outcome. A damaged/unavailable
+        // partition must not starve unrelated backlog work in this pass.
         guard.release().await;
-        let outcome = outcome
-            .with_context(|| format!("compacting {} {} partition", plan.signal, plan.date))?;
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                report.partition_failed += 1;
+                tracing::warn!(
+                    signal = %plan.signal,
+                    date = %plan.date,
+                    input_level = plan.input_level,
+                    error = %format!("{error:#}"),
+                    "compaction partition failed; continuing pass"
+                );
+                continue;
+            }
+        };
 
         match outcome {
             PartitionOutcome::Merged { bytes_out } => {

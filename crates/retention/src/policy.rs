@@ -115,6 +115,7 @@ mod tests {
                 body_bloom_size_bytes: None,
                 wal_seg_max: None,
                 wal_shard: None,
+                compacted_from: Vec::new(),
             },
             bucket: "b".into(),
             date: "2026-05-30".into(),

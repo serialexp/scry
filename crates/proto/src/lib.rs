@@ -52,6 +52,7 @@ pub use generated_query::{
     LabelNamesRequestOutput, LabelNamesResponse, LabelNamesResponseInput, LabelNamesResponseOutput,
     LabelValuesRequest, LabelValuesRequestInput, LabelValuesRequestOutput, LabelValuesResponse,
     LabelValuesResponseInput, LabelValuesResponseOutput, Matcher, QueryFrame, QueryFrameMsg,
-    QueryRequest, QueryRequestInput, QueryRequestOutput, SchemaMsg, SchemaMsgInput,
-    SchemaMsgOutput, StreamError, StreamErrorInput, StreamErrorOutput,
+    QueryRequest, QueryRequestInput, QueryRequestOutput, ResponseSuperseded,
+    ResponseSupersededInput, ResponseSupersededOutput, SchemaMsg, SchemaMsgInput, SchemaMsgOutput,
+    StreamError, StreamErrorInput, StreamErrorOutput,
 };

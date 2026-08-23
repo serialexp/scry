@@ -1,75 +1,36 @@
-# CURRENT_TASK — v1.0 web UI (own observability frontend)
+# Current task — query-attempt supersession and zero-grace compaction
 
-## What
-Build scry's own operator frontend (the v1.0 "own UI" milestone), replacing the
-Grafana-adapter direction. Design target = a Claude Design mock
-(`scry - Redesign (standalone).html` + `scry-source/`, both gitignored) — a
-visual spec in Claude's dc-runtime DSL, NOT portable code. Full design +
-phasing + decisions live in **docs/design/v1.0-web-ui.md**.
+## Problem
 
-Four views in one routed SolidJS app (`desktop/`, served in-browser by
-scry-webui): **Explore** (Logs/Traces/Metrics query), **Dashboards**,
-**Alerts**, **Fleet status**.
+Production accumulated ~319k block metadata sidecars because coordinated compaction's 600-second grace was implemented as an inline sleep inside every serial merge. The accepted design is in `docs/design/query-attempt-supersession.md`: durable compaction lineage, non-blocking/retryable physical reaping, and a `ResponseSuperseded` query frame that tells clients to discard a provisional attempt while queryd replans.
 
-## Decisions (settled with Bart)
-- **Scope:** full v1.0 UI, built in `desktop/` + scry-webui. Daemons' standalone
-  stats.rs pages on :4098 stay untouched.
-- **Fleet data path:** the UI asks queryd (new FleetStatusRequest/Response
-  frames on the query wire); queryd forwards what it pulls from Valkey via
-  discover_status_blobs. scry-webui stays a dumb byte-pipe. No Valkey ⇒ queryd
-  refuses with StreamError ("fleet requires Valkey") — no single-instance fake.
-- **Dashboards persistence:** object store = source of truth (reserved-prefix
-  JSON), catalog table = runtime index. Not Valkey.
-- **Alerts:** engine deferred past v1.0. Ship the view inert, gated behind a
-  "no backend support yet" state.
+## Implemented in this run
 
-## Phasing (see design doc checklist)
-- Phase 0 — design tokens + @solidjs/router + routed app shell (nav). ← NEXT
-- Phase 1 / 1a — Explore rebuild (logs/traces re-skin) + Metrics tab.
-- Phase 2 — Fleet view + FleetStatus wire frames + queryd handler.
-- Phase 3 — Dashboards (object-store persistence + catalog index + grid UI).
-- Phase 4 — Alerts view (inert).
+- Added `BlockMeta.compacted_from`: validated full transitive ancestor closure including intermediate outputs, bounded to 584 UUIDs / 24 KiB; all L0 builders initialize it empty.
+- Compaction fetches every input `meta.json` exactly once before merge commit and uses durable ancestry in the output sidecar.
+- Catalog schema v3 adds pointer-independent `superseded`, durable `block_lineage`, and persistent pending-reap fields; rebuilds old `blocks` tables to remove the self-FK; lineage replay is order-independent and detects forks.
+- `list_blocks`, `block_count`, and `live_row_count` use the canonical logical-live predicate.
+- Compaction treats output `meta.json` as logical commit, atomically applies output/supersession, records grace as reap eligibility, never sleeps inline, retries pending object deletion, and deletes `meta.json` last. Retention grace default was split from compaction grace.
+- Query schema 0.2 adds request capabilities and `ResponseSuperseded` tag `0x12`; bindings regenerated for Rust and TypeScript.
+- Rust CLI/probe and TypeScript client use strict attempt state machines and discard Arrow state/rows on reset.
+- Queryd validates capability, performs bounded same-connection mid-scan restart from locally known lineage, fails closed on unresolved still-live blocks/forks, and only caches a final attempt after EOS write+flush.
 
-## Still open (non-blocking for Phases 0–2)
-- Tauri parity for Fleet (browser-only vs desktop too).
-- Metrics query shape — does the wire return what a multi-series chart needs, or
-  is a server-side step/downsample needed? (Investigate in Phase 1a.)
-- Auth surface — confirm single-password webui session suffices for all views.
+## Verified so far
 
-## Status
-Design doc written + scope decided. No UI code yet — starting Phase 0.
-Prior work (D-057 status pages + webui relay timeout + label errors) committed
-in 614f29b.
+- `cargo check --workspace`
+- `cargo test -p scry-catalog -p scry-block`
+- `cargo test -p scry-compact --lib --tests`
+- `cargo test -p scry-cluster`
+- `cargo test -p scry-server --lib`
+- `cargo test -p scry-proto framing::tests`
+- `cd desktop && bun test`
+- TypeScript typecheck was run by the delegated protocol implementation.
 
-## 2026-08-20 queryd OOM / fields follow-up
+## Remaining work
 
-- Production `scry-queryd` v0.13.0 was OOM-killed at its 1536 MiB cgroup
-  limit. The browser's empty-frame errors were the resulting early TCP close.
-- The local UI now starts on a snapped 15-minute range (`desktop/src/store.ts`)
-  and surfaces metric-name (`__name__`) metadata errors instead of silently
-  rendering an empty picker. TypeScript typecheck + 25 frontend tests pass.
-- Direct wire probes against production after queryd restarted prove metadata
-  itself works for bounded 1h requests: metrics returned 156 label names and
-  999 metric names; logs returned 5 label names and expected values. Each
-  request took ~2 seconds. The earlier "no fields" state was caused by the
-  wedged/OOM queryd, compounded by swallowed metric-picker errors.
-- Queryd RSS rose from 222 MiB after restart to 846 MiB after four bounded
-  metadata probes because lazy metadata warming fills the postings cache. Its
-  defaults reserve 1024 MiB DataFusion + 256 MiB postings + 256 MiB result +
-  64 MiB bloom under a 1536 MiB pod limit; those independent budgets are not a
-  safe aggregate process budget.
-- Follow-up implemented after Bart authorized proceeding:
-  - metadata warming now projects only `(label_name,label_value)` and persists
-    one cold block at a time; it neither decodes fingerprint lists nor fills the
-    full postings cache;
-  - the default query window now applies to metadata frames too;
-  - queryd detects a finite cgroup-v2 `memory.max`, keeps 256 MiB headroom by
-    default (`--query-memory-reserve-mib`), refuses new data/metadata requests at
-    the threshold, and races metadata warming, planning, and batch streaming
-    against a 100ms memory monitor;
-  - resource refusal is `QUERY_ERR_RESOURCES` with the client-visible message
-    `Query too large, reduce range, increase memory or add extra queriers.`;
-  - UI defaults to a snapped 15m range and surfaces metric-picker metadata
-    errors.
-- Verification: `cargo test -p scry-query -p scry-server -p scry-queryd` passed;
-  desktop typecheck and all 25 frontend tests passed. Deployment was not changed.
+1. Add/finish deterministic Rust coverage for targeted-repair single-flight, concurrency/stability bounds, and mid-scan fault injection. TypeScript multi-attempt fixtures now cover successful discard/restart and malformed transitions.
+2. Implement conservative lineage pruning only after an authoritative stable partition reconcile can prove no extant or pending descendant needs each claim. Lineage row-count telemetry is now exposed; claims are deliberately retained meanwhile.
+3. Add richer repair/reset counters and latency telemetry beyond logs and catalog lineage size.
+4. Run deployment smokes and stage the fleet with grace retained before enabling zero grace. D-061 and architecture documentation are now recorded, but rollout/operator evidence remains outstanding.
+
+Do not deploy or mutate production without Bart's explicit confirmation. The design intentionally retains production grace as a non-blocking eligibility timestamp until the fleet rollout gate is complete.
