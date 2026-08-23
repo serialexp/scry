@@ -1093,7 +1093,9 @@ fn apply_lineage_in(conn: &Connection, meta: &BlockMeta, date: &str) -> Result<(
             params![ancestor, descendant, meta.signal, date, observed_at],
         )?;
         conn.execute(
-            "UPDATE blocks SET superseded = 1 WHERE uuid = ?1 AND uuid <> ?2",
+            "UPDATE blocks SET superseded = 1, \
+             superseded_by = COALESCE(superseded_by, ?2) \
+             WHERE uuid = ?1 AND uuid <> ?2",
             params![ancestor, descendant],
         )?;
     }

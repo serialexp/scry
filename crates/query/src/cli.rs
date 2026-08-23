@@ -687,6 +687,7 @@ async fn run_remote(
             }
             QueryFrameMsg::ResponseSuperseded(reset) => {
                 if awaiting_schema
+                    || active_attempt >= 2
                     || reset.superseded_attempt != active_attempt
                     || reset.next_attempt != active_attempt + 1
                 {
@@ -729,13 +730,11 @@ async fn run_remote(
 
     let signal_name = signal.name();
     eprintln!();
-    if server_total_rows as usize != total_rows {
-        eprintln!(
-            "# scan: {total_rows} {signal_name} rows total (server reported {server_total_rows}; mismatch!) via remote {host_port}"
-        );
-    } else {
-        eprintln!("# scan: {server_total_rows} {signal_name} rows total (via remote {host_port})");
-    }
+    anyhow::ensure!(
+        server_total_rows as usize == total_rows,
+        "remote query row-count mismatch: decoded {total_rows}, server reported {server_total_rows}"
+    );
+    eprintln!("# scan: {server_total_rows} {signal_name} rows total (via remote {host_port})");
     Ok(())
 }
 

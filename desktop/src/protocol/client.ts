@@ -165,6 +165,7 @@ export async function runQuery(
   let sawTerminator = false;
   let activeAttempt = 0;
   let awaitingSchema = true;
+  const maxSupersededAttempts = 2;
 
   for (const body of deframe(responseBytes)) {
     if (sawTerminator) throw new Error("server sent a frame after EndOfStream");
@@ -185,6 +186,7 @@ export async function runQuery(
       case "ResponseSuperseded":
         if (
           awaitingSchema ||
+          activeAttempt >= maxSupersededAttempts ||
           msg.value.superseded_attempt !== activeAttempt ||
           msg.value.next_attempt !== activeAttempt + 1
         ) {
@@ -218,6 +220,11 @@ export async function runQuery(
   }
 
   const table = tableFromIPC(concatChunks(ipcChunks));
+  if (BigInt(table.numRows) !== totalRows) {
+    throw new Error(
+      `query row-count mismatch: decoded ${table.numRows}, server reported ${totalRows}`,
+    );
+  }
   return {
     table,
     rowCount: table.numRows,

@@ -173,7 +173,7 @@ fn read_user_version(path: &Path) -> Result<u32> {
 fn count_live_blocks(path: &Path) -> Result<u64> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let n: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM blocks WHERE deleted_at IS NULL",
+        "SELECT COUNT(*) FROM blocks WHERE deleted_at IS NULL AND superseded = 0",
         [],
         |r| r.get(0),
     )?;

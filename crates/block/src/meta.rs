@@ -10,7 +10,7 @@
 use std::collections::HashSet;
 
 use anyhow::{bail, ensure, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
 /// Maximum number of UUIDs retained in a compacted block's full ancestor
@@ -26,6 +26,32 @@ pub const MAX_COMPACTED_ANCESTRY_BYTES: usize = 24 * 1024;
 /// already-durable closure. Input closures must be canonical (strictly sorted
 /// and deduplicated), and malformed/self-referential lineage is rejected
 /// rather than truncated.
+fn deserialize_compacted_from<'de, D>(deserializer: D) -> std::result::Result<Vec<Uuid>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let ancestors = Vec::<Uuid>::deserialize(deserializer)?;
+    if ancestors.len() > MAX_COMPACTED_ANCESTORS {
+        return Err(serde::de::Error::custom(format!(
+            "compacted_from exceeds {MAX_COMPACTED_ANCESTORS} UUIDs"
+        )));
+    }
+    if ancestors.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(serde::de::Error::custom(
+            "compacted_from must be strictly sorted and deduplicated",
+        ));
+    }
+    let encoded_len = serde_json::to_vec(&ancestors)
+        .map_err(serde::de::Error::custom)?
+        .len();
+    if encoded_len > MAX_COMPACTED_ANCESTRY_BYTES {
+        return Err(serde::de::Error::custom(format!(
+            "compacted_from exceeds {MAX_COMPACTED_ANCESTRY_BYTES} encoded bytes"
+        )));
+    }
+    Ok(ancestors)
+}
+
 pub fn compacted_ancestor_closure(output_uuid: Uuid, inputs: &[BlockMeta]) -> Result<Vec<Uuid>> {
     ensure!(
         !inputs.is_empty(),
@@ -111,7 +137,7 @@ pub struct BlockMeta {
     /// Sorted, deduplicated full transitive closure of blocks replaced by this
     /// block. This includes every direct compaction input and all of their
     /// ancestors. Fresh L0 blocks and legacy sidecars have an empty closure.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_compacted_from")]
     pub compacted_from: Vec<Uuid>,
 
     /// Producer software version string (cargo pkg version of the
@@ -208,4 +234,72 @@ pub struct BlockMeta {
     /// sidecars deserialising.
     #[serde(default)]
     pub wal_shard: Option<u32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn meta(uuid: Uuid, compacted_from: Vec<Uuid>) -> BlockMeta {
+        BlockMeta {
+            uuid,
+            signal: "logs".into(),
+            writer_id: Uuid::nil(),
+            ts_min_unix_nano: 1,
+            ts_max_unix_nano: 2,
+            row_count: 1,
+            byte_size: 1,
+            schema_version: 1,
+            level: 0,
+            compacted_from,
+            producer_version: "test".into(),
+            label_fingerprint_bloom: None,
+            has_postings: false,
+            postings_size_bytes: None,
+            series_types: None,
+            all_fingerprints: None,
+            has_body_bloom: false,
+            body_bloom_size_bytes: None,
+            wal_seg_max: None,
+            wal_shard: None,
+        }
+    }
+
+    #[test]
+    fn closure_contains_intermediates_and_is_canonical() {
+        let leaf_a = Uuid::from_u128(1);
+        let leaf_b = Uuid::from_u128(2);
+        let middle = Uuid::from_u128(3);
+        let output = Uuid::from_u128(4);
+        let ancestors =
+            compacted_ancestor_closure(output, &[meta(middle, vec![leaf_a, leaf_b])]).unwrap();
+        assert_eq!(ancestors, vec![leaf_a, leaf_b, middle]);
+    }
+
+    #[test]
+    fn decode_rejects_noncanonical_and_oversized_ancestry() {
+        let block = meta(Uuid::from_u128(10), Vec::new());
+        let mut value = serde_json::to_value(&block).unwrap();
+        value["compacted_from"] = serde_json::json!([Uuid::from_u128(2), Uuid::from_u128(1)]);
+        assert!(serde_json::from_value::<BlockMeta>(value).is_err());
+
+        let mut value = serde_json::to_value(&block).unwrap();
+        value["compacted_from"] = serde_json::Value::Array(
+            (0..=MAX_COMPACTED_ANCESTORS)
+                .map(|n| serde_json::json!(Uuid::from_u128(n as u128 + 1)))
+                .collect(),
+        );
+        assert!(serde_json::from_value::<BlockMeta>(value).is_err());
+    }
+
+    #[test]
+    fn legacy_sidecar_without_ancestry_decodes_empty() {
+        let block = meta(Uuid::from_u128(10), Vec::new());
+        let mut value = serde_json::to_value(&block).unwrap();
+        value.as_object_mut().unwrap().remove("compacted_from");
+        assert!(serde_json::from_value::<BlockMeta>(value)
+            .unwrap()
+            .compacted_from
+            .is_empty());
+    }
 }
