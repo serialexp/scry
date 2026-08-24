@@ -177,6 +177,43 @@ fn superseded_before_created_satisfies_foreign_key() {
 }
 
 #[test]
+fn legacy_superseded_event_uses_receivers_local_grace() {
+    let (catalog, _tmp) = open_catalog();
+    let writer = Uuid::now_v7();
+    let input = fake_meta("logs", writer, NOW);
+    let output = fake_meta("logs", writer, NOW + 1);
+    apply_event(
+        &catalog,
+        &BlockEvent::Created {
+            meta: input.clone(),
+        },
+    )
+    .unwrap();
+    let legacy = BlockEvent::Superseded {
+        inputs: vec![input.uuid],
+        by: output.uuid,
+        by_meta: output,
+        reap_eligible_at_unix_nano: 0,
+    };
+    scry_cluster::apply_event_with_grace(&catalog, &legacy, Duration::from_secs(600)).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    assert!(catalog
+        .list_pending_reaps(now + 599_000_000_000)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        catalog
+            .list_pending_reaps(now + 601_000_000_000)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn deleted_apply_removes_row_and_is_idempotent() {
     let (catalog, _tmp) = open_catalog();
     let writer = Uuid::now_v7();

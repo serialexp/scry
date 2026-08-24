@@ -19,6 +19,8 @@
 //! Cursors are a high-water mark and only ever advance, so a `Deleted` never
 //! regresses them (a later poll must not "rediscover" the deleted block).
 
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
 use anyhow::{Context, Result};
 use scry_block::BlockEvent;
 use scry_catalog::{date_dir, CatalogHandle};
@@ -39,6 +41,14 @@ pub struct ApplyOutcome {
 /// Apply one [`BlockEvent`] to `catalog`, idempotently. Safe to call with
 /// duplicated, reordered, or self-originated events.
 pub fn apply_event<C: CatalogHandle>(catalog: &C, event: &BlockEvent) -> Result<ApplyOutcome> {
+    apply_event_with_grace(catalog, event, Duration::ZERO)
+}
+
+pub fn apply_event_with_grace<C: CatalogHandle>(
+    catalog: &C,
+    event: &BlockEvent,
+    local_grace: Duration,
+) -> Result<ApplyOutcome> {
     let mut outcome = ApplyOutcome::default();
     match event {
         BlockEvent::Created { meta } => {
@@ -69,8 +79,25 @@ pub fn apply_event<C: CatalogHandle>(catalog: &C, event: &BlockEvent) -> Result<
         } => {
             // Apply output + lineage + logical supersession under one catalog
             // lock so a peer cannot list both representations between calls.
+            // Legacy events decode eligibility as 0; a receiving node with a
+            // configured grace must never interpret that as immediate deletion.
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            let local_eligible = now.saturating_add(local_grace.as_nanos() as u64);
+            let event_eligible = if *reap_eligible_at_unix_nano == 0 {
+                local_eligible
+            } else {
+                *reap_eligible_at_unix_nano
+            };
+            let eligible = if local_grace.is_zero() {
+                event_eligible
+            } else {
+                event_eligible.max(local_eligible)
+            };
             let inserted = catalog
-                .with(|c| c.apply_compaction(by_meta, inputs, *reap_eligible_at_unix_nano))
+                .with(|c| c.apply_compaction(by_meta, inputs, eligible))
                 .context("apply Superseded atomically")?;
             if inserted {
                 outcome.inserted = 1;

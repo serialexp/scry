@@ -94,6 +94,8 @@ use uuid::Uuid;
 /// stored (block) half always returns regardless.
 const LIVE_FETCH_DEADLINE: Duration = Duration::from_secs(2);
 const QUERY_REQUEST_DEADLINE: Duration = Duration::from_secs(10);
+const TARGETED_REPAIR_MAX_META_OBJECTS: usize = 50_000;
+const TARGETED_REPAIR_MAX_META_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Memory and concurrency limits for the live half of a merged logs query.
 #[derive(Debug, Clone, Copy)]
@@ -680,11 +682,26 @@ impl QueryService {
         signal: Signal,
         query: &Query,
     ) -> std::result::Result<Vec<CatalogEntry>, (u16, String)> {
+        self.list_candidates_and_watermarks(signal, query)
+            .map(|(candidates, _)| candidates)
+    }
+
+    fn list_candidates_and_watermarks(
+        &self,
+        signal: Signal,
+        query: &Query,
+    ) -> std::result::Result<
+        (
+            Vec<CatalogEntry>,
+            std::collections::HashMap<(Uuid, u32), u64>,
+        ),
+        (u16, String),
+    > {
         let guard = self
             .catalog
             .lock()
             .map_err(|e| (QUERY_ERR_INTERNAL, format!("catalog mutex poisoned: {e}")))?;
-        match signal {
+        let candidates = match signal {
             Signal::Metrics => list_metrics_candidates(&guard, query).map_err(|e| {
                 (
                     QUERY_ERR_INTERNAL,
@@ -705,7 +722,18 @@ impl QueryService {
                 QUERY_ERR_INTERNAL,
                 format!("BUG: unsupported signal {other:?} reached run_query"),
             )),
-        }
+        }?;
+        let watermarks = if signal == Signal::Logs {
+            guard
+                .list_watermarks("logs")
+                .map_err(|e| (QUERY_ERR_INTERNAL, format!("list_watermarks: {e:#}")))?
+                .into_iter()
+                .map(|(writer, shard, segment)| ((writer, shard), segment))
+                .collect()
+        } else {
+            std::collections::HashMap::new()
+        };
+        Ok((candidates, watermarks))
     }
 
     /// Register the merged history+live logs surface (D-054) into `ctx`: the
@@ -767,6 +795,7 @@ impl QueryService {
         discovery: &Arc<dyn LiveDiscovery>,
         req: &QueryRequest,
         candidates: &[CatalogEntry],
+        persistent_watermarks: &std::collections::HashMap<(Uuid, u32), u64>,
     ) -> std::result::Result<Vec<LiveLogRow>, (u16, String)> {
         // Discovery failure = the live half can't be served → refuse.
         let endpoints = discovery.discover().await.map_err(|e| {
@@ -829,7 +858,10 @@ impl QueryService {
         // being included in the block half while its WAL rows were retained
         // against an older watermark.
         let mut wm_cache: std::collections::HashMap<(Uuid, u32), Option<u64>> =
-            std::collections::HashMap::new();
+            persistent_watermarks
+                .iter()
+                .map(|(key, segment)| (*key, Some(*segment)))
+                .collect();
         for entry in candidates {
             if let (Some(segment), Some(shard)) = (entry.meta.wal_seg_max, entry.meta.wal_shard) {
                 wm_cache
@@ -1038,13 +1070,32 @@ impl QueryService {
         let prefix = ObjPath::from(format!("{signal}/{}/", date.replace('-', "/")));
         let mut stream = self.store.list(Some(&prefix));
         let mut objects = Vec::new();
+        let mut total_bytes = 0u64;
         while let Some(item) = stream.next().await {
             let object = item.map_err(|e| format!("targeted list {signal}/{date}: {e}"))?;
             if object.location.as_ref().ends_with(".meta.json") {
+                total_bytes = total_bytes.saturating_add(object.size);
+                if objects.len() >= TARGETED_REPAIR_MAX_META_OBJECTS {
+                    return Err(format!(
+                        "targeted repair partition {signal}/{date} exceeds {TARGETED_REPAIR_MAX_META_OBJECTS} metadata objects"
+                    ));
+                }
+                if total_bytes > TARGETED_REPAIR_MAX_META_BYTES {
+                    return Err(format!(
+                        "targeted repair partition {signal}/{date} metadata exceeds {TARGETED_REPAIR_MAX_META_BYTES} bytes"
+                    ));
+                }
                 objects.push(object);
             }
         }
         objects.sort_by(|a, b| a.location.cmp(&b.location));
+        if objects.len() > TARGETED_REPAIR_MAX_META_OBJECTS {
+            return Err(format!(
+                "targeted repair partition {signal}/{date} has {} metadata objects; limit is {}",
+                objects.len(),
+                TARGETED_REPAIR_MAX_META_OBJECTS
+            ));
+        }
         Ok(objects)
     }
 
@@ -1166,14 +1217,22 @@ impl QueryService {
             })
             .await
             .cloned();
-        if loaded.is_err() {
-            if let Ok(mut slots) = self.targeted_repair_slots.lock() {
+        if let Ok(mut slots) = self.targeted_repair_slots.lock() {
+            if loaded.is_err() {
                 if slots
                     .get(&partition)
                     .is_some_and(|current| Arc::ptr_eq(current, &slot))
                 {
                     slots.remove(&partition);
                 }
+            } else {
+                let ttl = self.targeted_repair_limits.cache_ttl;
+                slots.retain(|_, candidate| {
+                    candidate
+                        .cell
+                        .get()
+                        .is_none_or(|result| result.loaded_at.elapsed() <= ttl)
+                });
             }
         }
         loaded
@@ -1665,23 +1724,24 @@ impl QueryService {
             let mut repair_rounds = 0u8;
             let (mut stream, physical, cache_key, candidate_context) = loop {
                 // (1) Candidate blocks for this request.
-                let candidates = match self.list_candidates(signal, &req.query) {
-                    Ok(c) => c,
-                    Err((code, msg)) => {
-                        let _ = emit_stream_error(&mut wr, code, msg).await;
-                        let _ = wr.flush().await;
-                        self.emit_scan_complete(
-                            signal,
-                            None,
-                            rows_total,
-                            pool_start,
-                            cache_start,
-                            "miss",
-                            t0.elapsed(),
-                        );
-                        return Ok(());
-                    }
-                };
+                let (candidates, persistent_watermarks) =
+                    match self.list_candidates_and_watermarks(signal, &req.query) {
+                        Ok(snapshot) => snapshot,
+                        Err((code, msg)) => {
+                            let _ = emit_stream_error(&mut wr, code, msg).await;
+                            let _ = wr.flush().await;
+                            self.emit_scan_complete(
+                                signal,
+                                None,
+                                rows_total,
+                                pool_start,
+                                cache_start,
+                                "miss",
+                                t0.elapsed(),
+                            );
+                            return Ok(());
+                        }
+                    };
 
                 let candidate_context: Vec<(Uuid, String, String)> = candidates
                     .iter()
@@ -1693,6 +1753,7 @@ impl QueryService {
                             self.live_discovery.as_ref().expect("checked above"),
                             &req,
                             &candidates,
+                            &persistent_watermarks,
                         )
                         .await
                     {

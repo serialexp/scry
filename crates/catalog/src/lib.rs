@@ -306,13 +306,10 @@ impl Catalog {
         if !has_blocks {
             return Ok(());
         }
-        let has_fk = self
+        let user_version: u32 = self
             .conn
-            .prepare("PRAGMA foreign_key_list(blocks)")?
-            .query([])?
-            .next()?
-            .is_some();
-        if !has_fk {
+            .pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if user_version >= 3 {
             return Ok(());
         }
 
@@ -463,6 +460,31 @@ impl Catalog {
     /// shard)`. `None` when no block for that instance has been seen — the
     /// dedup treats it as `0` (covers nothing, so every live record is
     /// kept).
+    pub fn list_watermarks(&self, signal: &str) -> Result<Vec<(Uuid, u32, u64)>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT writer_id, shard, seg_max FROM wal_watermarks WHERE signal = ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![signal], |row| {
+                let writer: String = row.get(0)?;
+                let writer = Uuid::parse_str(&writer).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+                Ok((
+                    writer,
+                    row.get::<_, i64>(1)? as u32,
+                    row.get::<_, i64>(2)? as u64,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("list WAL watermarks")?;
+        Ok(rows)
+    }
+
     pub fn get_watermark(&self, writer_id: Uuid, signal: &str, shard: u32) -> Result<Option<u64>> {
         let v: Option<i64> = self
             .conn
@@ -644,7 +666,8 @@ impl Catalog {
             let mut stmt = tx.prepare_cached(
                 "UPDATE blocks SET superseded_by = ?1, superseded = 1, \
                  reap_output_uuid = ?1, reap_eligible_at = \
-                   MAX(COALESCE(reap_eligible_at, ?2), ?2) WHERE uuid = ?3",
+                   MAX(COALESCE(reap_eligible_at, ?2), ?2) \
+                 WHERE uuid = ?3 AND uuid <> ?1",
             )?;
             for input in inputs {
                 stmt.execute(params![
@@ -661,6 +684,23 @@ impl Catalog {
 
     /// Superseded inputs whose deferred grace has elapsed. Their full catalog
     /// metadata remains available until object deletion has completed.
+    /// Stage physical cleanup for lineage-superseded rows learned from bucket
+    /// reconciliation rather than a Superseded event. Existing eligibility is
+    /// preserved; only previously unstaged rows are filled.
+    pub fn stage_unstaged_superseded(&self, eligible_at_unix_nano: u64) -> Result<usize> {
+        let eligible = eligible_at_unix_nano.min(i64::MAX as u64) as i64;
+        self.conn
+            .execute(
+                "UPDATE blocks SET \
+                   reap_output_uuid = COALESCE(reap_output_uuid, superseded_by), \
+                   reap_eligible_at = COALESCE(reap_eligible_at, ?1) \
+                 WHERE superseded = 1 AND deleted_at IS NULL \
+                   AND superseded_by IS NOT NULL AND reap_eligible_at IS NULL",
+                params![eligible],
+            )
+            .context("stage reconciled superseded rows")
+    }
+
     pub fn list_pending_reaps(&self, now_unix_nano: u64) -> Result<Vec<PendingReap>> {
         let mut stmt = self.conn.prepare(
             r#"
@@ -673,7 +713,7 @@ impl Catalog {
                    reap_output_uuid, reap_eligible_at
             FROM blocks
             WHERE superseded = 1 AND reap_eligible_at IS NOT NULL
-              AND reap_eligible_at <= ?1
+              AND reap_output_uuid IS NOT NULL AND reap_eligible_at <= ?1
             ORDER BY reap_eligible_at, date, uuid
             "#,
         )?;

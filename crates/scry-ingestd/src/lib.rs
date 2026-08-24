@@ -21,8 +21,7 @@ use object_store::ObjectStore;
 use scry_block::{BlockEventSink, NoopSink};
 use scry_catalog::Catalog;
 use scry_cluster::{
-    apply_event, full_walk, poll_once, run_compaction_pass, run_retention_pass, LeaseProvider,
-    LocalLeaseProvider,
+    poll_once, run_compaction_pass, run_retention_pass, LeaseProvider, LocalLeaseProvider,
 };
 use scry_compact::CompactConfig;
 use scry_objstore::{open as open_objstore, ObjStoreConfig};
@@ -740,7 +739,8 @@ pub async fn run(args: Args) -> Result<()> {
         // 1. pub/sub convergence consumer (low-latency hint; only with Valkey).
         if let Some(url) = valkey_url.clone() {
             let cat = catalog.clone();
-            bg_tasks.push(tokio::spawn(run_consumer(url, cat)));
+            let convergence_grace = Duration::from_secs(args.compact_grace.unwrap_or(600));
+            bg_tasks.push(tokio::spawn(run_consumer(url, cat, convergence_grace)));
         }
 
         // 2. incremental cursor poller (backstops dropped events).
@@ -773,12 +773,20 @@ pub async fn run(args: Args) -> Result<()> {
             let bucket = bucket.clone();
             let cat = catalog.clone();
             let interval = Duration::from_secs(args.full_walk_interval.max(1));
+            let reap_grace = Duration::from_secs(args.compact_grace.unwrap_or(600));
             bg_tasks.push(tokio::spawn(async move {
                 let mut tick = tokio::time::interval(interval);
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     tick.tick().await;
-                    match full_walk(store.as_ref(), cat.as_ref(), &bucket).await {
+                    match scry_cluster::poll::full_walk_with_grace(
+                        store.as_ref(),
+                        cat.as_ref(),
+                        &bucket,
+                        reap_grace,
+                    )
+                    .await
+                    {
                         Ok(r) if r.inserted > 0 => info!(
                             inserted = r.inserted,
                             seen = r.seen,
@@ -921,7 +929,11 @@ pub async fn run(args: Args) -> Result<()> {
 /// Background pub/sub convergence consumer: subscribe to every block-event
 /// channel and apply each event to the catalog idempotently. Reconnects on a
 /// closed subscription; lag just drops events (the cursor poller backstops).
-async fn run_consumer(url: String, catalog: Arc<std::sync::Mutex<Catalog>>) {
+async fn run_consumer(
+    url: String,
+    catalog: Arc<std::sync::Mutex<Catalog>>,
+    compact_grace: Duration,
+) {
     use tokio::sync::broadcast::error::RecvError;
     loop {
         match subscribe_blocks(&url, &ALL_SIGNALS).await {
@@ -931,7 +943,11 @@ async fn run_consumer(url: String, catalog: Arc<std::sync::Mutex<Catalog>>) {
                     match rx.recv().await {
                         Ok(msg) => {
                             if let Some(env) = parse_envelope(&msg) {
-                                if let Err(e) = apply_event(catalog.as_ref(), &env.event) {
+                                if let Err(e) = scry_cluster::apply_event_with_grace(
+                                    catalog.as_ref(),
+                                    &env.event,
+                                    compact_grace,
+                                ) {
                                     warn!(error = %e, "applying block event to catalog failed");
                                 }
                             }

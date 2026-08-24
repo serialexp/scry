@@ -98,8 +98,15 @@ where
         };
 
         let fence = guard.fence();
-        if let Err(error) =
-            reconcile_partition(store.as_ref(), catalog, bucket, &plan.signal, &plan.date).await
+        if let Err(error) = reconcile_partition(
+            store.as_ref(),
+            catalog,
+            bucket,
+            &plan.signal,
+            &plan.date,
+            cfg.grace,
+        )
+        .await
         {
             guard.release().await;
             report.partition_failed += 1;
@@ -136,7 +143,16 @@ where
             continue;
         }
 
-        let writer_id = Uuid::now_v7();
+        // Keep compaction outputs under a writer prefix already known to cursor
+        // polling. The output UUID is still fresh/content-unique; only the path
+        // prefix is stable, so a dropped Created event is incrementally
+        // discoverable instead of waiting for the full walk.
+        let writer_id = plan
+            .inputs
+            .iter()
+            .map(|input| input.meta.writer_id)
+            .min()
+            .unwrap_or_else(Uuid::now_v7);
         let outcome = compact_partition(
             &plan,
             store.clone(),

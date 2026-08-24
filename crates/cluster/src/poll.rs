@@ -20,7 +20,7 @@
 //! advance (monotonic), so re-listing already-known blocks is a no-op.
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
@@ -94,6 +94,19 @@ where
     C: CatalogHandle,
     S: ObjectStore + ?Sized,
 {
+    full_walk_with_grace(store, catalog, bucket, Duration::ZERO).await
+}
+
+pub async fn full_walk_with_grace<C, S>(
+    store: &S,
+    catalog: &C,
+    bucket: &str,
+    reap_grace: Duration,
+) -> Result<PollReport>
+where
+    C: CatalogHandle,
+    S: ObjectStore + ?Sized,
+{
     let mut report = PollReport::default();
     tracing::info!("catalog full-walk starting bucket listing");
     let locations = collect_meta_locations(store, None).await?;
@@ -103,6 +116,14 @@ where
         "catalog full-walk listing complete; fetching sidecars"
     );
     fetch_and_apply(store, catalog, bucket, locations, &mut report).await?;
+    let eligible = (SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        + reap_grace)
+        .as_nanos() as u64;
+    catalog
+        .with(|c| c.stage_unstaged_superseded(eligible))
+        .context("stage full-walk superseded reaps")?;
     Ok(report)
 }
 
@@ -116,6 +137,7 @@ pub async fn reconcile_partition<C, S>(
     bucket: &str,
     signal: &str,
     date: &str,
+    reap_grace: Duration,
 ) -> Result<PollReport>
 where
     C: CatalogHandle,
@@ -125,6 +147,14 @@ where
     let locations = collect_meta_locations(store, Some(&prefix)).await?;
     let mut report = PollReport::default();
     fetch_and_apply(store, catalog, bucket, locations, &mut report).await?;
+    let eligible = (SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        + reap_grace)
+        .as_nanos() as u64;
+    catalog
+        .with(|c| c.stage_unstaged_superseded(eligible))
+        .context("stage partition superseded reaps")?;
     Ok(report)
 }
 
