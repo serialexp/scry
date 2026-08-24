@@ -11,6 +11,7 @@ import {
   refreshFleet,
 } from "../store";
 import type { FleetInstance } from "../protocol/client";
+import { fleetFields } from "./fleetFields";
 
 const POLL_MS = 5_000;
 
@@ -28,20 +29,8 @@ function formatDuration(seconds: number): string {
   return `${Math.floor(seconds / 86_400)}d ${Math.floor((seconds % 86_400) / 3600)}h`;
 }
 
-function displayValue(value: unknown): string | null {
-  if (typeof value === "boolean") return value ? "yes" : "no";
-  if (typeof value === "number") return value.toLocaleString();
-  if (typeof value === "string") return value;
-  return null;
-}
-
 const FleetCard: Component<{ instance: FleetInstance }> = (props) => {
-  const fields = createMemo(() =>
-    Object.entries(props.instance.data)
-      .map(([key, value]) => [key, displayValue(value)] as const)
-      .filter((entry): entry is readonly [string, string] => entry[1] !== null)
-      .slice(0, 8),
-  );
+  const fields = createMemo(() => fleetFields(props.instance));
   const age = createMemo(() => Math.max(0, Date.now() - props.instance.now_unix_ms));
 
   return (
@@ -63,8 +52,8 @@ const FleetCard: Component<{ instance: FleetInstance }> = (props) => {
       </dl>
       <Show when={fields().length > 0}>
         <dl class="fleet-data">
-          <For each={fields()}>{([key, value]) => (
-            <div><dt>{key.replaceAll("_", " ")}</dt><dd>{value}</dd></div>
+          <For each={fields()}>{([label, value]) => (
+            <div><dt>{label}</dt><dd title={value}>{value}</dd></div>
           )}</For>
         </dl>
       </Show>

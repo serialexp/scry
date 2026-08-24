@@ -27,9 +27,9 @@ use scry_compact::CompactConfig;
 use scry_objstore::{open as open_objstore, ObjStoreConfig};
 use scry_retention::RetentionConfig;
 use scry_server::{
-    decode, serve_status, BlockBuilderConfig, DummyShards, FleetSource, LiveRing, LocalStatus,
-    LogsShards, MetricsShards, ProfilesShards, Server, ServerConfig, ServerMetrics,
-    ShardedPipeline, TracesShards, INGEST_SHARDS,
+    decode, serve_status, BlockBuilderConfig, CompactionPassStats, DummyShards, FleetSource,
+    LiveRing, LocalStatus, LogsShards, MetricsShards, ProfilesShards, Server, ServerConfig,
+    ServerMetrics, ShardedPipeline, TracesShards, INGEST_SHARDS,
 };
 use scry_valkey::{
     parse_envelope, subscribe_blocks, StatusRegistration, TailRegistration, ValkeyClient,
@@ -323,17 +323,17 @@ pub async fn run(args: Args) -> Result<()> {
         "upload concurrency cap (shared encode+upload pool across all signals)"
     );
 
-    // Process-global ingest stats. Only built when the stats endpoint is
-    // enabled, so the no-stats path is byte-for-byte the old behaviour.
-    // When present, it's shared three ways: the ingest path bumps its
-    // counters, each signal's pipeline reports its upload gauges into
-    // it, and the stats HTTP server reads snapshots from it.
-    let stats_metrics: Option<Arc<ServerMetrics>> = args.stats_listen.as_ref().map(|_| {
-        Arc::new(
-            ServerMetrics::new(upload_concurrency)
-                .with_identity(writer_uuid.to_string(), args.listen.clone()),
-        )
-    });
+    // Process-global ingest stats. Build them whenever either the local HTTP
+    // dashboard or Valkey fleet publication is enabled. Like queryd, an ingestd
+    // connected to Valkey must report to the fleet even without --stats-listen.
+    let valkey_configured = args.valkey_url.is_some() || std::env::var(VALKEY_URL_ENV).is_ok();
+    let stats_metrics: Option<Arc<ServerMetrics>> =
+        (args.stats_listen.is_some() || valkey_configured).then(|| {
+            Arc::new(
+                ServerMetrics::new(upload_concurrency)
+                    .with_identity(writer_uuid.to_string(), args.listen.clone()),
+            )
+        });
 
     // ---- Multi-instance coordination (v0.9) -------------------------------
     // Resolve the Valkey URL (flag overrides env). When present we connect a
@@ -644,31 +644,23 @@ pub async fn run(args: Args) -> Result<()> {
     });
     server = server.with_live_ring(live_ring);
 
-    // Optional status HTTP endpoint (D-057). With Valkey present it publishes
-    // this instance's snapshot into the fleet registry and renders the whole
-    // fleet; without it, just this instance.
-    let (stats_task, status_registration) = match (args.stats_listen.clone(), stats_metrics.clone())
-    {
+    // Fleet publication is enabled whenever Valkey and metrics are present;
+    // --stats-listen controls only the optional local HTTP dashboard.
+    let status_registration = match (valkey.as_ref(), stats_metrics.as_ref()) {
+        (Some(c), Some(metrics)) => {
+            let m = metrics.clone();
+            let producer: scry_valkey::StatusProducer =
+                Arc::new(move || serde_json::to_string(&m.snapshot()).unwrap_or_default());
+            Some(
+                StatusRegistration::spawn(c.inner().clone(), writer_uuid, STATUS_TTL, producer)
+                    .await
+                    .context("registering status in Valkey")?,
+            )
+        }
+        _ => None,
+    };
+    let stats_task = match (args.stats_listen.clone(), stats_metrics.clone()) {
         (Some(addr), Some(metrics)) => {
-            // Heartbeat this instance's snapshot into Valkey (if any).
-            let status_registration = match valkey.as_ref() {
-                Some(c) => {
-                    let m = metrics.clone();
-                    let producer: scry_valkey::StatusProducer =
-                        Arc::new(move || serde_json::to_string(&m.snapshot()).unwrap_or_default());
-                    Some(
-                        StatusRegistration::spawn(
-                            c.inner().clone(),
-                            writer_uuid,
-                            STATUS_TTL,
-                            producer,
-                        )
-                        .await
-                        .context("registering status in Valkey")?,
-                    )
-                }
-                None => None,
-            };
             let fleet: Option<Arc<dyn FleetSource>> = Some(Arc::new(MergedFleetSource {
                 valkey: valkey.clone(),
                 local: local_agents.clone(),
@@ -676,7 +668,7 @@ pub async fn run(args: Args) -> Result<()> {
             let local: Arc<dyn LocalStatus> = metrics;
             let self_id = writer_uuid.to_string();
             let status_shutdown = shutdown.clone();
-            let task = tokio::spawn(async move {
+            Some(tokio::spawn(async move {
                 if let Err(e) = serve_status(
                     addr,
                     local,
@@ -688,10 +680,9 @@ pub async fn run(args: Args) -> Result<()> {
                 {
                     warn!(error = %e, "status endpoint failed");
                 }
-            });
-            (Some(task), status_registration)
+            }))
         }
-        _ => (None, None),
+        _ => None,
     };
 
     // ---- Multi-instance background loops (v0.9) ---------------------------
@@ -843,6 +834,9 @@ pub async fn run(args: Args) -> Result<()> {
 
             match valkey.as_ref() {
                 Some(c) => {
+                    if let Some(metrics) = stats_metrics.as_ref() {
+                        metrics.configure_compaction(true, compact_cfg.grace);
+                    }
                     let provider = ValkeyLeaseProvider::new(c.inner().clone());
                     bg_tasks.push(tokio::spawn(run_maintenance_loop(
                         provider,
@@ -853,12 +847,16 @@ pub async fn run(args: Args) -> Result<()> {
                         block_cfg,
                         retention_cfg,
                         event_sink.clone(),
+                        stats_metrics.clone(),
                         compact_interval,
                         retention_interval,
                         lease_ttl,
                     )));
                 }
                 None if args.allow_unfenced_maintenance => {
+                    if let Some(metrics) = stats_metrics.as_ref() {
+                        metrics.configure_compaction(true, compact_cfg.grace);
+                    }
                     warn!("--allow-unfenced-maintenance: running maintenance under a local single-process lease; UNSAFE with >1 instance on one bucket");
                     let provider = LocalLeaseProvider::new();
                     bg_tasks.push(tokio::spawn(run_maintenance_loop(
@@ -870,6 +868,7 @@ pub async fn run(args: Args) -> Result<()> {
                         block_cfg,
                         retention_cfg,
                         event_sink.clone(),
+                        stats_metrics.clone(),
                         compact_interval,
                         retention_interval,
                         lease_ttl,
@@ -971,6 +970,31 @@ async fn run_consumer(
     }
 }
 
+fn record_compaction_metrics(
+    metrics: Option<&ServerMetrics>,
+    report: &scry_compact::CompactReport,
+    duration: Duration,
+) {
+    let Some(metrics) = metrics else {
+        return;
+    };
+    metrics.record_compaction_pass(
+        CompactionPassStats {
+            merges: report.merges as u64,
+            blocks_in: report.blocks_in as u64,
+            blocks_out: report.blocks_out as u64,
+            bytes_out: report.bytes_out,
+            aborted: report.aborted as u64,
+            reaped: report.reaped as u64,
+            reap_failed: report.reap_failed as u64,
+            partition_failed: report.partition_failed as u64,
+            lease_held: report.lease_held as u64,
+            lease_unavailable: report.lease_unavailable as u64,
+        },
+        duration,
+    );
+}
+
 /// The lease-guarded maintenance loop: fire a compaction pass on
 /// `compact_interval` and (if any TTL is configured) a retention pass on
 /// `retention_interval`. Generic over the lease provider so the Valkey
@@ -985,6 +1009,7 @@ async fn run_maintenance_loop<L: LeaseProvider>(
     block_cfg: BlockBuilderConfig,
     retention_cfg: RetentionConfig,
     sink: Option<Arc<dyn BlockEventSink>>,
+    metrics: Option<Arc<ServerMetrics>>,
     compact_interval: Duration,
     retention_interval: Duration,
     lease_ttl: Duration,
@@ -1007,19 +1032,29 @@ async fn run_maintenance_loop<L: LeaseProvider>(
         };
         tokio::select! {
             _ = compact_tick.tick() => {
+                let started = std::time::Instant::now();
                 match run_compaction_pass(
                     &provider, store.clone(), catalog.as_ref(), &bucket,
                     &compact_cfg, &block_cfg, sink_ref, lease_ttl,
                 ).await {
-                    Ok(r) if r.merges > 0 || r.partition_failed > 0 || r.reap_failed > 0 => info!(
+                    Ok(r) if r.merges > 0 || r.partition_failed > 0 || r.reap_failed > 0 => {
+                        record_compaction_metrics(metrics.as_deref(), &r, started.elapsed());
+                        info!(
                         merges = r.merges, blocks_in = r.blocks_in,
                         blocks_out = r.blocks_out, reaped = r.reaped,
                         reap_failed = r.reap_failed,
                         partition_failed = r.partition_failed,
+                        lease_held = r.lease_held,
+                        lease_unavailable = r.lease_unavailable,
                         "compaction pass completed"
-                    ),
-                    Ok(_) => {}
-                    Err(e) => warn!(error = %e, "compaction pass failed"),
+                    )},
+                    Ok(r) => record_compaction_metrics(metrics.as_deref(), &r, started.elapsed()),
+                    Err(e) => {
+                        if let Some(metrics) = metrics.as_deref() {
+                            metrics.record_compaction_failure(started.elapsed());
+                        }
+                        warn!(error = %e, "compaction pass failed")
+                    },
                 }
             }
             _ = retention_tick.tick(), if retention_active => {

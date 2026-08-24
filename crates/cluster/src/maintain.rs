@@ -87,11 +87,13 @@ where
         let guard = match provider.try_acquire(&key, lease_ttl).await {
             Ok(Some(g)) => g,
             Ok(None) => {
+                report.lease_held += 1;
                 tracing::debug!(%key, "compaction partition held by a peer; skipping");
                 continue;
             }
             Err(e) => {
                 // Backend unreachable — pause destructive work for this pass.
+                report.lease_unavailable += 1;
                 tracing::warn!(%key, error = %e, "lease backend unreachable; skipping compaction");
                 continue;
             }

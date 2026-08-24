@@ -444,12 +444,19 @@ impl QueryService {
                         let waiting = svc.query_wait_permits.clone().try_acquire_owned();
                         match waiting {
                             Ok(wait_permit) => tokio::spawn(async move {
+                                let wait_started =
+                                    svc.metrics.as_ref().map(|m| m.admission_wait_started());
                                 let active = tokio::time::timeout(
                                     svc.query_queue_timeout,
                                     svc.query_active_permits.clone().acquire_owned(),
                                 )
                                 .await;
                                 drop(wait_permit);
+                                if let (Some(metrics), Some(started)) =
+                                    (svc.metrics.as_ref(), wait_started)
+                                {
+                                    metrics.admission_wait_finished(started);
+                                }
                                 match active {
                                     Ok(Ok(permit)) => {
                                         let _permit = permit;
@@ -458,12 +465,18 @@ impl QueryService {
                                         }
                                     }
                                     _ => {
+                                        if let Some(metrics) = svc.metrics.as_ref() {
+                                            metrics.record_admission_timeout();
+                                        }
                                         send_query_overload(sock, "query queue wait timed out")
                                             .await;
                                     }
                                 }
                             }),
                             Err(_) => tokio::spawn(async move {
+                                if let Some(metrics) = svc.metrics.as_ref() {
+                                    metrics.record_admission_rejected();
+                                }
                                 send_query_overload(sock, "query service is saturated").await;
                             }),
                         };
@@ -593,7 +606,8 @@ impl QueryService {
         // work. Clamp the look-back to the last `default_query_window_nanos`
         // unless the caller was explicit. Applied *before* the span so it
         // logs the effective bounds. See D-059.
-        if self.apply_default_window(&mut req.query) {
+        let defaulted_range = self.apply_default_window(&mut req.query);
+        if defaulted_range {
             info!(
                 request_id = %request_id,
                 ts_min = req.query.ts_min,
@@ -636,6 +650,10 @@ impl QueryService {
                 return Ok(());
             }
         };
+
+        if let Some(metrics) = self.metrics.as_ref() {
+            metrics.record_query_range(req.query.ts_min, req.query.ts_max, defaulted_range);
+        }
 
         // Span is the parent for every event emitted while building
         // and executing the query. Field shapes match existing
@@ -1156,7 +1174,7 @@ impl QueryService {
         &self,
         partition: &RepairPartition,
     ) -> std::result::Result<Arc<PartitionRepair>, String> {
-        for _ in 0..self.targeted_repair_limits.stable_attempts {
+        for attempt in 0..self.targeted_repair_limits.stable_attempts {
             let before = self.list_partition_meta_objects(partition).await?;
             let before_token = Self::partition_token(&before);
             let metas = self.fetch_partition_metas(before).await?;
@@ -1166,6 +1184,11 @@ impl QueryService {
                     loaded_at: Instant::now(),
                     metas: metas.into(),
                 }));
+            }
+            if attempt + 1 < self.targeted_repair_limits.stable_attempts {
+                if let Some(metrics) = self.metrics.as_ref() {
+                    metrics.record_repair_stability_retry();
+                }
             }
         }
         Err(format!(
@@ -1245,6 +1268,24 @@ impl QueryService {
         &self,
         missing: &[(Uuid, String, String)],
     ) -> std::result::Result<ReconciledRepair, String> {
+        if let Some(metrics) = self.metrics.as_ref() {
+            metrics.record_repair_attempt();
+        }
+        let result = self.reconcile_missing_partitions_inner(missing).await;
+        if let Some(metrics) = self.metrics.as_ref() {
+            if result.is_ok() {
+                metrics.record_repair_success();
+            } else {
+                metrics.record_repair_failure();
+            }
+        }
+        result
+    }
+
+    async fn reconcile_missing_partitions_inner(
+        &self,
+        missing: &[(Uuid, String, String)],
+    ) -> std::result::Result<ReconciledRepair, String> {
         if missing.is_empty() {
             return Err("targeted repair has no authoritative partition context".into());
         }
@@ -1295,6 +1336,20 @@ impl QueryService {
     }
 
     fn apply_reconciled_repair(
+        &self,
+        uuids: &[Uuid],
+        reconciled: &ReconciledRepair,
+    ) -> std::result::Result<u8, String> {
+        let result = self.apply_reconciled_repair_inner(uuids, reconciled);
+        if result.is_err() {
+            if let Some(metrics) = self.metrics.as_ref() {
+                metrics.record_repair_failure();
+            }
+        }
+        result
+    }
+
+    fn apply_reconciled_repair_inner(
         &self,
         uuids: &[Uuid],
         reconciled: &ReconciledRepair,
@@ -2028,6 +2083,9 @@ impl QueryService {
                                     {
                                         return Ok(());
                                     }
+                                    if let Some(metrics) = self.metrics.as_ref() {
+                                        metrics.record_response_reset();
+                                    }
                                     info!(
                                         signal = signal_name(signal),
                                         evicted = evicted.len(),
@@ -2207,6 +2265,9 @@ impl QueryService {
         // under concurrent queries it's noisy but still useful for
         // budget-headroom telemetry.
         let memory_reserved_bytes_end = self.memory_pool.reserved();
+        if let Some(metrics) = self.metrics.as_ref() {
+            metrics.record_memory_reservation(memory_reserved_bytes_end);
+        }
 
         info!(
             signal = signal_name(signal),

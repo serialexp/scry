@@ -279,7 +279,8 @@ body {
 .fleet-data dd { margin: 0; color: var(--text); font-family: var(--mono); font-size: 11px; }
 .fleet-data { display: grid; grid-template-columns: 1fr 1fr; gap: 0 14px; margin: 0; border-top: 1px solid var(--border); }
 .fleet-data > div { justify-content: space-between; gap: 10px; min-width: 0; padding: 7px 0; border-bottom: 1px solid var(--border); }
-.fleet-data dt { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fleet-data dt,
+.fleet-data dd { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 @media (max-width: 700px) {
   .fleet-view { padding: 20px 14px 36px; }

@@ -55,7 +55,7 @@ pub use server::{
     TracesPipeline, TracesShards,
 };
 pub use stats::{
-    serve_status, FleetSource, LocalStatus, QueryMetrics, ServerMetrics, StatusSnapshot,
-    UploadStats,
+    serve_status, CompactionPassStats, FleetSource, LocalStatus, QueryMetrics, ServerMetrics,
+    StatusSnapshot, UploadStats,
 };
 pub use tail::{SubId, SubscriptionRegistry, TailItem, TappingLogsAppender};

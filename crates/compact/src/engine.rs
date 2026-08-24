@@ -64,6 +64,10 @@ pub struct CompactReport {
     pub reap_failed: usize,
     /// Partitions whose merge/reconciliation failed while the pass continued.
     pub partition_failed: usize,
+    /// Eligible partitions currently leased by another maintenance instance.
+    pub lease_held: usize,
+    /// Eligible partitions skipped because the lease backend was unavailable.
+    pub lease_unavailable: usize,
 }
 
 /// Run a single compaction pass over a privately-owned catalog. Returns a
