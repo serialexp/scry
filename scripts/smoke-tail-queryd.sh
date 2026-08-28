@@ -30,12 +30,15 @@
 #      stream.
 #
 # Storage-free by design: the ingesters run WITHOUT --storage (the logs tap
-# still fires), and the query daemon is pointed at a dummy object store with
-# convergence effectively disabled (huge intervals), so **only a dev Valkey is
-# required** — no Garage. Point it at the dev Valkey with SCRY_VALKEY_URL
-# (default redis://127.0.0.1:6380 — this machine's `scry-valkey-smoke`).
+# still fires), and the query daemons are pointed at the reachable-but-empty
+# stub object store from `lib/stub-objstore.sh` with convergence effectively
+# disabled (huge intervals), so **only a dev Valkey is required** — no Garage.
+# (The stub is not decoration: `scry query` treats a cold-boot catalog seed as
+# fatal, so the unreachable endpoint this script used to pass would now kill
+# both daemons before they bind --tail-listen.) Point it at the dev Valkey with
+# SCRY_VALKEY_URL (default redis://127.0.0.1:6380 — `scry-valkey-smoke`).
 #
-# Env knobs: VALKEY_URL, IA/IB/QQ/QT/RQ/RT ports, SPEW_RATE (200), BATCHES (200).
+# Env knobs: VALKEY_URL, IA/IB/QQ/QT/RQ/RT/S3_PORT ports, SPEW_RATE, BATCHES.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -48,6 +51,7 @@ QQ="${QQ:-127.0.0.1:14422}"          # queryd query port (unused, but required)
 QT="${QT:-127.0.0.1:14423}"          # queryd tail-listen (front-door)
 RQ="${RQ:-127.0.0.1:14424}"          # refuse-queryd query port
 RT="${RT:-127.0.0.1:14425}"          # refuse-queryd tail-listen
+S3_PORT="${S3_PORT:-127.0.0.1:14426}"  # stub object store (always-empty bucket)
 SPEW_RATE="${SPEW_RATE:-200}"
 BATCHES="${BATCHES:-200}"
 
@@ -65,15 +69,13 @@ fail() {
 }
 ok() { echo "  ok: $*"; }
 
-# Dummy object store — the tail relay never touches it; queryd only needs the
-# env to parse. A refused endpoint means the single startup convergence poll
-# fails fast with one warning and then the huge interval keeps it quiet.
-export SCRY_OBJSTORE_ENDPOINT="http://127.0.0.1:1"
-export SCRY_OBJSTORE_REGION="garage"
-export SCRY_OBJSTORE_BUCKET="scry-smoke"
-export SCRY_OBJSTORE_ACCESS_KEY_ID="dummy"
-export SCRY_OBJSTORE_SECRET_ACCESS_KEY="dummy"
-export SCRY_OBJSTORE_PATH_STYLE="true"
+# A reachable-but-empty object store. The tail relay never reads or writes a
+# block, but queryd will not start until its catalog has seeded from the
+# bucket, so the endpoint has to answer.
+# shellcheck source=lib/stub-objstore.sh
+. "$ROOT/scripts/lib/stub-objstore.sh"
+start_stub_objstore "$S3_PORT" scry-smoke "$TMP/stub-s3.log" || fail "stub object store did not start"
+PIDS+=("$STUB_OBJSTORE_PID")
 
 # ── Pre-flight: Valkey must answer. ──────────────────────────────────
 if command -v valkey-cli >/dev/null; then VK=valkey-cli

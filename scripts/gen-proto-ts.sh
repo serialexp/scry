@@ -103,40 +103,4 @@ done
 # imports (`./bit-stream.js`, …) resolve to the shared copy above.
 { printf '%s\n' "$BANNER"; cat "$TMP_INGEST/generated.ts"; } > "$OUT/generated-ingest.ts"
 
-# ── Patch: supply the codec names the generator forgot to define ──────
-#
-# A schema type whose name collides with a JS global (ours: `Error`) gets its
-# class emitted with a trailing underscore — `Error_Encoder` — but every
-# *reference site* still says `ErrorEncoder`. Encoding or decoding such a
-# variant therefore dies with `ReferenceError: ErrorEncoder is not defined`.
-# For the ingest wire that is the `Error` frame, i.e. exactly the path a server
-# takes to explain a refusal (ERR_TAIL_UNAVAILABLE) — the one we most need to
-# read.
-#
-# We fix it by *adding* the missing binding rather than rewriting generated
-# logic: an alias per mangled class, appended at module scope. Nothing the
-# generator emitted changes. Delete this block once binschema mangles its
-# reference sites too; it is a no-op for schemas with no such collision.
-python3 - "$OUT" <<'PY'
-import re, sys
-from pathlib import Path
-
-out = Path(sys.argv[1])
-pattern = re.compile(r"^export class (\w+)_(Encoder|Decoder) ", re.M)
-for path in sorted(out.glob("generated*.ts")):
-    text = path.read_text()
-    names = pattern.findall(text)
-    if not names:
-        continue
-    lines = [
-        "",
-        "// --- appended by scripts/gen-proto-ts.sh ---",
-        "// binschema mangles a class whose schema name collides with a JS global",
-        "// but keeps the unmangled name at every reference site. Bind both.",
-    ]
-    lines += [f"const {base}{kind} = {base}_{kind};" for base, kind in names]
-    path.write_text(text + "\n".join(lines) + "\n")
-    print(f"patched {len(names)} mangled codec name(s) in {path.name}")
-PY
-
 echo "done. Review with: git diff desktop/src/proto"

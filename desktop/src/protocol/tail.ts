@@ -23,10 +23,10 @@ import {
   type FrameInput,
   type HelloAckOutput,
   type TailRecordOutput,
-  // Named `Error_Output` because binschema mangles a schema type that collides
-  // with a JS global. The gen script binds the mangled *codec classes* back to
-  // their unmangled names (the generator's own reference sites need that);
-  // types are erased at runtime, so here we just import the real name.
+  // Named `Error_Output` because binschema renames a schema type that collides
+  // with a JS global (`Error` → `Error_`). That rename is deliberate and now
+  // consistent across declaration and reference sites, so we import the real
+  // name and alias it locally for readability.
   type Error_Output as ErrorOutput,
   type GoodbyeOutput,
 } from "../proto/generated-ingest";

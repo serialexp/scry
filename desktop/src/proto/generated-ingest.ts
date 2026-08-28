@@ -39,7 +39,7 @@ export interface FrameInput {
    * - LiveBatch (when value === 0x53)
    * - Error (when value === 0xF0)
    */
-  msg: { type: 'Hello'; value: HelloInput } | { type: 'HelloAck'; value: HelloAckInput } | { type: 'Batch'; value: BatchInput } | { type: 'BatchAck'; value: BatchAckInput } | { type: 'FlowControl'; value: FlowControlInput } | { type: 'AgentStatus'; value: AgentStatusInput } | { type: 'Ping'; value: PingInput } | { type: 'Pong'; value: PongInput } | { type: 'Goodbye'; value: GoodbyeInput } | { type: 'Subscribe'; value: SubscribeInput } | { type: 'TailRecord'; value: TailRecordInput } | { type: 'LiveQuery'; value: LiveQueryInput } | { type: 'LiveBatch'; value: LiveBatchInput } | { type: 'Error'; value: ErrorInput };
+  msg: { type: 'Hello'; value: HelloInput } | { type: 'HelloAck'; value: HelloAckInput } | { type: 'Batch'; value: BatchInput } | { type: 'BatchAck'; value: BatchAckInput } | { type: 'FlowControl'; value: FlowControlInput } | { type: 'AgentStatus'; value: AgentStatusInput } | { type: 'Ping'; value: PingInput } | { type: 'Pong'; value: PongInput } | { type: 'Goodbye'; value: GoodbyeInput } | { type: 'Subscribe'; value: SubscribeInput } | { type: 'TailRecord'; value: TailRecordInput } | { type: 'LiveQuery'; value: LiveQueryInput } | { type: 'LiveBatch'; value: LiveBatchInput } | { type: 'Error'; value: Error_Input };
 }
 
 /**
@@ -69,7 +69,7 @@ export interface FrameOutput {
    * - LiveBatch (when value === 0x53)
    * - Error (when value === 0xF0)
    */
-  msg: { type: 'Hello'; value: HelloOutput } | { type: 'HelloAck'; value: HelloAckOutput } | { type: 'Batch'; value: BatchOutput } | { type: 'BatchAck'; value: BatchAckOutput } | { type: 'FlowControl'; value: FlowControlOutput } | { type: 'AgentStatus'; value: AgentStatusOutput } | { type: 'Ping'; value: PingOutput } | { type: 'Pong'; value: PongOutput } | { type: 'Goodbye'; value: GoodbyeOutput } | { type: 'Subscribe'; value: SubscribeOutput } | { type: 'TailRecord'; value: TailRecordOutput } | { type: 'LiveQuery'; value: LiveQueryOutput } | { type: 'LiveBatch'; value: LiveBatchOutput } | { type: 'Error'; value: ErrorOutput };
+  msg: { type: 'Hello'; value: HelloOutput } | { type: 'HelloAck'; value: HelloAckOutput } | { type: 'Batch'; value: BatchOutput } | { type: 'BatchAck'; value: BatchAckOutput } | { type: 'FlowControl'; value: FlowControlOutput } | { type: 'AgentStatus'; value: AgentStatusOutput } | { type: 'Ping'; value: PingOutput } | { type: 'Pong'; value: PongOutput } | { type: 'Goodbye'; value: GoodbyeOutput } | { type: 'Subscribe'; value: SubscribeOutput } | { type: 'TailRecord'; value: TailRecordOutput } | { type: 'LiveQuery'; value: LiveQueryOutput } | { type: 'LiveBatch'; value: LiveBatchOutput } | { type: 'Error'; value: Error_Output };
 }
 
 export type Frame = FrameOutput;
@@ -197,7 +197,7 @@ export class FrameEncoder extends BitStreamEncoder {
       }
     }
     else if (value.msg.type === 'Error') {
-      const encoder_value = new ErrorEncoder();
+      const encoder_value = new Error_Encoder();
       const encoded_value = encoder_value.encode(value.msg.value);
       for (const byte of encoded_value) {
         this.writeUint8(byte);
@@ -267,7 +267,7 @@ export class FrameEncoder extends BitStreamEncoder {
       size += _enc.calculateSize(value.msg.value);
     }
     else if (value.msg.type === 'Error') {
-      const _enc = new ErrorEncoder();
+      const _enc = new Error_Encoder();
       size += _enc.calculateSize(value.msg.value);
     }
     else {
@@ -366,7 +366,7 @@ export class FrameDecoder extends SeekableBitStreamDecoder {
       value.msg = { type: 'LiveBatch', value: decodedValue };
     }
     else if (discriminator === 0xF0) {
-      const decoder = new ErrorDecoder(this.bytes.slice(this.byteOffset), value);
+      const decoder = new Error_Decoder(this.bytes.slice(this.byteOffset), value);
       const decodedValue = decoder.decode();
       this.byteOffset += decoder.byteOffset;
       value.msg = { type: 'Error', value: decodedValue };
@@ -5453,9 +5453,3 @@ export class DummyRecordDecoder extends SeekableBitStreamDecoder {
   }
 }
 
-
-// --- appended by scripts/gen-proto-ts.sh ---
-// binschema mangles a class whose schema name collides with a JS global
-// but keeps the unmangled name at every reference site. Bind both.
-const ErrorEncoder = Error_Encoder;
-const ErrorDecoder = Error_Decoder;

@@ -34,10 +34,10 @@
 #      ERR_TAIL_UNAVAILABLE (9) → the client raises TailError with that code.
 #
 # Storage-free by design (like smoke-tail-queryd.sh): the ingester runs without
-# --storage and the query daemons point at a dummy object store with convergence
-# effectively disabled, so **only a dev Valkey is required** — no Garage. Point
-# it at SCRY_VALKEY_URL (default redis://127.0.0.1:6380, this machine's
-# `scry-valkey-smoke`).
+# --storage and the query daemons point at the reachable-but-empty stub object
+# store from `lib/stub-objstore.sh`, with convergence effectively disabled. So
+# **only a dev Valkey is required** — no Garage. Point it at SCRY_VALKEY_URL
+# (default redis://127.0.0.1:6380, this machine's `scry-valkey-smoke`).
 #
 # Env knobs: SCRY_VALKEY_URL, IA/QQ/QT/RQ/RT/WEB ports, SPEW_RATE, BATCHES.
 set -euo pipefail
@@ -75,59 +75,12 @@ command -v bun >/dev/null     || fail "bun not found (needed to run the TS tail 
 command -v curl >/dev/null    || fail "curl not found"
 command -v python3 >/dev/null || fail "python3 not found (needed to read the targets JSON)"
 
-# ── A stub object store that is always empty ─────────────────────────
-#
-# Nothing on the tail path reads or writes a block, but `scry query` refuses to
-# start until it has seeded its catalog from the bucket — an *unreachable*
-# endpoint is a fatal boot error, not a warning. Rather than drag Garage in for
-# a test that stores nothing, we answer the two requests a cold boot makes:
-# GET `_catalog/snapshot.sqlite` (404 ⇒ no snapshot) and ListObjectsV2 (an empty
-# listing ⇒ a seed of zero blocks). Signatures are never checked.
-STUB_S3_PY='
-import sys
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-
-EMPTY_LIST = (
-    b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
-    b"<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
-    b"<Name>scry-smoke</Name><KeyCount>0</KeyCount><MaxKeys>1000</MaxKeys>"
-    b"<IsTruncated>false</IsTruncated></ListBucketResult>"
-)
-
-class H(BaseHTTPRequestHandler):
-    def _listing(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "application/xml")
-        self.send_header("Content-Length", str(len(EMPTY_LIST)))
-        self.end_headers()
-        self.wfile.write(EMPTY_LIST)
-
-    def _missing(self):
-        self.send_response(404)
-        self.send_header("Content-Length", "0")
-        self.end_headers()
-
-    def do_GET(self):
-        if "list-type=2" in self.path:
-            self._listing()
-        else:
-            self._missing()
-
-    do_HEAD = do_GET
-
-    def log_message(self, *a):
-        pass
-
-ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
-'
-python3 -c "$STUB_S3_PY" "${S3_PORT#*:}" >"$TMP/stub-s3.log" 2>&1 &
-PIDS+=($!)
-export SCRY_OBJSTORE_ENDPOINT="http://$S3_PORT"
-export SCRY_OBJSTORE_REGION="garage"
-export SCRY_OBJSTORE_BUCKET="scry-smoke"
-export SCRY_OBJSTORE_ACCESS_KEY_ID="dummy"
-export SCRY_OBJSTORE_SECRET_ACCESS_KEY="dummy"
-export SCRY_OBJSTORE_PATH_STYLE="true"
+# A reachable-but-empty object store, so the daemons' cold catalog seed
+# succeeds without dragging Garage into a test that stores nothing.
+# shellcheck source=lib/stub-objstore.sh
+. "$ROOT/scripts/lib/stub-objstore.sh"
+start_stub_objstore "$S3_PORT" scry-smoke "$TMP/stub-s3.log" || fail "stub object store did not start"
+PIDS+=("$STUB_OBJSTORE_PID")
 
 # ── Pre-flight: Valkey must answer. ──────────────────────────────────
 if command -v valkey-cli >/dev/null; then VK=valkey-cli

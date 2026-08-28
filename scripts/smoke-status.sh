@@ -16,7 +16,8 @@
 #
 # Asserts:
 #   1. Fleet from either side — GET /stats.json on the INGEST page lists BOTH
-#      the ingest and the query instance (source:"valkey"); ditto the QUERY
+#      the ingest and the query instance (source:"mixed" for the ingester, which
+#      also merges locally-reported agents; "valkey" for queryd); ditto the QUERY
 #      page. Each instance is tagged with the correct role, and each page's
 #      self_id matches the instance serving it.
 #   2. Local fallback — a `scry query --stats-listen` with NO Valkey serves a
@@ -29,7 +30,8 @@
 # SCRY_VALKEY_URL (default redis://127.0.0.1:6380 — this machine's
 # `scry-valkey-smoke`).
 #
-# Env knobs: VALKEY_URL, II/QQ ingest+query wire ports, SI/SQ/SL stats ports.
+# Env knobs: VALKEY_URL, II/QQ ingest+query wire ports, SI/SQ/SL stats ports,
+# S3_PORT (the stub object store from lib/stub-objstore.sh).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -42,6 +44,7 @@ SI="${SI:-127.0.0.1:14442}"          # ingester stats port
 SQ="${SQ:-127.0.0.1:14443}"          # queryd stats port
 LQ="${LQ:-127.0.0.1:14444}"          # local-fallback queryd wire port
 SL="${SL:-127.0.0.1:14445}"          # local-fallback queryd stats port
+S3_PORT="${S3_PORT:-127.0.0.1:14446}" # stub object store (always-empty bucket)
 
 TMP="$(mktemp -d)"
 PIDS=()
@@ -57,14 +60,13 @@ fail() {
 }
 ok() { echo "  ok: $*"; }
 
-# Dummy object store — the ingester runs storage-less and the queryd only needs
-# the env to parse (convergence disabled with huge intervals).
-export SCRY_OBJSTORE_ENDPOINT="http://127.0.0.1:1"
-export SCRY_OBJSTORE_REGION="garage"
-export SCRY_OBJSTORE_BUCKET="scry-smoke"
-export SCRY_OBJSTORE_ACCESS_KEY_ID="dummy"
-export SCRY_OBJSTORE_SECRET_ACCESS_KEY="dummy"
-export SCRY_OBJSTORE_PATH_STYLE="true"
+# A reachable-but-empty object store. The ingester runs storage-less and the
+# queryds never scan a block, but queryd will not start until its catalog has
+# seeded from the bucket, so the endpoint has to answer.
+# shellcheck source=lib/stub-objstore.sh
+. "$ROOT/scripts/lib/stub-objstore.sh"
+start_stub_objstore "$S3_PORT" scry-smoke "$TMP/stub-s3.log" || fail "stub object store did not start"
+PIDS+=("$STUB_OBJSTORE_PID")
 
 # ── Pre-flight: Valkey must answer. ──────────────────────────────────
 if command -v valkey-cli >/dev/null; then VK=valkey-cli
@@ -138,7 +140,10 @@ def check(cond, msg):
     ok = ok and cond
 
 # Each page reports itself via source + self_id.
-check(ingest.get("source") == "valkey", f"ingest page source=valkey (got {ingest.get('source')})")
+# The ingester merges its own locally-reported agents with the Valkey fleet, so
+# its source is "mixed"; queryd has no local agents to merge and reports
+# "valkey". Either way the point is the same: not "local" -- Valkey is in play.
+check(ingest.get("source") == "mixed",  f"ingest page source=mixed (got {ingest.get('source')})")
 check(query.get("source")  == "valkey", f"query page source=valkey (got {query.get('source')})")
 
 ing_self = ingest.get("self_id")
