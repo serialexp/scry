@@ -202,7 +202,11 @@ ok "dedup exact: merged history+live = $L2 = N (ring copies of now-durable recor
 # ════════════════════════════════════════════════════════════════════
 echo "== phase 3: refuse-without-Valkey =="
 echo "-- starting a query daemon with NO --valkey-url ($RQ), sharing the catalog --"
-RUST_LOG=info "$SCRY" query \
+# `env -u SCRY_VALKEY_URL`: dropping the flag is not enough, since scry query
+# falls back to the env var — and this script is run with that var pointed at a
+# Valkey. Without the unset this daemon connects like any other and check (d)
+# asserts nothing.
+env -u SCRY_VALKEY_URL RUST_LOG=info "$SCRY" query \
   --listen "$RQ" --catalog "$CAT" \
   --poll-interval 999999 --full-walk-interval 999999 \
   >"$TMP/refuse.log" 2>&1 &

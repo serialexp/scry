@@ -193,7 +193,11 @@ echo "== phase 1 PASSED =="
 echo "== phase 2: refuse-without-Valkey =="
 
 echo "-- starting a query daemon with --tail-listen but NO --valkey-url --"
-RUST_LOG=info "$SCRY" query --listen "$RQ" --catalog "$TMP/refuse.sqlite" \
+# `env -u SCRY_VALKEY_URL` is the point of this daemon: omitting the flag is not
+# enough, because scry query falls back to the env var — and pointing that var
+# at a Valkey is how this script is meant to be run. Without the unset it
+# connects like everyone else and phase 2 asserts nothing.
+env -u SCRY_VALKEY_URL RUST_LOG=info "$SCRY" query --listen "$RQ" --catalog "$TMP/refuse.sqlite" \
   --tail-listen "$RT" --poll-interval 999999 --full-walk-interval 999999 \
   >"$TMP/refuse.log" 2>&1 &
 PIDS+=($!)
