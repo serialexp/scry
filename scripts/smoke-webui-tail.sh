@@ -131,7 +131,12 @@ wait_bind "$QT" || fail "queryd tail-listen never bound"
 ok "front-door listening on $QT"
 
 echo "== starting a second query daemon with NO Valkey (query $RQ, tail $RT) =="
-RUST_LOG=info "$SCRY" query --listen "$RQ" --catalog "$TMP/refuse.sqlite" \
+# `env -u SCRY_VALKEY_URL` is the whole point of this daemon: omitting the
+# --valkey-url *flag* is not enough, because scry query falls back to the env
+# var — and the documented way to run this script is to set exactly that var.
+# Without the unset, this daemon quietly connects to the same Valkey as the
+# front-door above and assertion 4 tests nothing.
+env -u SCRY_VALKEY_URL RUST_LOG=info "$SCRY" query --listen "$RQ" --catalog "$TMP/refuse.sqlite" \
   --tail-listen "$RT" --poll-interval 999999 --full-walk-interval 999999 \
   >"$TMP/refuse.log" 2>&1 &
 PIDS+=($!)
