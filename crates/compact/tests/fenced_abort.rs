@@ -144,7 +144,7 @@ fn one_logs_plan(catalog: &Catalog) -> scry_compact::PlannedMerge {
         signal_filter: Some("logs".into()),
     };
     let live = catalog.list_blocks().unwrap();
-    let mut plans = plan_merges(&live, &cfg);
+    let mut plans = plan_merges(&live, &cfg).merges;
     assert_eq!(plans.len(), 1, "exactly one logs partition to merge");
     plans.pop().unwrap()
 }

@@ -43,7 +43,25 @@ use scry_catalog::{Catalog, CatalogHandle, PendingReap};
 use uuid::Uuid;
 
 use crate::merge::merge_blocks;
-use crate::policy::{plan_merges, CompactConfig, PlannedMerge};
+use crate::policy::{plan_merges, CompactConfig, OversizedPartition, PlannedMerge};
+
+/// Surface partitions the planner declined. These are operator-actionable
+/// (raise `--compact-max-level`, restore the previous `--compact-fanout`, or
+/// accept the partition as terminal), and silently never compacting would be
+/// worse than a line per pass.
+pub fn warn_oversized(oversized: &[OversizedPartition]) {
+    for p in oversized {
+        tracing::warn!(
+            signal = %p.signal,
+            date = %p.date,
+            input_level = p.input_level,
+            projected_ancestors = p.projected_ancestors,
+            limit = scry_block::MAX_COMPACTED_ANCESTORS,
+            "partition cannot compact: merged block's ancestry would exceed the sidecar limit \
+             (blocks were likely built with a smaller --compact-fanout); skipping it"
+        );
+    }
+}
 
 /// Outcome of one [`compact_once`] pass.
 #[derive(Debug, Clone, Default)]
@@ -68,6 +86,11 @@ pub struct CompactReport {
     pub lease_held: usize,
     /// Eligible partitions skipped because the lease backend was unavailable.
     pub lease_unavailable: usize,
+    /// Eligible partitions declined because the merged output's ancestor
+    /// closure would exceed the sidecar cap (usually a `--compact-fanout`
+    /// changed between runs). These never make progress until the operator
+    /// intervenes, so the pass reports them rather than failing.
+    pub oversized: usize,
 }
 
 /// Run a single compaction pass over a privately-owned catalog. Returns a
@@ -88,8 +111,13 @@ pub async fn compact_once(
 ) -> Result<CompactReport> {
     cfg.validate().context("invalid compaction policy")?;
     let live = catalog.list_blocks().context("list live blocks")?;
-    let plans = plan_merges(&live, cfg);
-    let mut report = CompactReport::default();
+    let plan = plan_merges(&live, cfg);
+    let plans = plan.merges;
+    let mut report = CompactReport {
+        oversized: plan.oversized.len(),
+        ..Default::default()
+    };
+    warn_oversized(&plan.oversized);
     let now = now_unix_nano();
     let pending = catalog
         .list_pending_reaps(now)

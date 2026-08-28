@@ -62,10 +62,55 @@ async fn mark_uploaded_deletes_eligible_segments() {
     assert_eq!(s0, SegmentId(0));
     assert_eq!(s1, SegmentId(1));
 
-    // Delete up to seg 1 — segments 0 and 1 should be gone, 2 stays.
-    w.mark_uploaded(s1).await.unwrap();
+    // Release [0, 1] — segments 0 and 1 should be gone, 2 stays.
+    w.mark_uploaded(s0, s1).await.unwrap();
     let records: Vec<Vec<u8>> = w.replay().unwrap().collect::<Result<_, _>>().unwrap();
     assert_eq!(records, vec![b"seg2-record".to_vec()]);
+}
+
+/// The whole point of range-based release: a block that owns segments
+/// `[2, 2]` must not take out segments 0–1, which belong to an earlier
+/// block whose upload failed. A cumulative `≤`-release would delete all
+/// three and destroy records that exist nowhere else.
+#[tokio::test]
+async fn release_leaves_segments_below_the_range_intact() {
+    let tmp = TempDir::new().unwrap();
+    let mut w = Wal::open(cfg(&tmp, 1024 * 1024)).await.unwrap();
+    w.append(b"failed-block-seg0").await.unwrap();
+    let _s0 = w.rotate().await.unwrap();
+    w.append(b"failed-block-seg1").await.unwrap();
+    let _s1 = w.rotate().await.unwrap();
+    w.append(b"uploaded-block-seg2").await.unwrap();
+    let s2 = w.rotate().await.unwrap();
+    assert_eq!(s2, SegmentId(2));
+
+    // Only the successfully-uploaded block's own range goes.
+    w.mark_uploaded(s2, s2).await.unwrap();
+
+    let records: Vec<Vec<u8>> = w.replay().unwrap().collect::<Result<_, _>>().unwrap();
+    assert_eq!(
+        records,
+        vec![b"failed-block-seg0".to_vec(), b"failed-block-seg1".to_vec()],
+        "the failed block's segments must survive for replay"
+    );
+}
+
+/// Releasing the same range twice (a retried release, or a duplicate
+/// call) is a no-op rather than an error.
+#[tokio::test]
+async fn release_is_idempotent() {
+    let tmp = TempDir::new().unwrap();
+    let mut w = Wal::open(cfg(&tmp, 1024 * 1024)).await.unwrap();
+    w.append(b"seg0").await.unwrap();
+    let s0 = w.rotate().await.unwrap();
+    w.append(b"seg1").await.unwrap();
+    let _s1 = w.rotate().await.unwrap();
+
+    w.mark_uploaded(s0, s0).await.unwrap();
+    w.mark_uploaded(s0, s0).await.unwrap();
+
+    let records: Vec<Vec<u8>> = w.replay().unwrap().collect::<Result<_, _>>().unwrap();
+    assert_eq!(records, vec![b"seg1".to_vec()]);
 }
 
 #[tokio::test]
@@ -74,7 +119,7 @@ async fn mark_uploaded_refuses_active_segment() {
     let mut w = Wal::open(cfg(&tmp, 1024 * 1024)).await.unwrap();
     w.append(b"x").await.unwrap();
     let active = w.current_segment();
-    let err = w.mark_uploaded(active).await.unwrap_err();
+    let err = w.mark_uploaded(active, active).await.unwrap_err();
     assert!(
         err.to_string().contains("active segment"),
         "expected refusal mentioning the active segment, got: {err}"

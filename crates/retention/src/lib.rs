@@ -14,6 +14,10 @@
 //! - **Whole-block criterion.** A block is reaped only when its *newest*
 //!   record (`ts_max_unix_nano`) is past the TTL, so a block still holding
 //!   in-window data is never dropped.
+//! - **Durable grace.** The window between soft-deleting a block and
+//!   removing its objects is a persisted `delete_eligible_at` deadline,
+//!   not an in-process sleep, so an interrupted pass leaves recoverable
+//!   pending work instead of a stranded row and leaked objects.
 //!
 //! This crate is the engine plus a thin CLI (`src/main.rs`). The standalone
 //! [`retain_once`](engine::retain_once) entry point is single-instance (one
@@ -31,9 +35,10 @@
 pub mod engine;
 pub mod policy;
 
-pub use engine::{retain_once, retain_planned, RetentionReport};
+pub use engine::{reap_pending_deletions, retain_once, retain_planned, RetentionReport};
 pub use policy::{plan_reaping, RetentionConfig};
 
+use scry_duration::parse_duration;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -97,30 +102,6 @@ pub struct Args {
     pub interval: u64,
 }
 
-/// Tiny duration parser: integer + suffix (`ms`/`s`/`m`/`h`/`d`; bare
-/// number = seconds). Mirrors `noise-spewer`'s parser, plus `d` for days
-/// (the natural unit for retention TTLs).
-fn parse_duration(s: &str) -> Result<Duration, String> {
-    let s = s.trim();
-    let (num, unit) = s
-        .find(|c: char| c.is_alphabetic())
-        .map(|i| (&s[..i], &s[i..]))
-        .unwrap_or((s, "s"));
-    let n: u64 = num
-        .trim()
-        .parse()
-        .map_err(|_| format!("bad number in {s:?}"))?;
-    let dur = match unit.trim() {
-        "ms" => Duration::from_millis(n),
-        "s" | "" => Duration::from_secs(n),
-        "m" => Duration::from_secs(n * 60),
-        "h" => Duration::from_secs(n * 3600),
-        "d" => Duration::from_secs(n * 86_400),
-        other => return Err(format!("unknown duration unit {other:?}")),
-    };
-    Ok(dur)
-}
-
 /// Run the standalone (single-instance) retention tool: one pass, or a
 /// `--watch` loop. Dry-run unless `--apply`.
 pub async fn run(args: Args) -> Result<()> {
@@ -155,7 +136,7 @@ pub async fn run(args: Args) -> Result<()> {
     let obj_cfg = ObjStoreConfig::from_env()
         .context("loading SCRY_OBJSTORE_* env (try `source docker/garage/.env`)")?;
     let bucket = obj_cfg.bucket.clone();
-    let store = open_objstore(&obj_cfg)?;
+    let store = open_objstore(&obj_cfg).await?;
 
     let catalog = Catalog::open(&args.catalog, &bucket)
         .with_context(|| format!("opening catalog at {}", args.catalog.display()))?;
@@ -211,25 +192,43 @@ async fn run_pass(
         .as_nanos() as u64;
     let report = retain_once(store.clone(), catalog, cfg, now_unix_nano).await?;
 
-    let verb = if report.dry_run {
-        "would reap"
-    } else {
-        "reaped"
-    };
-    if report.reaped == 0 {
+    // A dry-run only ever produces candidates; an apply reports what was
+    // actually removed (`reaped`) separately from what is waiting out its
+    // grace window (`staged`), so the log never claims a deletion that
+    // hasn't happened.
+    if report.dry_run {
+        if report.candidates == 0 {
+            tracing::info!(scanned = report.scanned, "nothing to reap this pass");
+        } else {
+            tracing::info!(
+                scanned = report.scanned,
+                candidates = report.candidates,
+                bytes = report.bytes_candidates,
+                "retention pass complete (dry-run): would reap {} block(s), {} bytes",
+                report.candidates,
+                report.bytes_candidates
+            );
+        }
+        return Ok(());
+    }
+
+    if report.reaped == 0 && report.staged == 0 && report.reap_failed == 0 {
         tracing::info!(scanned = report.scanned, "nothing to reap this pass");
     } else {
         tracing::info!(
             scanned = report.scanned,
+            candidates = report.candidates,
+            staged = report.staged,
             reaped = report.reaped,
             bytes = report.bytes_reaped,
-            dry_run = report.dry_run,
-            "retention pass complete: {verb} {} block(s), {} bytes",
+            reap_failed = report.reap_failed,
+            "retention pass complete: reaped {} block(s), {} bytes; {} staged for later",
             report.reaped,
-            report.bytes_reaped
+            report.bytes_reaped,
+            report.staged
         );
         for (signal, (count, bytes)) in &report.by_signal {
-            tracing::info!(%signal, count, bytes, "  per-signal: {verb} {count} block(s)");
+            tracing::info!(%signal, count, bytes, "  per-signal: reaped {count} block(s)");
         }
     }
     Ok(())

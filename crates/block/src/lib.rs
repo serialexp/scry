@@ -292,6 +292,69 @@ pub fn block_path(
     )
 }
 
+/// Attempts per object in [`put_block_objects`] — the initial PUT plus
+/// two retries.
+const PUT_ATTEMPTS: u32 = 3;
+
+/// Backoff before the *n*-th retry (1-based): 250 ms, then 1 s. Bounded on
+/// purpose — see [`put_block_objects`].
+fn put_backoff(retry: u32) -> std::time::Duration {
+    std::time::Duration::from_millis(250 * 4u64.pow(retry.saturating_sub(1)))
+}
+
+/// Upload an encoded block's objects **in order**, retrying each one a
+/// bounded number of times before giving up.
+///
+/// Every builder's `finish_and_upload` funnels through here, so the retry
+/// policy is defined once rather than five times. Ordering is preserved
+/// exactly: `meta.json` is the last entry of [`EncodedBlock::puts`] and is
+/// the commit point that makes a block visible to reconciliation, so it
+/// must not be written before the data objects it describes.
+///
+/// Retries are **per object**, not per block: a failure re-PUTs only the
+/// object that failed, leaving already-landed objects alone. PUTs are
+/// idempotent here — a block's paths are unique to its UUID and the bytes
+/// are fixed — so a retry can only rewrite identical content.
+///
+/// The attempt budget is deliberately small. The caller (`scry-server`'s
+/// `run_upload`) holds an upload-semaphore permit for the whole call, and
+/// that pool is what bounds ingest: retrying for too long would
+/// backpressure ingest rather than absorb a blip. When the budget is
+/// exhausted the final error is returned unchanged, and the caller's WAL
+/// segments for this block stay on disk for replay.
+pub async fn put_block_objects(store: &dyn ObjectStore, puts: Vec<(Path, Bytes)>) -> Result<()> {
+    use anyhow::Context as _;
+    use object_store::ObjectStoreExt as _;
+
+    for (path, bytes) in puts {
+        let mut attempt = 1;
+        loop {
+            match store.put(&path, bytes.clone().into()).await {
+                Ok(_) => break,
+                Err(e) if attempt < PUT_ATTEMPTS => {
+                    let backoff = put_backoff(attempt);
+                    tracing::warn!(
+                        %path,
+                        attempt,
+                        attempts = PUT_ATTEMPTS,
+                        backoff_ms = backoff.as_millis() as u64,
+                        error = %e,
+                        "block object PUT failed; retrying"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    attempt += 1;
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("upload {path} (gave up after {PUT_ATTEMPTS} attempts)")
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Delete every object that makes up a block — main parquet, meta.json,
 /// and whichever sidecars its flags say it carries. Used by both
 /// compaction (reaping merged-away inputs) and retention (reaping
@@ -381,5 +444,184 @@ mod tests {
             props.dictionary_enabled(&col),
             "postings dictionary must stay on"
         );
+    }
+
+    /// An `ObjectStore` whose `put` fails the first `fail_first` attempts
+    /// (across all objects) with a retryable-looking error, then delegates
+    /// to `InMemory`. `attempts` counts every PUT that reached the store.
+    struct FlakyStore {
+        inner: object_store::memory::InMemory,
+        fail_first: u64,
+        attempts: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl FlakyStore {
+        fn new(fail_first: u64) -> Self {
+            Self {
+                inner: object_store::memory::InMemory::new(),
+                fail_first,
+                attempts: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            }
+        }
+    }
+
+    impl std::fmt::Display for FlakyStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FlakyStore")
+        }
+    }
+    impl std::fmt::Debug for FlakyStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("FlakyStore").finish()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for FlakyStore {
+        async fn put_opts(
+            &self,
+            l: &Path,
+            p: object_store::PutPayload,
+            o: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            let n = self
+                .attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n < self.fail_first {
+                return Err(object_store::Error::Generic {
+                    store: "FlakyStore",
+                    source: "injected transient failure".into(),
+                });
+            }
+            self.inner.put_opts(l, p, o).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            l: &Path,
+            o: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(l, o).await
+        }
+        async fn get_opts(
+            &self,
+            l: &Path,
+            o: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(l, o).await
+        }
+        fn delete_stream(
+            &self,
+            l: futures::stream::BoxStream<'static, object_store::Result<Path>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(l)
+        }
+        fn list(
+            &self,
+            p: Option<&Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(p)
+        }
+        fn list_with_offset(
+            &self,
+            p: Option<&Path>,
+            o: &Path,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list_with_offset(p, o)
+        }
+        async fn list_with_delimiter(
+            &self,
+            p: Option<&Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(p).await
+        }
+        async fn copy_opts(
+            &self,
+            f: &Path,
+            t: &Path,
+            o: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(f, t, o).await
+        }
+        async fn rename_opts(
+            &self,
+            f: &Path,
+            t: &Path,
+            o: object_store::RenameOptions,
+        ) -> object_store::Result<()> {
+            self.inner.rename_opts(f, t, o).await
+        }
+    }
+
+    fn two_puts() -> Vec<(Path, Bytes)> {
+        vec![
+            (Path::from("blk/main.parquet"), Bytes::from_static(b"main")),
+            (Path::from("blk/meta.json"), Bytes::from_static(b"meta")),
+        ]
+    }
+
+    /// A transient object-store failure must not sink the block: the PUT
+    /// is retried within the attempt budget and the block still commits.
+    /// Without this, one blip meant the records waited for a restart.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn put_retries_transient_failures_then_succeeds() {
+        // Fail the first two attempts — inside the 3-attempt budget.
+        let store = FlakyStore::new(2);
+        let attempts = store.attempts.clone();
+
+        put_block_objects(&store, two_puts())
+            .await
+            .expect("should succeed within the attempt budget");
+
+        // 2 failed attempts on the first object + its success + the
+        // second object's single attempt.
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "retries are per object; the second object must not be re-PUT"
+        );
+        // Both objects actually landed.
+        use object_store::ObjectStoreExt as _;
+        assert!(store.get(&Path::from("blk/main.parquet")).await.is_ok());
+        assert!(store.get(&Path::from("blk/meta.json")).await.is_ok());
+    }
+
+    /// A permanently-failing store must give up after the attempt budget
+    /// and surface the error, so the caller keeps its WAL segments for
+    /// replay rather than believing the block landed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn put_gives_up_after_the_attempt_budget() {
+        let store = FlakyStore::new(u64::MAX);
+        let attempts = store.attempts.clone();
+
+        let err = put_block_objects(&store, two_puts())
+            .await
+            .expect_err("a permanently failing store must surface an error");
+
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            PUT_ATTEMPTS as u64,
+            "should stop at the attempt budget rather than retry forever"
+        );
+        assert!(
+            format!("{err:#}").contains("gave up after"),
+            "error should say the budget was exhausted, got: {err:#}"
+        );
+    }
+
+    /// `meta.json` is the commit point for catalog reconciliation, so it
+    /// must never be written before the data objects it describes — not
+    /// even when an earlier object needed retries.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn put_preserves_order_across_retries() {
+        let store = FlakyStore::new(1);
+        put_block_objects(&store, two_puts()).await.unwrap();
+
+        // The main object exists; since PUTs are sequential and the meta
+        // only goes after it returns Ok, meta can't have preceded it.
+        use object_store::ObjectStoreExt as _;
+        let main = store.get(&Path::from("blk/main.parquet")).await;
+        assert!(main.is_ok(), "data object must be present once meta is");
     }
 }

@@ -33,7 +33,7 @@ use arrow::array::{ArrayRef, BinaryArray, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
-use object_store::{path::Path, ObjectStore, ObjectStoreExt};
+use object_store::{path::Path, ObjectStore};
 use parquet::arrow::ArrowWriter;
 use scry_proto::streaming::DummyAppender;
 use uuid::Uuid;
@@ -216,12 +216,7 @@ impl DummyBlockBuilder {
         let enc = tokio::task::spawn_blocking(move || self.encode())
             .await
             .context("join dummy encode task")??;
-        for (path, bytes) in enc.puts {
-            store
-                .put(&path, bytes.into())
-                .await
-                .with_context(|| format!("upload {path}"))?;
-        }
+        crate::put_block_objects(store, enc.puts).await?;
         let meta = enc.meta;
         tracing::info!(
             block_uuid = %meta.uuid,

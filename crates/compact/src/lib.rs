@@ -29,9 +29,14 @@ pub mod engine;
 pub mod merge;
 pub mod policy;
 
-pub use engine::{compact_once, compact_partition, reap_pending, CompactReport, PartitionOutcome};
+pub use engine::{
+    compact_once, compact_partition, reap_pending, warn_oversized, CompactReport, PartitionOutcome,
+};
 pub use merge::merge_blocks;
-pub use policy::{plan_merges, CompactConfig, PlannedMerge};
+pub use policy::{
+    plan_merges, projected_ancestry_len, validate_against_catalog, CompactConfig, CompactionPlan,
+    OversizedPartition, PlannedMerge,
+};
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -92,7 +97,7 @@ pub async fn run(args: Args) -> Result<()> {
     let obj_cfg = ObjStoreConfig::from_env()
         .context("loading SCRY_OBJSTORE_* env (try `source docker/garage/.env`)")?;
     let bucket = obj_cfg.bucket.clone();
-    let store = open_objstore(&obj_cfg)?;
+    let store = open_objstore(&obj_cfg).await?;
 
     let catalog = Catalog::open(&args.catalog, &bucket)
         .with_context(|| format!("opening catalog at {}", args.catalog.display()))?;
@@ -112,7 +117,27 @@ pub async fn run(args: Args) -> Result<()> {
     // so the tool works against a shared bucket with no online catalog.
     if !args.no_reconcile {
         reconcile(&catalog, &store).await?;
+        // `reconcile_from_bucket` applies lineage — a merge that committed
+        // its `meta.json` and then crashed leaves its inputs correctly marked
+        // superseded, so queries already read the merged block. But it does
+        // not stage them for physical cleanup, and `list_pending_reaps`
+        // requires `reap_eligible_at IS NOT NULL`: without this the recovered
+        // inputs' objects are invisible to every reaper and leak forever.
+        //
+        // The multi-instance path stages inside `reconcile_partition` /
+        // `full_walk`; the standalone CLI is the one flow that had no
+        // equivalent. Staged here rather than inside `reconcile_from_bucket`
+        // so read-only tools (`scry list`, `scry get`) don't schedule
+        // deletions as a side effect of looking at the bucket.
+        stage_recovered_reaps(&catalog, compact_cfg.grace)?;
     }
+
+    // `CompactConfig::validate` above only proves a *uniform* tree fits. Now
+    // that the catalog reflects the bucket, check the blocks that actually
+    // exist — a fanout changed between runs can leave partitions that can
+    // never compact again, and the operator should hear that at startup, not
+    // infer it from a partition that quietly stops shrinking.
+    report_stuck_partitions(&catalog, &compact_cfg)?;
 
     if args.watch {
         tracing::info!(
@@ -134,6 +159,53 @@ pub async fn run(args: Args) -> Result<()> {
         run_pass(&store, &catalog, &bucket, &compact_cfg, &block_cfg).await?;
     }
 
+    Ok(())
+}
+
+/// Give lineage-superseded rows learned from bucket reconciliation the same
+/// `reap_eligible_at` a `Superseded` event would have, so the pass's existing
+/// `list_pending_reaps` can clean up after an interrupted merge.
+///
+/// Idempotent (`COALESCE` — an already-staged row keeps its deadline), so
+/// running it every invocation is safe.
+fn stage_recovered_reaps(catalog: &Catalog, grace: Duration) -> Result<()> {
+    let eligible = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        + grace)
+        .as_nanos() as u64;
+    let staged = catalog
+        .stage_unstaged_superseded(eligible)
+        .context("stage reconciled superseded rows for reaping")?;
+    if staged > 0 {
+        tracing::info!(
+            staged,
+            grace_secs = grace.as_secs(),
+            "staged superseded blocks recovered from the bucket for cleanup"
+        );
+    }
+    Ok(())
+}
+
+/// Startup check: warn about partitions whose next merge cannot encode its
+/// ancestry under the configured policy. Deliberately **not** fatal — the
+/// other partitions still compact fine, and refusing to start would turn a
+/// localized stall into a total outage of compaction.
+fn report_stuck_partitions(catalog: &Catalog, cfg: &CompactConfig) -> Result<()> {
+    let live = catalog.list_blocks().context("list live blocks")?;
+    let stuck = policy::validate_against_catalog(&live, cfg);
+    if stuck.is_empty() {
+        return Ok(());
+    }
+    tracing::warn!(
+        partitions = stuck.len(),
+        fanout = cfg.fanout,
+        max_level = cfg.max_level,
+        limit = scry_block::MAX_COMPACTED_ANCESTORS,
+        "existing blocks cannot compact under this policy; they will be skipped every pass \
+         (were they built with a different --fanout?)"
+    );
+    warn_oversized(&stuck);
     Ok(())
 }
 
@@ -161,13 +233,14 @@ async fn run_pass(
 ) -> Result<()> {
     let report = compact_once(store.clone(), catalog, bucket, compact_cfg, block_cfg).await?;
     if report.merges == 0 {
-        tracing::info!("nothing to compact this pass");
+        tracing::info!(oversized = report.oversized, "nothing to compact this pass");
     } else {
         tracing::info!(
             merges = report.merges,
             blocks_in = report.blocks_in,
             blocks_out = report.blocks_out,
             bytes_out = report.bytes_out,
+            oversized = report.oversized,
             "compaction pass complete"
         );
     }

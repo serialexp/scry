@@ -316,6 +316,7 @@ async fn lease_holder_reconciles_prior_committed_output_before_remerging_inputs(
             signal_filter: Some("logs".into()),
         },
     )
+    .merges
     .pop()
     .unwrap();
     let committed = scry_compact::merge_blocks(
@@ -545,4 +546,102 @@ async fn retention_pass_defers_to_the_global_lease() {
         catalog.get_block(old.uuid).unwrap().is_none(),
         "aged block reaped"
     );
+}
+
+/// A peer told that blocks were *staged* for deletion must hide them from
+/// queries straight away, while their objects are still in the bucket.
+///
+/// This is what gives peers the same grace window the retention owner gives
+/// itself. Without it, a peer keeps planning queries against these blocks right
+/// up until the objects vanish, and every such query 404s and has to self-heal.
+#[test]
+fn soft_deleted_apply_hides_rows_for_the_owners_grace_window() {
+    let (catalog, _tmp) = open_catalog();
+    let writer = Uuid::now_v7();
+    let a = fake_meta("logs", writer, NOW);
+    let b = fake_meta("logs", writer, NOW + 1);
+    apply_event(&catalog, &BlockEvent::Created { meta: a.clone() }).unwrap();
+    apply_event(&catalog, &BlockEvent::Created { meta: b.clone() }).unwrap();
+    assert_eq!(catalog.list_blocks().unwrap().len(), 2);
+
+    const GRACE: u64 = 600 * 1_000_000_000;
+    let soft = BlockEvent::SoftDeleted {
+        signal: "logs".into(),
+        uuids: vec![a.uuid, b.uuid],
+        deleted_at_unix_nano: NOW,
+        delete_eligible_at_unix_nano: NOW + GRACE,
+    };
+    let outcome = apply_event(&catalog, &soft).unwrap();
+    assert_eq!(outcome.soft_deleted, 2);
+
+    // Hidden from queries immediately …
+    assert!(
+        catalog.list_blocks().unwrap().is_empty(),
+        "a peer must stop planning against staged blocks at once"
+    );
+    // … but the rows survive, carrying the owner's deadline.
+    assert!(catalog.get_block(a.uuid).unwrap().is_some());
+    assert!(
+        catalog
+            .list_pending_deletions(NOW + GRACE - 1)
+            .unwrap()
+            .is_empty(),
+        "not eligible before the owner's deadline"
+    );
+    assert_eq!(
+        catalog.list_pending_deletions(NOW + GRACE).unwrap().len(),
+        2,
+        "eligible exactly at the deadline"
+    );
+
+    // Duplicated / reordered delivery is a no-op, and an event carrying an
+    // *earlier* deadline must never shorten the window already recorded.
+    apply_event(&catalog, &soft).unwrap();
+    apply_event(
+        &catalog,
+        &BlockEvent::SoftDeleted {
+            signal: "logs".into(),
+            uuids: vec![a.uuid, b.uuid],
+            deleted_at_unix_nano: NOW - 10,
+            delete_eligible_at_unix_nano: NOW + 1,
+        },
+    )
+    .unwrap();
+    assert!(
+        catalog
+            .list_pending_deletions(NOW + GRACE - 1)
+            .unwrap()
+            .is_empty(),
+        "a late/earlier event must not shorten the grace window"
+    );
+
+    // The hard delete still lands normally afterwards.
+    apply_event(
+        &catalog,
+        &BlockEvent::Deleted {
+            signal: "logs".into(),
+            uuids: vec![a.uuid, b.uuid],
+        },
+    )
+    .unwrap();
+    assert_eq!(catalog.block_count().unwrap(), 0);
+}
+
+/// A `SoftDeleted` for blocks this peer has never seen is a no-op, not an
+/// error — events are reordered and peers converge at different rates.
+#[test]
+fn soft_deleted_apply_tolerates_unknown_blocks() {
+    let (catalog, _tmp) = open_catalog();
+    let outcome = apply_event(
+        &catalog,
+        &BlockEvent::SoftDeleted {
+            signal: "logs".into(),
+            uuids: vec![Uuid::now_v7()],
+            deleted_at_unix_nano: NOW,
+            delete_eligible_at_unix_nano: NOW + 1,
+        },
+    )
+    .unwrap();
+    assert_eq!(outcome.soft_deleted, 1, "intent is reported");
+    assert_eq!(catalog.block_count().unwrap(), 0);
 }

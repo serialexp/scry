@@ -23,6 +23,7 @@ members = [
     "crates/valkey",
     "crates/scry-webui",
     "crates/tail",
+    "crates/duration",
     "crates/httpsig",
     "crates/replay-opensearch",
     "crates/scry",
@@ -62,6 +63,7 @@ aws-sigv4              = { version = "1", default-features = false, features = [
 binschema-runtime = { path = "crates/binschema-runtime" }
 scry-proto        = { path = "crates/proto" }
 scry-match        = { path = "crates/match" }
+scry-duration     = { path = "crates/duration" }
 scry-objstore     = { path = "crates/objstore" }
 scry-wal          = { path = "crates/wal" }
 scry-block        = { path = "crates/block" }

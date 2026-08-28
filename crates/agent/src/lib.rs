@@ -5,6 +5,7 @@
 //! binschema wire to a scry ingest server. Logs only, ingest only — the
 //! first dogfood signal.
 
+use scry_duration::parse_duration;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -942,21 +943,6 @@ fn hostname_string() -> String {
                 .map(|s| s.trim().to_string())
         })
         .unwrap_or_else(|| "unknown".into())
-}
-
-fn parse_duration(s: &str) -> Result<Duration, String> {
-    let s = s.trim();
-    let (num, mult) = if let Some(v) = s.strip_suffix("ms") {
-        (v, 1u64)
-    } else if let Some(v) = s.strip_suffix('s') {
-        (v, 1000)
-    } else if let Some(v) = s.strip_suffix('m') {
-        (v, 60_000)
-    } else {
-        (s, 1000)
-    };
-    let base: u64 = num.parse().map_err(|_| format!("invalid duration: {s}"))?;
-    Ok(Duration::from_millis(base * mult))
 }
 
 /// Resolve a `--scrape-bearer` argument: a literal token, or `@/path` to read

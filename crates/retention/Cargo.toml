@@ -13,6 +13,7 @@ path = "src/lib.rs"
 anyhow             = { workspace = true }
 clap               = { workspace = true }
 object_store       = { workspace = true }
+scry-duration         = { workspace = true }
 scry-block         = { workspace = true }
 scry-catalog       = { workspace = true }
 scry-objstore      = { workspace = true }

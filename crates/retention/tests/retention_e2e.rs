@@ -29,7 +29,7 @@ use scry_block::{
 use scry_catalog::Catalog;
 use scry_proto::streaming::{LogsAppender, MetricsAppender};
 use scry_query::{register_logs_table, Query, LOGS_TABLE_NAME};
-use scry_retention::{plan_reaping, retain_once, retain_planned, RetentionConfig};
+use scry_retention::{plan_reaping, retain_once, retain_planned, RetentionConfig, RetentionReport};
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -195,11 +195,11 @@ async fn logs_retention_dry_run_then_apply() {
         .await
         .unwrap();
     assert!(dry.dry_run);
-    assert_eq!(dry.reaped, 1, "only the aged logs block is a candidate");
-    assert_eq!(
-        dry.by_signal.get("logs").copied(),
-        Some((1, m_old.byte_size))
-    );
+    assert_eq!(dry.candidates, 1, "only the aged logs block is a candidate");
+    assert_eq!(dry.bytes_candidates, m_old.byte_size);
+    assert_eq!(dry.reaped, 0, "a dry-run deletes nothing");
+    assert_eq!(dry.staged, 0, "a dry-run stages nothing");
+    assert!(dry.by_signal.is_empty(), "by_signal tracks actual reaps");
     assert_eq!(
         catalog.list_blocks().unwrap().len(),
         3,
@@ -215,7 +215,13 @@ async fn logs_retention_dry_run_then_apply() {
         .await
         .unwrap();
     assert!(!applied.dry_run);
-    assert_eq!(applied.reaped, 1);
+    assert_eq!(applied.candidates, 1);
+    assert_eq!(applied.reaped, 1, "grace 0 reaps within the same pass");
+    assert_eq!(applied.bytes_reaped, m_old.byte_size);
+    assert_eq!(
+        applied.by_signal.get("logs").copied(),
+        Some((1, m_old.byte_size))
+    );
 
     // Old block: row dropped + objects gone.
     assert!(catalog.get_block(m_old.uuid).unwrap().is_none());
@@ -285,6 +291,7 @@ async fn retention_aborts_under_a_lost_lease_leaving_blocks_intact() {
     assert_eq!(expired.len(), 1, "block is a reaping candidate");
 
     // But the lease is lost → retain_planned must abort and touch nothing.
+    let mut report = RetentionReport::default();
     let aborted = retain_planned(
         &expired,
         store.clone(),
@@ -293,10 +300,13 @@ async fn retention_aborts_under_a_lost_lease_leaving_blocks_intact() {
         NOW,
         &LostFence,
         &NoopSink,
+        &mut report,
     )
     .await
     .unwrap();
     assert!(aborted, "a lost lease aborts the pass");
+    assert_eq!(report.reaped, 0, "an aborted pass deletes nothing");
+    assert_eq!(report.staged, 0, "an aborted pass stages nothing");
 
     // Block survives: row present, objects present.
     assert!(
@@ -306,5 +316,227 @@ async fn retention_aborts_under_a_lost_lease_leaving_blocks_intact() {
     assert!(
         parquet_present(&store, &m_old).await,
         "objects must survive a fenced abort"
+    );
+    // Nothing was staged, so there is no pending work left behind either.
+    assert!(
+        catalog.list_pending_deletions(u64::MAX).unwrap().is_empty(),
+        "an aborted pass must not leave half-staged deletions"
+    );
+}
+
+/// **Leak regression test.**
+///
+/// With a non-zero grace, one pass stages the deletion and a *later* pass
+/// completes it. The staging is durable, so the block is reaped even
+/// though the process that staged it never got to finish the job — which
+/// is exactly what a crash, a restart, or a lost lease during the old
+/// in-process `sleep` looked like. Before this, such a block was stranded
+/// forever: invisible to queries, never re-planned, objects leaked.
+#[tokio::test]
+async fn interrupted_grace_is_recovered_by_a_later_pass() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let writer = Uuid::now_v7();
+
+    let fp_old: u64 = 0xA001;
+    let mut old = LogsBlockBuilder::new(writer, test_cfg());
+    old.observe_stream(fp_old, labels(&[("service", "api")]));
+    logs_entries(&mut old, fp_old, NOW - 90 * DAY, 50);
+    let m_old = old
+        .finish_and_upload(store.as_ref())
+        .await
+        .unwrap()
+        .expect("old block");
+
+    let tmp = TempDir::new().unwrap();
+    let catalog = Catalog::open(&tmp.path().join("cat.sqlite"), BUCKET).unwrap();
+    assert!(catalog.insert_block(&m_old).unwrap());
+
+    const GRACE: u64 = 600 * 1_000_000_000; // 600s, the multi-instance default
+    let mut cfg = ttl_logs(7, true);
+    cfg.grace = Duration::from_nanos(GRACE);
+
+    // ── Pass 1: stages the deletion; nothing is removed yet. ─────────
+    let staged = retain_once(store.clone(), &catalog, &cfg, NOW)
+        .await
+        .unwrap();
+    assert_eq!(staged.candidates, 1);
+    assert_eq!(staged.staged, 1, "block staged for deletion after grace");
+    assert_eq!(staged.reaped, 0, "nothing reaped inside the grace window");
+
+    // Invisible to queries immediately, but still fully recoverable work.
+    assert!(
+        catalog.list_blocks().unwrap().is_empty(),
+        "a staged block leaves the live set at once"
+    );
+    assert!(
+        parquet_present(&store, &m_old).await,
+        "objects must survive the grace window"
+    );
+    assert_eq!(
+        catalog.list_pending_deletions(NOW + GRACE).unwrap().len(),
+        1,
+        "the deletion is durable pending work, not an in-process timer"
+    );
+
+    // ── The staging process is "lost" here — no sleep to resume, no
+    //    state in memory. A completely fresh pass picks the work up.
+    let recovered = retain_once(store.clone(), &catalog, &cfg, NOW + GRACE + 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        recovered.reaped, 1,
+        "a later pass must finish the interrupted deletion"
+    );
+    assert_eq!(recovered.bytes_reaped, m_old.byte_size);
+    assert_eq!(
+        recovered.by_signal.get("logs").copied(),
+        Some((1, m_old.byte_size))
+    );
+
+    // Objects and row are genuinely gone; no pending work remains.
+    assert!(
+        !parquet_present(&store, &m_old).await,
+        "the block's objects must finally be deleted"
+    );
+    assert!(catalog.get_block(m_old.uuid).unwrap().is_none());
+    assert!(catalog.list_pending_deletions(u64::MAX).unwrap().is_empty());
+}
+
+/// A pass that runs *before* the grace deadline must not reap early — the
+/// window exists so peers and in-flight readers can finish.
+#[tokio::test]
+async fn staged_deletion_is_not_reaped_before_its_deadline() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let writer = Uuid::now_v7();
+
+    let fp_old: u64 = 0xA001;
+    let mut old = LogsBlockBuilder::new(writer, test_cfg());
+    old.observe_stream(fp_old, labels(&[("service", "api")]));
+    logs_entries(&mut old, fp_old, NOW - 90 * DAY, 50);
+    let m_old = old
+        .finish_and_upload(store.as_ref())
+        .await
+        .unwrap()
+        .expect("old block");
+
+    let tmp = TempDir::new().unwrap();
+    let catalog = Catalog::open(&tmp.path().join("cat.sqlite"), BUCKET).unwrap();
+    assert!(catalog.insert_block(&m_old).unwrap());
+
+    const GRACE: u64 = 600 * 1_000_000_000;
+    let mut cfg = ttl_logs(7, true);
+    cfg.grace = Duration::from_nanos(GRACE);
+
+    retain_once(store.clone(), &catalog, &cfg, NOW)
+        .await
+        .unwrap();
+
+    // A pass one nanosecond short of the deadline reaps nothing.
+    let early = retain_once(store.clone(), &catalog, &cfg, NOW + GRACE - 1)
+        .await
+        .unwrap();
+    assert_eq!(early.reaped, 0, "must not reap before the grace deadline");
+    assert!(parquet_present(&store, &m_old).await);
+    assert!(catalog.get_block(m_old.uuid).unwrap().is_some());
+}
+
+/// A [`BlockEventSink`] that records every emitted event for assertion.
+#[derive(Default)]
+struct CapturingSink {
+    events: std::sync::Mutex<Vec<scry_block::BlockEvent>>,
+}
+
+impl scry_block::BlockEventSink for CapturingSink {
+    fn emit(&self, event: scry_block::BlockEvent) {
+        self.events.lock().unwrap().push(event);
+    }
+}
+
+/// Peers must learn about a staged deletion when it is *staged*, not when the
+/// objects are already gone.
+///
+/// Without this event a peer keeps listing the blocks as live for the whole
+/// grace window, then discovers they are missing the hard way: every query it
+/// plans in the gap between the owner's bucket DELETEs and the `Deleted` event
+/// 404s and has to self-heal. Emitting `SoftDeleted` at staging time gives the
+/// peer the same grace window the owner gives itself.
+#[tokio::test]
+async fn staging_announces_the_soft_delete_before_the_objects_go() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let writer = Uuid::now_v7();
+
+    let fp: u64 = 0xA001;
+    let mut old = LogsBlockBuilder::new(writer, test_cfg());
+    old.observe_stream(fp, labels(&[("service", "api")]));
+    logs_entries(&mut old, fp, NOW - 90 * DAY, 50);
+    let m_old = old
+        .finish_and_upload(store.as_ref())
+        .await
+        .unwrap()
+        .expect("old block");
+
+    let tmp = TempDir::new().unwrap();
+    let catalog = Catalog::open(&tmp.path().join("cat.sqlite"), BUCKET).unwrap();
+    assert!(catalog.insert_block(&m_old).unwrap());
+
+    const GRACE: u64 = 600 * 1_000_000_000;
+    let mut cfg = ttl_logs(7, true);
+    cfg.grace = Duration::from_nanos(GRACE);
+
+    let live = catalog.list_blocks().unwrap();
+    let expired = plan_reaping(&live, &cfg, NOW);
+    assert_eq!(expired.len(), 1);
+
+    let sink = CapturingSink::default();
+    let mut report = RetentionReport::default();
+    let aborted = retain_planned(
+        &expired,
+        store.clone(),
+        &catalog,
+        &cfg,
+        NOW,
+        &scry_block::AlwaysValid,
+        &sink,
+        &mut report,
+    )
+    .await
+    .unwrap();
+    assert!(!aborted);
+    assert_eq!(report.staged, 1);
+    assert_eq!(report.reaped, 0, "still inside the grace window");
+
+    // The announcement went out while the objects are still there — that is
+    // the entire point.
+    assert!(
+        parquet_present(&store, &m_old).await,
+        "objects must still exist when peers are told"
+    );
+    let events = sink.events.lock().unwrap().clone();
+    assert_eq!(events.len(), 1, "one event per signal: {events:?}");
+    match &events[0] {
+        scry_block::BlockEvent::SoftDeleted {
+            signal,
+            uuids,
+            deleted_at_unix_nano,
+            delete_eligible_at_unix_nano,
+        } => {
+            assert_eq!(signal, "logs");
+            assert_eq!(uuids, &vec![m_old.uuid]);
+            assert_eq!(*deleted_at_unix_nano, NOW);
+            assert_eq!(
+                *delete_eligible_at_unix_nano,
+                NOW + GRACE,
+                "peers get the owner's deadline, not their own clock"
+            );
+        }
+        other => panic!("expected SoftDeleted, got {other:?}"),
+    }
+
+    // No `Deleted` yet — that only follows the actual bucket DELETEs.
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, scry_block::BlockEvent::Deleted { .. })),
+        "nothing was hard-deleted this pass"
     );
 }

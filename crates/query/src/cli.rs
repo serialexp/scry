@@ -61,6 +61,11 @@ use crate::{
     EvictOnNotFound, Query, QueryRequest, METRICS_TABLE_NAME,
 };
 
+/// How many times a local query will evict 404'd catalog rows and re-plan
+/// before giving up. Matches the daemon's planning-repair budget. Bounded so a
+/// pathologically broken bucket still terminates rather than spinning.
+const MAX_REPLAN_ROUNDS: u8 = 3;
+
 /// CLI arguments for the `scry get` subcommand.
 #[derive(Parser, Debug)]
 #[command(about = "One-shot query against a catalog (local) or a running query daemon (--remote)")]
@@ -389,7 +394,7 @@ pub async fn run(args: Args) -> Result<()> {
     if let Some(v) = args.pool_autoscale_headroom {
         pool_cfg.autoscale_headroom = v;
     }
-    let (store, pool) = open_with_pool_config(&cfg, pool_cfg)?;
+    let (store, pool) = open_with_pool_config(&cfg, pool_cfg).await?;
 
     // Local mode requires `--catalog` (enforced via clap's
     // `required_unless_present = "remote"`).
@@ -421,14 +426,21 @@ pub async fn run(args: Args) -> Result<()> {
     // reaping the same bucket) surfaces as an evict-and-re-plan rather than a
     // hard failure: a `NotFound` during the postings/sidecar GETs in
     // `register_*_table` records the dead block's UUID; if registration fails
-    // with anything recorded we drop those stale catalog rows and re-plan once.
+    // with anything recorded we drop those stale catalog rows and re-plan.
     // (Traces/profiles resolve no sidecar at plan time, so their 404 only
     // appears mid-scan — there the query errors and a re-run heals it.)
+    //
+    // Bounded at [`MAX_REPLAN_ROUNDS`] rather than exactly one: a single round
+    // heals a burst of blocks that 404 *together* (they are evicted as a set),
+    // but not a peer that keeps reaping while we re-plan — a retention pass
+    // deleting a day's expired blocks does exactly that, and one round would
+    // surface it to the user as a hard 404 the very next attempt would have
+    // survived. The daemon path already allows several rounds; this matches it.
     let evict = Arc::new(EvictOnNotFound::new(store));
     let store: Arc<dyn ObjectStore> = evict.clone();
     let table_name = signal.table_name();
     let ctx = {
-        let mut replanned = false;
+        let mut replan_rounds = 0u8;
         loop {
             let ctx = SessionContext::new();
             let reg = match signal.0 {
@@ -444,13 +456,14 @@ pub async fn run(args: Args) -> Result<()> {
                 Ok(()) => break ctx,
                 Err(e) => {
                     let evicted = evict.take_evicted();
-                    if !replanned && !evicted.is_empty() {
-                        replanned = true;
+                    if replan_rounds < MAX_REPLAN_ROUNDS && !evicted.is_empty() {
+                        replan_rounds += 1;
                         catalog
                             .delete_blocks(&evicted)
                             .context("evicting stale catalog rows after 404")?;
                         eprintln!(
-                            "note: evicted {} stale block row(s) after 404; re-planning",
+                            "note: evicted {} stale block row(s) after 404; re-planning \
+                             (round {replan_rounds}/{MAX_REPLAN_ROUNDS})",
                             evicted.len()
                         );
                         continue;

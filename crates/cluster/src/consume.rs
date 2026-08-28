@@ -34,6 +34,8 @@ pub struct ApplyOutcome {
     pub inserted: usize,
     /// Rows transitioned to superseded.
     pub superseded: usize,
+    /// Rows hidden from queries pending their retention grace deadline.
+    pub soft_deleted: usize,
     /// Rows deleted.
     pub deleted: usize,
 }
@@ -115,6 +117,23 @@ pub fn apply_event_with_grace<C: CatalogHandle>(
             // We can't cheaply know how many rows actually transitioned
             // (some inputs may be unknown to this peer); report the intent.
             outcome.superseded = inputs.len();
+        }
+        BlockEvent::SoftDeleted {
+            uuids,
+            deleted_at_unix_nano,
+            delete_eligible_at_unix_nano,
+            ..
+        } => {
+            // Hide the rows locally for the remainder of the owner's grace
+            // window, so this peer stops planning queries against blocks whose
+            // objects are about to disappear. Idempotent, and never shortens an
+            // existing deadline.
+            catalog
+                .with(|c| {
+                    c.mark_deleted(uuids, *deleted_at_unix_nano, *delete_eligible_at_unix_nano)
+                })
+                .context("apply SoftDeleted: mark_deleted")?;
+            outcome.soft_deleted = uuids.len();
         }
         BlockEvent::Deleted { uuids, .. } => {
             catalog

@@ -242,6 +242,21 @@ pub struct Pipeline<B: BlockBuilder> {
     /// [`ShardedPipeline`] from its construction loop; `0` for a standalone
     /// [`Pipeline`] (the sole shard).
     shard_index: u32,
+    /// First WAL segment feeding the currently-open block — the **low**
+    /// bound of the range that block will release once it uploads.
+    ///
+    /// A block can span several segments (`append` auto-rotates when one
+    /// crosses `max_segment_bytes`), so this cannot be derived from the
+    /// sealed segment alone. Uploads run concurrently and fail
+    /// independently: releasing a cumulative `≤ sealed` range would let a
+    /// later block's success unlink an earlier *failed* block's segments,
+    /// destroying acked records that exist nowhere else. Each block
+    /// therefore releases exactly `[block_low_seg, sealed]`.
+    ///
+    /// Starts at 0 (replay merged every on-disk segment's records into the
+    /// builder, so the first successful upload legitimately owns them all)
+    /// and advances to `sealed + 1` on every `spawn_upload`.
+    block_low_seg: u64,
 }
 
 impl<B: BlockBuilder> Pipeline<B> {
@@ -325,6 +340,7 @@ impl<B: BlockBuilder> Pipeline<B> {
             event_sink: None,
             block_started_at,
             shard_index: 0,
+            block_low_seg: 0,
         })
     }
 
@@ -558,6 +574,15 @@ impl<B: BlockBuilder> Pipeline<B> {
             .await
             .context("WAL rotate on spawn_upload")?;
 
+        // The block about to upload owns exactly [block_low_seg, sealed];
+        // everything appended from here lands in the fresh segment and
+        // belongs to the *next* block. Advancing the low bound now (rather
+        // than in the upload task) keeps the ranges of concurrent uploads
+        // disjoint, which is what stops a later success from unlinking an
+        // earlier failure's segments.
+        let low_seg = SegmentId(self.block_low_seg);
+        self.block_low_seg = sealed.0 + 1;
+
         let new_builder = B::new(self.writer_uuid, self.cfg);
         let mut old_builder = std::mem::replace(&mut self.builder, new_builder);
         // The fresh builder is empty: the next record starts a new block.
@@ -595,6 +620,7 @@ impl<B: BlockBuilder> Pipeline<B> {
             let _permit = permit;
             run_upload::<B>(
                 old_builder,
+                low_seg,
                 sealed,
                 store,
                 wal,
@@ -827,6 +853,7 @@ impl<B: BlockBuilder> ShardedPipeline<B> {
 #[allow(clippy::too_many_arguments)]
 async fn run_upload<B: BlockBuilder>(
     builder: B,
+    low_seg: SegmentId,
     sealed: SegmentId,
     store: Arc<dyn ObjectStore>,
     wal: Arc<Mutex<Wal>>,
@@ -842,20 +869,27 @@ async fn run_upload<B: BlockBuilder>(
             if let Some(s) = stats {
                 s.record_success(meta.byte_size, upload_nanos);
             }
-            // WAL release: the sealed segments through `sealed` have
-            // been uploaded; safe to delete. We hold the WAL lock only
-            // to validate + snapshot the signal dir (a comparison + a
-            // PathBuf clone, microseconds), then drop it and do the slow
-            // part — the directory scan and the unlinks — with *no* lock
-            // held. The foreground ingest path takes the WAL lock under
-            // the pipeline mutex on every batch, so unlinking under the
-            // lock would periodically stall all ingest for this signal.
+            // WAL release: the segments in [low_seg, sealed] are exactly
+            // what this block durably contains, so only they are safe to
+            // delete. Concurrently-uploading blocks own disjoint ranges —
+            // a cumulative release here would unlink the segments of an
+            // earlier block whose upload failed, destroying acked records
+            // that exist nowhere else.
+            //
+            // We hold the WAL lock only to validate + snapshot the signal
+            // dir (a comparison + a PathBuf clone, microseconds), then
+            // drop it and do the slow part — the directory scan and the
+            // unlinks — with *no* lock held. The foreground ingest path
+            // takes the WAL lock under the pipeline mutex on every batch,
+            // so unlinking under the lock would periodically stall all
+            // ingest for this signal.
             let release = wal.lock().await.prepare_release(sealed);
             match release {
                 Ok(dir) => {
-                    if let Err(e) = Wal::release_segments(&dir, sealed).await {
+                    if let Err(e) = Wal::release_segments(&dir, low_seg, sealed).await {
                         warn!(
                             signal = B::SIGNAL,
+                            low_seq = low_seg.0,
                             sealed_seq = sealed.0,
                             error = %e,
                             "WAL release_segments after block upload"
@@ -864,6 +898,7 @@ async fn run_upload<B: BlockBuilder>(
                 }
                 Err(e) => warn!(
                     signal = B::SIGNAL,
+                    low_seq = low_seg.0,
                     sealed_seq = sealed.0,
                     error = %e,
                     "WAL prepare_release after block upload"
@@ -908,35 +943,43 @@ async fn run_upload<B: BlockBuilder>(
                 block_uuid = %meta.uuid,
                 row_count = meta.row_count,
                 byte_size = meta.byte_size,
-                "block uploaded; WAL segments through {} released",
+                "block uploaded; WAL segments [{}, {}] released",
+                low_seg.0,
                 sealed.0,
             );
         }
         Ok(None) => {
             // Builder was empty — vanishingly unlikely since
             // spawn_upload checks above, but possible if someone
-            // called flush() under tight races. Leave the sealed WAL
-            // segment in place; replay will pick it up next time.
+            // called flush() under tight races. Leave this block's WAL
+            // range in place; replay will pick it up next time.
             warn!(
                 signal = B::SIGNAL,
-                "upload produced no block; WAL segment retained for replay"
+                low_seq = low_seg.0,
+                sealed_seq = sealed.0,
+                "upload produced no block; WAL segments retained for replay"
             );
         }
         Err(e) => {
             if let Some(s) = stats {
                 s.record_failure();
             }
-            // The upload failed. The sealed WAL segment is *not*
-            // marked uploaded, so a future flush (or next-start
-            // replay) will retry. We don't propagate the error from
-            // the task — failing the task would also be invisible
+            // The upload failed even after the object store retries
+            // inside `finish_and_upload`. This block's records were
+            // already drained out of the live builder, so nothing in
+            // this process will re-upload them: recovery is the WAL
+            // replay on next start. What makes that sound is that we do
+            // *not* release [low_seg, sealed] here, and no other block's
+            // release covers that range. We don't propagate the error
+            // from the task — failing the task would be invisible
             // because the JoinSet entry just records a returned unit.
             // Logging here is the recovery signal.
             warn!(
                 signal = B::SIGNAL,
+                low_seq = low_seg.0,
                 sealed_seq = sealed.0,
                 error = ?e,
-                "block upload failed; WAL segment retained for replay"
+                "block upload failed; WAL segments retained for replay on next start"
             );
         }
     }
@@ -1288,6 +1331,217 @@ mod tests {
                 .await
                 .unwrap(),
             "no block to seal after a flush"
+        );
+    }
+
+    /// An `ObjectStore` whose `put` fails while `failing` is set, then
+    /// delegates to `InMemory`. Lets a test make one block's upload fail
+    /// and a later block's succeed.
+    struct SwitchableStore {
+        inner: InMemory,
+        failing: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl SwitchableStore {
+        fn new() -> Self {
+            Self {
+                inner: InMemory::new(),
+                failing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }
+        }
+    }
+
+    impl std::fmt::Display for SwitchableStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "SwitchableStore")
+        }
+    }
+    impl std::fmt::Debug for SwitchableStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("SwitchableStore").finish()
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for SwitchableStore {
+        async fn put_opts(&self, l: &Path, p: PutPayload, o: PutOptions) -> OsResult<PutResult> {
+            if self.failing.load(Ordering::SeqCst) {
+                return Err(object_store::Error::Generic {
+                    store: "SwitchableStore",
+                    source: "injected upload failure".into(),
+                });
+            }
+            self.inner.put_opts(l, p, o).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            l: &Path,
+            o: PutMultipartOptions,
+        ) -> OsResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(l, o).await
+        }
+        async fn get_opts(&self, l: &Path, o: GetOptions) -> OsResult<GetResult> {
+            self.inner.get_opts(l, o).await
+        }
+        fn delete_stream(
+            &self,
+            l: BoxStream<'static, OsResult<Path>>,
+        ) -> BoxStream<'static, OsResult<Path>> {
+            self.inner.delete_stream(l)
+        }
+        fn list(&self, p: Option<&Path>) -> BoxStream<'static, OsResult<ObjectMeta>> {
+            self.inner.list(p)
+        }
+        fn list_with_offset(
+            &self,
+            p: Option<&Path>,
+            o: &Path,
+        ) -> BoxStream<'static, OsResult<ObjectMeta>> {
+            self.inner.list_with_offset(p, o)
+        }
+        async fn list_with_delimiter(&self, p: Option<&Path>) -> OsResult<ListResult> {
+            self.inner.list_with_delimiter(p).await
+        }
+        async fn copy_opts(&self, f: &Path, t: &Path, o: CopyOptions) -> OsResult<()> {
+            self.inner.copy_opts(f, t, o).await
+        }
+        async fn rename_opts(&self, f: &Path, t: &Path, o: RenameOptions) -> OsResult<()> {
+            self.inner.rename_opts(f, t, o).await
+        }
+    }
+
+    /// Count the WAL segment files currently on disk for the pipeline's
+    /// signal — i.e. what a restart would replay.
+    fn wal_segments(wal_dir: &std::path::Path) -> Vec<String> {
+        let signal_dir = wal_dir.join(DummyBlockBuilder::SIGNAL);
+        let mut names: Vec<String> = std::fs::read_dir(&signal_dir)
+            .expect("signal dir")
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("wal-"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// **Data-loss regression test.**
+    ///
+    /// Block A's upload fails; block B's then succeeds. B must release
+    /// only its own WAL segment. The old cumulative `≤ sealed` release
+    /// deleted every segment up to B's, taking A's with it — so A's
+    /// already-acked records existed in neither the bucket nor the WAL
+    /// and were gone for good.
+    ///
+    /// Asserts A's segment survives (a restart can still replay it) and
+    /// that B's is gone (its records are durable in the bucket).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_upload_keeps_its_wal_segments_when_a_later_block_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SwitchableStore::new();
+        let failing = store.failing.clone();
+        let store: Arc<dyn ObjectStore> = Arc::new(store);
+
+        // Every ingest closes a block.
+        let cfg = BlockBuilderConfig {
+            max_rows: 1,
+            ..Default::default()
+        };
+        let mut pipeline = Pipeline::<DummyBlockBuilder>::open_with_config(
+            tmp.path().to_path_buf(),
+            store.clone(),
+            None,
+            Uuid::now_v7(),
+            append_one,
+            cfg,
+        )
+        .await
+        .unwrap();
+
+        // Block A (WAL segment 0) — upload fails. Drain it before
+        // restoring the store, so A exhausts its retry budget and fails
+        // for good rather than succeeding on a retry.
+        failing.store(true, Ordering::SeqCst);
+        pipeline.ingest(b"block-a").await.unwrap();
+        pipeline.flush().await.unwrap(); // A's failure is logged, not propagated
+
+        // Block B (WAL segment 1) — upload succeeds.
+        failing.store(false, Ordering::SeqCst);
+        pipeline.ingest(b"block-b").await.unwrap();
+        pipeline.flush().await.unwrap();
+
+        let segments = wal_segments(tmp.path());
+        assert!(
+            segments.contains(&"wal-00000000000000000000.log".to_string()),
+            "the failed block's WAL segment must survive for replay, found: {segments:?}"
+        );
+        assert!(
+            !segments.contains(&"wal-00000000000000000001.log".to_string()),
+            "the successful block's segment should have been released, found: {segments:?}"
+        );
+
+        // And the surviving segment really does still hold A's records.
+        let replayed: Vec<Vec<u8>> = {
+            let wal = pipeline.wal.lock().await;
+            wal.replay().unwrap().collect::<Result<_, _>>().unwrap()
+        };
+        assert!(
+            replayed.iter().any(|r| r == b"block-a"),
+            "the failed block's records must be replayable"
+        );
+        assert!(
+            !replayed.iter().any(|r| r == b"block-b"),
+            "the uploaded block's records should not be replayed again"
+        );
+    }
+
+    /// A block spanning several WAL segments (the segment cap tripped
+    /// mid-block) releases the whole range it owns, not just the final
+    /// sealed segment — otherwise the earlier segments would leak and be
+    /// replayed forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn successful_upload_releases_every_segment_the_block_spans() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        // Big row cap so the block does NOT close on size — the block
+        // stays open across several WAL segments.
+        let cfg = BlockBuilderConfig {
+            max_rows: 1_000_000,
+            ..Default::default()
+        };
+        let mut pipeline = Pipeline::<DummyBlockBuilder>::open_with_config(
+            tmp.path().to_path_buf(),
+            store,
+            None,
+            Uuid::now_v7(),
+            append_one,
+            cfg,
+        )
+        .await
+        .unwrap();
+
+        // Roll the WAL between appends, exactly as `append`'s size-cap
+        // auto-rotation does mid-block. All three records still feed the
+        // same open block, so it spans segments 0..2.
+        pipeline.ingest(b"record-one").await.unwrap();
+        pipeline.wal.lock().await.rotate().await.unwrap();
+        pipeline.ingest(b"record-two").await.unwrap();
+        pipeline.wal.lock().await.rotate().await.unwrap();
+        pipeline.ingest(b"record-three").await.unwrap();
+        assert!(
+            wal_segments(tmp.path()).len() > 1,
+            "test setup: should have rolled multiple segments"
+        );
+
+        // Seal + upload the single block spanning all those segments.
+        pipeline.flush().await.unwrap();
+
+        let replayed: Vec<Vec<u8>> = {
+            let wal = pipeline.wal.lock().await;
+            wal.replay().unwrap().collect::<Result<_, _>>().unwrap()
+        };
+        assert!(
+            replayed.is_empty(),
+            "every segment the uploaded block spanned should be released, replayable: {replayed:?}"
         );
     }
 }

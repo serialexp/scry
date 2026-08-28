@@ -17,6 +17,7 @@ pub mod pace;
 pub mod stats;
 pub mod wire;
 
+use scry_duration::parse_duration;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -149,26 +150,6 @@ pub struct Args {
     /// HTTP request timeout for OpenSearch calls.
     #[arg(long, value_parser = parse_duration, default_value = "60s")]
     pub os_timeout: Duration,
-}
-
-fn parse_duration(s: &str) -> Result<Duration, String> {
-    let (num, unit) = s
-        .trim()
-        .find(|c: char| c.is_alphabetic())
-        .map(|i| (&s[..i], &s[i..]))
-        .unwrap_or((s, "s"));
-    let n: u64 = num
-        .trim()
-        .parse()
-        .map_err(|_| format!("bad number in {s:?}"))?;
-    let dur = match unit.trim() {
-        "ms" => Duration::from_millis(n),
-        "s" | "" => Duration::from_secs(n),
-        "m" => Duration::from_secs(n * 60),
-        "h" => Duration::from_secs(n * 3600),
-        other => return Err(format!("unknown duration unit {other:?}")),
-    };
-    Ok(dur)
 }
 
 pub async fn run(args: Args) -> Result<()> {

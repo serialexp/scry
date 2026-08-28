@@ -33,7 +33,7 @@ async fn roundtrip_put_get_list_delete() {
         Some(c) => c,
         None => return,
     };
-    let store = open(&cfg).expect("open objstore");
+    let store = open(&cfg).await.expect("open objstore");
 
     // Use a per-test prefix so concurrent runs don't trample each other.
     let prefix = format!("test/roundtrip/{}", uuid_like(std::time::SystemTime::now()));

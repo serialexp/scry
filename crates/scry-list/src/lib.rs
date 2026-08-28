@@ -75,7 +75,7 @@ pub async fn run(args: Args) -> Result<()> {
     // newly-flushed blocks. Never returns; the one-shot listing below is the
     // non-`--interval` path.
     if let Some(secs) = args.interval {
-        let store = open_objstore(&cfg)?;
+        let store = open_objstore(&cfg).await?;
         let period = Duration::from_secs(secs.max(1));
         tracing::info!(
             interval_secs = secs,
@@ -103,7 +103,7 @@ pub async fn run(args: Args) -> Result<()> {
     }
 
     if !args.no_reconcile {
-        let store = open_objstore(&cfg)?;
+        let store = open_objstore(&cfg).await?;
         let report = catalog.reconcile_from_bucket(store.as_ref()).await?;
         eprintln!(
             "reconcile: seen={} inserted={} already_present={} failed={}",

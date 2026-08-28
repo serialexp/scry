@@ -390,6 +390,10 @@ pub struct CompactionPassStats {
     pub partition_failed: u64,
     pub lease_held: u64,
     pub lease_unavailable: u64,
+    /// Partitions the planner declined because the merged output's ancestor
+    /// closure would exceed the sidecar cap. A non-zero value that never
+    /// returns to zero means those partitions will never compact again.
+    pub oversized: u64,
 }
 
 /// Process-global ingest metrics. Record counters are bumped once per *batch*
@@ -434,6 +438,8 @@ pub struct ServerMetrics {
     compaction_partition_failed: AtomicU64,
     compaction_lease_held: AtomicU64,
     compaction_lease_unavailable: AtomicU64,
+    /// Gauge, not a counter: stuck partitions as of the most recent pass.
+    compaction_oversized: AtomicU64,
     compaction_last_pass_unix_ms: AtomicU64,
     compaction_last_pass_duration_ms: AtomicU64,
 }
@@ -477,6 +483,7 @@ impl ServerMetrics {
             compaction_partition_failed: AtomicU64::new(0),
             compaction_lease_held: AtomicU64::new(0),
             compaction_lease_unavailable: AtomicU64::new(0),
+            compaction_oversized: AtomicU64::new(0),
             compaction_last_pass_unix_ms: AtomicU64::new(0),
             compaction_last_pass_duration_ms: AtomicU64::new(0),
         }
@@ -536,6 +543,9 @@ impl ServerMetrics {
             .fetch_add(pass.lease_held, Ordering::Relaxed);
         self.compaction_lease_unavailable
             .fetch_add(pass.lease_unavailable, Ordering::Relaxed);
+        // Replaced, not accumulated — this is "how many are stuck right now".
+        self.compaction_oversized
+            .store(pass.oversized, Ordering::Relaxed);
         self.compaction_last_pass_duration_ms.store(
             u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
@@ -681,6 +691,7 @@ impl ServerMetrics {
                 "partition_failed": self.compaction_partition_failed.load(Ordering::Relaxed),
                 "lease_held": self.compaction_lease_held.load(Ordering::Relaxed),
                 "lease_unavailable": self.compaction_lease_unavailable.load(Ordering::Relaxed),
+                "oversized": self.compaction_oversized.load(Ordering::Relaxed),
                 "last_pass_unix_ms": self.compaction_last_pass_unix_ms.load(Ordering::Acquire),
                 "last_pass_duration_ms": self.compaction_last_pass_duration_ms.load(Ordering::Relaxed),
             },
@@ -1554,6 +1565,7 @@ mod tests {
                 partition_failed: 3,
                 lease_held: 4,
                 lease_unavailable: 5,
+                oversized: 6,
             },
             Duration::from_millis(125),
         );
@@ -1586,6 +1598,9 @@ mod tests {
         assert_eq!(c["partition_failed"], serde_json::json!(3));
         assert_eq!(c["lease_held"], serde_json::json!(4));
         assert_eq!(c["lease_unavailable"], serde_json::json!(5));
+        // A gauge: the second pass reported none stuck, which replaces the 6
+        // from the first pass rather than adding to it.
+        assert_eq!(c["oversized"], serde_json::json!(0));
         assert_eq!(c["last_pass_duration_ms"], serde_json::json!(9));
         assert!(c["last_pass_unix_ms"].as_u64().unwrap() > 0);
     }

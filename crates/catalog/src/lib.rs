@@ -138,6 +138,17 @@ impl Catalog {
         self.add_column_if_missing("blocks", "reap_output_uuid", "TEXT")?;
         self.add_column_if_missing("blocks", "reap_eligible_at", "INTEGER")?;
         self.migrate_blocks_v3()?;
+        // Durable retention grace: the instant a soft-deleted block's
+        // objects may be removed. Previously the grace window was an
+        // in-process sleep, so an interrupted pass stranded the row
+        // (invisible to `list_blocks`, never re-planned) and leaked its
+        // objects forever.
+        //
+        // Added *after* `migrate_blocks_v3`, which rebuilds `blocks` from a
+        // fixed column list and would otherwise drop this column straight
+        // back off a v1 catalog. The migration doesn't reference it, so
+        // there's nothing to carry across.
+        self.add_column_if_missing("blocks", "delete_eligible_at", "INTEGER")?;
 
         // The DDL matches ARCHITECTURE.md § The catalog § Schema with
         // the `buckets` table omitted (one bucket in v0.1) and the
@@ -170,6 +181,10 @@ impl Catalog {
               superseded_by       TEXT,
               superseded          INTEGER NOT NULL DEFAULT 0,
               deleted_at          INTEGER,
+              -- Retention's durable grace deadline, set with `deleted_at`.
+              -- Pending deletion work survives a crash / restart / lost
+              -- lease because it lives here rather than in a sleeping task.
+              delete_eligible_at  INTEGER,
               reap_output_uuid    TEXT,
               reap_eligible_at    INTEGER,
               -- D-054 dedup watermark: highest WAL segment this block
@@ -207,6 +222,10 @@ impl Catalog {
             CREATE INDEX IF NOT EXISTS idx_blocks_pending_reap
               ON blocks(reap_eligible_at)
               WHERE superseded = 1 AND reap_eligible_at IS NOT NULL;
+
+            CREATE INDEX IF NOT EXISTS idx_blocks_pending_deletion
+              ON blocks(delete_eligible_at)
+              WHERE deleted_at IS NOT NULL AND delete_eligible_at IS NOT NULL;
 
             -- Per-(signal, writer, date) high-water mark for incremental
             -- ListObjects polling (ARCHITECTURE.md § Cursor-driven polling).
@@ -897,26 +916,79 @@ impl Catalog {
         Ok(rows)
     }
 
-    /// Soft-delete a set of blocks: stamp `deleted_at` with
-    /// `deleted_at_unix_nano`. Because [`list_blocks`](Self::list_blocks)
+    /// Soft-delete a set of expired blocks and record **when their objects
+    /// become removable**. Because [`list_blocks`](Self::list_blocks)
     /// filters `deleted_at IS NULL`, a marked block drops out of the live
-    /// set immediately — so the retention reaper can mark expired blocks,
-    /// let queries stop listing them, wait an optional grace window, and
-    /// only then delete their objects + rows. At grace 0 this step is
-    /// skipped and [`delete_blocks`](Self::delete_blocks) is called
-    /// directly. Runs in one transaction.
-    pub fn mark_deleted(&self, uuids: &[Uuid], deleted_at_unix_nano: u64) -> Result<()> {
+    /// set immediately, so queries stop listing it while readers that
+    /// already planned against it finish.
+    ///
+    /// Both columns are stamped in one transaction because the grace
+    /// deadline is what makes the soft delete recoverable: a row with
+    /// `deleted_at` but no `delete_eligible_at` is invisible to queries
+    /// *and* to [`list_pending_deletions`](Self::list_pending_deletions),
+    /// i.e. permanently stranded along with its objects. Retention used to
+    /// hold that window in a `sleep`, so any interruption leaked the block;
+    /// now the deadline is durable and the next pass picks the work up.
+    /// This mirrors compaction's `reap_eligible_at` staging.
+    pub fn mark_deleted(
+        &self,
+        uuids: &[Uuid],
+        deleted_at_unix_nano: u64,
+        delete_eligible_at_unix_nano: u64,
+    ) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         {
-            let mut stmt =
-                tx.prepare_cached("UPDATE blocks SET deleted_at = ?1 WHERE uuid = ?2")?;
+            // Keep the later of any existing and the new deadline, so a
+            // re-stage can extend a grace window but never shorten one a
+            // reader is relying on (same `MAX(COALESCE(...))` idiom as
+            // `stage_superseded`).
+            let mut stmt = tx.prepare_cached(
+                "UPDATE blocks SET deleted_at = COALESCE(deleted_at, ?1), \
+                 delete_eligible_at = MAX(COALESCE(delete_eligible_at, ?2), ?2) \
+                 WHERE uuid = ?3",
+            )?;
             for uuid in uuids {
-                stmt.execute(params![deleted_at_unix_nano as i64, uuid.to_string()])
-                    .context("UPDATE deleted_at")?;
+                stmt.execute(params![
+                    deleted_at_unix_nano as i64,
+                    delete_eligible_at_unix_nano.min(i64::MAX as u64) as i64,
+                    uuid.to_string()
+                ])
+                .context("UPDATE deleted_at")?;
             }
         }
         tx.commit().context("commit mark_deleted")?;
         Ok(())
+    }
+
+    /// Soft-deleted blocks whose grace window has elapsed — the durable
+    /// work list retention reaps from. Mirrors
+    /// [`list_pending_reaps`](Self::list_pending_reaps), which does the
+    /// same job for compaction inputs.
+    ///
+    /// This is what makes an interrupted grace recoverable: the rows stay
+    /// here across a crash, a restart, or a lost lease until their objects
+    /// and rows are actually gone.
+    pub fn list_pending_deletions(&self, now_unix_nano: u64) -> Result<Vec<CatalogEntry>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT uuid, bucket, signal, date, writer_id, level,
+                   ts_min, ts_max, row_count, byte_size,
+                   schema_version, fingerprint,
+                   has_postings, postings_size_bytes,
+                   has_body_bloom, body_bloom_size_bytes,
+                   wal_seg_max, wal_shard
+            FROM blocks
+            WHERE deleted_at IS NOT NULL AND delete_eligible_at IS NOT NULL
+              AND delete_eligible_at <= ?1
+            ORDER BY delete_eligible_at, date, uuid
+            "#,
+        )?;
+        let rows = stmt.query_map(
+            params![now_unix_nano.min(i64::MAX as u64) as i64],
+            row_to_entry,
+        )?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("list pending deletions")
     }
 
     /// The highest block UUID this instance has ingested for

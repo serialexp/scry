@@ -45,9 +45,18 @@
 //!     │
 //!   < upload block to object storage >
 //!     │
-//!   mark_uploaded(SegmentId)
-//!     │  → deletes every segment whose seq ≤ given seq
+//!   mark_uploaded(lo, hi)
+//!     │  → deletes the segments in [lo, hi] — the exact range that
+//!     │    fed the uploaded block, never a cumulative ≤-sweep
 //! ```
+//!
+//! Release is deliberately **range-based, not cumulative**. Uploads for
+//! one signal run concurrently and can fail independently: a cumulative
+//! "delete everything ≤ hi" would let a *later* block's successful
+//! release unlink an *earlier* failed block's segments, destroying
+//! already-acknowledged records that exist nowhere else. Each block
+//! releases only the segments it durably contains, so a failed upload's
+//! segments always survive for replay.
 //!
 //! On the next process start, [`Wal::replay`] yields every record from
 //! every undeleted segment in append order. The first frame whose CRC
@@ -222,9 +231,9 @@ impl Wal {
         Ok(SegmentId(sealed_seq))
     }
 
-    /// Delete every segment whose seq is ≤ `up_to`. Refuses to delete
-    /// the active segment (which would lose all subsequent appends
-    /// silently); rotate first.
+    /// Delete the segments in `[lo, hi]` — the range that fed one
+    /// uploaded block. Refuses to delete the active segment (which would
+    /// lose all subsequent appends silently); rotate first.
     ///
     /// Convenience wrapper around [`Wal::prepare_release`] +
     /// [`Wal::release_segments`] that does both steps while holding
@@ -232,17 +241,17 @@ impl Wal {
     /// separately so the slow filesystem work (a `read_dir` plus N
     /// `unlink`s) runs *without* the WAL lock held — see the pipeline's
     /// `run_upload`.
-    pub async fn mark_uploaded(&mut self, up_to: SegmentId) -> Result<()> {
-        let signal_dir = self.prepare_release(up_to)?;
-        Self::release_segments(&signal_dir, up_to).await
+    pub async fn mark_uploaded(&mut self, lo: SegmentId, hi: SegmentId) -> Result<()> {
+        let signal_dir = self.prepare_release(hi)?;
+        Self::release_segments(&signal_dir, lo, hi).await
     }
 
-    /// Validate that `up_to` is a *sealed* (non-active) segment and
-    /// return the signal directory, so the caller can release the
-    /// eligible segments with [`Wal::release_segments`] *without*
-    /// holding the WAL mutex. Cheap: a single comparison plus a
-    /// `PathBuf` clone, so the WAL lock is held only for microseconds
-    /// even on the block-close path.
+    /// Validate that `up_to` — the *upper* bound of a release range — is
+    /// a *sealed* (non-active) segment and return the signal directory,
+    /// so the caller can release the range with
+    /// [`Wal::release_segments`] *without* holding the WAL mutex. Cheap:
+    /// a single comparison plus a `PathBuf` clone, so the WAL lock is
+    /// held only for microseconds even on the block-close path.
     ///
     /// Refuses the active segment (deleting it would silently drop every
     /// subsequent append); rotate first.
@@ -257,8 +266,8 @@ impl Wal {
         Ok(self.signal_dir.clone())
     }
 
-    /// Delete every sealed segment in `signal_dir` whose seq is ≤
-    /// `up_to`. **No WAL lock required**: sealed segments are immutable
+    /// Delete every sealed segment in `signal_dir` whose seq falls in
+    /// `[lo, hi]`. **No WAL lock required**: sealed segments are immutable
     /// and never reopened by `append`/`rotate` (which only ever touch
     /// the active segment, whose seq is strictly greater than any
     /// releasable one — guaranteed by [`Wal::prepare_release`]). Pair it
@@ -266,16 +275,21 @@ impl Wal {
     /// blocks the foreground append path, which takes the WAL lock under
     /// the pipeline mutex.
     ///
-    /// Idempotent: an already-deleted segment is ignored, so two uploads
-    /// finishing out of order (each releasing through its own sealed id,
-    /// with overlapping ≤-ranges) don't race-fail on the overlap.
-    pub async fn release_segments(signal_dir: &Path, up_to: SegmentId) -> Result<()> {
+    /// The range is **exact, never cumulative**: concurrent uploads own
+    /// disjoint ranges, so a block that finishes second cannot unlink the
+    /// segments of a block whose upload failed first. That failed block's
+    /// records are then still on disk for the next replay — the
+    /// difference between a retryable failure and silent data loss.
+    ///
+    /// Idempotent: an already-deleted segment is ignored, so a retried or
+    /// duplicated release is harmless.
+    pub async fn release_segments(signal_dir: &Path, lo: SegmentId, hi: SegmentId) -> Result<()> {
         let mut deleted = 0u64;
         let mut rd = fs::read_dir(signal_dir).await?;
         while let Some(entry) = rd.next_entry().await? {
             let name = entry.file_name();
             if let Some(seq) = parse_segment_filename(&name.to_string_lossy()) {
-                if seq <= up_to.0 {
+                if seq >= lo.0 && seq <= hi.0 {
                     let path = entry.path();
                     match fs::remove_file(&path).await {
                         Ok(()) => deleted += 1,
@@ -290,7 +304,7 @@ impl Wal {
                 }
             }
         }
-        tracing::debug!(up_to = up_to.0, deleted, "WAL segments deleted");
+        tracing::debug!(lo = lo.0, hi = hi.0, deleted, "WAL segments deleted");
         Ok(())
     }
 

@@ -409,7 +409,7 @@ fn marked_deleted_blocks_drop_out_of_list_blocks() {
 
     // Soft-delete A: it leaves the live set immediately, but the row
     // (and so block_count) still exists during the grace window.
-    cat.mark_deleted(&[a], ts + 1).unwrap();
+    cat.mark_deleted(&[a], ts + 1, ts + 1).unwrap();
     let live = cat.list_blocks().unwrap();
     assert_eq!(live.len(), 1, "marked block is hidden from queries");
     assert_eq!(live[0].meta.uuid, b);
@@ -422,6 +422,92 @@ fn marked_deleted_blocks_drop_out_of_list_blocks() {
     cat.delete_blocks(&[a]).unwrap();
     assert!(cat.get_block(a).unwrap().is_none());
     assert_eq!(cat.list_blocks().unwrap().len(), 1);
+}
+
+/// A soft-deleted block stays discoverable as *pending deletion work*
+/// until its durable grace deadline passes — and then indefinitely, until
+/// something actually reaps it.
+///
+/// This is what makes an interrupted grace window recoverable. Before the
+/// deadline was persisted, a crash mid-grace left the row invisible to
+/// `list_blocks` (deleted) and to the planner (never re-selected), so its
+/// objects leaked forever.
+#[test]
+fn pending_deletions_appear_only_once_their_grace_has_elapsed() {
+    let tmp = TempDir::new().unwrap();
+    let cat = Catalog::open(&tmp.path().join("cat.sqlite"), "scry-dev").unwrap();
+    let writer = Uuid::now_v7();
+    let ts = 1_700_000_000_000_000_000;
+
+    let a = Uuid::now_v7();
+    cat.insert_block(&meta(a, writer, ts, 10)).unwrap();
+
+    let deleted_at = ts + 1;
+    let eligible_at = deleted_at + 600_000_000_000; // +600s grace
+    cat.mark_deleted(&[a], deleted_at, eligible_at).unwrap();
+
+    // Mid-grace: hidden from queries, but not yet reapable.
+    assert!(cat.list_blocks().unwrap().is_empty());
+    assert!(
+        cat.list_pending_deletions(eligible_at - 1)
+            .unwrap()
+            .is_empty(),
+        "a block inside its grace window must not be reaped yet"
+    );
+
+    // At the deadline it becomes eligible (boundary is inclusive).
+    let due = cat.list_pending_deletions(eligible_at).unwrap();
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].meta.uuid, a);
+
+    // It stays pending across restarts/passes until actually reaped —
+    // the property the old in-process sleep could not provide.
+    assert_eq!(
+        cat.list_pending_deletions(eligible_at + 1_000_000_000)
+            .unwrap()
+            .len(),
+        1,
+        "pending work must persist until it is done"
+    );
+
+    cat.delete_blocks(&[a]).unwrap();
+    assert!(cat.list_pending_deletions(u64::MAX).unwrap().is_empty());
+}
+
+/// Re-staging a block already awaiting deletion never shortens the grace
+/// window a concurrent reader may be relying on, and never rewrites the
+/// original `deleted_at`.
+#[test]
+fn restaging_a_pending_deletion_only_extends_its_grace() {
+    let tmp = TempDir::new().unwrap();
+    let cat = Catalog::open(&tmp.path().join("cat.sqlite"), "scry-dev").unwrap();
+    let writer = Uuid::now_v7();
+    let ts = 1_700_000_000_000_000_000;
+
+    let a = Uuid::now_v7();
+    cat.insert_block(&meta(a, writer, ts, 10)).unwrap();
+
+    let first_eligible = ts + 1_000;
+    cat.mark_deleted(&[a], ts, first_eligible).unwrap();
+
+    // An earlier deadline must not win.
+    cat.mark_deleted(&[a], ts + 500, first_eligible - 500)
+        .unwrap();
+    assert!(
+        cat.list_pending_deletions(first_eligible - 1)
+            .unwrap()
+            .is_empty(),
+        "a re-stage must not pull the deadline earlier"
+    );
+
+    // A later one does.
+    let later = first_eligible + 5_000;
+    cat.mark_deleted(&[a], ts + 600, later).unwrap();
+    assert!(
+        cat.list_pending_deletions(later - 1).unwrap().is_empty(),
+        "the extended deadline should now apply"
+    );
+    assert_eq!(cat.list_pending_deletions(later).unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -645,4 +731,71 @@ fn poll_cursors_are_keyed_per_signal_writer_date_and_listed() {
     cursors.sort();
     assert!(cursors.contains(&("logs".to_string(), w1, "2026-05-30".to_string())));
     assert!(cursors.contains(&("metrics".to_string(), w2, "2026-05-30".to_string())));
+}
+
+/// Lineage learned from the *bucket* (a merged block's `compacted_from`, as
+/// `reconcile_from_bucket` replays it) hides the inputs from queries but does
+/// **not** schedule their objects for deletion — `list_pending_reaps` requires
+/// a `reap_eligible_at`, which only `mark_superseded` or an explicit staging
+/// call sets.
+///
+/// This is the crash-recovery shape: a merge PUT its `meta.json` (the commit
+/// point) and died before publishing. Whoever reconciles next must stage the
+/// recovered inputs, or their objects leak with nothing left to notice them.
+#[test]
+fn lineage_recovered_from_the_bucket_needs_explicit_reap_staging() {
+    let tmp = TempDir::new().unwrap();
+    let cat = Catalog::open(&tmp.path().join("cat.sqlite"), "scry-dev").unwrap();
+    let writer = Uuid::now_v7();
+    let ts = 1_700_000_000_000_000_000;
+
+    let in_a = Uuid::now_v7();
+    let in_b = Uuid::now_v7();
+    cat.insert_block(&meta(in_a, writer, ts, 10)).unwrap();
+    cat.insert_block(&meta(in_b, writer, ts, 20)).unwrap();
+
+    // The merged block arrives carrying its ancestry, exactly as a sidecar
+    // read back off the bucket would.
+    let merged = Uuid::now_v7();
+    let mut merged_meta = meta(merged, writer, ts, 30);
+    merged_meta.level = 1;
+    merged_meta.compacted_from = {
+        let mut v = vec![in_a, in_b];
+        v.sort_unstable();
+        v
+    };
+    cat.insert_block(&merged_meta).unwrap();
+
+    // Query correctness is already right: inputs are hidden, merged is live.
+    let live = cat.list_blocks().unwrap();
+    assert_eq!(live.len(), 1, "inputs superseded by lineage");
+    assert_eq!(live[0].meta.uuid, merged);
+
+    // But physical cleanup is not scheduled — the leak.
+    assert!(
+        cat.list_pending_reaps(u64::MAX).unwrap().is_empty(),
+        "lineage alone must not schedule deletion"
+    );
+
+    // Staging is what closes the gap.
+    let staged = cat.stage_unstaged_superseded(ts).unwrap();
+    assert_eq!(staged, 2, "both recovered inputs staged");
+    let mut pending: Vec<Uuid> = cat
+        .list_pending_reaps(ts)
+        .unwrap()
+        .into_iter()
+        .map(|p| p.entry.meta.uuid)
+        .collect();
+    pending.sort_unstable();
+    let mut expect = vec![in_a, in_b];
+    expect.sort_unstable();
+    assert_eq!(pending, expect);
+
+    // Idempotent: a second staging pass must not move an existing deadline.
+    assert_eq!(
+        cat.stage_unstaged_superseded(ts + 10_000).unwrap(),
+        0,
+        "already-staged rows keep their original deadline"
+    );
+    assert_eq!(cat.list_pending_reaps(ts).unwrap().len(), 2);
 }

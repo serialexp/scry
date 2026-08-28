@@ -21,6 +21,7 @@ clap                = { workspace = true }
 opentelemetry-proto = { workspace = true }
 prost               = { workspace = true }
 reqwest             = { workspace = true }
+scry-duration         = { workspace = true }
 scry-client         = { workspace = true }
 scry-httpsig        = { workspace = true }
 scry-proto          = { workspace = true }

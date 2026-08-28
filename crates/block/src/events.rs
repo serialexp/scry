@@ -60,6 +60,26 @@ pub enum BlockEvent {
         reap_eligible_at_unix_nano: u64,
     },
 
+    /// `uuids` were **staged** for deletion by retention: they are past their
+    /// TTL and no longer live for queries, but their objects are still in the
+    /// bucket until `delete_eligible_at_unix_nano` passes.
+    ///
+    /// This is what gives peers the same grace window the owner gives itself.
+    /// Without it a peer keeps listing the blocks as live right up until the
+    /// objects vanish, and only learns otherwise from the [`Self::Deleted`]
+    /// event fired *after* the bucket DELETEs — so every query planned in
+    /// between 404s and has to self-heal. Applying the soft-delete early means
+    /// peers stop planning against these blocks before they are removed.
+    ///
+    /// Apply = `mark_deleted(uuids, deleted_at, delete_eligible_at)`, which is
+    /// idempotent (`COALESCE` on the timestamp, `MAX` on the deadline).
+    SoftDeleted {
+        signal: String,
+        uuids: Vec<Uuid>,
+        deleted_at_unix_nano: u64,
+        delete_eligible_at_unix_nano: u64,
+    },
+
     /// `uuids` were hard-deleted from the bucket (compaction reaping its
     /// superseded inputs, or retention reaping expired blocks). `signal` is
     /// carried explicitly so the event routes to the right
@@ -75,6 +95,7 @@ impl BlockEvent {
         match self {
             BlockEvent::Created { meta } => &meta.signal,
             BlockEvent::Superseded { by_meta, .. } => &by_meta.signal,
+            BlockEvent::SoftDeleted { signal, .. } => signal,
             BlockEvent::Deleted { signal, .. } => signal,
         }
     }

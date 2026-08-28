@@ -439,14 +439,64 @@ scripts/smoke-webui.sh            # scry web browser surface (auth + multi-targe
 One image, `serialexp/scry:latest` (multi-arch `linux/amd64` + `linux/arm64`),
 carries every role; the manifest's `command:` selects which binary runs.
 
-**Prerequisite:** an S3-compatible bucket (Cloudflare R2, Hetzner Object
-Storage, Garage, MinIO, …). The server reads credentials from
-`SCRY_OBJSTORE_*` env, supplied by a Secret.
+**Prerequisite:** a dedicated S3-compatible bucket (AWS S3, Cloudflare R2,
+Hetzner Object Storage, Garage, MinIO, …). Configure its endpoint, region,
+bucket, and addressing mode with `SCRY_OBJSTORE_ENDPOINT`,
+`SCRY_OBJSTORE_REGION`, `SCRY_OBJSTORE_BUCKET`, and
+`SCRY_OBJSTORE_PATH_STYLE`. For AWS, omit `SCRY_OBJSTORE_ACCESS_KEY_ID` and
+`SCRY_OBJSTORE_SECRET_ACCESS_KEY`: scry uses the standard AWS credential chain
+(environment, shared profile, web identity/IRSA, ECS task or EKS Pod Identity,
+then EC2 IMDS), including automatic refresh of temporary credentials. For
+non-AWS services, explicit `SCRY_OBJSTORE_ACCESS_KEY_ID` and
+`SCRY_OBJSTORE_SECRET_ACCESS_KEY` remain available; temporary credentials may
+also set `SCRY_OBJSTORE_SESSION_TOKEN`.
+
+### Object-storage bucket recommendations
+
+Scry treats the bucket as its source of truth and manages immutable blocks as
+sets of objects (parquet plus metadata and signal-specific sidecars). Configure
+the bucket accordingly:
+
+- Keep it private, block public access, disable ACLs where supported, and enable
+  server-side encryption. On AWS, SSE-S3 is sufficient unless your policy
+  requires a customer-managed KMS key.
+- Start with an immediately-readable general-purpose tier such as **S3
+  Standard**. Standard-IA or Intelligent-Tiering can suit older data after
+  accounting for retrieval, minimum-duration, and per-object monitoring fees.
+  Do **not** transition live Scry objects to Glacier or another archive tier
+  that requires restoration before reads; queries expect immediate range GETs.
+- Do **not** configure provider lifecycle expiration for current objects. Scry
+  retention deletes a complete block and all of its sidecars together; an S3
+  lifecycle rule operates on individual objects and can leave a block
+  incomplete. Configure retention in scry instead.
+- Leave bucket versioning off unless recovery from accidental deletion is an
+  explicit requirement. Compaction and retention deliberately delete objects,
+  so versioning otherwise retains—and bills for—every old block. If versioning
+  is enabled, expire noncurrent versions after a deliberately chosen short
+  recovery window.
+- Disable Object Lock/retention holds on this bucket because they prevent scry's
+  compaction and retention cleanup. A lifecycle rule that only aborts incomplete
+  multipart uploads after a few days is safe.
+- Grant the runtime identity least-privilege bucket listing and object
+  get/put/delete access. With SSE-KMS, also grant the necessary KMS permissions.
+
+For AWS S3, use an HTTPS regional endpoint and virtual-hosted addressing, for
+example:
+
+```bash
+SCRY_OBJSTORE_ENDPOINT=https://s3.eu-west-1.amazonaws.com
+SCRY_OBJSTORE_REGION=eu-west-1
+SCRY_OBJSTORE_BUCKET=my-scry-bucket
+SCRY_OBJSTORE_PATH_STYLE=false
+# No static keys: attach an IAM role to the workload or instance.
+```
 
 ```bash
 kubectl apply -f deploy/k8s/namespace.yaml
 
-# Fill in real bucket credentials, then apply out of band (never commit it):
+# Create the referenced environment object out of band (never commit it).
+# For AWS workload roles it still supplies endpoint/region/bucket/path-style,
+# but remove the access-key, secret-key, and session-token entries:
 cp deploy/k8s/objstore-secret.example.yaml deploy/k8s/objstore-secret.yaml
 $EDITOR deploy/k8s/objstore-secret.yaml
 kubectl apply -f deploy/k8s/objstore-secret.yaml

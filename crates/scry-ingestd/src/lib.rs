@@ -24,6 +24,7 @@ use scry_cluster::{
     poll_once, run_compaction_pass, run_retention_pass, LeaseProvider, LocalLeaseProvider,
 };
 use scry_compact::CompactConfig;
+use scry_duration::parse_duration;
 use scry_objstore::{open as open_objstore, ObjStoreConfig};
 use scry_retention::RetentionConfig;
 use scry_server::{
@@ -443,7 +444,7 @@ pub async fn run(args: Args) -> Result<()> {
             catalog  = ?args.catalog,
             "storage mode: WAL + parquet blocks → object storage (dummy + metrics + logs + traces + profiles)"
         );
-        let store = open_objstore(&cfg)?;
+        let store = open_objstore(&cfg).await?;
         let catalog = match args.catalog.as_ref() {
             Some(p) => Some(Arc::new(std::sync::Mutex::new(
                 Catalog::open(p, &bucket)
@@ -990,6 +991,7 @@ fn record_compaction_metrics(
             partition_failed: report.partition_failed as u64,
             lease_held: report.lease_held as u64,
             lease_unavailable: report.lease_unavailable as u64,
+            oversized: report.oversized as u64,
         },
         duration,
     );
@@ -1025,6 +1027,26 @@ async fn run_maintenance_loop<L: LeaseProvider>(
         apply = retention_cfg.apply,
         "maintenance loop started"
     );
+
+    // Say up front if blocks already in the catalog can never compact under
+    // this policy (typically a `--compact-fanout` changed between runs),
+    // rather than leaving the operator to notice a partition that silently
+    // stops shrinking. Not fatal: every other partition still compacts.
+    {
+        let stuck = catalog
+            .lock()
+            .map(|c| c.list_blocks().unwrap_or_default())
+            .map(|live| scry_compact::validate_against_catalog(&live, &compact_cfg))
+            .unwrap_or_default();
+        if !stuck.is_empty() {
+            warn!(
+                partitions = stuck.len(),
+                fanout = compact_cfg.fanout,
+                "existing blocks cannot compact under this policy; they will be skipped every pass"
+            );
+            scry_compact::warn_oversized(&stuck);
+        }
+    }
     loop {
         let sink_ref: &dyn BlockEventSink = match sink.as_ref() {
             Some(s) => s.as_ref(),
@@ -1037,7 +1059,7 @@ async fn run_maintenance_loop<L: LeaseProvider>(
                     &provider, store.clone(), catalog.as_ref(), &bucket,
                     &compact_cfg, &block_cfg, sink_ref, lease_ttl,
                 ).await {
-                    Ok(r) if r.merges > 0 || r.partition_failed > 0 || r.reap_failed > 0 => {
+                    Ok(r) if r.merges > 0 || r.partition_failed > 0 || r.reap_failed > 0 || r.oversized > 0 => {
                         record_compaction_metrics(metrics.as_deref(), &r, started.elapsed());
                         info!(
                         merges = r.merges, blocks_in = r.blocks_in,
@@ -1046,6 +1068,7 @@ async fn run_maintenance_loop<L: LeaseProvider>(
                         partition_failed = r.partition_failed,
                         lease_held = r.lease_held,
                         lease_unavailable = r.lease_unavailable,
+                        oversized = r.oversized,
                         "compaction pass completed"
                     )},
                     Ok(r) => record_compaction_metrics(metrics.as_deref(), &r, started.elapsed()),
@@ -1063,9 +1086,20 @@ async fn run_maintenance_loop<L: LeaseProvider>(
                     &provider, store.clone(), catalog.as_ref(),
                     &retention_cfg, now, sink_ref, lease_ttl,
                 ).await {
-                    Ok(r) if r.reaped > 0 => info!(
-                        reaped = r.reaped, bytes = r.bytes_reaped,
-                        dry_run = r.dry_run, "retention pass"
+                    // `reaped` counts blocks whose objects AND rows are
+                    // actually gone; `staged` is soft-deleted work waiting
+                    // out its durable grace. Reporting the plan as if it
+                    // were deletions (the old behaviour) claimed removals
+                    // that had not happened — especially on an aborted pass.
+                    Ok(r) if r.reaped > 0 || r.staged > 0 || r.reap_failed > 0 => info!(
+                        candidates = r.candidates,
+                        staged = r.staged,
+                        reaped = r.reaped,
+                        bytes = r.bytes_reaped,
+                        reap_failed = r.reap_failed,
+                        aborted = r.aborted,
+                        dry_run = r.dry_run,
+                        "retention pass"
                     ),
                     Ok(_) => {}
                     Err(e) => warn!(error = %e, "retention pass failed"),
@@ -1083,29 +1117,6 @@ fn now_unix_nano() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos() as u64
-}
-
-/// Parse a duration with an optional `ms`/`s`/`m`/`h`/`d` suffix (bare number
-/// = seconds). Mirrors `scry-retention`'s CLI parser.
-fn parse_duration(s: &str) -> Result<Duration, String> {
-    let s = s.trim();
-    let (num, unit) = s
-        .find(|c: char| c.is_alphabetic())
-        .map(|i| (&s[..i], &s[i..]))
-        .unwrap_or((s, "s"));
-    let n: u64 = num
-        .trim()
-        .parse()
-        .map_err(|_| format!("bad number in {s:?}"))?;
-    let dur = match unit.trim() {
-        "ms" => Duration::from_millis(n),
-        "s" | "" => Duration::from_secs(n),
-        "m" => Duration::from_secs(n * 60),
-        "h" => Duration::from_secs(n * 3600),
-        "d" => Duration::from_secs(n * 86_400),
-        other => return Err(format!("unknown duration unit {other:?}")),
-    };
-    Ok(dur)
 }
 
 /// Resolve the address to advertise into the Valkey tail registry (D-053).

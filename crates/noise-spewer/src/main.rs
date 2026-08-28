@@ -12,6 +12,7 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use rand::SeedableRng;
+use scry_duration::parse_duration;
 use scry_proto::{
     build,
     constants::{
@@ -60,27 +61,6 @@ struct Args {
     /// Random seed; if unset we pick one and log it.
     #[arg(long)]
     seed: Option<u64>,
-}
-
-fn parse_duration(s: &str) -> Result<Duration, String> {
-    // Tiny subset: integer + suffix.
-    let (num, unit) = s
-        .trim()
-        .find(|c: char| c.is_alphabetic())
-        .map(|i| (&s[..i], &s[i..]))
-        .unwrap_or((s, "s"));
-    let n: u64 = num
-        .trim()
-        .parse()
-        .map_err(|_| format!("bad number in {s:?}"))?;
-    let dur = match unit.trim() {
-        "ms" => Duration::from_millis(n),
-        "s" | "" => Duration::from_secs(n),
-        "m" => Duration::from_secs(n * 60),
-        "h" => Duration::from_secs(n * 3600),
-        other => return Err(format!("unknown duration unit {other:?}")),
-    };
-    Ok(dur)
 }
 
 #[tokio::main]

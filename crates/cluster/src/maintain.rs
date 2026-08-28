@@ -29,7 +29,9 @@ use scry_catalog::CatalogHandle;
 use scry_compact::{
     compact_partition, plan_merges, reap_pending, CompactConfig, CompactReport, PartitionOutcome,
 };
-use scry_retention::{plan_reaping, retain_planned, RetentionConfig, RetentionReport};
+use scry_retention::{
+    plan_reaping, reap_pending_deletions, retain_planned, RetentionConfig, RetentionReport,
+};
 use uuid::Uuid;
 
 use crate::lease::{LeaseGuard, LeaseProvider};
@@ -67,8 +69,13 @@ where
     let live = catalog
         .with(|c| c.list_blocks())
         .context("list live blocks")?;
-    let plans = plan_merges(&live, cfg);
-    let mut report = CompactReport::default();
+    let plan = plan_merges(&live, cfg);
+    let plans = plan.merges;
+    let mut report = CompactReport {
+        oversized: plan.oversized.len(),
+        ..Default::default()
+    };
+    scry_compact::warn_oversized(&plan.oversized);
 
     // Reaping is durable catalog work, independent of whether this pass finds a
     // new merge. Partition leases still fence new logical commits; cleanup is
@@ -201,10 +208,12 @@ where
 
 /// Run one lease-guarded retention pass. In dry-run (`cfg.apply == false`) it
 /// reports candidates and acquires no lease (fully inert). In apply mode it
-/// acquires the global retention lease and runs the reap lifecycle under its
-/// fence, emitting `Deleted` events through `sink`. If the lease is held by a
-/// peer or its backend is unreachable, the pass reports `aborted` and reaps
-/// nothing.
+/// first completes any deletion work whose durable grace deadline has passed
+/// (lease-free — those rows are already soft-deleted), then acquires the
+/// global retention lease and stages newly-expired blocks under its fence,
+/// emitting `Deleted` events through `sink`. If the lease is held by a peer or
+/// its backend is unreachable, the pass reports `aborted` and stages nothing —
+/// but already-eligible pending work still gets finished.
 pub async fn run_retention_pass<L, C>(
     provider: &L,
     store: Arc<dyn ObjectStore>,
@@ -229,14 +238,25 @@ where
         ..Default::default()
     };
     for e in &expired {
-        let slot = report.by_signal.entry(e.meta.signal.clone()).or_default();
-        slot.0 += 1;
-        slot.1 += e.meta.byte_size;
-        report.reaped += 1;
-        report.bytes_reaped += e.meta.byte_size;
+        report.candidates += 1;
+        report.bytes_candidates += e.meta.byte_size;
     }
 
-    if !cfg.apply || expired.is_empty() {
+    if !cfg.apply {
+        return Ok(report);
+    }
+
+    // Finish deletion work staged by an earlier pass (possibly on another
+    // instance) whose grace has elapsed — including anything stranded by a
+    // crash or a lost lease mid-grace. Lease-free and idempotent: these
+    // rows are already soft-deleted and invisible to queries, the same
+    // reasoning that lets compaction reap outside the partition lease.
+    let pending = catalog
+        .with(|c| c.list_pending_deletions(now_unix_nano))
+        .context("list pending deletions")?;
+    reap_pending_deletions(store.clone(), catalog, &pending, sink, &mut report).await;
+
+    if expired.is_empty() {
         return Ok(report);
     }
 
@@ -263,6 +283,7 @@ where
         now_unix_nano,
         fence.as_ref(),
         sink,
+        &mut report,
     )
     .await;
     guard.release().await;

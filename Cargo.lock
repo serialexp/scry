@@ -3443,6 +3443,7 @@ dependencies = [
  "clap",
  "rand 0.8.6",
  "rand_distr",
+ "scry-duration",
  "scry-proto",
  "tokio",
  "tracing",
@@ -4461,6 +4462,7 @@ dependencies = [
  "kube",
  "reqwest",
  "scry-client",
+ "scry-duration",
  "scry-match",
  "scry-proto",
  "serde",
@@ -4479,6 +4481,7 @@ version = "0.17.1"
 dependencies = [
  "anyhow",
  "arrow",
+ "async-trait",
  "bytes",
  "chrono",
  "futures",
@@ -4570,6 +4573,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "scry-duration"
+version = "0.17.1"
+
+[[package]]
 name = "scry-gateway"
 version = "0.17.1"
 dependencies = [
@@ -4583,6 +4590,7 @@ dependencies = [
  "prost",
  "reqwest",
  "scry-client",
+ "scry-duration",
  "scry-httpsig",
  "scry-proto",
  "serde",
@@ -4620,6 +4628,7 @@ dependencies = [
  "scry-catalog",
  "scry-cluster",
  "scry-compact",
+ "scry-duration",
  "scry-objstore",
  "scry-retention",
  "scry-server",
@@ -4657,6 +4666,8 @@ version = "0.17.1"
 dependencies = [
  "anyhow",
  "async-trait",
+ "aws-config",
+ "aws-credential-types",
  "bytes",
  "futures",
  "object_store",
@@ -4736,6 +4747,7 @@ dependencies = [
  "clap",
  "indicatif",
  "reqwest",
+ "scry-duration",
  "scry-httpsig",
  "scry-proto",
  "serde",
@@ -4757,6 +4769,7 @@ dependencies = [
  "object_store",
  "scry-block",
  "scry-catalog",
+ "scry-duration",
  "scry-objstore",
  "scry-proto",
  "scry-query",

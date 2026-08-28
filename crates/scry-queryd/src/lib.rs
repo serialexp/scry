@@ -358,7 +358,7 @@ pub async fn run(args: Args) -> Result<()> {
     if let Some(v) = args.pool_autoscale_headroom {
         pool_cfg.autoscale_headroom = v;
     }
-    let (store, pool) = open_with_pool_config(&cfg, pool_cfg)?;
+    let (store, pool) = open_with_pool_config(&cfg, pool_cfg).await?;
 
     // Cold-start bootstrap (D-055): if the catalog file is absent, restore it
     // from the bucket snapshot in a single GET instead of paying an O(all

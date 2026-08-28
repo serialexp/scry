@@ -6,6 +6,7 @@
 //! Each sink is opt-in (at least one required): the scry ingest server
 //! (`--upstream`), Grafana Loki, OpenSearch, and Mimir.
 
+use scry_duration::parse_duration;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{bail, Context, Result};
@@ -341,19 +342,4 @@ fn hostname_string() -> String {
                 .filter(|s| !s.is_empty())
         })
         .unwrap_or_else(|| "scry-gateway".to_string())
-}
-
-fn parse_duration(s: &str) -> Result<Duration, String> {
-    let s = s.trim();
-    let (num, mult) = if let Some(v) = s.strip_suffix("ms") {
-        (v, 1u64)
-    } else if let Some(v) = s.strip_suffix('s') {
-        (v, 1000)
-    } else if let Some(v) = s.strip_suffix('m') {
-        (v, 60_000)
-    } else {
-        (s, 1000)
-    };
-    let base: u64 = num.parse().map_err(|_| format!("invalid duration: {s}"))?;
-    Ok(Duration::from_millis(base * mult))
 }

@@ -15,6 +15,7 @@ async-trait       = { workspace = true }
 clap              = { workspace = true }
 num_cpus          = { workspace = true }
 object_store      = { workspace = true }
+scry-duration        = { workspace = true }
 scry-block        = { workspace = true }
 scry-catalog      = { workspace = true }
 scry-cluster      = { workspace = true }

@@ -26,8 +26,9 @@ twox-hash     = { workspace = true }
 uuid          = { workspace = true }
 
 [dev-dependencies]
-futures = { workspace = true }
-tokio   = { workspace = true, features = ["macros", "rt-multi-thread"] }
+async-trait = { workspace = true }
+futures     = { workspace = true }
+tokio       = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

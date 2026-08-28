@@ -1,0 +1,16 @@
+[package]
+name        = "scry-duration"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The single human-readable duration parser (`500ms`, `30s`, `5m`, `2h`, `7d`) shared by every scry CLI, so one grammar and one overflow policy apply everywhere."
+
+[lib]
+name = "scry_duration"
+path = "src/lib.rs"
+
+[dependencies]
+
+[lints]
+workspace = true

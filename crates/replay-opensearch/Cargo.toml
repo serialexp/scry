@@ -17,6 +17,7 @@ chrono       = { workspace = true }
 clap         = { workspace = true }
 indicatif    = { workspace = true }
 reqwest      = { workspace = true }
+scry-duration = { workspace = true }
 scry-httpsig = { workspace = true }
 scry-proto   = { workspace = true }
 serde        = { workspace = true, features = ["derive"] }

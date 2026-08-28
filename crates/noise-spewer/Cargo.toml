@@ -15,6 +15,7 @@ binschema-runtime = { workspace = true }
 clap              = { workspace = true }
 rand              = { workspace = true }
 rand_distr        = { workspace = true }
+scry-duration        = { workspace = true }
 scry-proto        = { workspace = true }
 tokio             = { workspace = true }
 tracing           = { workspace = true }
