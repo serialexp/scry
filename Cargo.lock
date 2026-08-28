@@ -4832,6 +4832,7 @@ dependencies = [
  "scry-catalog",
  "scry-cluster",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "uuid",

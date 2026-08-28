@@ -32,8 +32,10 @@ pub mod consume;
 pub mod lease;
 pub mod maintain;
 pub mod poll;
+pub mod staged;
 
 pub use consume::{apply_event, apply_event_with_grace, ApplyOutcome};
 pub use lease::{LeaseGuard, LeaseProvider, LocalGuard, LocalLeaseProvider};
 pub use maintain::{run_compaction_pass, run_retention_pass, RETENTION_LEASE_KEY};
 pub use poll::{full_walk, poll_once, reconcile_partition, PollReport};
+pub use staged::apply_staged_deletions;

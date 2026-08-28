@@ -25,6 +25,7 @@ pub mod pubsub;
 pub mod registry;
 pub mod remote_status;
 pub mod sink;
+pub mod staged;
 pub mod status;
 
 pub use client::{ValkeyClient, VALKEY_URL_ENV};
@@ -33,6 +34,10 @@ pub use pubsub::{channel_for, parse_envelope, publish_envelope, subscribe_blocks
 pub use registry::{discover_tail_endpoints, TailRegistration, TAIL_REGISTRY_PREFIX};
 pub use remote_status::{remove_remote_status, upsert_remote_status, AGENT_STATUS_TTL};
 pub use sink::ValkeySink;
+pub use staged::{
+    converge_staged_deletions, list_staged_deletions, spawn_staged_deletion_refresh,
+    stage_deletions, unstage_deletions, STAGED_DELETION_PREFIX,
+};
 pub use status::{
     discover_status_blobs, StatusProducer, StatusRegistration, STATUS_PREFIX, STATUS_TTL,
 };

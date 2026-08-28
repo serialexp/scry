@@ -326,3 +326,174 @@ async fn status_registration_publishes_fresh_snapshots_and_deregisters() {
         "gone after deregister: {blobs:?}"
     );
 }
+
+// ── staged-deletions registry ────────────────────────────────────────
+//
+// The registry that lets an instance which was not listening — because it
+// booted after the staging, or had never seen the block — find out which
+// blocks its peers have already hidden. A staged deletion is deliberately
+// invisible in the bucket (the objects stay put for the grace window), so
+// this is the only place that truth lives outside the owner's catalog.
+
+/// A fabricated meta: no bucket objects, which is fine because every assertion
+/// here is about catalog rows.
+fn staged_test_meta(uuid: Uuid) -> scry_block::BlockMeta {
+    scry_block::BlockMeta {
+        uuid,
+        signal: "logs".to_string(),
+        writer_id: Uuid::now_v7(),
+        ts_min_unix_nano: 1_700_000_000_000_000_000,
+        ts_max_unix_nano: 1_700_000_000_000_000_001,
+        row_count: 10,
+        byte_size: 100,
+        schema_version: 1,
+        level: 0,
+        producer_version: String::new(),
+        label_fingerprint_bloom: None,
+        has_postings: false,
+        postings_size_bytes: None,
+        series_types: None,
+        all_fingerprints: None,
+        has_body_bloom: false,
+        body_bloom_size_bytes: None,
+        wal_seg_max: None,
+        wal_shard: None,
+        compacted_from: Vec::new(),
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires a real Valkey (scripts/dev-valkey-up.sh)"]
+async fn staged_deletions_round_trip() {
+    let c = client().await;
+    let now = 1_700_000_000_000_000_000u64;
+    let eligible = now + 600_000_000_000;
+    let mine = [Uuid::now_v7(), Uuid::now_v7()];
+
+    scry_valkey::stage_deletions(c.inner(), &mine, eligible, now)
+        .await
+        .expect("stage");
+
+    let listed = scry_valkey::list_staged_deletions(c.inner())
+        .await
+        .expect("list");
+    for uuid in &mine {
+        assert_eq!(
+            listed.iter().find(|(u, _)| u == uuid).map(|(_, e)| *e),
+            Some(eligible),
+            "staged block {uuid} must come back with its peer's own deadline"
+        );
+    }
+
+    scry_valkey::unstage_deletions(c.inner(), &mine)
+        .await
+        .expect("unstage");
+    let listed = scry_valkey::list_staged_deletions(c.inner())
+        .await
+        .expect("list after unstage");
+    assert!(
+        !listed.iter().any(|(u, _)| mine.contains(u)),
+        "reaped blocks must leave the registry: {listed:?}"
+    );
+}
+
+/// The seam: retention emits `SoftDeleted` into a `BlockEventSink` and knows
+/// nothing about Valkey. The sink is what mirrors it into the registry.
+#[tokio::test]
+#[ignore = "requires a real Valkey (scripts/dev-valkey-up.sh)"]
+async fn sink_mirrors_soft_deleted_into_the_registry() {
+    let c = client().await;
+    let (sink, _task) = ValkeySink::spawn(c.inner().clone(), Uuid::now_v7());
+    let now = 1_700_000_000_000_000_000u64;
+    let eligible = now + 600_000_000_000;
+    let uuid = Uuid::now_v7();
+
+    sink.emit(BlockEvent::SoftDeleted {
+        signal: "logs".to_string(),
+        uuids: vec![uuid],
+        deleted_at_unix_nano: now,
+        delete_eligible_at_unix_nano: eligible,
+    });
+
+    // The publisher is a background task; give it a moment to drain.
+    let staged = await_registry_contains(&c, uuid, true).await;
+    assert!(
+        staged,
+        "a SoftDeleted emitted through the sink must appear in the registry"
+    );
+
+    sink.emit(BlockEvent::Deleted {
+        signal: "logs".to_string(),
+        uuids: vec![uuid],
+    });
+    let still_there = await_registry_contains(&c, uuid, false).await;
+    assert!(
+        !still_there,
+        "once the objects are really gone the entry must go too"
+    );
+}
+
+/// Poll the registry until `uuid`'s presence matches `want`, or we give up.
+/// Returns the final observed presence.
+async fn await_registry_contains(c: &ValkeyClient, uuid: Uuid, want: bool) -> bool {
+    for _ in 0..50 {
+        let listed = scry_valkey::list_staged_deletions(c.inner())
+            .await
+            .expect("list");
+        let present = listed.iter().any(|(u, _)| *u == uuid);
+        if present == want {
+            return present;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    scry_valkey::list_staged_deletions(c.inner())
+        .await
+        .expect("list")
+        .iter()
+        .any(|(u, _)| *u == uuid)
+}
+
+/// End to end, and the whole reason the registry exists: an instance seeds its
+/// catalog from the bucket — which still holds the objects of a block a peer
+/// staged, because that is what the grace window is for — and then converges,
+/// and the block stops being listed for queries.
+#[tokio::test]
+#[ignore = "requires a real Valkey (scripts/dev-valkey-up.sh)"]
+async fn converge_hides_a_block_a_peer_already_staged() {
+    let c = client().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog =
+        scry_catalog::Catalog::open(&tmp.path().join("cat.sqlite"), "test-bucket").unwrap();
+
+    // What the bucket walk would have produced: the block, live.
+    let uuid = Uuid::now_v7();
+    catalog.insert_block(&staged_test_meta(uuid)).unwrap();
+    assert_eq!(
+        catalog.list_blocks().unwrap().len(),
+        1,
+        "live after the walk"
+    );
+
+    // What a peer did before we existed, and never re-announces.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    scry_valkey::stage_deletions(c.inner(), &[uuid], now + 600_000_000_000, now)
+        .await
+        .expect("peer stages the deletion");
+
+    let applied = scry_valkey::converge_staged_deletions(c.inner(), &catalog)
+        .await
+        .expect("converge");
+
+    assert!(applied >= 1, "at least our own entry was applied");
+    assert!(
+        catalog.list_blocks().unwrap().is_empty(),
+        "a block the peer staged must not be served after convergence"
+    );
+
+    scry_valkey::unstage_deletions(c.inner(), &[uuid])
+        .await
+        .ok();
+}

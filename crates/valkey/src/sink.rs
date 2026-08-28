@@ -42,6 +42,7 @@ impl ValkeySink {
             let mut seq: u64 = 0;
             while let Some(event) = rx.recv().await {
                 seq += 1;
+                mirror_deletion_staging(&client, &event).await;
                 let env = Envelope::new(origin, seq, event);
                 if let Err(e) = publish_envelope(&client, &env).await {
                     tracing::warn!(error = %e, "publishing block event failed; dropping (polling will backstop)");
@@ -49,6 +50,51 @@ impl ValkeySink {
             }
         });
         (Self { tx }, task)
+    }
+}
+
+/// Keep the staged-deletions registry ([`crate::staged`]) in step with the
+/// deletion events flowing past.
+///
+/// Pub/sub only reaches instances listening at that instant and is never
+/// replayed, so a `SoftDeleted` is invisible to anyone who boots afterwards —
+/// and a staged block is deliberately invisible in the bucket too, since its
+/// objects are still there. Mirroring the staging into a key with a TTL gives
+/// a late arrival somewhere to look.
+///
+/// Done here, in the publisher, rather than in the retention engine: the engine
+/// takes a `&dyn BlockEventSink` precisely so it never has to know Valkey
+/// exists, and this sink is already the Valkey-aware half of that seam.
+///
+/// Failures are logged, not propagated. A missed stage costs a peer one
+/// planned-then-404'd query (the `EvictOnNotFound` self-heal it had before this
+/// registry existed); a missed unstage costs a stale entry that expires on its
+/// own and applies to a block nobody has.
+async fn mirror_deletion_staging(client: &fred::clients::Client, event: &BlockEvent) {
+    match event {
+        BlockEvent::SoftDeleted {
+            uuids,
+            deleted_at_unix_nano,
+            delete_eligible_at_unix_nano,
+            ..
+        } => {
+            if let Err(e) = crate::staged::stage_deletions(
+                client,
+                uuids,
+                *delete_eligible_at_unix_nano,
+                *deleted_at_unix_nano,
+            )
+            .await
+            {
+                tracing::warn!(error = %e, "recording staged deletions failed; a peer booting during the grace window may re-list these blocks until they are reaped");
+            }
+        }
+        BlockEvent::Deleted { uuids, .. } => {
+            if let Err(e) = crate::staged::unstage_deletions(client, uuids).await {
+                tracing::debug!(error = %e, "unstaging reaped deletions failed; entries will expire via TTL");
+            }
+        }
+        BlockEvent::Created { .. } | BlockEvent::Superseded { .. } => {}
     }
 }
 

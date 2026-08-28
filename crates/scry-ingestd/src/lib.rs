@@ -759,6 +759,19 @@ pub async fn run(args: Args) -> Result<()> {
             }));
         }
 
+        // 2b. staged-deletion refresh: re-hide blocks a peer has staged for
+        //     retention that the poll or walk has just (re-)inserted as live.
+        //     The `SoftDeleted` event only lands on peers that already knew the
+        //     block; this catches the ones we learn about afterwards. One SCAN
+        //     over a prefix that is empty unless retention is mid-grace-window.
+        if let Some(vk) = valkey.as_ref() {
+            bg_tasks.push(scry_valkey::spawn_staged_deletion_refresh(
+                vk.inner().clone(),
+                catalog.clone(),
+                Duration::from_secs(args.poll_interval.max(1)),
+            ));
+        }
+
         // 3. periodic full walk (ultimate backstop; discovers new prefixes).
         {
             let store = store.clone();

@@ -3209,3 +3209,87 @@ that a target with no tail address surfaces as `LiveUnavailableError`, and that 
 Valkey-less front-door's `ERR_TAIL_UNAVAILABLE` survives both relays as a typed
 error. It needs only a dev Valkey — a ~30-line python stub answers the two
 object-store requests a cold queryd boot makes.
+
+## D-063: Staged deletions are published to a Valkey registry, not just pub/sub
+
+**Date:** 2026-08-28
+**Status:** accepted
+
+Retention deletes a block in two steps: **stage** it (`mark_deleted` sets
+`deleted_at`, so queries stop listing it) and, once the grace deadline passes,
+**reap** it (DELETE the objects, drop the row). D-037 made the grace window
+durable; D-039's `BlockEvent::SoftDeleted` tells peers about the staging so they
+hide the same rows for the same window instead of discovering the deletion by
+planning a query and hitting a 404.
+
+That event only reaches instances **listening at that instant**, and pub/sub is
+never replayed. Two situations slip through, and neither is recoverable from
+bucket state — because a staged deletion is *deliberately invisible* in the
+bucket, the objects being exactly what the grace window preserves:
+
+1. An instance that boots after the staging and seeds its catalog by walking the
+   bucket. It finds the objects, still there, and inserts the blocks as live.
+   Nobody re-announces the staging.
+2. An instance that never saw the block's `Created`, so the `SoftDeleted`
+   updated no rows, and a later poll or walk then inserts the block as live.
+
+**The registry.** Staging is mirrored into one Valkey key per block —
+`SET scry/deleted/<uuid> "<delete_eligible_at_unix_nano>" PX <ttl>` — read back
+with one read-only Lua `SCAN`, the same idiom as the D-053 tail registry. The
+grace deadline *is* an expiry, so `PX` does all the housekeeping: an entry
+becomes irrelevant exactly when the objects are reaped and vanishes on its own.
+There is no cleanup pass, and a crashed reaper cannot leak entries. The TTL
+carries `STAGED_TTL_MARGIN` (300s) of slack on top of the remaining window,
+because a late reaper (missed tick, lease handed over, slow bucket) must not
+leave a booting peer un-warned; erring long is free, since a stale entry names a
+block that is either still hidden or already gone.
+
+**Applied *after* the inserts, which is what removes the need to remember
+anything.** The obvious alternative was a pending-tombstone table: record a
+`SoftDeleted` for a block we do not have, and consult it on insert. Bart's
+framing killed it — at boot "we're not serving anything at all yet", so the
+walker can insert everything, *then* read the registry and apply it, by which
+time the rows exist and a plain `mark_deleted` lands. No second place for
+deletion state to live, no schema change. The same read on a timer covers case
+2: a poll or walk re-inserts a block as live, and the next refresh hides it
+again. The residue is that a block can be live for the moment between a
+*periodic* insert and the next refresh — a query planned in that sliver 404s and
+self-heals through `EvictOnNotFound`, which is exactly the behaviour that
+existed before this registry. At boot there is no sliver at all, because the
+apply runs before the listener opens.
+
+**Where the code lives, and why.** The retention engine is untouched: it takes a
+`&dyn BlockEventSink` precisely so it never learns Valkey exists, and
+`ValkeySink`'s publisher — already the Valkey-aware half of that seam — mirrors
+`SoftDeleted` into the registry and `Deleted` out of it. The apply is
+`scry_cluster::apply_staged_deletions` (pure, catalog-only, unit-tested with a
+fake meta); `scry_valkey::converge_staged_deletions` is the list+apply both
+daemons call, and `spawn_staged_deletion_refresh` the timer loop. `scry-valkey`
+already depended on both `scry-cluster` and `scry-catalog`, so this needed no
+new dependency edge and no duplicated wiring in the two binaries.
+
+**queryd now subscribes before its seed walk.** Previously the pub/sub consumer
+was spawned with the other background loops, long after the boot walk — so
+during a walk that is O(every block in the bucket) and can run for minutes, this
+instance heard nothing at all. Most such misses self-correct, because the next
+poll or walk re-reads the same bucket truth; `SoftDeleted` is the one that does
+not, for the reason above. The Valkey connection moved up accordingly (it was
+already built before the service, for D-054 live discovery).
+
+**Kept:** `BlockEvent::SoftDeleted` itself. It still does the work for peers that
+already know the block, which is the common case in a converged fleet; the
+registry covers the arrivals it cannot reach.
+
+**Sealed by** three real-Valkey integration tests in
+`crates/valkey/tests/valkey_integration.rs` — the registry round-trips,
+`ValkeySink` mirrors a `SoftDeleted` in and a `Deleted` out, and a catalog
+holding a block "just seeded from the bucket" stops listing it after
+`converge_staged_deletions` — plus four `scry-cluster` unit tests covering the
+apply, unknown blocks, and the `MAX`-deadline idempotency that lets the refresh
+loop re-run every poll cycle without ever shortening a window a reader is
+relying on.
+
+**Not done:** closing the periodic-insert sliver (would need the tombstone table
+after all), and any equivalent for compaction's `Superseded` — that one *is*
+recoverable from bucket state, since the merged block's `meta.json` is there to
+be found.

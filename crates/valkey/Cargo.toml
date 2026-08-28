@@ -13,14 +13,15 @@ path = "src/lib.rs"
 anyhow       = { workspace = true }
 fred         = { workspace = true, features = ["subscriber-client", "i-scripts"] }
 scry-block   = { workspace = true }
+scry-catalog = { workspace = true }
 scry-cluster = { workspace = true }
 tokio        = { workspace = true }
 tracing      = { workspace = true }
 uuid         = { workspace = true }
 
 [dev-dependencies]
-scry-catalog = { workspace = true }
 serde_json   = { workspace = true }
+tempfile     = "3"
 
 [lints]
 workspace = true

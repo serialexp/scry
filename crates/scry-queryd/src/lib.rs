@@ -410,6 +410,53 @@ pub async fn run(args: Args) -> Result<()> {
             .with_context(|| format!("opening catalog at {}", args.catalog.display()))?,
     ));
 
+    // Clones for the convergence loops, captured before `catalog`/`store` are
+    // moved into the service. The daemon and the loops share one catalog
+    // connection (`std::sync::Mutex<Catalog>` is a `CatalogHandle`).
+    let conv_catalog = catalog.clone();
+    let conv_store = store.clone();
+    let conv_bucket = cfg.bucket.clone();
+
+    // ── Valkey (v0.9 convergence + D-054 live discovery) ──────────
+    // Built before the service so the live-merge (D-054) discovery source can
+    // be injected: `--live` logs queries fan in to the ingesters discovered
+    // via the D-053 tail registry. With no Valkey the live half is refused
+    // (`QUERY_ERR_LIVE_UNAVAILABLE`), so we only attach a discovery when it's
+    // present.
+    let valkey_url = args
+        .valkey_url
+        .clone()
+        .or_else(|| std::env::var(VALKEY_URL_ENV).ok());
+    // Ephemeral per-process identity — the query daemon has no persistent
+    // writer_id (it writes no blocks), so it mints one UUID at startup and
+    // reuses it as the Valkey client id AND the status-registry / self_id key.
+    let instance_uuid = Uuid::now_v7();
+    let valkey = match valkey_url.as_deref() {
+        Some(url) => Some(
+            ValkeyClient::connect(url, instance_uuid)
+                .await
+                .with_context(|| format!("connecting to Valkey at {url}"))?,
+        ),
+        None => {
+            info!("{VALKEY_URL_ENV} unset and no --valkey-url; convergence via polling + full-walk only");
+            None
+        }
+    };
+    // The convergence consumer starts **here**, before the seed walk rather
+    // than alongside the other background loops far below. The walk is O(every
+    // block in the bucket) and can run for minutes; a consumer started after it
+    // hears nothing published during that window, and pub/sub is never
+    // replayed. Most such misses self-correct (the next poll or walk re-reads
+    // the same bucket truth), but a `SoftDeleted` does not: a staged block's
+    // objects are deliberately still in the bucket, so a walk that misses the
+    // event re-lists the block as live. See `apply_staged_deletions` below for
+    // the other half of that fix.
+    let mut bg_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    if let Some(url) = valkey_url.clone() {
+        let cat = conv_catalog.clone();
+        bg_tasks.push(tokio::spawn(run_consumer(url, cat)));
+    }
+
     if needs_cold_seed {
         info!(
             catalog = %args.catalog.display(),
@@ -427,6 +474,30 @@ pub async fn run(args: Args) -> Result<()> {
             elapsed_secs = started.elapsed().as_secs_f64(),
             "catalog seed complete"
         );
+    }
+
+    // Whatever we just seeded from the bucket, our peers may already have
+    // hidden some of it. A staged deletion is invisible in the bucket by
+    // design — the objects stay put for the grace window — so the walk above
+    // inserted those blocks as live, and the `SoftDeleted` that said otherwise
+    // was published before this process existed and is never replayed.
+    //
+    // Reading the staged set *after* the inserts is what makes this work with
+    // no memory of events for blocks we did not yet have: by now the rows
+    // exist, so a plain `mark_deleted` lands. And this runs before the
+    // listener opens, so there is no window in which we serve a block a peer
+    // considers gone.
+    if let Some(vk) = valkey.as_ref() {
+        match scry_valkey::converge_staged_deletions(vk.inner(), conv_catalog.as_ref()).await {
+            Ok(n) if n > 0 => info!(
+                staged = n,
+                "applied peers' staged deletions before opening the listener"
+            ),
+            Ok(_) => {}
+            Err(e) => {
+                warn!(error = %e, "applying peers' staged deletions failed; blocks a peer has hidden may be listed until they are reaped")
+            }
+        }
     }
 
     // Postings cache: env defaults, overridden by --postings-cache-bytes.
@@ -499,38 +570,6 @@ pub async fn run(args: Args) -> Result<()> {
     // value also prevents later listeners from missing an earlier signal.
     let shutdown = scry_server::shutdown::channel();
 
-    // Clones for the convergence loops, captured before `catalog`/`store` are
-    // moved into the service. The daemon and the loops share one catalog
-    // connection (`std::sync::Mutex<Catalog>` is a `CatalogHandle`).
-    let conv_catalog = catalog.clone();
-    let conv_store = store.clone();
-    let conv_bucket = cfg.bucket.clone();
-
-    // ── Valkey (v0.9 convergence + D-054 live discovery) ──────────
-    // Built before the service so the live-merge (D-054) discovery source can
-    // be injected: `--live` logs queries fan in to the ingesters discovered
-    // via the D-053 tail registry. With no Valkey the live half is refused
-    // (`QUERY_ERR_LIVE_UNAVAILABLE`), so we only attach a discovery when it's
-    // present.
-    let valkey_url = args
-        .valkey_url
-        .clone()
-        .or_else(|| std::env::var(VALKEY_URL_ENV).ok());
-    // Ephemeral per-process identity — the query daemon has no persistent
-    // writer_id (it writes no blocks), so it mints one UUID at startup and
-    // reuses it as the Valkey client id AND the status-registry / self_id key.
-    let instance_uuid = Uuid::now_v7();
-    let valkey = match valkey_url.as_deref() {
-        Some(url) => Some(
-            ValkeyClient::connect(url, instance_uuid)
-                .await
-                .with_context(|| format!("connecting to Valkey at {url}"))?,
-        ),
-        None => {
-            info!("{VALKEY_URL_ENV} unset and no --valkey-url; convergence via polling + full-walk only");
-            None
-        }
-    };
     let live_discovery: Option<Arc<dyn LiveDiscovery>> = valkey
         .clone()
         .map(|vk| Arc::new(ValkeyLiveDiscovery { valkey: vk }) as Arc<dyn LiveDiscovery>);
@@ -631,13 +670,7 @@ pub async fn run(args: Args) -> Result<()> {
     // destructive work. Stale rows a peer deleted are healed at query time by
     // the `EvictOnNotFound` re-plan in `QueryService`. (`valkey`/`valkey_url`
     // were built above so the live-discovery source could be injected.)
-    let mut bg_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-
-    // pub/sub convergence consumer (only with Valkey).
-    if let Some(url) = valkey_url.clone() {
-        let cat = conv_catalog.clone();
-        bg_tasks.push(tokio::spawn(run_consumer(url, cat)));
-    }
+    // (the pub/sub convergence consumer was started before the seed walk)
 
     // Incremental cursor poller.
     {
@@ -661,6 +694,18 @@ pub async fn run(args: Args) -> Result<()> {
                 }
             }
         }));
+    }
+
+    // Periodic staged-deletion refresh: re-hide blocks a peer has staged that
+    // the poll or walk above has just (re-)inserted as live. Same cadence as
+    // the poller — one SCAN over a prefix that is empty unless retention is
+    // mid-grace-window.
+    if let Some(vk) = valkey.as_ref() {
+        bg_tasks.push(scry_valkey::spawn_staged_deletion_refresh(
+            vk.inner().clone(),
+            conv_catalog.clone(),
+            Duration::from_secs(args.poll_interval.max(1)),
+        ));
     }
 
     // Periodic full walk.
