@@ -4467,10 +4467,11 @@ export class SpanEncoder extends BitStreamEncoder {
     size += value.trace_id.length;
     // span_id: bytes (kind: fixed)
     size += value.span_id.length;
-    if (value.parent_span_id !== undefined) {
-      // parent_span_id: custom type (optional)
-      const parent_span_id_encoder = new optionalEncoder();
-      size += parent_span_id_encoder.calculateSize(value.parent_span_id);
+    // parent_span_id: optional (presence: uint8)
+    size += 1; // parent_span_id presence indicator
+    if (value.parent_span_id !== undefined && value.parent_span_id !== null) {
+      // parent_span_id: bytes (kind: fixed)
+      size += value.parent_span_id.length;
     }
     // name: string (utf8)
     size += new TextEncoder().encode(value.name).length;
