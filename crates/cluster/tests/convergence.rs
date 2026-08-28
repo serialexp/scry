@@ -554,6 +554,12 @@ async fn retention_pass_defers_to_the_global_lease() {
 /// This is what gives peers the same grace window the retention owner gives
 /// itself. Without it, a peer keeps planning queries against these blocks right
 /// up until the objects vanish, and every such query 404s and has to self-heal.
+///
+/// The window is re-based on the *local* clock: only the owner's grace
+/// *duration* crosses the wire, never its absolute deadline. Reaping pending
+/// deletions is lease-free, so an owner whose clock ran behind would otherwise
+/// hand every peer a deadline already in their past and collapse the window to
+/// nothing — see `a_stagers_slow_clock_cannot_collapse_the_grace_window`.
 #[test]
 fn soft_deleted_apply_hides_rows_for_the_owners_grace_window() {
     let (catalog, _tmp) = open_catalog();
@@ -565,12 +571,26 @@ fn soft_deleted_apply_hides_rows_for_the_owners_grace_window() {
     assert_eq!(catalog.list_blocks().unwrap().len(), 2);
 
     const GRACE: u64 = 600 * 1_000_000_000;
+    /// `applied_at` is read just *before* the apply, which stamps its own
+    /// `now` microseconds later, so the eligibility boundary sits slightly
+    /// past `applied_at + GRACE`. A second of slack is far below the window.
+    const SLACK: u64 = 1_000_000_000;
+    let local_now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64
+    };
+
+    // The owner's timestamps are *its* clock — here, deliberately nothing like
+    // ours (NOW is 1000 days after the epoch). Only their difference is used.
     let soft = BlockEvent::SoftDeleted {
         signal: "logs".into(),
         uuids: vec![a.uuid, b.uuid],
         deleted_at_unix_nano: NOW,
         delete_eligible_at_unix_nano: NOW + GRACE,
     };
+    let applied_at = local_now();
     let outcome = apply_event(&catalog, &soft).unwrap();
     assert_eq!(outcome.soft_deleted, 2);
 
@@ -579,23 +599,37 @@ fn soft_deleted_apply_hides_rows_for_the_owners_grace_window() {
         catalog.list_blocks().unwrap().is_empty(),
         "a peer must stop planning against staged blocks at once"
     );
-    // … but the rows survive, carrying the owner's deadline.
+    // … but the rows survive, carrying a locally-based deadline. The owner's
+    // absolute deadline (NOW + GRACE) is decades in our past; adopting it
+    // verbatim would make these instantly reapable.
     assert!(catalog.get_block(a.uuid).unwrap().is_some());
     assert!(
         catalog
-            .list_pending_deletions(NOW + GRACE - 1)
+            .list_pending_deletions(NOW + GRACE)
             .unwrap()
             .is_empty(),
-        "not eligible before the owner's deadline"
+        "the owner's absolute deadline was adopted; a slow clock would delete data early"
+    );
+    assert!(
+        catalog
+            .list_pending_deletions(applied_at + GRACE - 1)
+            .unwrap()
+            .is_empty(),
+        "not eligible before a full grace window has passed on our clock"
     );
     assert_eq!(
-        catalog.list_pending_deletions(NOW + GRACE).unwrap().len(),
+        catalog
+            .list_pending_deletions(applied_at + GRACE + SLACK)
+            .unwrap()
+            .len(),
         2,
-        "eligible exactly at the deadline"
+        "eligible once our own grace window elapses"
     );
 
-    // Duplicated / reordered delivery is a no-op, and an event carrying an
-    // *earlier* deadline must never shorten the window already recorded.
+    // Duplicated / reordered delivery is a no-op, and must not re-date the
+    // hiding — the applier recomputes `now + grace` every time, so without
+    // first-application-wins the deadline would creep forward forever and the
+    // blocks would never become reapable here.
     apply_event(&catalog, &soft).unwrap();
     apply_event(
         &catalog,
@@ -607,12 +641,13 @@ fn soft_deleted_apply_hides_rows_for_the_owners_grace_window() {
         },
     )
     .unwrap();
-    assert!(
+    assert_eq!(
         catalog
-            .list_pending_deletions(NOW + GRACE - 1)
+            .list_pending_deletions(applied_at + GRACE + SLACK)
             .unwrap()
-            .is_empty(),
-        "a late/earlier event must not shorten the grace window"
+            .len(),
+        2,
+        "a repeat application moved the deadline"
     );
 
     // The hard delete still lands normally afterwards.
@@ -644,4 +679,147 @@ fn soft_deleted_apply_tolerates_unknown_blocks() {
     .unwrap();
     assert_eq!(outcome.soft_deleted, 1, "intent is reported");
     assert_eq!(catalog.block_count().unwrap(), 0);
+}
+
+/// Collects everything emitted, so a test can assert on the events a pass
+/// broadcast rather than only on its catalog after-state.
+#[derive(Default)]
+struct RecordingSink(Mutex<Vec<BlockEvent>>);
+
+impl scry_block::BlockEventSink for RecordingSink {
+    fn emit(&self, event: BlockEvent) {
+        self.0.lock().unwrap().push(event);
+    }
+}
+
+/// Deletion work that is staged but not yet reaped must be re-announced on
+/// every retention pass, for as long as it stays outstanding.
+///
+/// The `SoftDeleted` emitted when a block is staged is a one-shot, and the
+/// Valkey staged-deletions registry it feeds holds entries under a TTL sized
+/// for a reap that happens roughly on schedule. When the reap stalls — a
+/// crashed reaper, a bucket that keeps failing — the entry would expire while
+/// the objects are still there, and an instance booting afterwards would walk
+/// the bucket and serve data retention had deliberately hidden. Re-announcing
+/// keeps the registry alive exactly as long as the work is.
+#[tokio::test]
+async fn retention_re_announces_deletions_that_have_not_been_reaped() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let writer = Uuid::now_v7();
+    let staged = build_logs_block(&store, writer, 0xB001, NOW - 90 * DAY, 10).await;
+
+    let (catalog, _tmp) = open_catalog();
+    catalog.insert_block(&staged).unwrap();
+    // Staged, with a grace window that has not elapsed: hidden from queries,
+    // objects still in the bucket, not yet eligible for the reap.
+    catalog
+        .mark_deleted(&[staged.uuid], NOW, NOW + 10 * DAY)
+        .unwrap();
+
+    // No TTL configured, so this pass plans no *new* staging — the only thing
+    // it can legitimately emit is the re-announcement.
+    let cfg = RetentionConfig {
+        default_ttl: None,
+        overrides: Default::default(),
+        grace: Duration::ZERO,
+        apply: true,
+    };
+    let sink = RecordingSink::default();
+    let report = run_retention_pass(
+        &LocalLeaseProvider::new(),
+        store.clone(),
+        &catalog,
+        &cfg,
+        NOW,
+        &sink,
+        Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.candidates, 0, "nothing newly expired");
+    assert_eq!(report.reaped, 0, "the grace window has not elapsed");
+    assert!(
+        catalog.get_block(staged.uuid).unwrap().is_some(),
+        "the staged block is still in the catalog"
+    );
+
+    let events = sink.0.lock().unwrap();
+    let announced: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            BlockEvent::SoftDeleted {
+                signal,
+                uuids,
+                deleted_at_unix_nano,
+                delete_eligible_at_unix_nano,
+            } => Some((
+                signal.clone(),
+                uuids.clone(),
+                *deleted_at_unix_nano,
+                *delete_eligible_at_unix_nano,
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        announced,
+        vec![("logs".to_string(), vec![staged.uuid], NOW, NOW + 10 * DAY)],
+        "the outstanding deletion is re-announced with its deadline pair intact"
+    );
+}
+
+/// Once the objects are actually gone, there is nothing left to keep alive, so
+/// the pass must stop re-announcing — otherwise the registry would carry an
+/// entry for a block that no longer exists anywhere, forever.
+#[tokio::test]
+async fn a_reaped_deletion_is_no_longer_re_announced() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let writer = Uuid::now_v7();
+    let staged = build_logs_block(&store, writer, 0xB002, NOW - 90 * DAY, 10).await;
+
+    let (catalog, _tmp) = open_catalog();
+    catalog.insert_block(&staged).unwrap();
+    // Staged with a grace window that has already elapsed: this pass reaps it.
+    catalog
+        .mark_deleted(&[staged.uuid], NOW - DAY, NOW - 1)
+        .unwrap();
+
+    let cfg = RetentionConfig {
+        default_ttl: None,
+        overrides: Default::default(),
+        grace: Duration::ZERO,
+        apply: true,
+    };
+    let sink = RecordingSink::default();
+    let first = run_retention_pass(
+        &LocalLeaseProvider::new(),
+        store.clone(),
+        &catalog,
+        &cfg,
+        NOW,
+        &sink,
+        Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.reaped, 1, "the elapsed grace window is reaped");
+    assert!(catalog.get_block(staged.uuid).unwrap().is_none());
+
+    // The next pass has nothing outstanding to announce.
+    let sink2 = RecordingSink::default();
+    run_retention_pass(
+        &LocalLeaseProvider::new(),
+        store.clone(),
+        &catalog,
+        &cfg,
+        NOW,
+        &sink2,
+        Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
+    assert!(
+        sink2.0.lock().unwrap().is_empty(),
+        "a reaped block is not re-announced"
+    );
 }

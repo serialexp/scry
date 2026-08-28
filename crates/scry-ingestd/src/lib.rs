@@ -143,6 +143,15 @@ pub struct Args {
     #[arg(long)]
     valkey_url: Option<String>,
 
+    /// Valkey key namespace for this deployment. Every key and channel scry
+    /// uses lives under it (`<ns>/lease/…`, `<ns>/blocks/<signal>`,
+    /// `<ns>/tail/…`, `<ns>/deleted/…`, `<ns>/status/…`). Falls back to
+    /// `$SCRY_VALKEY_NAMESPACE`, then `scry`. Give two deployments sharing one
+    /// Valkey two different namespaces: otherwise they contend for each
+    /// other's leases and converge each other's block events.
+    #[arg(long)]
+    valkey_namespace: Option<String>,
+
     /// Instance role. `full` ingests, converges, and contends for
     /// maintenance leases; `ingest-only` ingests + converges but never runs
     /// maintenance; `query-only` only converges (no ingest pipelines, no
@@ -352,9 +361,11 @@ pub async fn run(args: Args) -> Result<()> {
         .valkey_url
         .clone()
         .or_else(|| std::env::var(VALKEY_URL_ENV).ok());
+    let valkey_keys = scry_valkey::Keyspace::resolve(args.valkey_namespace.as_deref())
+        .context("resolving the Valkey key namespace")?;
     let valkey = match valkey_url.as_deref() {
         Some(url) => Some(
-            ValkeyClient::connect(url, writer_uuid)
+            ValkeyClient::connect(url, writer_uuid, valkey_keys.clone())
                 .await
                 .with_context(|| format!("connecting to Valkey at {url}"))?,
         ),
@@ -368,7 +379,7 @@ pub async fn run(args: Args) -> Result<()> {
     // `with_event_sink` a no-op.
     let (event_sink, sink_task): (Option<Arc<dyn BlockEventSink>>, _) = match valkey.as_ref() {
         Some(c) => {
-            let (sink, task) = ValkeySink::spawn(c.inner().clone(), writer_uuid);
+            let (sink, task) = ValkeySink::spawn(c.clone(), writer_uuid);
             (Some(Arc::new(sink)), Some(task))
         }
         None => (None, None),
@@ -391,7 +402,7 @@ pub async fn run(args: Args) -> Result<()> {
                     .context("resolving tail advertise address")?;
             let ttl = Duration::from_secs(args.lease_ttl.max(1));
             Some(
-                TailRegistration::spawn(c.inner().clone(), writer_uuid, addr, ttl)
+                TailRegistration::spawn(c, writer_uuid, addr, ttl)
                     .await
                     .context("registering tail address in Valkey")?,
             )
@@ -653,7 +664,7 @@ pub async fn run(args: Args) -> Result<()> {
             let producer: scry_valkey::StatusProducer =
                 Arc::new(move || serde_json::to_string(&m.snapshot()).unwrap_or_default());
             Some(
-                StatusRegistration::spawn(c.inner().clone(), writer_uuid, STATUS_TTL, producer)
+                StatusRegistration::spawn(c, writer_uuid, STATUS_TTL, producer)
                     .await
                     .context("registering status in Valkey")?,
             )
@@ -732,11 +743,23 @@ pub async fn run(args: Args) -> Result<()> {
         if let Some(url) = valkey_url.clone() {
             let cat = catalog.clone();
             let convergence_grace = Duration::from_secs(args.compact_grace.unwrap_or(600));
-            bg_tasks.push(tokio::spawn(run_consumer(url, cat, convergence_grace)));
+            bg_tasks.push(tokio::spawn(run_consumer(
+                url,
+                valkey_keys.clone(),
+                cat,
+                convergence_grace,
+            )));
         }
+
+        // The staged-deletions read (D-063) is sequenced at the end of each
+        // poll and walk rather than run on its own timer: both can insert a
+        // block a peer has already staged, and the bucket — which still holds
+        // the objects through the grace window — says nothing to the contrary.
+        let staged_client = valkey.clone();
 
         // 2. incremental cursor poller (backstops dropped events).
         {
+            let staged_client = staged_client.clone();
             let store = store.clone();
             let bucket = bucket.clone();
             let cat = catalog.clone();
@@ -755,25 +778,19 @@ pub async fn run(args: Args) -> Result<()> {
                         Ok(_) => {}
                         Err(e) => warn!(error = %e, "convergence poll failed"),
                     }
+                    scry_valkey::converge_staged_deletions_logged(
+                        staged_client.as_ref(),
+                        cat.as_ref(),
+                        "poll",
+                    )
+                    .await;
                 }
             }));
         }
 
-        // 2b. staged-deletion refresh: re-hide blocks a peer has staged for
-        //     retention that the poll or walk has just (re-)inserted as live.
-        //     The `SoftDeleted` event only lands on peers that already knew the
-        //     block; this catches the ones we learn about afterwards. One SCAN
-        //     over a prefix that is empty unless retention is mid-grace-window.
-        if let Some(vk) = valkey.as_ref() {
-            bg_tasks.push(scry_valkey::spawn_staged_deletion_refresh(
-                vk.inner().clone(),
-                catalog.clone(),
-                Duration::from_secs(args.poll_interval.max(1)),
-            ));
-        }
-
         // 3. periodic full walk (ultimate backstop; discovers new prefixes).
         {
+            let staged_client = staged_client.clone();
             let store = store.clone();
             let bucket = bucket.clone();
             let cat = catalog.clone();
@@ -800,6 +817,12 @@ pub async fn run(args: Args) -> Result<()> {
                         Ok(_) => {}
                         Err(e) => warn!(error = %e, "convergence full-walk failed"),
                     }
+                    scry_valkey::converge_staged_deletions_logged(
+                        staged_client.as_ref(),
+                        cat.as_ref(),
+                        "full-walk",
+                    )
+                    .await;
                 }
             }));
         }
@@ -851,7 +874,7 @@ pub async fn run(args: Args) -> Result<()> {
                     if let Some(metrics) = stats_metrics.as_ref() {
                         metrics.configure_compaction(true, compact_cfg.grace);
                     }
-                    let provider = ValkeyLeaseProvider::new(c.inner().clone());
+                    let provider = ValkeyLeaseProvider::new(c.clone());
                     bg_tasks.push(tokio::spawn(run_maintenance_loop(
                         provider,
                         store,
@@ -944,12 +967,13 @@ pub async fn run(args: Args) -> Result<()> {
 /// closed subscription; lag just drops events (the cursor poller backstops).
 async fn run_consumer(
     url: String,
+    keys: scry_valkey::Keyspace,
     catalog: Arc<std::sync::Mutex<Catalog>>,
     compact_grace: Duration,
 ) {
     use tokio::sync::broadcast::error::RecvError;
     loop {
-        match subscribe_blocks(&url, &ALL_SIGNALS).await {
+        match subscribe_blocks(&url, &keys, &ALL_SIGNALS).await {
             Ok((_sub, mut rx)) => {
                 info!("subscribed to block-event channels for catalog convergence");
                 loop {

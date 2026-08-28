@@ -11,6 +11,7 @@ path = "src/lib.rs"
 
 [dependencies]
 anyhow       = { workspace = true }
+futures      = { workspace = true }
 fred         = { workspace = true, features = ["subscriber-client", "i-scripts"] }
 scry-block   = { workspace = true }
 scry-catalog = { workspace = true }

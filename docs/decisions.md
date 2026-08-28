@@ -3223,7 +3223,7 @@ hide the same rows for the same window instead of discovering the deletion by
 planning a query and hitting a 404.
 
 That event only reaches instances **listening at that instant**, and pub/sub is
-never replayed. Two situations slip through, and neither is recoverable from
+never replayed. Three situations slip through, and none is recoverable from
 bucket state — because a staged deletion is *deliberately invisible* in the
 bucket, the objects being exactly what the grace window preserves:
 
@@ -3232,64 +3232,144 @@ bucket, the objects being exactly what the grace window preserves:
    Nobody re-announces the staging.
 2. An instance that never saw the block's `Created`, so the `SoftDeleted`
    updated no rows, and a later poll or walk then inserts the block as live.
+3. A walk that fetched a block's sidecar just *before* the objects were reaped,
+   and inserts the row just after. The `Deleted` it may also have heard already
+   went by.
 
 **The registry.** Staging is mirrored into one Valkey key per block —
-`SET scry/deleted/<uuid> "<delete_eligible_at_unix_nano>" PX <ttl>` — read back
-with one read-only Lua `SCAN`, the same idiom as the D-053 tail registry. The
-grace deadline *is* an expiry, so `PX` does all the housekeeping: an entry
-becomes irrelevant exactly when the objects are reaped and vanishes on its own.
-There is no cleanup pass, and a crashed reaper cannot leak entries. The TTL
-carries `STAGED_TTL_MARGIN` (300s) of slack on top of the remaining window,
-because a late reaper (missed tick, lease handed over, slow bucket) must not
-leave a booting peer un-warned; erring long is free, since a stale entry names a
-block that is either still hidden or already gone.
+`SET <ns>/deleted/<uuid> "<staged_at>:<delete_eligible_at>" PX <ttl>` — read back
+with a client-side `SCAN`. The grace deadline *is* an expiry, so `PX` does all
+the housekeeping: an entry becomes irrelevant when the objects are reaped and
+vanishes on its own. There is no cleanup pass, and a crashed reaper cannot leak
+entries. The TTL carries `STAGED_TTL_MARGIN` (300s) of slack on top of the
+window, for ordinary scheduling jitter.
+
+**The value carries `staged_at`, not just the deadline, because deadlines must
+never be compared across machines.** Reaping pending deletions is deliberately
+lease-free (`scry_cluster::maintain`), so any instance holding a pending row
+will eventually delete those objects. An absolute deadline written by an
+instance whose clock runs behind therefore looks *already past* to every peer,
+and they all reap immediately — collapsing the window everywhere at once. A
+reader takes only the **duration** (`eligible - staged_at`) and re-bases it on
+its own clock. Erring long is free (a late reap is idempotent and
+`NotFound`-tolerant); erring short deletes data out from under live readers. The
+same reasoning applies to the `SoftDeleted` event, whose apply path adopts the
+duration too.
+
+**Applying it is first-application-wins**, not `mark_deleted`'s `MAX(deadline)`:
+the convergence path recomputes `now + grace` on every cycle, so keeping the
+later deadline would push it forward forever and the block would never become
+reapable. `adopt_peer_deletion` updates only rows with `deleted_at IS NULL`.
+
+**Nothing is ever unstaged.** An entry survives its block's reap and stays for
+the rest of its TTL as a **fence** — that is what covers case 3. Applying an
+entry for a block nobody has is a no-op, so a lingering entry costs nothing, and
+never issuing a multi-key `DEL` keeps the registry usable on a Valkey cluster.
+Conversely the entry must not lapse while the work is outstanding: a reap that
+stalls (crashed reaper, failing bucket) would leave objects with no entry
+naming them, and the next instance to boot would walk the bucket and serve data
+retention had hidden. So every retention pass re-announces every block that is
+staged-but-not-reaped, and the entry stays alive exactly as long as the work
+does.
 
 **Applied *after* the inserts, which is what removes the need to remember
 anything.** The obvious alternative was a pending-tombstone table: record a
 `SoftDeleted` for a block we do not have, and consult it on insert. Bart's
 framing killed it — at boot "we're not serving anything at all yet", so the
 walker can insert everything, *then* read the registry and apply it, by which
-time the rows exist and a plain `mark_deleted` lands. No second place for
-deletion state to live, no schema change. The same read on a timer covers case
-2: a poll or walk re-inserts a block as live, and the next refresh hides it
-again. The residue is that a block can be live for the moment between a
-*periodic* insert and the next refresh — a query planned in that sliver 404s and
-self-heals through `EvictOnNotFound`, which is exactly the behaviour that
-existed before this registry. At boot there is no sliver at all, because the
+time the rows exist and a plain update lands. No second place for deletion state
+to live, no schema change. The same read covers case 2, and it is **sequenced
+after** each convergence poll and full walk rather than run on an independent
+timer: an insert immediately followed by the apply that hides it again is a
+much smaller window than "whenever the timer next fires", and it cannot
+interleave the other way round. At boot there is no window at all, because the
 apply runs before the listener opens.
+
+**The `SCAN` runs client-side.** It used to loop inside a Lua script, which was
+wrong twice over: a script is atomic, so the server serves nobody — not a lease
+renewal, not a publish — until the whole keyspace has been walked; and `SCAN` in
+a zero-key script routes to a single node, so on a cluster it silently sees one
+shard's entries. (`MATCH` filters what comes back but does not reduce the work.)
+Reads and writes are **pipelined** in batches: staging runs inside the single
+sink worker, where one awaited round trip per block would stall every other
+event behind a large retention pass. A pipeline also routes per command, so it
+stays correct on a cluster where one batch spans hash slots. Staging attempts
+every uuid even when some fail, and reports how many landed — stopping at the
+first error would leave peers holding a prefix of a staging the `SoftDeleted`
+announced in full.
 
 **Where the code lives, and why.** The retention engine is untouched: it takes a
 `&dyn BlockEventSink` precisely so it never learns Valkey exists, and
 `ValkeySink`'s publisher — already the Valkey-aware half of that seam — mirrors
-`SoftDeleted` into the registry and `Deleted` out of it. The apply is
-`scry_cluster::apply_staged_deletions` (pure, catalog-only, unit-tested with a
-fake meta); `scry_valkey::converge_staged_deletions` is the list+apply both
-daemons call, and `spawn_staged_deletion_refresh` the timer loop. `scry-valkey`
-already depended on both `scry-cluster` and `scry-catalog`, so this needed no
-new dependency edge and no duplicated wiring in the two binaries.
+`SoftDeleted` into the registry. The apply is
+`scry_cluster::apply_staged_deletions` (pure, catalog-only, unit-tested);
+`scry_valkey::converge_staged_deletions{,_logged}` is the list+apply both daemons
+call. `scry-valkey` already depended on both `scry-cluster` and `scry-catalog`,
+so this needed no new dependency edge.
 
-**queryd now subscribes before its seed walk.** Previously the pub/sub consumer
-was spawned with the other background loops, long after the boot walk — so
-during a walk that is O(every block in the bucket) and can run for minutes, this
-instance heard nothing at all. Most such misses self-correct, because the next
-poll or walk re-reads the same bucket truth; `SoftDeleted` is the one that does
-not, for the reason above. The Valkey connection moved up accordingly (it was
-already built before the service, for D-054 live discovery).
+**queryd now subscribes before its seed walk, and waits until it is actually
+subscribed.** Previously the pub/sub consumer was spawned with the other
+background loops, long after the boot walk — so during a walk that is O(every
+block in the bucket) and can run for minutes, this instance heard nothing at
+all. Most such misses self-correct, because the next poll or walk re-reads the
+same bucket truth; `SoftDeleted` is the one that does not. Spawning is not
+subscribing, though — `run_consumer` does its `subscribe_blocks` inside the task
+— so the boot path waits on a `oneshot` the consumer fires on its first
+successful subscribe, bounded (10s) so an unreachable Valkey delays readiness
+rather than preventing it.
 
 **Kept:** `BlockEvent::SoftDeleted` itself. It still does the work for peers that
 already know the block, which is the common case in a converged fleet; the
 registry covers the arrivals it cannot reach.
 
-**Sealed by** three real-Valkey integration tests in
-`crates/valkey/tests/valkey_integration.rs` — the registry round-trips,
-`ValkeySink` mirrors a `SoftDeleted` in and a `Deleted` out, and a catalog
-holding a block "just seeded from the bucket" stops listing it after
-`converge_staged_deletions` — plus four `scry-cluster` unit tests covering the
-apply, unknown blocks, and the `MAX`-deadline idempotency that lets the refresh
-loop re-run every poll cycle without ever shortening a window a reader is
-relying on.
+**Sealed by** real-Valkey integration tests in
+`crates/valkey/tests/valkey_integration.rs` — the registry round-trips both
+stamps, `ValkeySink` mirrors a `SoftDeleted` in and leaves the fence standing
+after a `Deleted`, and a catalog holding a block "just seeded from the bucket"
+stops listing it after `converge_staged_deletions` — plus `scry-cluster` unit
+tests covering the apply, unknown blocks, a stager's slow clock, re-application
+idempotency, and the re-announcement of unreaped work (with its counterpart:
+once reaped, nothing is announced).
 
-**Not done:** closing the periodic-insert sliver (would need the tombstone table
-after all), and any equivalent for compaction's `Superseded` — that one *is*
-recoverable from bucket state, since the merged block's `meta.json` is there to
-be found.
+**Not done:** closing the sliver between a periodic insert and the converge that
+follows it (would need the tombstone table after all), and any equivalent for
+compaction's `Superseded` — that one *is* recoverable from bucket state, since
+the merged block's `meta.json` is there to be found.
+
+## D-064: One configurable Valkey key namespace per deployment
+
+**Date:** 2026-08-29
+**Status:** accepted
+
+Every key and channel scry used was a hard-coded literal: `scry/lease/…`,
+`scry/blocks/<signal>`, `scry/tail/ingesters/…`, `scry/deleted/…`,
+`scry/status/…`. Two deployments pointed at one Valkey — a staging and a
+production cluster, or two buckets that happen to share a cache — therefore
+shared all of them. That is not a cosmetic collision: they contend for each
+other's leases (one deployment's compaction blocks the other's), list each
+other's instances in the fleet and tail views, and converge each other's block
+events. Block UUIDs make a same-UUID data collision vanishingly unlikely, but
+the lease and registry keys are not UUID-keyed and collide by construction.
+
+`Keyspace` (in `scry-valkey`) is now the single place any of those strings is
+built, and `ValkeyClient` carries one — so a key-building site reads the
+namespace off the connection it already holds, rather than from a global or a
+parameter threaded through every call. Both daemons take `--valkey-namespace`,
+falling back to `$SCRY_VALKEY_NAMESPACE` and then to `scry`, which is exactly
+what an existing deployment already has in its keys.
+
+The namespace is validated to `[A-Za-z0-9_.:-]{1,64}`. `/` is our own separator,
+and `*`/`?`/`[` are glob metacharacters in `SCAN MATCH` — either would make a
+prefix scan match keys it does not own, or miss keys it does.
+
+`scry-cluster` is deliberately Valkey-agnostic, so it keeps naming leases
+**logically** (`lease/retention`, `lease/compact/<signal>/<date>/<level>`) and
+`ValkeyLeaseProvider` prefixes them on the way out. The alternative — passing a
+namespace into the cluster crate — would have put Valkey's addressing scheme
+into the one crate written not to know about it.
+
+**Sealed by** `Keyspace` unit tests (the default namespace reproduces the
+historical keys verbatim; two namespaces share no key; glob and separator
+characters are rejected) and a real-Valkey integration test that runs two
+clients in different namespaces and asserts they share no lease, no tail
+registration, no staged deletion, and no pub/sub channel.

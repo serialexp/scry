@@ -6,7 +6,7 @@
 //! daemon) into a per-instance key:
 //!
 //! ```text
-//! SET scry/status/<instance_uuid> "<snapshot-json>" PX <ttl_ms>
+//! SET <namespace>/status/<instance_uuid> "<snapshot-json>" PX <ttl_ms>
 //! ```
 //!
 //! Unlike the tail registry ([`crate::registry`]) — whose *value* (the address)
@@ -24,8 +24,7 @@ use anyhow::{Context, Result};
 use fred::prelude::*;
 use uuid::Uuid;
 
-/// Key prefix for the per-instance status registry.
-pub const STATUS_PREFIX: &str = "scry/status/";
+use crate::ValkeyClient;
 
 /// TTL for a status heartbeat. Chosen short so a dead instance drops off the
 /// fleet view promptly; the renew task re-publishes every `ttl/3` (~2s), which
@@ -60,11 +59,6 @@ else
 end
 "#;
 
-/// The registry key for an instance.
-fn key_for(instance_uuid: Uuid) -> String {
-    format!("{STATUS_PREFIX}{instance_uuid}")
-}
-
 /// Produces the current status snapshot as a JSON string. Invoked on every
 /// heartbeat, so it must be cheap (a handful of atomic reads + serialise).
 pub type StatusProducer = Arc<dyn Fn() -> String + Send + Sync>;
@@ -85,12 +79,13 @@ impl StatusRegistration {
     /// initial `SET` synchronously (so a broken Valkey surfaces immediately),
     /// then re-publishes `producer()` every `ttl/3`.
     pub async fn spawn(
-        client: Client,
+        client: &ValkeyClient,
         instance_uuid: Uuid,
         ttl: Duration,
         producer: StatusProducer,
     ) -> Result<Self> {
-        let key = key_for(instance_uuid);
+        let key = client.keys().status(&instance_uuid.to_string());
+        let client = client.inner().clone();
         let ttl_ms = ttl.as_millis().max(1) as i64;
         let last = Arc::new(std::sync::Mutex::new(String::new()));
 
@@ -177,9 +172,10 @@ fn spawn_renew(
 
 /// Enumerate the live status snapshots currently in the registry (each a JSON
 /// blob). Order is unspecified.
-pub async fn discover_status_blobs(client: &Client) -> Result<Vec<String>> {
-    let pattern = format!("{STATUS_PREFIX}*");
+pub async fn discover_status_blobs(client: &ValkeyClient) -> Result<Vec<String>> {
+    let pattern = format!("{}*", client.keys().status_prefix());
     let blobs: Vec<String> = client
+        .inner()
         .eval(DISCOVER_LUA, Vec::<String>::new(), vec![pattern])
         .await
         .context("discovering status blobs")?;

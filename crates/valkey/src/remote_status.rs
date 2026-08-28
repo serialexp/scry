@@ -6,10 +6,9 @@ use anyhow::{Context, Result};
 use fred::prelude::*;
 use uuid::Uuid;
 
-use crate::status::STATUS_PREFIX;
+use crate::ValkeyClient;
 
 pub const AGENT_STATUS_TTL: Duration = Duration::from_secs(20);
-const OWNER_PREFIX: &str = "scry/status-owner/";
 
 const UPSERT_LUA: &str = r#"
 local owner = redis.call('GET', KEYS[2])
@@ -26,23 +25,25 @@ redis.call('DEL', KEYS[2])
 return 1
 "#;
 
-fn keys(instance_id: &str) -> (String, String) {
+fn keys(client: &ValkeyClient, instance_id: &str) -> (String, String) {
+    // `/` is our key separator; a remote agent's id is operator-supplied, so
+    // encode it rather than let it forge a key in another part of the
+    // namespace.
     let encoded = instance_id.replace('/', "%2F");
-    (
-        format!("{STATUS_PREFIX}{encoded}"),
-        format!("{OWNER_PREFIX}{encoded}"),
-    )
+    let ks = client.keys();
+    (ks.status(&encoded), ks.status_owner(&encoded))
 }
 
 pub async fn upsert_remote_status(
-    client: &Client,
+    client: &ValkeyClient,
     instance_id: &str,
     owner: Uuid,
     snapshot_json: &str,
 ) -> Result<bool> {
-    let (status_key, owner_key) = keys(instance_id);
+    let (status_key, owner_key) = keys(client, instance_id);
     let ttl_ms = AGENT_STATUS_TTL.as_millis() as i64;
     let result: i64 = client
+        .inner()
         .eval(
             UPSERT_LUA,
             vec![status_key, owner_key],
@@ -57,9 +58,14 @@ pub async fn upsert_remote_status(
     Ok(result == 1)
 }
 
-pub async fn remove_remote_status(client: &Client, instance_id: &str, owner: Uuid) -> Result<bool> {
-    let (status_key, owner_key) = keys(instance_id);
+pub async fn remove_remote_status(
+    client: &ValkeyClient,
+    instance_id: &str,
+    owner: Uuid,
+) -> Result<bool> {
+    let (status_key, owner_key) = keys(client, instance_id);
     let result: i64 = client
+        .inner()
         .eval(
             REMOVE_LUA,
             vec![status_key, owner_key],

@@ -81,7 +81,7 @@ struct ValkeyLiveDiscovery {
 #[async_trait::async_trait]
 impl LiveDiscovery for ValkeyLiveDiscovery {
     async fn discover(&self) -> anyhow::Result<Vec<String>> {
-        discover_tail_endpoints(self.valkey.inner()).await
+        discover_tail_endpoints(&self.valkey).await
     }
 }
 
@@ -95,7 +95,7 @@ struct ValkeyFleetSource {
 #[async_trait::async_trait]
 impl FleetSource for ValkeyFleetSource {
     async fn blobs(&self) -> Vec<String> {
-        discover_status_blobs(self.valkey.inner())
+        discover_status_blobs(&self.valkey)
             .await
             .unwrap_or_else(|e| {
                 warn!(error = %e, "status fleet discovery failed");
@@ -270,6 +270,15 @@ pub struct Args {
     #[arg(long)]
     valkey_url: Option<String>,
 
+    /// Valkey key namespace for this deployment. Every key and channel scry
+    /// uses lives under it (`<ns>/lease/…`, `<ns>/blocks/<signal>`,
+    /// `<ns>/tail/…`, `<ns>/deleted/…`, `<ns>/status/…`). Falls back to
+    /// `$SCRY_VALKEY_NAMESPACE`, then `scry`. Give two deployments sharing one
+    /// Valkey two different namespaces: otherwise they contend for each
+    /// other's leases and converge each other's block events.
+    #[arg(long)]
+    valkey_namespace: Option<String>,
+
     /// Seconds between incremental cursor convergence polls.
     #[arg(long, default_value_t = 5)]
     poll_interval: u64,
@@ -431,9 +440,11 @@ pub async fn run(args: Args) -> Result<()> {
     // writer_id (it writes no blocks), so it mints one UUID at startup and
     // reuses it as the Valkey client id AND the status-registry / self_id key.
     let instance_uuid = Uuid::now_v7();
+    let valkey_keys = scry_valkey::Keyspace::resolve(args.valkey_namespace.as_deref())
+        .context("resolving the Valkey key namespace")?;
     let valkey = match valkey_url.as_deref() {
         Some(url) => Some(
-            ValkeyClient::connect(url, instance_uuid)
+            ValkeyClient::connect(url, instance_uuid, valkey_keys.clone())
                 .await
                 .with_context(|| format!("connecting to Valkey at {url}"))?,
         ),
@@ -452,9 +463,35 @@ pub async fn run(args: Args) -> Result<()> {
     // event re-lists the block as live. See `apply_staged_deletions` below for
     // the other half of that fix.
     let mut bg_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    let mut consumer_ready: Option<tokio::sync::oneshot::Receiver<()>> = None;
     if let Some(url) = valkey_url.clone() {
         let cat = conv_catalog.clone();
-        bg_tasks.push(tokio::spawn(run_consumer(url, cat)));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        consumer_ready = Some(rx);
+        bg_tasks.push(tokio::spawn(run_consumer(
+            url,
+            valkey_keys.clone(),
+            cat,
+            Some(tx),
+        )));
+    }
+
+    // Spawning the consumer is not the same as being subscribed: `run_consumer`
+    // does its `subscribe_blocks` inside the task, so without this barrier the
+    // seed walk and the staged-deletions read below could both complete while
+    // the subscription was still being established — and a staging published in
+    // that gap would be missed by both halves of the fix. Bounded, because a
+    // Valkey that never answers must not keep the daemon from booting: on
+    // timeout we carry on and let the poll loops converge.
+    if let Some(rx) = consumer_ready {
+        match tokio::time::timeout(CONSUMER_READY_TIMEOUT, rx).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => warn!("block-event consumer stopped before it subscribed"),
+            Err(_) => warn!(
+                timeout_secs = CONSUMER_READY_TIMEOUT.as_secs(),
+                "block-event subscription not established in time; continuing (polling will backstop)"
+            ),
+        }
     }
 
     if needs_cold_seed {
@@ -488,7 +525,7 @@ pub async fn run(args: Args) -> Result<()> {
     // listener opens, so there is no window in which we serve a block a peer
     // considers gone.
     if let Some(vk) = valkey.as_ref() {
-        match scry_valkey::converge_staged_deletions(vk.inner(), conv_catalog.as_ref()).await {
+        match scry_valkey::converge_staged_deletions(vk, conv_catalog.as_ref()).await {
             Ok(n) if n > 0 => info!(
                 staged = n,
                 "applied peers' staged deletions before opening the listener"
@@ -672,8 +709,18 @@ pub async fn run(args: Args) -> Result<()> {
     // were built above so the live-discovery source could be injected.)
     // (the pub/sub convergence consumer was started before the seed walk)
 
+    // The staged-deletions read (D-063) is sequenced at the *end* of each poll
+    // and walk rather than run on its own timer. Both of those can insert a
+    // block a peer has already staged — the objects are still in the bucket
+    // during the grace window, so there is nothing in the bucket to say
+    // otherwise — and an independent timer would leave it listed as live until
+    // the next tick. `None` when there is no Valkey: nothing to converge
+    // against, and the call is skipped entirely.
+    let staged_client = valkey.clone();
+
     // Incremental cursor poller.
     {
+        let staged_client = staged_client.clone();
         let store = conv_store.clone();
         let bucket = conv_bucket.clone();
         let cat = conv_catalog.clone();
@@ -692,24 +739,19 @@ pub async fn run(args: Args) -> Result<()> {
                     Ok(_) => {}
                     Err(e) => warn!(error = %e, "convergence poll failed"),
                 }
+                scry_valkey::converge_staged_deletions_logged(
+                    staged_client.as_ref(),
+                    cat.as_ref(),
+                    "poll",
+                )
+                .await;
             }
         }));
     }
 
-    // Periodic staged-deletion refresh: re-hide blocks a peer has staged that
-    // the poll or walk above has just (re-)inserted as live. Same cadence as
-    // the poller — one SCAN over a prefix that is empty unless retention is
-    // mid-grace-window.
-    if let Some(vk) = valkey.as_ref() {
-        bg_tasks.push(scry_valkey::spawn_staged_deletion_refresh(
-            vk.inner().clone(),
-            conv_catalog.clone(),
-            Duration::from_secs(args.poll_interval.max(1)),
-        ));
-    }
-
     // Periodic full walk.
     {
+        let staged_client = staged_client.clone();
         let store = conv_store.clone();
         let bucket = conv_bucket.clone();
         let cat = conv_catalog.clone();
@@ -728,6 +770,12 @@ pub async fn run(args: Args) -> Result<()> {
                     Ok(_) => {}
                     Err(e) => warn!(error = %e, "convergence full-walk failed"),
                 }
+                scry_valkey::converge_staged_deletions_logged(
+                    staged_client.as_ref(),
+                    cat.as_ref(),
+                    "full-walk",
+                )
+                .await;
             }
         }));
     }
@@ -800,7 +848,7 @@ pub async fn run(args: Args) -> Result<()> {
             let producer: scry_valkey::StatusProducer =
                 Arc::new(move || serde_json::to_string(&metrics.snapshot()).unwrap_or_default());
             Some(
-                StatusRegistration::spawn(c.inner().clone(), instance_uuid, STATUS_TTL, producer)
+                StatusRegistration::spawn(c, instance_uuid, STATUS_TTL, producer)
                     .await
                     .context("registering status in Valkey")?,
             )
@@ -862,12 +910,27 @@ pub async fn run(args: Args) -> Result<()> {
 /// Background pub/sub convergence consumer: subscribe to every block-event
 /// channel and apply each event to the catalog idempotently. Reconnects on a
 /// closed subscription; lag drops events (the cursor poller backstops).
-async fn run_consumer(url: String, catalog: Arc<Mutex<Catalog>>) {
+/// How long the boot path waits for the pub/sub subscription to come up before
+/// proceeding without it. Long enough to cover a slow Valkey handshake, short
+/// enough that an unreachable Valkey delays readiness rather than preventing it.
+const CONSUMER_READY_TIMEOUT: Duration = Duration::from_secs(10);
+
+async fn run_consumer(
+    url: String,
+    keys: scry_valkey::Keyspace,
+    catalog: Arc<Mutex<Catalog>>,
+    mut subscribed: Option<tokio::sync::oneshot::Sender<()>>,
+) {
     use tokio::sync::broadcast::error::RecvError;
     loop {
-        match subscribe_blocks(&url, &ALL_SIGNALS).await {
+        match subscribe_blocks(&url, &keys, &ALL_SIGNALS).await {
             Ok((_sub, mut rx)) => {
                 info!("subscribed to block-event channels for catalog convergence");
+                // Tell the boot path the subscription is live. Only the first
+                // success matters; a later reconnect has no one waiting.
+                if let Some(tx) = subscribed.take() {
+                    let _ = tx.send(());
+                }
                 loop {
                     match rx.recv().await {
                         Ok(msg) => {

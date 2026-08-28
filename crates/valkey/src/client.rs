@@ -14,6 +14,8 @@ use fred::prelude::*;
 use tokio::sync::watch;
 use uuid::Uuid;
 
+use crate::keyspace::Keyspace;
+
 /// Environment variable naming the Valkey endpoint (e.g.
 /// `redis://127.0.0.1:6379`). Unset ⇒ Valkey-less degraded operation.
 pub const VALKEY_URL_ENV: &str = "SCRY_VALKEY_URL";
@@ -30,12 +32,16 @@ pub struct ValkeyClient {
     /// `true` while the connection is healthy. Lags reality by one event but
     /// is only ever used to choose a polling cadence, never for correctness.
     health: watch::Receiver<bool>,
+    /// This deployment's key namespace. Every key/channel this crate builds
+    /// comes from here, so two scry deployments can share one Valkey.
+    keys: Keyspace,
 }
 
 impl ValkeyClient {
     /// Connect to `url` and start the health watcher. `holder` is this
-    /// instance's stable id (reused across reconnects).
-    pub async fn connect(url: &str, holder: Uuid) -> Result<Self> {
+    /// instance's stable id (reused across reconnects); `keys` is the
+    /// deployment namespace every key is built under.
+    pub async fn connect(url: &str, holder: Uuid, keys: Keyspace) -> Result<Self> {
         let config = Config::from_url(url).with_context(|| format!("parsing Valkey url {url}"))?;
         let client = Builder::from_config(config)
             .build()
@@ -45,19 +51,22 @@ impl ValkeyClient {
         let (tx, rx) = watch::channel(client.is_connected());
         spawn_health_watcher(&client, tx);
 
-        tracing::info!(%url, %holder, "connected to Valkey");
+        tracing::info!(%url, %holder, namespace = keys.namespace(), "connected to Valkey");
         Ok(Self {
             client,
             holder,
             health: rx,
+            keys,
         })
     }
 
     /// Connect from `SCRY_VALKEY_URL`, or `Ok(None)` if it is unset. `holder`
-    /// is this instance's stable id.
-    pub async fn from_env(holder: Uuid) -> Result<Option<Self>> {
+    /// is this instance's stable id; `keys` the deployment namespace.
+    pub async fn from_env(holder: Uuid, keys: Keyspace) -> Result<Option<Self>> {
         match std::env::var(VALKEY_URL_ENV) {
-            Ok(url) if !url.trim().is_empty() => Ok(Some(Self::connect(url.trim(), holder).await?)),
+            Ok(url) if !url.trim().is_empty() => {
+                Ok(Some(Self::connect(url.trim(), holder, keys).await?))
+            }
             _ => {
                 tracing::info!(
                     "{VALKEY_URL_ENV} unset; running without Valkey (single-instance: no pub/sub, maintenance paused)"
@@ -75,6 +84,11 @@ impl ValkeyClient {
     /// This instance's id (lease holder, event origin).
     pub fn holder(&self) -> Uuid {
         self.holder
+    }
+
+    /// This deployment's key namespace.
+    pub fn keys(&self) -> &Keyspace {
+        &self.keys
     }
 
     /// A receiver for the connection-health flag (`true` = healthy).

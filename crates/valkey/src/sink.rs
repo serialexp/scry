@@ -16,6 +16,7 @@ use scry_block::{BlockEvent, BlockEventSink, Envelope};
 use uuid::Uuid;
 
 use crate::pubsub::publish_envelope;
+use crate::ValkeyClient;
 
 /// Bounded buffer of pending events. Generous enough to ride out brief Valkey
 /// hiccups; overflow drops (backstopped by polling).
@@ -33,10 +34,7 @@ impl ValkeySink {
     /// command/publish handle; `origin` is this instance's id (stamped on
     /// every envelope). The returned [`JoinHandle`](tokio::task::JoinHandle)
     /// ends when the last sink clone is dropped.
-    pub fn spawn(
-        client: fred::clients::Client,
-        origin: Uuid,
-    ) -> (Self, tokio::task::JoinHandle<()>) {
+    pub fn spawn(client: ValkeyClient, origin: Uuid) -> (Self, tokio::task::JoinHandle<()>) {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<BlockEvent>(SINK_CAPACITY);
         let task = tokio::spawn(async move {
             let mut seq: u64 = 0;
@@ -66,11 +64,18 @@ impl ValkeySink {
 /// takes a `&dyn BlockEventSink` precisely so it never has to know Valkey
 /// exists, and this sink is already the Valkey-aware half of that seam.
 ///
-/// Failures are logged, not propagated. A missed stage costs a peer one
-/// planned-then-404'd query (the `EvictOnNotFound` self-heal it had before this
-/// registry existed); a missed unstage costs a stale entry that expires on its
-/// own and applies to a block nobody has.
-async fn mirror_deletion_staging(client: &fred::clients::Client, event: &BlockEvent) {
+/// Nothing is removed on `Deleted`. An entry stays until its TTL lapses, so
+/// that for the rest of the window it acts as a **fence**: a peer's bucket walk
+/// that fetched the block's sidecar just before the objects were reaped will
+/// insert the row afterwards, and only a still-present entry hides it again.
+/// Applying an entry for a block nobody has is a no-op, so a lingering entry
+/// costs nothing — and never issuing a multi-key `DEL` keeps the registry
+/// usable on a Valkey cluster.
+///
+/// Failures are logged, not propagated: a missed stage costs a peer one
+/// planned-then-404'd query, which is the `EvictOnNotFound` self-heal that
+/// existed before this registry.
+async fn mirror_deletion_staging(client: &ValkeyClient, event: &BlockEvent) {
     match event {
         BlockEvent::SoftDeleted {
             uuids,
@@ -89,12 +94,8 @@ async fn mirror_deletion_staging(client: &fred::clients::Client, event: &BlockEv
                 tracing::warn!(error = %e, "recording staged deletions failed; a peer booting during the grace window may re-list these blocks until they are reaped");
             }
         }
-        BlockEvent::Deleted { uuids, .. } => {
-            if let Err(e) = crate::staged::unstage_deletions(client, uuids).await {
-                tracing::debug!(error = %e, "unstaging reaped deletions failed; entries will expire via TTL");
-            }
+        BlockEvent::Created { .. } | BlockEvent::Superseded { .. } | BlockEvent::Deleted { .. } => {
         }
-        BlockEvent::Created { .. } | BlockEvent::Superseded { .. } => {}
     }
 }
 

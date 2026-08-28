@@ -960,6 +960,51 @@ impl Catalog {
         Ok(())
     }
 
+    /// Adopt a *peer's* soft delete: hide these blocks with a locally-computed
+    /// deadline, but only if they are not already hidden.
+    ///
+    /// Distinct from [`mark_deleted`](Self::mark_deleted) in the one way that
+    /// matters for a repeating caller. `mark_deleted` takes the `MAX` of the
+    /// old and new deadlines, which is right for the owner (a re-stage may
+    /// legitimately extend a window a reader relies on) but wrong for the
+    /// convergence path, which re-applies the same peer staging on every poll
+    /// cycle with a *freshly computed* `now + remaining_grace`. Under `MAX`
+    /// each pass would push the deadline further out and the block would never
+    /// become reapable here. First application wins instead: the grace we
+    /// grant is decided once, when we first hear about the block.
+    ///
+    /// `WHERE deleted_at IS NULL` also means this can never contradict a
+    /// staging this instance performed itself.
+    ///
+    /// Returns the number of rows actually hidden (0 when everything in
+    /// `uuids` is already hidden or absent — the steady state).
+    pub fn adopt_peer_deletion(
+        &self,
+        uuids: &[Uuid],
+        deleted_at_unix_nano: u64,
+        delete_eligible_at_unix_nano: u64,
+    ) -> Result<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut changed = 0usize;
+        {
+            let mut stmt = tx.prepare_cached(
+                "UPDATE blocks SET deleted_at = ?1, delete_eligible_at = ?2 \
+                 WHERE uuid = ?3 AND deleted_at IS NULL",
+            )?;
+            for uuid in uuids {
+                changed += stmt
+                    .execute(params![
+                        deleted_at_unix_nano as i64,
+                        delete_eligible_at_unix_nano.min(i64::MAX as u64) as i64,
+                        uuid.to_string()
+                    ])
+                    .context("UPDATE deleted_at (peer adoption)")?;
+            }
+        }
+        tx.commit().context("commit adopt_peer_deletion")?;
+        Ok(changed)
+    }
+
     /// Soft-deleted blocks whose grace window has elapsed — the durable
     /// work list retention reaps from. Mirrors
     /// [`list_pending_reaps`](Self::list_pending_reaps), which does the
@@ -989,6 +1034,41 @@ impl Catalog {
         )?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .context("list pending deletions")
+    }
+
+    /// Every block that is soft-deleted but whose objects have **not** been
+    /// reaped yet — the outstanding deletion work, regardless of whether its
+    /// grace window has elapsed.
+    ///
+    /// Distinct from
+    /// [`list_pending_deletions`](Self::list_pending_deletions), which returns
+    /// only the subset that is already *due*. This is the whole in-flight set,
+    /// which is what a retention pass re-announces so peers (and the Valkey
+    /// staged-deletions registry, whose entries would otherwise expire on a
+    /// schedule that assumed the reap succeeded) keep hearing about work that
+    /// is still outstanding.
+    ///
+    /// Returns `(uuid, signal, deleted_at, delete_eligible_at)`.
+    pub fn list_staged_deletions(&self) -> Result<Vec<(Uuid, String, u64, u64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT uuid, signal, deleted_at, delete_eligible_at FROM blocks \
+             WHERE deleted_at IS NOT NULL AND delete_eligible_at IS NOT NULL \
+             ORDER BY signal, delete_eligible_at",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let uuid: String = r.get(0)?;
+            let signal: String = r.get(1)?;
+            let deleted_at: i64 = r.get(2)?;
+            let eligible_at: i64 = r.get(3)?;
+            Ok((uuid, signal, deleted_at as u64, eligible_at as u64))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (uuid, signal, deleted_at, eligible_at) = row.context("row")?;
+            let Ok(uuid) = uuid.parse() else { continue };
+            out.push((uuid, signal, deleted_at, eligible_at));
+        }
+        Ok(out)
     }
 
     /// The highest block UUID this instance has ingested for

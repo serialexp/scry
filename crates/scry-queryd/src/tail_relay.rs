@@ -276,7 +276,7 @@ where
             }
             // Periodic rediscovery: reconcile the upstream set.
             _ = tick.tick() => {
-                match discover_tail_endpoints(valkey.inner()).await {
+                match discover_tail_endpoints(&valkey).await {
                     Ok(addrs) => reconcile(&addrs, &mut upstreams, &tx, &matchers),
                     Err(e) => warn!(%peer, error = %e, "tail rediscovery failed; keeping current upstreams"),
                 }

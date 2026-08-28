@@ -100,7 +100,7 @@ impl AgentStatusRelay {
                         }
                         if let Some(client) = &valkey {
                             if let Err(e) = upsert_remote_status(
-                                client.inner(),
+                                client,
                                 &status.instance_id,
                                 status.owner_token,
                                 &json,
@@ -114,8 +114,7 @@ impl AgentStatusRelay {
                     Command::Remove { instance_id, owner } => {
                         worker_registry.remove(&instance_id, owner);
                         if let Some(client) = &valkey {
-                            if let Err(e) =
-                                remove_remote_status(client.inner(), &instance_id, owner).await
+                            if let Err(e) = remove_remote_status(client, &instance_id, owner).await
                             {
                                 warn!(error = %e, agent = %instance_id, "removing remote agent status failed");
                             }
@@ -176,7 +175,7 @@ impl FleetSource for MergedFleetSource {
         let mut by_id: HashMap<String, (u64, String)> = HashMap::new();
         let mut blobs = self.local.blobs();
         if let Some(valkey) = &self.valkey {
-            match scry_valkey::discover_status_blobs(valkey.inner()).await {
+            match scry_valkey::discover_status_blobs(valkey).await {
                 Ok(remote) => blobs.extend(remote),
                 Err(e) => warn!(error = %e, "status fleet discovery failed; using local agents"),
             }

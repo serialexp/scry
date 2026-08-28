@@ -1,66 +1,117 @@
 //! Applying peers' staged deletions to the local catalog.
 //!
 //! The counterpart to `scry_valkey::staged`, kept here so it is Valkey-agnostic
-//! and unit-testable: the caller supplies the `(uuid, delete_eligible_at)`
-//! pairs however it obtained them.
+//! and unit-testable: the caller supplies the entries however it obtained them.
 //!
 //! # Why this is a separate step from the event consumer
 //!
 //! [`apply_event`](crate::apply_event) handles a `SoftDeleted` that arrives
-//! while we are listening and already know the block. Two situations it cannot
-//! cover, because in both the information simply never reaches us:
+//! while we are listening and already know the block. Three situations it
+//! cannot cover, because in each the information never reaches us at a moment
+//! when we can act on it:
 //!
 //! - We booted after the staging. Pub/sub is not replayed, and the bucket still
 //!   holds the objects (that is what the grace window is for), so seeding from
 //!   the bucket inserts the blocks as live with nothing to contradict it.
 //! - We never saw the block's `Created`, so the `SoftDeleted` updated no rows,
 //!   and a later poll or walk then inserted the block as live.
+//! - A walk fetched a block's sidecar, the block was hard-deleted, the
+//!   `Deleted` event arrived and matched nothing, and then the walk inserted
+//!   the row it had already fetched.
 //!
-//! Both are fixed by re-reading the staged set *after* the inserts and applying
-//! it — at boot before the listener opens, and after each periodic poll and
-//! walk. Applying after the inserts is what makes this work without any memory
-//! of events for blocks we did not have: by then the rows exist.
+//! All three are fixed by re-reading the staged set *after* the inserts and
+//! applying it — at boot before the listener opens, and at the end of each
+//! poll and walk. Applying after the inserts is what makes this work without
+//! any memory of events for blocks we did not have: by then the rows exist.
+//!
+//! # The deadline is re-based on the local clock
+//!
+//! Reaping pending deletions is deliberately lease-free (see
+//! [`crate::maintain`]), so any instance holding a pending row will eventually
+//! delete those objects. That makes it unsafe to adopt a peer's *absolute*
+//! deadline: an instance whose clock is behind writes a deadline that every
+//! peer reads as already past, and the grace window collapses to nothing
+//! everywhere at once. So an entry carries the staging instant as well, and we
+//! keep only the **duration**, re-based on our own clock.
+//!
+//! This grants a full grace window from the moment we first hear about the
+//! block, which is usually longer than what remains of the original. That is
+//! the safe direction: a late reap is idempotent and `NotFound`-tolerant, and
+//! the owner reaps on schedule regardless. Short would mean deleting objects
+//! out from under readers who were promised the window.
 
 use anyhow::{Context, Result};
 use scry_catalog::CatalogHandle;
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
-/// Hide every block a peer has staged for deletion, using the peer's own
-/// reap deadline.
+/// One entry of the staged-deletions registry.
 ///
-/// `staged` is `(block uuid, delete_eligible_at_unix_nano)`. Entries naming
-/// blocks this catalog does not have are a no-op — they cost one UPDATE that
-/// matches nothing, which is the correct outcome, not an error.
+/// Both timestamps come from the **staging instance's** clock and are only ever
+/// meaningful relative to each other; see the module docs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StagedDeletion {
+    pub uuid: Uuid,
+    /// When the staging instance hid the block, by its own clock.
+    pub staged_at_unix_nano: u64,
+    /// When the staging instance intends the objects to become reapable, by
+    /// its own clock.
+    pub delete_eligible_at_unix_nano: u64,
+}
+
+impl StagedDeletion {
+    /// The grace window the staging instance intended, in nanoseconds.
+    /// Clock-independent, because both ends came from the same clock.
+    ///
+    /// Saturating: a deadline at or before the staging instant means "no
+    /// grace", which is the legitimate `grace = 0` configuration.
+    pub fn grace_nanos(&self) -> u64 {
+        self.delete_eligible_at_unix_nano
+            .saturating_sub(self.staged_at_unix_nano)
+    }
+}
+
+/// Hide every block a peer has staged for deletion, granting each the grace
+/// window its stager intended, measured from *our* clock.
 ///
-/// Returns the number of entries applied (the intent, not the rows changed;
-/// `mark_deleted` does not report a count and most calls here are re-applying
-/// what is already hidden).
+/// Entries naming blocks this catalog does not have are a no-op — one UPDATE
+/// that matches nothing, which is the correct outcome, not an error.
 ///
-/// Idempotent: `mark_deleted` `COALESCE`s the `deleted_at` it already has and
-/// takes the `MAX` of the deadlines, so repeating this every poll cycle never
-/// re-dates a hidden block or shortens a window a reader is relying on.
+/// Returns the number of rows **newly** hidden. Re-running this on every poll
+/// cycle is the normal case and returns 0 once converged, so a caller can log
+/// only when something actually changed.
+///
+/// Uses [`adopt_peer_deletion`](scry_catalog::Catalog::adopt_peer_deletion)
+/// rather than `mark_deleted`: first application wins. `mark_deleted` takes the
+/// `MAX` of the deadlines, which is right for the owner but would let this
+/// path — which recomputes `now + grace` every cycle — push the deadline
+/// forward forever, so the block would never become reapable here.
 pub fn apply_staged_deletions<C: CatalogHandle + ?Sized>(
     catalog: &C,
-    staged: &[(Uuid, u64)],
+    staged: &[StagedDeletion],
     now_unix_nano: u64,
 ) -> Result<usize> {
     if staged.is_empty() {
         return Ok(0);
     }
-    // Group by deadline so blocks staged in the same retention pass go through
-    // as one transaction, instead of one per block.
-    let mut by_deadline: BTreeMap<u64, Vec<Uuid>> = BTreeMap::new();
-    for (uuid, eligible_at) in staged {
-        by_deadline.entry(*eligible_at).or_default().push(*uuid);
+    // Group by intended grace so blocks staged in the same retention pass go
+    // through as one transaction rather than one per block.
+    let mut by_grace: BTreeMap<u64, Vec<Uuid>> = BTreeMap::new();
+    for entry in staged {
+        by_grace
+            .entry(entry.grace_nanos())
+            .or_default()
+            .push(entry.uuid);
     }
 
-    for (eligible_at, uuids) in &by_deadline {
-        catalog
-            .with(|c| c.mark_deleted(uuids, now_unix_nano, *eligible_at))
+    let mut hidden = 0usize;
+    for (grace, uuids) in &by_grace {
+        let eligible_at = now_unix_nano.saturating_add(*grace);
+        hidden += catalog
+            .with(|c| c.adopt_peer_deletion(uuids, now_unix_nano, eligible_at))
             .context("applying peers' staged deletions")?;
     }
-    Ok(staged.len())
+    Ok(hidden)
 }
 
 #[cfg(test)]
@@ -70,6 +121,7 @@ mod tests {
     use scry_catalog::Catalog;
 
     const NOW: u64 = 1_700_000_000_000_000_000;
+    const GRACE: u64 = 600_000_000_000; // 600s
 
     fn open_catalog() -> (Catalog, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
@@ -104,6 +156,14 @@ mod tests {
         }
     }
 
+    fn entry(uuid: Uuid, staged_at: u64, eligible_at: u64) -> StagedDeletion {
+        StagedDeletion {
+            uuid,
+            staged_at_unix_nano: staged_at,
+            delete_eligible_at_unix_nano: eligible_at,
+        }
+    }
+
     /// The case the whole module exists for: a block inserted by a bucket walk
     /// that a peer had already staged is hidden once the staged set is applied.
     #[test]
@@ -113,9 +173,10 @@ mod tests {
         cat.insert_block(&meta(uuid)).unwrap();
         assert_eq!(cat.list_blocks().unwrap().len(), 1, "live before");
 
-        let applied = apply_staged_deletions(&cat, &[(uuid, NOW + 600_000_000_000)], NOW).unwrap();
+        let hidden =
+            apply_staged_deletions(&cat, &[entry(uuid, NOW, NOW + GRACE)], NOW + 5).unwrap();
 
-        assert_eq!(applied, 1);
+        assert_eq!(hidden, 1);
         assert!(
             cat.list_blocks().unwrap().is_empty(),
             "a staged block must not be listed for queries"
@@ -127,34 +188,90 @@ mod tests {
     #[test]
     fn unknown_blocks_are_a_no_op() {
         let (cat, _tmp) = open_catalog();
-        let applied = apply_staged_deletions(&cat, &[(Uuid::now_v7(), NOW + 1)], NOW).unwrap();
-        assert_eq!(applied, 1, "intent is reported");
+        let hidden =
+            apply_staged_deletions(&cat, &[entry(Uuid::now_v7(), NOW, NOW + GRACE)], NOW).unwrap();
+        assert_eq!(hidden, 0, "nothing was hidden; there was nothing to hide");
         assert_eq!(cat.block_count().unwrap(), 0);
     }
 
-    /// Re-applied every poll cycle, so it must never shorten a grace window a
-    /// reader is relying on, nor re-date the hiding.
+    /// The clock-skew fix. A peer whose clock is an hour behind writes a
+    /// deadline that is already in *our* past. Adopting it verbatim would make
+    /// the block instantly reapable and destroy the grace window; only the
+    /// duration may cross the wire.
     #[test]
-    fn reapplying_never_shortens_the_window() {
+    fn a_stagers_slow_clock_cannot_collapse_the_grace_window() {
         let (cat, _tmp) = open_catalog();
         let uuid = Uuid::now_v7();
         cat.insert_block(&meta(uuid)).unwrap();
 
-        let far = NOW + 600_000_000_000;
-        apply_staged_deletions(&cat, &[(uuid, far)], NOW).unwrap();
-        // A second pass carrying an earlier deadline must not win.
-        apply_staged_deletions(&cat, &[(uuid, NOW + 1)], NOW + 5).unwrap();
+        // Stager is an hour behind: its "now + 600s" is still 55 minutes ago.
+        let hour = 3_600_000_000_000u64;
+        let stager_now = NOW - hour;
+        apply_staged_deletions(&cat, &[entry(uuid, stager_now, stager_now + GRACE)], NOW).unwrap();
 
-        let pending = cat.list_pending_deletions(far - 1).unwrap();
         assert!(
-            pending.is_empty(),
-            "block became reapable early: the shorter deadline was taken"
+            cat.list_pending_deletions(NOW).unwrap().is_empty(),
+            "block became reapable immediately: the peer's absolute deadline was adopted"
         );
-        let pending = cat.list_pending_deletions(far + 1).unwrap();
         assert_eq!(
-            pending.len(),
+            cat.list_pending_deletions(NOW + GRACE + 1).unwrap().len(),
             1,
-            "still reapable once the real deadline passes"
+            "a full grace window from our own clock, then reapable"
+        );
+    }
+
+    /// Re-applied after every poll and walk, so the deadline must not drift
+    /// forward each time — otherwise the block never becomes reapable here.
+    #[test]
+    fn reapplying_does_not_push_the_deadline_forward() {
+        let (cat, _tmp) = open_catalog();
+        let uuid = Uuid::now_v7();
+        cat.insert_block(&meta(uuid)).unwrap();
+
+        let e = entry(uuid, NOW, NOW + GRACE);
+        assert_eq!(apply_staged_deletions(&cat, &[e], NOW).unwrap(), 1);
+        // Many cycles later, the same entry is still in the registry.
+        for i in 1..5 {
+            assert_eq!(
+                apply_staged_deletions(&cat, &[e], NOW + i * GRACE).unwrap(),
+                0,
+                "already hidden; nothing new"
+            );
+        }
+
+        assert_eq!(
+            cat.list_pending_deletions(NOW + GRACE + 1).unwrap().len(),
+            1,
+            "deadline drifted forward with each re-apply"
+        );
+    }
+
+    /// grace = 0 is a legitimate configuration (the single-instance default),
+    /// and must not underflow into an enormous window.
+    #[test]
+    fn zero_and_inverted_grace_are_immediately_reapable() {
+        let (cat, _tmp) = open_catalog();
+        let zero = Uuid::now_v7();
+        let inverted = Uuid::now_v7();
+        cat.insert_block(&meta(zero)).unwrap();
+        cat.insert_block(&meta(inverted)).unwrap();
+
+        apply_staged_deletions(
+            &cat,
+            &[
+                entry(zero, NOW, NOW),
+                // A deadline before the staging instant: nonsense, but must
+                // saturate to "no grace", not wrap to ~584 years.
+                entry(inverted, NOW, NOW - 1),
+            ],
+            NOW,
+        )
+        .unwrap();
+
+        assert_eq!(
+            cat.list_pending_deletions(NOW).unwrap().len(),
+            2,
+            "both should be reapable now"
         );
     }
 

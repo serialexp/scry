@@ -58,6 +58,8 @@ use anyhow::{Context, Result};
 use fred::prelude::*;
 use scry_block::Fence;
 use scry_cluster::{LeaseGuard, LeaseProvider};
+
+use crate::ValkeyClient;
 use uuid::Uuid;
 
 /// Extend the lease iff we still own it. KEYS[1]=key, ARGV[1]=token,
@@ -209,14 +211,19 @@ impl Drop for ValkeyLease {
     }
 }
 
-/// A [`LeaseProvider`] backed by Valkey. Clone-cheap (holds a `fred::Client`).
+/// A [`LeaseProvider`] backed by Valkey. Clone-cheap (holds a [`ValkeyClient`]).
+///
+/// `scry-cluster` is Valkey-agnostic and hands us **logical** key names
+/// (`lease/retention`, `lease/compact/<signal>/<date>/<level>`); this is where
+/// they are prefixed with the deployment namespace, so two deployments sharing
+/// one Valkey never contend for each other's leases.
 #[derive(Clone)]
 pub struct ValkeyLeaseProvider {
-    client: Client,
+    client: ValkeyClient,
 }
 
 impl ValkeyLeaseProvider {
-    pub fn new(client: Client) -> Self {
+    pub fn new(client: ValkeyClient) -> Self {
         Self { client }
     }
 }
@@ -224,7 +231,8 @@ impl ValkeyLeaseProvider {
 impl LeaseProvider for ValkeyLeaseProvider {
     type Guard = ValkeyLease;
 
-    async fn try_acquire(&self, key: &str, ttl: Duration) -> Result<Option<ValkeyLease>> {
+    async fn try_acquire(&self, logical_key: &str, ttl: Duration) -> Result<Option<ValkeyLease>> {
+        let key = self.client.keys().lease(logical_key);
         let token = Uuid::now_v7().to_string();
         let ttl_ms = ttl.as_millis().max(1) as i64;
 
@@ -236,8 +244,9 @@ impl LeaseProvider for ValkeyLeaseProvider {
         // SET key token NX PX ttl. Null reply ⇒ key already held ⇒ not ours.
         let res: Value = self
             .client
+            .inner()
             .set(
-                key,
+                key.as_str(),
                 token.clone(),
                 Some(Expiration::PX(ttl_ms)),
                 Some(SetOptions::NX),
@@ -251,8 +260,8 @@ impl LeaseProvider for ValkeyLeaseProvider {
 
         let fence = Arc::new(ValkeyFence::new(sent, backstop_for(ttl)));
         let renew = spawn_renew(
-            self.client.clone(),
-            key.to_string(),
+            self.client.inner().clone(),
+            key.clone(),
             token.clone(),
             ttl,
             ttl_ms,
@@ -260,8 +269,8 @@ impl LeaseProvider for ValkeyLeaseProvider {
         );
 
         Ok(Some(ValkeyLease {
-            client: self.client.clone(),
-            key: key.to_string(),
+            client: self.client.inner().clone(),
+            key,
             token,
             fence,
             renew,

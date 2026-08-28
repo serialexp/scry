@@ -23,9 +23,9 @@ use scry_cluster::{LeaseGuard, LeaseProvider};
 use std::sync::Arc;
 
 use scry_valkey::{
-    channel_for, discover_status_blobs, discover_tail_endpoints, parse_envelope, publish_envelope,
-    subscribe_blocks, StatusRegistration, TailRegistration, ValkeyClient, ValkeyLeaseProvider,
-    ValkeySink,
+    discover_status_blobs, discover_tail_endpoints, parse_envelope, publish_envelope,
+    subscribe_blocks, Keyspace, StatusRegistration, TailRegistration, ValkeyClient,
+    ValkeyLeaseProvider, ValkeySink,
 };
 use uuid::Uuid;
 
@@ -34,13 +34,25 @@ fn url() -> String {
 }
 
 async fn client() -> ValkeyClient {
-    ValkeyClient::connect(&url(), Uuid::now_v7())
+    client_ns(Keyspace::default()).await
+}
+
+/// A client in a specific deployment namespace — what an operator sets with
+/// `--valkey-namespace`.
+async fn client_ns(keys: Keyspace) -> ValkeyClient {
+    ValkeyClient::connect(&url(), Uuid::now_v7(), keys)
         .await
         .expect("connect to Valkey (is scripts/dev-valkey-up.sh running?)")
 }
 
+/// A namespace no other test (or run) uses.
+fn unique_ns() -> Keyspace {
+    Keyspace::new(&format!("scry-test-{}", Uuid::now_v7().simple())).expect("valid namespace")
+}
+
+/// A **logical** lease key. The provider prefixes it with the namespace.
 fn unique_key(kind: &str) -> String {
-    format!("scry/test/{kind}/{}", Uuid::now_v7())
+    format!("test/{kind}/{}", Uuid::now_v7())
 }
 
 fn deleted_event(signal: &str) -> BlockEvent {
@@ -54,7 +66,7 @@ fn deleted_event(signal: &str) -> BlockEvent {
 #[ignore = "requires a real Valkey (scripts/dev-valkey-up.sh)"]
 async fn lease_is_mutually_exclusive() {
     let c = client().await;
-    let provider = ValkeyLeaseProvider::new(c.inner().clone());
+    let provider = ValkeyLeaseProvider::new(c.clone());
     let key = unique_key("lease");
 
     let first = provider
@@ -88,7 +100,7 @@ async fn lease_is_mutually_exclusive() {
 #[ignore = "requires a real Valkey (scripts/dev-valkey-up.sh)"]
 async fn lease_renews_past_its_initial_ttl() {
     let c = client().await;
-    let provider = ValkeyLeaseProvider::new(c.inner().clone());
+    let provider = ValkeyLeaseProvider::new(c.clone());
     let key = unique_key("renew");
 
     // Short TTL: the auto-renew (every ttl/3 ≈ 200ms) must keep it alive.
@@ -119,7 +131,7 @@ async fn lease_renews_past_its_initial_ttl() {
 #[ignore = "requires a real Valkey (scripts/dev-valkey-up.sh)"]
 async fn dropping_a_lease_invalidates_its_fence() {
     let c = client().await;
-    let provider = ValkeyLeaseProvider::new(c.inner().clone());
+    let provider = ValkeyLeaseProvider::new(c.clone());
     let key = unique_key("drop");
 
     let held = provider
@@ -141,7 +153,7 @@ async fn pubsub_round_trips_an_envelope() {
     let signal = format!("metrics-{}", Uuid::now_v7());
 
     // Subscriber first, so it is listening before we publish.
-    let (sub, mut rx) = subscribe_blocks(&url(), &[signal.as_str()])
+    let (sub, mut rx) = subscribe_blocks(&url(), &Keyspace::default(), &[signal.as_str()])
         .await
         .expect("subscribe");
 
@@ -151,14 +163,17 @@ async fn pubsub_round_trips_an_envelope() {
     let pubc = client().await;
     let event = deleted_event(&signal);
     let env = Envelope::new(Uuid::now_v7(), 1, event.clone());
-    publish_envelope(pubc.inner(), &env).await.expect("publish");
+    publish_envelope(&pubc, &env).await.expect("publish");
 
     let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
         .await
         .expect("did not receive published message in time")
         .expect("broadcast channel closed");
 
-    assert_eq!(msg.channel.to_string(), channel_for(&signal));
+    assert_eq!(
+        msg.channel.to_string(),
+        Keyspace::default().blocks_channel(&signal)
+    );
     let got = parse_envelope(&msg).expect("parse envelope");
     assert_eq!(got.event.signal(), signal);
 
@@ -170,14 +185,14 @@ async fn pubsub_round_trips_an_envelope() {
 async fn sink_publishes_emitted_events() {
     let signal = format!("logs-{}", Uuid::now_v7());
 
-    let (sub, mut rx) = subscribe_blocks(&url(), &[signal.as_str()])
+    let (sub, mut rx) = subscribe_blocks(&url(), &Keyspace::default(), &[signal.as_str()])
         .await
         .expect("subscribe");
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let pubc = client().await;
     let origin = Uuid::now_v7();
-    let (sink, task) = ValkeySink::spawn(pubc.inner().clone(), origin);
+    let (sink, task) = ValkeySink::spawn(pubc.clone(), origin);
 
     sink.emit(deleted_event(&signal));
 
@@ -206,31 +221,21 @@ async fn tail_registration_is_discoverable_and_deregisters() {
     let addr_a = format!("10.0.0.1:{}", &uuid_a.simple().to_string()[..8]);
     let addr_b = format!("10.0.0.2:{}", &uuid_b.simple().to_string()[..8]);
 
-    let reg_a = TailRegistration::spawn(
-        c.inner().clone(),
-        uuid_a,
-        addr_a.clone(),
-        Duration::from_secs(10),
-    )
-    .await
-    .expect("register A");
-    let reg_b = TailRegistration::spawn(
-        c.inner().clone(),
-        uuid_b,
-        addr_b.clone(),
-        Duration::from_secs(10),
-    )
-    .await
-    .expect("register B");
+    let reg_a = TailRegistration::spawn(&c, uuid_a, addr_a.clone(), Duration::from_secs(10))
+        .await
+        .expect("register A");
+    let reg_b = TailRegistration::spawn(&c, uuid_b, addr_b.clone(), Duration::from_secs(10))
+        .await
+        .expect("register B");
 
     // Discovery sees both (subset — a shared Valkey may host other entries).
-    let found = discover_tail_endpoints(c.inner()).await.expect("discover");
+    let found = discover_tail_endpoints(&c).await.expect("discover");
     assert!(found.contains(&addr_a), "A discoverable: {found:?}");
     assert!(found.contains(&addr_b), "B discoverable: {found:?}");
 
     // Deregister A promptly; B remains.
     reg_a.deregister().await;
-    let found = discover_tail_endpoints(c.inner()).await.expect("discover");
+    let found = discover_tail_endpoints(&c).await.expect("discover");
     assert!(
         !found.contains(&addr_a),
         "A gone after deregister: {found:?}"
@@ -248,17 +253,12 @@ async fn tail_registration_renews_past_its_ttl() {
     let addr = format!("10.0.0.9:{}", &uuid.simple().to_string()[..8]);
 
     // Short TTL: the ttl/3 heartbeat must keep the key alive past it.
-    let reg = TailRegistration::spawn(
-        c.inner().clone(),
-        uuid,
-        addr.clone(),
-        Duration::from_millis(600),
-    )
-    .await
-    .expect("register");
+    let reg = TailRegistration::spawn(&c, uuid, addr.clone(), Duration::from_millis(600))
+        .await
+        .expect("register");
 
     tokio::time::sleep(Duration::from_millis(1500)).await;
-    let found = discover_tail_endpoints(c.inner()).await.expect("discover");
+    let found = discover_tail_endpoints(&c).await.expect("discover");
     assert!(
         found.contains(&addr),
         "renewed registration still present: {found:?}"
@@ -287,17 +287,12 @@ async fn status_registration_publishes_fresh_snapshots_and_deregisters() {
 
     // Short TTL so the ttl/3 heartbeat must both keep the key alive AND refresh
     // its value past the TTL.
-    let reg = StatusRegistration::spawn(
-        c.inner().clone(),
-        uuid,
-        Duration::from_millis(600),
-        producer,
-    )
-    .await
-    .expect("register status");
+    let reg = StatusRegistration::spawn(&c, uuid, Duration::from_millis(600), producer)
+        .await
+        .expect("register status");
 
     // Discoverable immediately (initial SET is synchronous).
-    let blobs = discover_status_blobs(c.inner()).await.expect("discover");
+    let blobs = discover_status_blobs(&c).await.expect("discover");
     let mine: Vec<&String> = blobs.iter().filter(|b| b.contains(&marker)).collect();
     assert_eq!(mine.len(), 1, "exactly one of our blobs present: {blobs:?}");
     let first_tick: u64 = serde_json::from_str::<serde_json::Value>(mine[0]).unwrap()["tick"]
@@ -307,7 +302,7 @@ async fn status_registration_publishes_fresh_snapshots_and_deregisters() {
     // After several heartbeats the key is still alive (past TTL) and its value
     // has advanced (a re-published fresh snapshot, not just a TTL bump).
     tokio::time::sleep(Duration::from_millis(1500)).await;
-    let blobs = discover_status_blobs(c.inner()).await.expect("discover");
+    let blobs = discover_status_blobs(&c).await.expect("discover");
     let mine: Vec<&String> = blobs.iter().filter(|b| b.contains(&marker)).collect();
     assert_eq!(mine.len(), 1, "still present past TTL: {blobs:?}");
     let later_tick: u64 = serde_json::from_str::<serde_json::Value>(mine[0]).unwrap()["tick"]
@@ -320,7 +315,7 @@ async fn status_registration_publishes_fresh_snapshots_and_deregisters() {
 
     // Deregister removes it promptly.
     reg.deregister().await;
-    let blobs = discover_status_blobs(c.inner()).await.expect("discover");
+    let blobs = discover_status_blobs(&c).await.expect("discover");
     assert!(
         !blobs.iter().any(|b| b.contains(&marker)),
         "gone after deregister: {blobs:?}"
@@ -370,31 +365,39 @@ async fn staged_deletions_round_trip() {
     let eligible = now + 600_000_000_000;
     let mine = [Uuid::now_v7(), Uuid::now_v7()];
 
-    scry_valkey::stage_deletions(c.inner(), &mine, eligible, now)
+    scry_valkey::stage_deletions(&c, &mine, eligible, now)
         .await
         .expect("stage");
 
-    let listed = scry_valkey::list_staged_deletions(c.inner())
-        .await
-        .expect("list");
+    let listed = scry_valkey::list_staged_deletions(&c).await.expect("list");
     for uuid in &mine {
-        assert_eq!(
-            listed.iter().find(|(u, _)| u == uuid).map(|(_, e)| *e),
-            Some(eligible),
-            "staged block {uuid} must come back with its peer's own deadline"
-        );
+        let entry = listed
+            .iter()
+            .find(|s| s.uuid == *uuid)
+            .unwrap_or_else(|| panic!("staged block {uuid} must come back"));
+        // Both stamps survive the round trip: a reader needs the *pair*,
+        // because what it adopts is the grace duration between them, re-based
+        // on its own clock — never the stager's absolute deadline.
+        assert_eq!(entry.staged_at_unix_nano, now);
+        assert_eq!(entry.delete_eligible_at_unix_nano, eligible);
+        assert_eq!(entry.grace_nanos(), eligible - now);
     }
 
-    scry_valkey::unstage_deletions(c.inner(), &mine)
+    // Re-staging the same block is how an unreaped deletion keeps its entry
+    // alive across passes; it must overwrite cleanly, not duplicate.
+    scry_valkey::stage_deletions(&c, &mine, eligible, now)
         .await
-        .expect("unstage");
-    let listed = scry_valkey::list_staged_deletions(c.inner())
+        .expect("re-stage");
+    let listed = scry_valkey::list_staged_deletions(&c)
         .await
-        .expect("list after unstage");
-    assert!(
-        !listed.iter().any(|(u, _)| mine.contains(u)),
-        "reaped blocks must leave the registry: {listed:?}"
-    );
+        .expect("list after re-stage");
+    for uuid in &mine {
+        assert_eq!(
+            listed.iter().filter(|s| s.uuid == *uuid).count(),
+            1,
+            "one entry per block"
+        );
+    }
 }
 
 /// The seam: retention emits `SoftDeleted` into a `BlockEventSink` and knows
@@ -403,7 +406,7 @@ async fn staged_deletions_round_trip() {
 #[ignore = "requires a real Valkey (scripts/dev-valkey-up.sh)"]
 async fn sink_mirrors_soft_deleted_into_the_registry() {
     let c = client().await;
-    let (sink, _task) = ValkeySink::spawn(c.inner().clone(), Uuid::now_v7());
+    let (sink, _task) = ValkeySink::spawn(c.clone(), Uuid::now_v7());
     let now = 1_700_000_000_000_000_000u64;
     let eligible = now + 600_000_000_000;
     let uuid = Uuid::now_v7();
@@ -422,14 +425,21 @@ async fn sink_mirrors_soft_deleted_into_the_registry() {
         "a SoftDeleted emitted through the sink must appear in the registry"
     );
 
+    // A `Deleted` does *not* retract the entry. For the rest of its TTL it is
+    // a fence: a peer whose bucket walk fetched this block's sidecar just
+    // before the objects were reaped inserts the row afterwards, and only a
+    // still-present entry hides it again. Applying an entry for a block nobody
+    // has is a no-op, so a lingering entry costs nothing — and never issuing a
+    // multi-key DEL keeps the registry usable on a Valkey cluster.
     sink.emit(BlockEvent::Deleted {
         signal: "logs".to_string(),
         uuids: vec![uuid],
     });
-    let still_there = await_registry_contains(&c, uuid, false).await;
+    // Wait for it to disappear (it must not), then assert it is still there.
+    let still_present = await_registry_contains(&c, uuid, false).await;
     assert!(
-        !still_there,
-        "once the objects are really gone the entry must go too"
+        still_present,
+        "the entry must stay as a fence until its TTL lapses, not be retracted on Deleted"
     );
 }
 
@@ -437,20 +447,18 @@ async fn sink_mirrors_soft_deleted_into_the_registry() {
 /// Returns the final observed presence.
 async fn await_registry_contains(c: &ValkeyClient, uuid: Uuid, want: bool) -> bool {
     for _ in 0..50 {
-        let listed = scry_valkey::list_staged_deletions(c.inner())
-            .await
-            .expect("list");
-        let present = listed.iter().any(|(u, _)| *u == uuid);
+        let listed = scry_valkey::list_staged_deletions(&c).await.expect("list");
+        let present = listed.iter().any(|s| s.uuid == uuid);
         if present == want {
             return present;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    scry_valkey::list_staged_deletions(c.inner())
+    scry_valkey::list_staged_deletions(&c)
         .await
         .expect("list")
         .iter()
-        .any(|(u, _)| *u == uuid)
+        .any(|s| s.uuid == uuid)
 }
 
 /// End to end, and the whole reason the registry exists: an instance seeds its
@@ -479,11 +487,11 @@ async fn converge_hides_a_block_a_peer_already_staged() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos() as u64;
-    scry_valkey::stage_deletions(c.inner(), &[uuid], now + 600_000_000_000, now)
+    scry_valkey::stage_deletions(&c, &[uuid], now + 600_000_000_000, now)
         .await
         .expect("peer stages the deletion");
 
-    let applied = scry_valkey::converge_staged_deletions(c.inner(), &catalog)
+    let applied = scry_valkey::converge_staged_deletions(&c, &catalog)
         .await
         .expect("converge");
 
@@ -493,7 +501,94 @@ async fn converge_hides_a_block_a_peer_already_staged() {
         "a block the peer staged must not be served after convergence"
     );
 
-    scry_valkey::unstage_deletions(c.inner(), &[uuid])
+    // Nothing to clean up: entries are never retracted, only expired, and the
+    // uuid is fresh so no other test can see it.
+}
+
+// ── deployment namespacing ───────────────────────────────────────────
+//
+// Two scry deployments — a staging and a production cluster, say — may point
+// at one Valkey. Everything they coordinate through must be separated by the
+// `--valkey-namespace` they were started with, or they contend for each
+// other's leases, list each other's instances, and converge each other's
+// block events.
+
+/// Two namespaces must not see one another's leases, registries, or channels.
+#[tokio::test]
+#[ignore = "requires a real Valkey (scripts/dev-valkey-up.sh)"]
+async fn two_namespaces_do_not_share_a_keyspace() {
+    let ns_a = unique_ns();
+    let ns_b = unique_ns();
+    let a = client_ns(ns_a.clone()).await;
+    let b = client_ns(ns_b.clone()).await;
+
+    // 1. Leases: the same logical key in two namespaces is two leases, so a
+    //    peer deployment's compaction can never block ours.
+    let key = unique_key("lease");
+    let held_a = ValkeyLeaseProvider::new(a.clone())
+        .try_acquire(&key, Duration::from_secs(10))
         .await
-        .ok();
+        .expect("acquire in A")
+        .expect("A wins its own namespace");
+    let held_b = ValkeyLeaseProvider::new(b.clone())
+        .try_acquire(&key, Duration::from_secs(10))
+        .await
+        .expect("acquire in B")
+        .expect("B is not blocked by A's identically-named lease");
+    held_a.release().await;
+    held_b.release().await;
+
+    // 2. Tail registry.
+    let uuid = Uuid::now_v7();
+    let addr = format!("10.0.0.7:{}", &uuid.simple().to_string()[..8]);
+    let reg = TailRegistration::spawn(&a, uuid, addr.clone(), Duration::from_secs(10))
+        .await
+        .expect("register in A");
+    assert!(discover_tail_endpoints(&a).await.unwrap().contains(&addr));
+    assert!(
+        !discover_tail_endpoints(&b).await.unwrap().contains(&addr),
+        "B must not discover A's ingesters"
+    );
+    reg.deregister().await;
+
+    // 3. Staged deletions — the one with a correctness consequence: an entry
+    //    adopted across deployments would hide a live block.
+    let block = Uuid::now_v7();
+    let now = 1_700_000_000_000_000_000u64;
+    scry_valkey::stage_deletions(&a, &[block], now + 600_000_000_000, now)
+        .await
+        .expect("stage in A");
+    assert!(scry_valkey::list_staged_deletions(&a)
+        .await
+        .unwrap()
+        .iter()
+        .any(|s| s.uuid == block));
+    assert!(
+        !scry_valkey::list_staged_deletions(&b)
+            .await
+            .unwrap()
+            .iter()
+            .any(|s| s.uuid == block),
+        "B must not adopt A's staged deletion"
+    );
+
+    // 4. Block-event pub/sub: same signal, two channels.
+    let signal = format!("logs-{}", Uuid::now_v7());
+    let (sub, mut rx) = subscribe_blocks(&url(), &ns_b, &[signal.as_str()])
+        .await
+        .expect("subscribe in B");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    publish_envelope(
+        &a,
+        &Envelope::new(Uuid::now_v7(), 1, deleted_event(&signal)),
+    )
+    .await
+    .expect("publish in A");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .is_err(),
+        "B must not receive A's block events"
+    );
+    let _ = sub.quit().await;
 }

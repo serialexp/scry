@@ -124,15 +124,25 @@ pub fn apply_event_with_grace<C: CatalogHandle>(
             delete_eligible_at_unix_nano,
             ..
         } => {
-            // Hide the rows locally for the remainder of the owner's grace
-            // window, so this peer stops planning queries against blocks whose
-            // objects are about to disappear. Idempotent, and never shortens an
-            // existing deadline.
+            // Hide the rows locally so this peer stops planning queries against
+            // blocks whose objects are about to disappear.
+            //
+            // The owner's *deadline* is not adopted, only the **duration** it
+            // implies. Reaping pending deletions is deliberately lease-free
+            // (see `crate::maintain`), so whoever holds a pending row will
+            // eventually delete those objects — and an owner whose clock runs
+            // behind would otherwise hand every peer a deadline already in
+            // their past, collapsing the grace window to zero everywhere at
+            // once. Both event timestamps come from the owner's one clock, so
+            // their difference is the one trustworthy quantity.
+            let grace = delete_eligible_at_unix_nano.saturating_sub(*deleted_at_unix_nano);
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
             catalog
-                .with(|c| {
-                    c.mark_deleted(uuids, *deleted_at_unix_nano, *delete_eligible_at_unix_nano)
-                })
-                .context("apply SoftDeleted: mark_deleted")?;
+                .with(|c| c.adopt_peer_deletion(uuids, now, now.saturating_add(grace)))
+                .context("apply SoftDeleted: adopt_peer_deletion")?;
             outcome.soft_deleted = uuids.len();
         }
         BlockEvent::Deleted { uuids, .. } => {

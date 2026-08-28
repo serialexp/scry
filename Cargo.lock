@@ -4828,6 +4828,7 @@ version = "0.17.1"
 dependencies = [
  "anyhow",
  "fred",
+ "futures",
  "scry-block",
  "scry-catalog",
  "scry-cluster",

@@ -6,7 +6,7 @@
 //! already serves `Subscribe`/`TailRecord`) into a per-instance key:
 //!
 //! ```text
-//! SET scry/tail/ingesters/<writer_uuid> "<host:port>" PX <ttl_ms>
+//! SET <namespace>/tail/ingesters/<writer_uuid> "<host:port>" PX <ttl_ms>
 //! ```
 //!
 //! renewed every `ttl/3`. The queryd relay enumerates the live set with one
@@ -22,8 +22,7 @@ use anyhow::{Context, Result};
 use fred::prelude::*;
 use uuid::Uuid;
 
-/// Key prefix for the per-instance tail-address registry.
-pub const TAIL_REGISTRY_PREFIX: &str = "scry/tail/ingesters/";
+use crate::ValkeyClient;
 
 /// Enumerate live ingester tail addresses. One read-only `EVAL` that `SCAN`s
 /// the registry prefix and `GET`s each key, so expired (crashed) instances are
@@ -57,11 +56,6 @@ else
 end
 "#;
 
-/// The registry key for an instance.
-fn key_for(writer_uuid: Uuid) -> String {
-    format!("{TAIL_REGISTRY_PREFIX}{writer_uuid}")
-}
-
 /// A live registration of this instance's tail address. Auto-renews in the
 /// background; [`deregister`](Self::deregister) removes the key promptly, and
 /// dropping stops renewing and lets the key expire via its TTL.
@@ -77,12 +71,13 @@ impl TailRegistration {
     /// initial `SET` synchronously (so a broken Valkey surfaces immediately),
     /// then renews every `ttl/3`.
     pub async fn spawn(
-        client: Client,
+        client: &ValkeyClient,
         writer_uuid: Uuid,
         addr: String,
         ttl: Duration,
     ) -> Result<Self> {
-        let key = key_for(writer_uuid);
+        let key = client.keys().tail(writer_uuid);
+        let client = client.inner().clone();
         let ttl_ms = ttl.as_millis().max(1) as i64;
 
         set_key(&client, &key, &addr, ttl_ms)
@@ -159,9 +154,10 @@ fn spawn_renew(
 }
 
 /// Enumerate the live ingester tail addresses currently in the registry.
-pub async fn discover_tail_endpoints(client: &Client) -> Result<Vec<String>> {
-    let pattern = format!("{TAIL_REGISTRY_PREFIX}*");
+pub async fn discover_tail_endpoints(client: &ValkeyClient) -> Result<Vec<String>> {
+    let pattern = format!("{}*", client.keys().tail_prefix());
     let addrs: Vec<String> = client
+        .inner()
         .eval(DISCOVER_LUA, Vec::<String>::new(), vec![pattern])
         .await
         .context("discovering tail endpoints")?;

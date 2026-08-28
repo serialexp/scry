@@ -12,127 +12,162 @@
 //! [`BlockEvent::SoftDeleted`](scry_block::BlockEvent::SoftDeleted) tells peers
 //! about the staging so they hide the same rows at the same time. But pub/sub
 //! only reaches instances that are *listening at that moment*, and it is never
-//! replayed. Two cases slip through:
+//! replayed. Three cases slip through:
 //!
 //! 1. An instance that boots **after** the staging and seeds its catalog by
 //!    walking the bucket. It finds the objects — they are still there — and
 //!    inserts the blocks as live. Nobody will re-announce the staging.
 //! 2. An instance that never saw the block's `Created`, so the `SoftDeleted`
 //!    applied to nothing, and a later poll or walk then inserts it live.
+//! 3. A block whose objects were *hard* deleted between a walk fetching its
+//!    sidecar and that walk inserting the row — the `Deleted` event lands in
+//!    the gap and deletes nothing, then the insert resurrects it.
 //!
-//! Neither is recoverable from bucket state, because a staged deletion is
+//! None is recoverable from bucket state, because a staged deletion is
 //! deliberately invisible in the bucket. So the staging is also written here,
 //! as one key per block:
 //!
 //! ```text
-//! SET scry/deleted/<block_uuid> "<delete_eligible_at_unix_nano>" PX <ttl_ms>
+//! SET <ns>/deleted/<block_uuid> "<staged_at>:<delete_eligible_at>" PX <ttl_ms>
 //! ```
 //!
-//! and read back with one read-only Lua `SCAN` ([`list_staged_deletions`]).
-//! A booting instance walks the bucket, then — before it serves anything —
-//! reads this set and applies it, so it starts up already knowing what its
-//! peers know. Same read after every periodic poll and walk, which is what
-//! closes case 2.
+//! read back with a client-side `SCAN` ([`list_staged_deletions`]). A booting
+//! instance walks the bucket, then — before it serves anything — reads this set
+//! and applies it, so it starts up already knowing what its peers know. The
+//! same read after each poll and walk closes cases 2 and 3.
 //!
-//! # Why the TTL is right
+//! # Entries are never deleted, only expired
 //!
-//! The grace deadline *is* an expiry, so Valkey's own `PX` does the
-//! housekeeping: an entry becomes irrelevant exactly when the objects are
-//! reaped, and disappears on its own. There is no cleanup pass and no way to
-//! leak entries — a crashed reaper's keys expire like anyone else's.
+//! Nothing removes an entry when the block is finally reaped. That is
+//! deliberate: for the rest of the window the entry is a **fence**, and case 3
+//! above is exactly why one is needed. A walk that resurrects a hard-deleted
+//! block finds the entry still present and hides it again. Applying an entry
+//! for a block nobody has is a no-op, so a lingering entry costs nothing.
 //!
-//! [`unstage_deletions`] removes entries promptly once the objects really are
-//! gone (the peer-visible truth is then the absence of the block itself), but
-//! it is only an optimisation: a stale entry names a block nobody has, and
-//! applying it is a no-op.
+//! It also keeps every operation single-key, which is what makes the registry
+//! usable on a Valkey cluster: no multi-key `DEL` to hit `CROSSSLOT`.
+//!
+//! # Why the TTL is a floor, not a guess
+//!
+//! The entry has to outlive the *deletion*, not the deadline: a reaper that
+//! crashes, loses its lease, or keeps failing against the bucket leaves the
+//! objects in place indefinitely, and an entry that expired meanwhile would let
+//! a freshly-booted instance serve data retention had deliberately hidden.
+//! Every retention pass therefore re-stages the rows that are still pending, so
+//! the TTL is renewed for as long as the work is outstanding and only lapses
+//! once the block is really gone.
+//!
+//! # Why the value carries `staged_at`
+//!
+//! Deadlines must never be compared across machines. Pending-deletion reaping
+//! is deliberately lease-free (see `scry_cluster::maintain`), so an absolute
+//! deadline written by an instance with a slow clock would look *already past*
+//! to every peer, and they would reap immediately — collapsing the grace window
+//! the owner intended. Carrying the staging instant alongside the deadline lets
+//! a reader take only the **duration** (`eligible - staged_at`) and re-base it
+//! on its own clock. Erring long is safe (a late reap is idempotent and
+//! `NotFound`-tolerant); erring short deletes data out from under live readers.
 
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use fred::prelude::*;
 use scry_catalog::CatalogHandle;
+use scry_cluster::StagedDeletion;
 use uuid::Uuid;
 
-/// Key prefix for the staged-deletions registry.
-pub const STAGED_DELETION_PREFIX: &str = "scry/deleted/";
+use crate::ValkeyClient;
 
-/// Slack added to every entry's TTL on top of the remaining grace window.
+/// Slack added to every entry's TTL on top of the grace window.
 ///
-/// The entry must outlive the grace window it describes, not expire exactly at
-/// the boundary: the reaper may run late (a missed tick, a lost lease handed to
-/// a peer, a slow bucket), and until the objects are actually gone a booting
-/// instance still needs to be told to hide them. Erring long is free — the
-/// entry names a block that is either still hidden or already deleted, and
-/// applying it in the second case is a no-op.
+/// The entry must outlive the window it describes rather than expiring at the
+/// boundary, because the reaper may run late (a missed tick, a lease handed
+/// over, a slow bucket). This is only the *floor*: a reap that stalls for
+/// longer keeps the entry alive by re-staging, so this margin covers ordinary
+/// scheduling jitter, not failure.
 const STAGED_TTL_MARGIN: Duration = Duration::from_secs(300);
 
-/// Enumerate the registry: one read-only `EVAL` that `SCAN`s the prefix and
-/// `GET`s each key, returning a flat `[key, value, key, value, …]`. Expired
-/// entries are naturally absent.
-///
-/// ARGV[1] = match pattern. No `KEYS` — read-only, and confined to a prefix
-/// this crate owns, so `SCAN`-in-script is safe (same idiom as
-/// [`crate::registry`]).
-const LIST_LUA: &str = r#"
-local cursor = "0"
-local out = {}
-repeat
-  local r = redis.call('SCAN', cursor, 'MATCH', ARGV[1], 'COUNT', 100)
-  cursor = r[1]
-  for _, k in ipairs(r[2]) do
-    local v = redis.call('GET', k)
-    if v then
-      out[#out + 1] = k
-      out[#out + 1] = v
-    end
-  end
-until cursor == "0"
-return out
-"#;
+/// How many keys to ask for per `SCAN` page, and how many commands to put in
+/// one pipeline. Large enough that 100k entries is a manageable number of round
+/// trips, small enough that no single response is unbounded.
+const SCAN_PAGE: u32 = 512;
+const PIPE_BATCH: usize = 512;
 
-/// The registry key for a block.
-fn key_for(uuid: Uuid) -> String {
-    format!("{STAGED_DELETION_PREFIX}{uuid}")
+/// Encode the entry value: the staging instant and the deadline, so a reader
+/// can recover the *duration* without trusting our clock.
+fn encode_value(staged_at_unix_nano: u64, delete_eligible_at_unix_nano: u64) -> String {
+    format!("{staged_at_unix_nano}:{delete_eligible_at_unix_nano}")
 }
 
-/// Parse a `uuid` back out of a registry key. Returns `None` for a key that
-/// does not carry the prefix or whose remainder is not a UUID — a foreign key
-/// caught by the `SCAN` pattern is skipped, never fatal.
-fn uuid_from_key(key: &str) -> Option<Uuid> {
-    key.strip_prefix(STAGED_DELETION_PREFIX)?.parse().ok()
+/// Inverse of [`encode_value`]. `None` for anything malformed — a truncated or
+/// foreign value must be skipped, never defaulted, since a zero deadline would
+/// make the block instantly reapable.
+fn decode_value(raw: &str) -> Option<(u64, u64)> {
+    let (staged, eligible) = raw.split_once(':')?;
+    Some((staged.parse().ok()?, eligible.parse().ok()?))
 }
 
-/// Record that `uuids` have been staged for deletion and will become reapable
-/// at `delete_eligible_at_unix_nano`.
+/// Record that `uuids` have been staged for deletion and become reapable
+/// `delete_eligible_at_unix_nano - staged_at_unix_nano` after the staging.
 ///
-/// `now_unix_nano` is passed in rather than read here so the TTL is a pure
-/// function of the caller's clock — the same clock that produced the deadline.
+/// Both timestamps come from the caller's clock, and both are stored, so no
+/// reader ever has to assume the two clocks agree.
+///
+/// Writes are **pipelined**: this runs inside the single sink worker, and one
+/// awaited round trip per block would stall every other event behind a large
+/// retention pass. Every uuid is attempted even when some fail, because
+/// stopping at the first error would leave peers holding a prefix of the
+/// staging while the `SoftDeleted` event announced all of it; the error says
+/// how many of how many landed.
 pub async fn stage_deletions(
-    client: &Client,
+    client: &ValkeyClient,
     uuids: &[Uuid],
     delete_eligible_at_unix_nano: u64,
-    now_unix_nano: u64,
+    staged_at_unix_nano: u64,
 ) -> Result<()> {
     if uuids.is_empty() {
         return Ok(());
     }
-    let remaining_nanos = delete_eligible_at_unix_nano.saturating_sub(now_unix_nano);
-    let ttl_ms = (Duration::from_nanos(remaining_nanos) + STAGED_TTL_MARGIN).as_millis();
+    let grace_nanos = delete_eligible_at_unix_nano.saturating_sub(staged_at_unix_nano);
+    let ttl_ms = (Duration::from_nanos(grace_nanos) + STAGED_TTL_MARGIN).as_millis();
     // Clamp: fred takes an i64, and a nonsense deadline must not wrap.
     let ttl_ms = ttl_ms.min(i64::MAX as u128) as i64;
-    let value = delete_eligible_at_unix_nano.to_string();
+    let value = encode_value(staged_at_unix_nano, delete_eligible_at_unix_nano);
+    let keys = client.keys();
+    let client = client.inner();
 
-    for uuid in uuids {
-        let _: Value = client
-            .set(
-                key_for(*uuid),
+    let mut failed = 0usize;
+    let mut last_err: Option<String> = None;
+    for chunk in uuids.chunks(PIPE_BATCH) {
+        let pipe = client.pipeline();
+        for uuid in chunk {
+            // Queuing into a pipeline is local — this await does not round-trip.
+            pipe.set::<Value, _, _>(
+                keys.staged(*uuid),
                 value.as_str(),
                 Some(Expiration::PX(ttl_ms)),
                 None,
                 false,
             )
             .await
-            .with_context(|| format!("staging deletion of block {uuid}"))?;
+            .context("queueing staged-deletion SET")?;
+        }
+        for r in pipe.try_all::<Value>().await {
+            if let Err(e) = r {
+                failed += 1;
+                last_err = Some(e.to_string());
+            }
+        }
+    }
+
+    if failed > 0 {
+        anyhow::bail!(
+            "staged {} of {} deletions in Valkey ({failed} failed); late-booting \
+             peers may re-list the rest until they are reaped: {}",
+            uuids.len() - failed,
+            uuids.len(),
+            last_err.unwrap_or_default()
+        );
     }
     tracing::debug!(
         blocks = uuids.len(),
@@ -142,49 +177,90 @@ pub async fn stage_deletions(
     Ok(())
 }
 
-/// Drop registry entries for blocks whose objects have actually been reaped.
-/// Best-effort: on error the entries expire via their TTL.
-pub async fn unstage_deletions(client: &Client, uuids: &[Uuid]) -> Result<()> {
-    if uuids.is_empty() {
-        return Ok(());
-    }
-    let keys: Vec<String> = uuids.iter().map(|u| key_for(*u)).collect();
-    let _: Value = client
-        .del(keys)
-        .await
-        .context("unstaging reaped deletions")?;
-    Ok(())
-}
+/// Read the whole registry: every block a peer has staged whose entry has not
+/// yet expired. Order is unspecified.
+///
+/// The `SCAN` runs **client-side**, one page at a time. It used to loop inside
+/// a Lua script, which was wrong twice over: a script is atomic, so the server
+/// could serve nobody — not a lease renewal, not a publish — until the whole
+/// keyspace had been walked; and `SCAN` inside a zero-key script is routed to a
+/// single node, so on a cluster it would silently see one shard's worth of
+/// entries. (`MATCH` filters what comes back but does not reduce the work, so
+/// the cost scales with the whole keyspace, not with our prefix.)
+pub async fn list_staged_deletions(client: &ValkeyClient) -> Result<Vec<StagedDeletion>> {
+    use futures::StreamExt;
 
-/// Read the whole registry: `(block uuid, delete_eligible_at_unix_nano)` for
-/// every block a peer has staged and not yet reaped. Order is unspecified.
-pub async fn list_staged_deletions(client: &Client) -> Result<Vec<(Uuid, u64)>> {
-    let pattern = format!("{STAGED_DELETION_PREFIX}*");
-    let flat: Vec<String> = client
-        .eval(LIST_LUA, Vec::<String>::new(), vec![pattern])
-        .await
-        .context("listing staged deletions")?;
-
-    let mut out = Vec::with_capacity(flat.len() / 2);
-    for pair in flat.chunks_exact(2) {
-        let (Some(uuid), Ok(eligible)) = (uuid_from_key(&pair[0]), pair[1].parse::<u64>()) else {
-            tracing::warn!(key = %pair[0], "skipping unparseable staged-deletion entry");
-            continue;
+    let keys_ns = client.keys().clone();
+    let client = client.inner();
+    let pattern = format!("{}*", keys_ns.staged_prefix());
+    let mut keys: Vec<String> = Vec::new();
+    {
+        // On a cluster every primary has to be scanned; plain `scan` would only
+        // reach whichever node the client happened to pick.
+        let mut stream = if client.is_clustered() {
+            client
+                .scan_cluster_buffered(&pattern, Some(SCAN_PAGE), None)
+                .boxed()
+        } else {
+            client
+                .scan_buffered(&pattern, Some(SCAN_PAGE), None)
+                .boxed()
         };
-        out.push((uuid, eligible));
+        while let Some(key) = stream.next().await {
+            let key = key.context("scanning the staged-deletions registry")?;
+            if let Some(s) = key.as_str() {
+                keys.push(s.to_string());
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(keys.len());
+    for chunk in keys.chunks(PIPE_BATCH) {
+        // A pipeline, not `MGET`: fred routes each command in a pipeline
+        // independently, so this stays correct on a cluster where one chunk's
+        // keys span hash slots.
+        let pipe = client.pipeline();
+        for key in chunk {
+            pipe.get::<Value, _>(key.as_str())
+                .await
+                .context("queueing staged-deletion GET")?;
+        }
+        let values: Vec<Option<String>> = pipe
+            .all()
+            .await
+            .context("reading the staged-deletions registry")?;
+
+        for (key, value) in chunk.iter().zip(values) {
+            // A key that expired between the SCAN and the GET is simply gone.
+            let Some(raw) = value else { continue };
+            let (Some(uuid), Some((staged_at, eligible_at))) =
+                (keys_ns.staged_uuid(key), decode_value(&raw))
+            else {
+                tracing::warn!(key = %key, "skipping unparseable staged-deletion entry");
+                continue;
+            };
+            out.push(StagedDeletion {
+                uuid,
+                staged_at_unix_nano: staged_at,
+                delete_eligible_at_unix_nano: eligible_at,
+            });
+        }
     }
     Ok(out)
 }
 
 /// Read the staged set and apply it to `catalog`: the one call both daemons
-/// make, at boot and on a timer.
+/// make, at boot and after each poll and walk.
 ///
 /// Errors are returned rather than logged so the caller can say which of its
 /// phases failed; neither failure mode is fatal, because the fallback is the
-/// behaviour that existed before this registry (a peer-deleted block is healed
-/// at query time by `EvictOnNotFound`).
+/// behaviour that existed before this registry (a peer-deleted block healed at
+/// query time by `EvictOnNotFound`).
+///
+/// Returns the number of rows *newly* hidden, so a caller can log convergence
+/// without emitting a line on every quiet cycle.
 pub async fn converge_staged_deletions<C: CatalogHandle + ?Sized>(
-    client: &Client,
+    client: &ValkeyClient,
     catalog: &C,
 ) -> Result<usize> {
     let staged = list_staged_deletions(client).await?;
@@ -198,40 +274,34 @@ pub async fn converge_staged_deletions<C: CatalogHandle + ?Sized>(
     scry_cluster::apply_staged_deletions(catalog, &staged, now)
 }
 
-/// Background loop that re-applies the staged set every `interval`.
+/// [`converge_staged_deletions`] with the daemons' shared logging, and a
+/// `None` client meaning "no Valkey, nothing to converge against".
 ///
-/// Complements [`crate::sink`]'s live `SoftDeleted` publishing rather than
-/// duplicating it: the event covers peers that already know the block, this
-/// covers the block we learned about *after* the event went past — a poll or
-/// walk inserts it as live, and the next tick here hides it again. Cheap
-/// enough to run unconditionally: one `SCAN` over a prefix that is empty
-/// whenever nothing is staged, and the catalog write is skipped entirely when
-/// the set comes back empty.
-pub fn spawn_staged_deletion_refresh<C>(
-    client: Client,
-    catalog: std::sync::Arc<C>,
-    interval: Duration,
-) -> tokio::task::JoinHandle<()>
-where
-    C: CatalogHandle + Send + Sync + 'static + ?Sized,
+/// Both daemons call this at the end of every poll and full walk, so it stays
+/// quiet unless something actually changed — otherwise a healthy fleet would
+/// emit two lines per poll interval forever. `after` names the phase that just
+/// ran, so a log line says which insert path resurrected the block.
+pub async fn converge_staged_deletions_logged<C>(
+    client: Option<&crate::ValkeyClient>,
+    catalog: &C,
+    after: &str,
+) where
+    C: CatalogHandle + ?Sized,
 {
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(interval.max(Duration::from_secs(1)));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        tick.tick().await; // consume the immediate first tick; boot already applied
-        loop {
-            tick.tick().await;
-            match converge_staged_deletions(&client, catalog.as_ref()).await {
-                Ok(n) if n > 0 => {
-                    tracing::debug!(staged = n, "re-applied peers' staged deletions")
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!(error = %e, "refreshing peers' staged deletions failed; retrying next tick")
-                }
-            }
+    let Some(client) = client else { return };
+    match converge_staged_deletions(client, catalog).await {
+        Ok(n) if n > 0 => {
+            tracing::info!(
+                hidden = n,
+                after,
+                "hid blocks a peer had staged for deletion"
+            )
         }
-    })
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, after, "applying peers' staged deletions failed; blocks a peer has hidden may be listed until they are reaped")
+        }
+    }
 }
 
 #[cfg(test)]
@@ -239,14 +309,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn key_round_trips_through_uuid() {
-        let uuid = Uuid::now_v7();
-        assert_eq!(uuid_from_key(&key_for(uuid)), Some(uuid));
+    fn value_round_trips() {
+        assert_eq!(decode_value(&encode_value(7, 11)), Some((7, 11)));
     }
 
+    /// A truncated or foreign value must be skipped rather than parsed into a
+    /// deadline of zero, which would make the block instantly reapable.
     #[test]
-    fn foreign_keys_are_skipped_not_fatal() {
-        assert_eq!(uuid_from_key("scry/tail/ingesters/whatever"), None);
-        assert_eq!(uuid_from_key("scry/deleted/not-a-uuid"), None);
+    fn malformed_values_are_rejected_not_defaulted() {
+        assert_eq!(decode_value(""), None);
+        assert_eq!(decode_value("12345"), None, "no separator");
+        assert_eq!(decode_value("abc:def"), None);
+        assert_eq!(decode_value("12:"), None);
     }
 }

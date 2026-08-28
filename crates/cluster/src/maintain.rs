@@ -12,19 +12,26 @@
 //! Lease granularity (per the v0.9 plan):
 //! - **compaction** — one lease per `(signal, date, input_level)` partition,
 //!   so independent partitions compact concurrently across instances;
-//! - **retention** — one global lease (`scry/lease/retention`), since a
+//! - **retention** — one global lease (`lease/retention`), since a
 //!   retention pass spans all signals and is cheap.
+//!
+//! Lease keys here are **logical**: this crate knows nothing about Valkey, so
+//! it names a lease and lets the provider decide where that lives. The Valkey
+//! provider prefixes them with the deployment namespace
+//! (`scry_valkey::Keyspace`), which is what keeps two deployments sharing one
+//! Valkey from contending for each other's leases.
 //!
 //! `try_acquire` returning `Err` (backend unreachable) pauses that unit: no
 //! lease ⇒ no destructive work. The functions here are the unit-testable
 //! cores; the daemon drives them on a timer (Phase 6).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use object_store::ObjectStore;
-use scry_block::{BlockBuilderConfig, BlockEventSink};
+use scry_block::{BlockBuilderConfig, BlockEvent, BlockEventSink};
 use scry_catalog::CatalogHandle;
 use scry_compact::{
     compact_partition, plan_merges, reap_pending, CompactConfig, CompactReport, PartitionOutcome,
@@ -37,13 +44,55 @@ use uuid::Uuid;
 use crate::lease::{LeaseGuard, LeaseProvider};
 use crate::poll::reconcile_partition;
 
-/// Lease key for a compaction partition.
+/// Logical lease key for a compaction partition.
 fn compaction_lease_key(signal: &str, date: &str, input_level: u32) -> String {
-    format!("scry/lease/compact/{signal}/{date}/{input_level}")
+    format!("lease/compact/{signal}/{date}/{input_level}")
 }
 
-/// The single global retention lease key.
-pub const RETENTION_LEASE_KEY: &str = "scry/lease/retention";
+/// The single global retention lease's logical key.
+pub const RETENTION_LEASE_KEY: &str = "lease/retention";
+
+/// Re-emit a `SoftDeleted` for every block that is hidden but not yet reaped.
+///
+/// A staging announcement is one-shot, and the thing consuming it — the Valkey
+/// staged-deletions registry — holds entries under a TTL sized for a reap that
+/// happens on schedule. This is what keeps that TTL honest when the reap
+/// stalls, so an entry lapses only once the block is actually gone.
+///
+/// Best-effort and non-fatal: a catalog read failure here must not stop the
+/// pass from doing its real work, and the sink itself is drop-on-full.
+/// Grouped per `(signal, deadline pair)`: the signal is the pub/sub channel
+/// selector, and the two timestamps have to stay paired because a receiver
+/// derives the grace *duration* from their difference.
+fn announce_outstanding_deletions<C: CatalogHandle>(catalog: &C, sink: &dyn BlockEventSink) {
+    let staged = match catalog.with(|c| c.list_staged_deletions()) {
+        Ok(s) if !s.is_empty() => s,
+        Ok(_) => return,
+        Err(e) => {
+            tracing::warn!(error = %e, "listing outstanding deletions failed; the staged-deletions registry may expire while objects remain");
+            return;
+        }
+    };
+
+    let mut by_key: BTreeMap<(String, u64, u64), Vec<Uuid>> = BTreeMap::new();
+    for (uuid, signal, deleted_at, eligible_at) in staged {
+        by_key
+            .entry((signal, deleted_at, eligible_at))
+            .or_default()
+            .push(uuid);
+    }
+    let groups = by_key.len();
+    let blocks: usize = by_key.values().map(|v| v.len()).sum();
+    for ((signal, deleted_at, eligible_at), uuids) in by_key {
+        sink.emit(BlockEvent::SoftDeleted {
+            signal,
+            uuids,
+            deleted_at_unix_nano: deleted_at,
+            delete_eligible_at_unix_nano: eligible_at,
+        });
+    }
+    tracing::debug!(blocks, groups, "re-announced outstanding staged deletions");
+}
 
 /// Run one lease-guarded compaction pass. Plans every eligible partition;
 /// for each, tries to acquire its lease and (if won) runs the full merge
@@ -245,6 +294,18 @@ where
     if !cfg.apply {
         return Ok(report);
     }
+
+    // Re-announce deletion work that is still outstanding, before doing any of
+    // it. The `SoftDeleted` a staging pass emitted was a one-shot: peers that
+    // were listening got it, and the Valkey staged-deletions registry got an
+    // entry whose TTL assumed the reap would happen roughly on schedule. When
+    // it does not — a crashed reaper, a lease handed over, a bucket that keeps
+    // failing — that entry expires while the objects are still sitting there,
+    // and an instance booting afterwards walks the bucket and serves data
+    // retention deliberately hid. Re-emitting keeps the registry alive exactly
+    // as long as the work is, and costs one event per signal per pass.
+    // Idempotent for peers: adopting a deletion they already have is a no-op.
+    announce_outstanding_deletions(catalog, sink);
 
     // Finish deletion work staged by an earlier pass (possibly on another
     // instance) whose grace has elapsed — including anything stranded by a

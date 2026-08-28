@@ -76,7 +76,7 @@ pub trait LocalStatus: Send + Sync + 'static {
 }
 
 /// Supplies the *other* instances' snapshots as raw JSON blobs. The Valkey-
-/// backed impl (in the daemon crates) enumerates `scry/status/*` with one Lua
+/// backed impl (in the daemon crates) enumerates `<namespace>/status/*` with one Lua
 /// `SCAN`. Kept as a trait so `scry-server` stays Valkey-agnostic.
 #[async_trait::async_trait]
 pub trait FleetSource: Send + Sync + 'static {

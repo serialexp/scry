@@ -83,14 +83,14 @@ pub enum BlockEvent {
     /// `uuids` were hard-deleted from the bucket (compaction reaping its
     /// superseded inputs, or retention reaping expired blocks). `signal` is
     /// carried explicitly so the event routes to the right
-    /// `scry/blocks/<signal>` channel without parsing the UUIDs. Apply =
+    /// `<ns>/blocks/<signal>` channel without parsing the UUIDs. Apply =
     /// `delete_blocks(uuids)` (idempotent DELETE by key).
     Deleted { signal: String, uuids: Vec<Uuid> },
 }
 
 impl BlockEvent {
     /// The signal this event pertains to — the pub/sub channel selector
-    /// (`scry/blocks/<signal>`).
+    /// (`<ns>/blocks/<signal>`).
     pub fn signal(&self) -> &str {
         match self {
             BlockEvent::Created { meta } => &meta.signal,
