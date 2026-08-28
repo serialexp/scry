@@ -3104,3 +3104,108 @@ lineage-bearing catalogs, monitor live blocks, pending reaps, lineage claims, re
 failures, resets, and query errors, and run data/metadata/live-query smokes. Only then
 set compaction grace to zero. Retention grace remains independent. Do not remove the
 compatibility grace path until the fleet has completed this gate.
+
+## D-062: Live log tailing in the UI (browser + desktop)
+
+**Date:** 2026-08-28
+**Status:** accepted
+
+D-052 gave scry a live-tail surface, D-053 gave it a front door, D-054 gave it a
+merged history+live *query*. None of the three had a client other than
+`scry tail`. `QuerySpec.live` existed in the frontend and nothing set it. This
+entry is the UI half: a **Live** toggle in Explore that keeps a logs result
+growing as records arrive, in the browser (through `scry web`) and in the Tauri
+desktop shell, over a real server push stream.
+
+**Real push, not polling.** Bart's call, and the point of the feature: "otherwise
+what is the feature for? We need some way to exercise it." Polling would have
+been a smaller change that tested nothing the CLI doesn't already test.
+
+**Both transports were request/response by construction.** `HttpTransport.query`
+does `await res.arrayBuffer()`; the Tauri `run_query` command reads the socket to
+EOF; `deframe()` demands a complete buffer. Nothing was *disabled* — there was no
+path for bytes to reach the UI incrementally. So the streaming work is additive:
+a `FrameStream` incremental deframer, a `tail(addr, request, onFrame, signal)`
+method on `Transport` alongside `query`, and per-shell implementations. `deframe`
+and `query` are untouched, so the one-shot path cannot regress.
+
+**Pipeline the handshake, keep `scry web` protocol-free.** The tail sub-protocol
+is Hello → HelloAck → Subscribe → records, which *looks* interactive and would
+force protocol knowledge into the relay. It isn't: both
+`scry-queryd/src/tail_relay.rs::serve_conn` and the ingester read frames
+sequentially off a `BufReader` and do not care that the Subscribe arrived before
+they replied. The client therefore writes **Hello and Subscribe in one flush**
+and validates HelloAck-then-records on the way back. Both transports stay "write
+some bytes, read a stream" and `scry web` stays the dumb byte-pipe D-040/D-046
+made it — `POST /api/tail` reuses the same connect + `Body::from_stream` relay as
+`/api/query`, with a `Semaphore` and an idle timeout of its own.
+
+**A tail address is separate config, and its absence is reported.** queryd's tail
+listener is a different port from its query port (D-053: the two binschema unions
+collide on their first byte), so a webui target needs two addresses. A repeatable
+`--queryd-tail id=host:port` attaches to an existing `--queryd` id; an unknown id
+is a startup error. Targets without one simply have no live capability, and
+`GET /api/targets` reports that as `live: false` so the toggle can disable itself
+with a reason rather than failing on click. The browser still sends only an
+opaque id — `Target.tail_addr` is `#[serde(skip)]` like `addr`, so the SSRF-safe
+property of D-046 is unchanged. Requesting a tail on such a target is **409**,
+kept distinct from 400 (unknown id) and 502 (upstream down).
+
+**Separate admission and a separate idle timeout.** A tail holds its relay slot
+for minutes; a query holds it for seconds. Sharing the 32 query permits would let
+eight idle browser tabs starve every query, so tails get their own semaphore
+(`--max-tails`, default 8). The 30s query idle timeout is equally wrong in the
+other direction — a quiet log stream is not a stuck one — so tails get
+`--tail-idle-timeout` (default 900s, `0` disables entirely).
+
+**The seam is approximate, on purpose.** Tail records are best-effort: dropped
+under load rather than backpressuring ingest, unordered across ingesters, never
+deduplicated against stored history. The client subscribes **first**, then runs
+the history query, then admits only records strictly newer than the history's
+newest timestamp. Subscribing first means nothing logged during the query is
+lost; the price is an overlap, which the seam resolves. Equal timestamps are
+**excluded** rather than included, because a duplicated line is a visible lie
+about what was logged while a line dropped at the exact seam nanosecond is
+invisible — and for a best-effort tail, acceptable. This deliberately does not
+pretend to be exactly-once: D-054's `live: true` merged query is the surface with
+a real watermark, and it remains what the history half runs.
+
+**The row shape is the seam between the two sources.** `LogRow` and its decoders
+moved out of `ResultsTable.tsx` into `desktop/src/logs.ts`, joined by
+`tailRecordToLogRow`. A query row and a pushed record become the same struct, so
+the reader view, the severity chips, the ANSI stripping, the filter box and the
+inspector rail work on live rows with no changes at all. The client-side buffer
+is capped (5000 rows) and DOM updates are coalesced to ~4 Hz, because on a busy
+stream the browser tab — not the server — is what falls over first. Overflow
+drops the **oldest**: a running tail must scroll, not freeze.
+
+**Auto-refresh for the other three signals.** The server tails logs only, so
+Metrics/Traces/Profiles get the honest alternative: a re-run on a timer
+(`off / 5s / 10s / 30s / 1m`). A tick re-applies the active *quick range* before
+re-running, so "last 15m" slides forward instead of freezing at the minute it was
+picked, and it skips while a run is in flight so a slow query can't stack ticks.
+Only one of the two controls is ever offered, because only one of them is real.
+
+**One generator quirk worth knowing.** binschema 0.6.x mangles a schema type
+whose name collides with a JS global — the ingest schema's `Error` frame is
+emitted as `class Error_Encoder` — but every *reference site* still says
+`ErrorEncoder`, so encoding or decoding that variant dies with a `ReferenceError`.
+That is precisely the frame carrying `ERR_TAIL_UNAVAILABLE`, i.e. the path a
+Valkey-less queryd takes to explain a refusal. `scripts/gen-proto-ts.sh` appends
+an alias per mangled class rather than rewriting generated logic, so the
+"generated bindings are the single source of protocol truth" rule holds and the
+patch becomes a no-op once binschema mangles its reference sites too.
+
+**Verification.** `crates/scry-webui/tests/tail.rs` (8 tests) covers the auth
+gate, 400 vs 409, that the tail address is dialled rather than the query address,
+that records stream before upstream EOF, that tail admission is separate from
+query admission, that dropping the body closes the upstream socket, and that a
+quiet tail survives a disabled idle timeout. `scripts/smoke-webui-tail.sh` is the
+end-to-end criterion: a real ingester → Valkey discovery → queryd front-door →
+`scry web` → the **shipped** TypeScript client (`desktop/scripts/tail-probe.ts`
+imports `HttpTransport` and `runTail` unmodified), asserting the target live
+flags, that matching records decode while the subscription excludes the others,
+that a target with no tail address surfaces as `LiveUnavailableError`, and that a
+Valkey-less front-door's `ERR_TAIL_UNAVAILABLE` survives both relays as a typed
+error. It needs only a dev Valkey — a ~30-line python stub answers the two
+object-store requests a cold queryd boot makes.

@@ -9,7 +9,7 @@
 
 import { For, Show, createMemo, createSignal, type Component, type JSX } from "solid-js";
 
-import { attrEntries, fmtCell, fmtTs } from "../format";
+import { fmtCell, fmtTs } from "../format";
 import {
   buildSpanTree,
   decodeFrameRows,
@@ -18,43 +18,28 @@ import {
   layoutSpans,
   singleTraceId,
 } from "../traces";
-import { state, resultTable, resultKind, selected, setSelected } from "../store";
+import { MAX_LOG_ROWS, decodeLogRows, isLogTable, mergeLogRows } from "../logs";
+import {
+  state,
+  resultTable,
+  resultKind,
+  selected,
+  setSelected,
+  liveRows,
+  liveActive,
+} from "../store";
 import { severity } from "../severity";
 import TracesView, { type TraceData } from "./TracesView";
 import FramesView, { type FramesData } from "./FramesView";
 
 /** Cap rendered rows so a large result can't lock up the DOM. */
-const MAX_DISPLAY_ROWS = 2000;
+const MAX_DISPLAY_ROWS = MAX_LOG_ROWS;
 
-// ── log helpers ───────────────────────────────────────────────────────
-
-// Canonical ansi-regex (chalk) — matches CSI/OSC colour & cursor sequences.
-const ANSI_RE = new RegExp(
-  [
-    "[\\u001B\\u009B][[\\]()#;?]*(?:(?:(?:(?:;[-a-zA-Z\\d\\/#&.:=?%@~_]+)*|[a-zA-Z\\d]+(?:;[-a-zA-Z\\d\\/#&.:=?%@~_]*)*)?\\u0007)",
-    "(?:(?:\\d{1,4}(?:;\\d{0,4})*)?[\\dA-PR-TZcf-nq-uy=><~]))",
-  ].join("|"),
-  "g",
-);
-
-/** Leftover C0/C1 control chars, keeping tab (\\t) and newline (\\n). */
-const CTRL_RE = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g;
-
-/** Strip ANSI escapes, then any leftover control chars except tab/newline. */
-function stripAnsi(s: string): string {
-  return s.replace(ANSI_RE, "").replace(CTRL_RE, "");
-}
-
-interface LogRow {
-  ts: bigint;
-  sev: number;
-  body: string;
-  /** Stream labels (the service identity) — joined from the postings
-   *  sidecar onto every row by the query engine. Shown as primary chips. */
-  labels: [string, string][];
-  /** Per-entry attributes (stream=stdout/stderr, trace_id, …). Secondary. */
-  attrs: [string, string][];
-}
+// -- log helpers -------------------------------------------------------
+//
+// The row shape, its ANSI stripping and its decoders live in `../logs`: a
+// live-tail record produces exactly the same row from a completely different
+// wire, and the view must not be able to tell them apart.
 
 /** Stream-label keys promoted to always-visible chips, in display order.
  *  These answer "which service / workload is this?" — the rest fold into
@@ -105,28 +90,23 @@ const ResultsTable: Component = () => {
   const [raw, setRaw] = createSignal(false);
 
   // Logs view (null unless the result carries the canonical log columns).
+  //
+  // Two sources, one list: the queried history, then whatever the live
+  // subscription has pushed since. `mergeLogRows` keeps the newest when the
+  // pair overruns the display cap, so a running tail scrolls rather than
+  // stopping dead at 2000 rows.
   const logs = createMemo(() => {
     const t = resultTable();
-    if (!t) return null;
-    const names = new Set(t.schema.fields.map((f) => f.name));
-    if (!(names.has("body") && names.has("ts_unix_nano") && names.has("severity"))) {
-      return null;
-    }
-    const all = t.toArray();
-    const shown = Math.min(all.length, MAX_DISPLAY_ROWS);
-    const rows: LogRow[] = [];
-    for (let i = 0; i < shown; i++) {
-      const o = (all[i]?.toJSON?.() ?? {}) as Record<string, unknown>;
-      const tsRaw = o.ts_unix_nano;
-      rows.push({
-        ts: typeof tsRaw === "bigint" ? tsRaw : BigInt((tsRaw as number | string) ?? 0),
-        sev: Number(o.severity ?? 0),
-        body: stripAnsi(String(o.body ?? "")),
-        labels: attrEntries(o.labels),
-        attrs: attrEntries(o.attributes),
-      });
-    }
-    return { rows, shown, total: t.numRows };
+    if (!t || !isLogTable(t)) return null;
+    const history = decodeLogRows(t, MAX_DISPLAY_ROWS);
+    const live = liveActive() ? liveRows() : [];
+    const rows = mergeLogRows(history, live, MAX_DISPLAY_ROWS);
+    return {
+      rows,
+      shown: history.length,
+      total: t.numRows,
+      liveCount: live.length,
+    };
   });
 
   const filteredLogs = createMemo(() => {
@@ -243,6 +223,11 @@ const ResultsTable: Component = () => {
                   onInput={(e) => setFilter(e.currentTarget.value)}
                 />
                 <span>{filteredLogs().length.toLocaleString()} shown</span>
+                <Show when={lv().liveCount > 0}>
+                  <span class="live-count" title="records pushed by the live subscription since the query ran">
+                    +{lv().liveCount.toLocaleString()} live
+                  </span>
+                </Show>
                 <Show when={lv().shown < lv().total}>
                   <span class="warn">scanned first {lv().shown.toLocaleString()}</span>
                 </Show>

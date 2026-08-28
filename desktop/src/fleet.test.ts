@@ -19,6 +19,10 @@ class StubTransport implements Transport {
     expect(decoded.msg.type).toBe("FleetStatusRequest");
     return this.result;
   }
+
+  async tail(): Promise<void> {
+    throw new Error("this stub only serves one-shot requests");
+  }
 }
 
 describe("fetchFleetStatus", () => {

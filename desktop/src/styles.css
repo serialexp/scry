@@ -1562,6 +1562,101 @@ textarea {
   padding-left: 8px;
 }
 
+/* ── Live pill / auto-refresh ─────────────────────────────────────── */
+
+.live-pill {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--panel-2);
+  border: 1px solid var(--border-2);
+  color: var(--muted);
+  border-radius: 8px;
+  height: 34px;
+  padding: 0 12px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.live-pill:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.live-pill:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.live-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--muted);
+  flex: 0 0 auto;
+}
+
+/* The dot is the status: grey idle, pulsing while connecting/reconnecting,
+   steady green while records are actually arriving, red when it gave up. */
+.live-pill.connecting .live-dot,
+.live-pill.reconnecting .live-dot {
+  background: var(--warn);
+  animation: live-blink 1s steps(2, end) infinite;
+}
+
+.live-pill.streaming {
+  color: var(--text);
+  border-color: var(--teal);
+}
+
+.live-pill.streaming .live-dot {
+  background: var(--teal);
+  box-shadow: 0 0 6px var(--teal);
+}
+
+.live-pill.error {
+  border-color: var(--danger);
+}
+
+.live-pill.error .live-dot {
+  background: var(--danger);
+}
+
+@keyframes live-blink {
+  50% {
+    opacity: 0.25;
+  }
+}
+
+.live-drop {
+  color: var(--warn);
+  font-variant-numeric: tabular-nums;
+}
+
+.live-count {
+  color: var(--teal);
+  font-variant-numeric: tabular-nums;
+}
+
+.refresh-select {
+  flex: 0 0 auto;
+  background: var(--panel-2);
+  border: 1px solid var(--border-2);
+  color: var(--muted);
+  border-radius: 8px;
+  height: 34px;
+  padding: 0 6px;
+  font-size: 12px;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.refresh-select:hover {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
 .adv-toggle {
   flex: 0 0 auto;
   background: var(--panel-2);

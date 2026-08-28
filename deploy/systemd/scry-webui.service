@@ -55,7 +55,14 @@ Environment=SCRY_WEBUI_SECURE_COOKIE=1
 EnvironmentFile=-%h/.config/scry-webui/webui.env
 
 # systemd substitutes ${VAR} from the merged environment above (no shell).
-ExecStart=%h/.cargo/bin/scry web --listen ${SCRY_WEBUI_LISTEN} --queryd ${SCRY_WEBUI_QUERYD}
+#
+# The trailing $SCRY_WEBUI_EXTRA_ARGS uses the *unquoted* form on purpose:
+# systemd word-splits it, and an unset/empty value adds no argument at all
+# (whereas ${VAR} would pass one empty argument and fail parsing). That is how
+# optional flags like `--queryd-tail id=host:port` — needed for the UI's live
+# log tail, pointing at the query daemon's --tail-listen port — get added
+# without editing this unit.
+ExecStart=%h/.cargo/bin/scry web --listen ${SCRY_WEBUI_LISTEN} --queryd ${SCRY_WEBUI_QUERYD} $SCRY_WEBUI_EXTRA_ARGS
 
 Restart=on-failure
 RestartSec=2s

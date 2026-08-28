@@ -1,19 +1,37 @@
 //! Transport abstraction for the query protocol.
 //!
-//! The protocol client only needs a way to send one framed request and
-//! receive the full ordered response byte stream — the daemon's "one
-//! connection per query" lifecycle makes that a clean request/response
-//! shape. Keeping it behind an interface means the protocol logic is
-//! transport-agnostic.
+//! Two shapes of traffic share one interface:
 //!
-//! Two implementations live alongside this interface, each in its own module so
-//! the browser bundle never statically imports the Tauri API:
-//!   - `transport-tauri.ts` — `TauriTransport`, a native TCP socket via the
-//!     Rust `run_query` command (desktop app).
-//!   - `transport-http.ts` — `HttpTransport`, a `fetch` to the `scry-webui`
-//!     server's `/api/query` relay (browser).
+//!   - `query` — send one framed request, get the full ordered response byte
+//!     stream. The daemon's "one connection per query" lifecycle makes this a
+//!     clean request/response.
+//!   - `tail` — send one framed subscription, then receive frames until the
+//!     caller aborts or the server hangs up. Same bytes-in/bytes-out contract,
+//!     but delivered incrementally, because a live tail has no end.
+//!
+//! Keeping both behind an interface means the protocol logic is
+//! transport-agnostic. Two implementations live alongside it, each in its own
+//! module so the browser bundle never statically imports the Tauri API:
+//!   - `transport-tauri.ts` — native TCP sockets via Rust commands (desktop).
+//!   - `transport-http.ts` — `fetch` to the `scry-webui` server's `/api/query`
+//!     and `/api/tail` relays (browser).
 //!
 //! `store.ts` picks one at runtime via `getTransport()` (see `env.ts`).
+
+/** Called once per complete frame body received on a tail stream. */
+export type FrameHandler = (body: Uint8Array) => void;
+
+/**
+ * The selected target exists but has no live-tail endpoint configured, so no
+ * subscription is possible. Distinct from a transport failure: nothing is
+ * wrong, this deployment simply doesn't offer tailing here.
+ */
+export class LiveUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "LiveUnavailableError";
+  }
+}
 
 export interface Transport {
   /**
@@ -29,4 +47,22 @@ export interface Transport {
    * supplies a raw address). Empty ⇒ the server's default target.
    */
   query(addr: string, request: Uint8Array): Promise<Uint8Array>;
+
+  /**
+   * Send the already-framed subscription `request` to `addr`'s **live-tail**
+   * endpoint and invoke `onFrame` for every frame the server pushes back,
+   * until `signal` aborts or the server closes the stream.
+   *
+   * Resolves when the stream ends normally (including on abort). Rejects on a
+   * transport failure, or with `LiveUnavailableError` when this target has no
+   * live endpoint. `addr` is interpreted exactly as in `query` — a raw
+   * `host:port` under Tauri (the daemon's `--tail-listen` port), a target id in
+   * the browser (the server holds the matching `--queryd-tail` address).
+   */
+  tail(
+    addr: string,
+    request: Uint8Array,
+    onFrame: FrameHandler,
+    signal: AbortSignal,
+  ): Promise<void>;
 }

@@ -41,6 +41,10 @@ class StubTransport implements Transport {
     expect(decoded.msg.value.capabilities).toBe(QUERY_CAP_ATTEMPT_SUPERSESSION);
     return this.response;
   }
+
+  async tail(): Promise<void> {
+    throw new Error("this stub only serves one-shot requests");
+  }
 }
 
 const spec = { signal: Signal.Logs, matchers: [] };

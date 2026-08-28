@@ -8,7 +8,7 @@ use axum::body::{to_bytes, Body};
 use axum::http::{header, Request, StatusCode};
 use axum::Router;
 use axum_extra::extract::cookie::Key;
-use scry_webui::{parse_targets, router, AppState};
+use scry_webui::{parse_targets, router, AppConfig, AppState, RelayLimits, Target};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tower::ServiceExt;
@@ -43,18 +43,30 @@ fn app_targets_limits(
     max_relays: usize,
 ) -> Router {
     let (targets, default) = parse_targets(raw).unwrap();
-    let state = AppState::new(
+    router(state_for(
         targets,
         default,
-        PASSWORD.to_string(),
-        Key::from(&[9u8; 64]),
-        3600,
-        false,
-        setup_timeout,
-        idle_timeout,
-        max_relays,
-    );
-    router(state)
+        RelayLimits {
+            setup_timeout,
+            idle_timeout,
+            max_relays,
+            ..RelayLimits::default()
+        },
+    ))
+}
+
+/// Build app state over a ready-made target list. Fixed key so a cookie minted
+/// by one cloned instance verifies in the next.
+fn state_for(targets: Vec<Target>, default: String, limits: RelayLimits) -> AppState {
+    AppState::new(AppConfig {
+        targets,
+        default_target: default,
+        password: PASSWORD.to_string(),
+        key: Key::from(&[9u8; 64]),
+        session_ttl: 3600,
+        secure_cookie: false,
+        limits,
+    })
 }
 
 /// Log in and return the `name=value` cookie pair to replay on later requests.

@@ -30,6 +30,16 @@ import {
   applyQuickRange,
   activeRange,
   clearTimeRange,
+  liveStatus,
+  liveError,
+  liveDropped,
+  liveUnavailableReason,
+  liveActive,
+  toggleLive,
+  stopLive,
+  REFRESH_INTERVALS,
+  refreshMs,
+  setRefreshInterval,
 } from "../../store";
 
 /** Signal tabs, in the mock's order. Dot colour distinguishes them at a
@@ -63,6 +73,41 @@ const QueryBar: Component = () => {
     void refreshLabels();
   });
   onMount(() => void refreshLabels());
+
+  // A running tail belongs to one signal on one target. Switching either leaves
+  // it streaming rows nothing renders while still holding a relay slot open on
+  // the server, so stop it rather than let it linger invisibly. (Changing
+  // *matchers* deliberately does not stop it — the user is narrowing a live
+  // view, and Live re-subscribes with the new set on the next toggle.)
+  let liveScope: string | null = null;
+  createEffect(() => {
+    const scope = `${state.signal}|${state.target}|${state.addr}`;
+    if (!liveActive()) {
+      liveScope = null;
+      return;
+    }
+    if (liveScope === null) liveScope = scope;
+    else if (liveScope !== scope) {
+      liveScope = null;
+      stopLive();
+    }
+  });
+
+  /** Tooltip for the Live pill when it *is* available — what a click does now. */
+  function liveTitle(): string {
+    switch (liveStatus()) {
+      case "off":
+        return "Stream matching log lines as they arrive";
+      case "connecting":
+        return "Subscribing…";
+      case "streaming":
+        return "Streaming — click to stop";
+      case "reconnecting":
+        return "Stream dropped; reconnecting. Records logged in the gap are lost.";
+      case "error":
+        return "Live tailing stopped";
+    }
+  }
 
   /** Non-blank matchers, as {index, name, value} — the tokens to render. */
   const tokens = () =>
@@ -169,6 +214,41 @@ const QueryBar: Component = () => {
             )}
           </For>
         </div>
+
+        {/* Live tail (logs) / auto-refresh (everything else). Only ever one of
+            the two is offered, because only one of them is real: the server
+            tails logs and nothing else. */}
+        <Show
+          when={state.signal === "Logs"}
+          fallback={
+            <select
+              class="refresh-select"
+              title="Re-run this query on a timer"
+              value={String(refreshMs())}
+              onChange={(e) => setRefreshInterval(Number(e.currentTarget.value))}
+            >
+              <For each={REFRESH_INTERVALS}>
+                {(r) => <option value={String(r.ms)}>{r.ms === 0 ? "↻ off" : `↻ ${r.label}`}</option>}
+              </For>
+            </select>
+          }
+        >
+          <button
+            type="button"
+            class={`live-pill ${liveStatus()}`}
+            disabled={liveUnavailableReason() !== null && liveStatus() === "off"}
+            title={liveUnavailableReason() ?? liveError() ?? liveTitle()}
+            onClick={() => toggleLive()}
+          >
+            <span class="live-dot" />
+            Live
+            <Show when={liveDropped() > 0}>
+              <span class="live-drop" title="rows dropped from the client-side buffer">
+                −{liveDropped().toLocaleString()}
+              </span>
+            </Show>
+          </button>
+        </Show>
 
         {/* Advanced toggle + Run */}
         <button

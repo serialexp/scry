@@ -6,7 +6,7 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use axum_extra::extract::cookie::Key;
-use scry_webui::{parse_targets, router, AppState};
+use scry_webui::{parse_targets, router, AppConfig, AppState, RelayLimits};
 use tower::ServiceExt;
 
 const PASSWORD: &str = "hunter2";
@@ -24,17 +24,19 @@ fn secure_state() -> AppState {
 
 fn state_with_secure(secure: bool) -> AppState {
     let (targets, default) = parse_targets(&["127.0.0.1:1".to_string()]).unwrap();
-    AppState::new(
+    AppState::new(AppConfig {
         targets,
-        default,
-        PASSWORD.to_string(),
-        Key::from(&[7u8; 64]),
-        3600,
-        secure,
-        Duration::from_secs(30),
-        Duration::from_secs(30),
-        32,
-    )
+        default_target: default,
+        password: PASSWORD.to_string(),
+        key: Key::from(&[7u8; 64]),
+        session_ttl: 3600,
+        secure_cookie: secure,
+        limits: RelayLimits {
+            setup_timeout: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(30),
+            ..RelayLimits::default()
+        },
+    })
 }
 
 fn login_req(password: &str) -> Request<Body> {

@@ -46,3 +46,53 @@ export function deframe(buf: Uint8Array): Uint8Array[] {
   }
   return frames;
 }
+
+/**
+ * Incremental de-framer for a *push* stream.
+ *
+ * `deframe` above works because a query response is complete by the time we
+ * see it. A live tail never completes: frames arrive over minutes and a network
+ * chunk can split anywhere — mid-body, or even between the four bytes of a
+ * length prefix. This buffers the remainder and yields whole frames only.
+ *
+ * Returned frames are views into the accumulated buffer, so decode them before
+ * the next `push` (which is what every caller does).
+ */
+export class FrameStream {
+  #buf: Uint8Array = new Uint8Array(0);
+
+  /** Feed one network chunk; returns every frame body it completed. */
+  push(chunk: Uint8Array): Uint8Array[] {
+    if (chunk.length === 0) return [];
+    if (this.#buf.length === 0) {
+      this.#buf = chunk;
+    } else {
+      const joined = new Uint8Array(this.#buf.length + chunk.length);
+      joined.set(this.#buf, 0);
+      joined.set(chunk, this.#buf.length);
+      this.#buf = joined;
+    }
+
+    const frames: Uint8Array[] = [];
+    let off = 0;
+    for (;;) {
+      if (this.#buf.length - off < 4) break;
+      const dv = new DataView(this.#buf.buffer, this.#buf.byteOffset + off, 4);
+      const len = dv.getUint32(0, false); // big-endian
+      if (len > MAX_FRAME_BYTES) {
+        throw new Error(`frame too large: ${len} bytes, max ${MAX_FRAME_BYTES}`);
+      }
+      if (this.#buf.length - off - 4 < len) break;
+      frames.push(this.#buf.subarray(off + 4, off + 4 + len));
+      off += 4 + len;
+    }
+    if (off > 0) this.#buf = this.#buf.subarray(off);
+    return frames;
+  }
+
+  /** Bytes held back awaiting the rest of their frame. Non-zero at stream end
+   *  means the peer was cut off mid-frame. */
+  get pendingBytes(): number {
+    return this.#buf.length;
+  }
+}

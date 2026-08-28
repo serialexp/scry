@@ -25,6 +25,22 @@ import {
   type MetaScope,
   type FleetInstance,
 } from "./protocol/client";
+import { LiveUnavailableError } from "./protocol/transport";
+import {
+  TailError,
+  equalityMatcher,
+  runTail,
+} from "./protocol/tail";
+import {
+  MAX_LOG_ROWS,
+  appendCapped,
+  decodeLogRows,
+  isAfterSeam,
+  isLogTable,
+  newestTs,
+  tailRecordToLogRow,
+  type LogRow,
+} from "./logs";
 import { severity, severityRank } from "./severity";
 import {
   chooseStepMs,
@@ -195,6 +211,9 @@ export { authed, authChecked };
 export interface TargetInfo {
   id: string;
   label: string;
+  /** Whether `scry web` has a `--queryd-tail` address for this target, i.e.
+   *  whether live tailing is possible against it. Absent on older servers. */
+  live?: boolean;
 }
 
 // The target allowlist fetched from `scry-webui` after login (browser only).
@@ -396,6 +415,10 @@ function specFromForm(): QuerySpec {
     // in the SQL); only send the limit for the default SELECT *.
     limit: sql === "" ? parseBigIntOpt(state.limit) : undefined,
     traceId,
+    // While tailing, the history half should include the ingesters' in-flight
+    // ring too (D-054) — otherwise the pane shows a gap between the newest
+    // sealed block and the first pushed record.
+    live: state.signal === "Logs" && liveActive() ? true : undefined,
   };
 }
 
@@ -653,6 +676,307 @@ export async function runCurrentQuery(): Promise<void> {
 export async function drillLabelValue(name: string, value: string): Promise<void> {
   applyLabelMatcher(name, value);
   await runCurrentQuery();
+}
+
+// ── Live tail (D-052/D-053) ──────────────────────────────────────────
+//
+// A subscription to the ingesters' logs tap, relayed by the query daemon's
+// tail front-door, appended to the query result as records arrive.
+//
+// Order of operations matters. We subscribe *first* and only then run the
+// history query, so nothing logged during the query is missed; the price is an
+// overlap, which the history's newest timestamp (the "seam") resolves. Doing it
+// the other way round would leave a real gap with nothing to reconstruct it
+// from.
+//
+// Everything here is best-effort by construction: the server drops records
+// under load rather than backpressuring ingest, and a reconnect after a dropped
+// stream loses whatever happened in the gap. That is the tail's contract, not a
+// defect in this client — for a complete answer, re-run the query.
+
+/** Rolling ceiling on retained live rows. Bounds the tab, not the server. */
+export const LIVE_ROW_CAP = 5000;
+/** Coalesce arrivals into at most this many DOM updates per second. */
+const LIVE_FLUSH_MS = 250;
+/** Reconnect backoff bounds after a stream ends unexpectedly. */
+const LIVE_RECONNECT_MIN_MS = 1000;
+const LIVE_RECONNECT_MAX_MS = 8000;
+
+export type LiveStatus =
+  | "off"
+  | "connecting"
+  | "streaming"
+  | "reconnecting"
+  | "error";
+
+const [liveStatus, setLiveStatus] = createSignal<LiveStatus>("off");
+const [liveError, setLiveError] = createSignal<string | null>(null);
+const [liveRows, setLiveRows] = createSignal<LogRow[]>([]);
+const [liveDropped, setLiveDropped] = createSignal(0);
+export { liveStatus, liveError, liveRows, liveDropped };
+
+/** Is a live subscription wanted right now? (Distinct from `liveStatus`, which
+ *  reports what the connection is actually doing.) */
+export const liveActive = () => liveStatus() !== "off" && liveStatus() !== "error";
+
+/** Why live tailing is not available for the current form, or `null` when it
+ *  is. Drives the toggle's disabled state and its tooltip. */
+export function liveUnavailableReason(): string | null {
+  if (state.signal !== "Logs") {
+    return "Live tailing is logs-only — the server has no tail for other signals.";
+  }
+  if (state.sql.trim() !== "") {
+    return "Live tailing can't apply custom SQL; clear it to stream.";
+  }
+  if (inBrowser) {
+    const t = targets().find((x) => x.id === state.target);
+    // `live === undefined` is an older server that doesn't report the flag;
+    // let the attempt happen and surface whatever it says.
+    if (t && t.live === false) {
+      return "This target has no live endpoint (scry web needs --queryd-tail).";
+    }
+  }
+  return null;
+}
+
+// The in-flight subscription: an abort handle, the seam the history query
+// established, and rows arrived before that seam was known.
+let liveAbort: AbortController | null = null;
+let liveSeam: bigint | null = null;
+let liveSeamKnown = false;
+let liveHeld: LogRow[] = [];
+let livePending: LogRow[] = [];
+let liveFlushTimer: ReturnType<typeof setTimeout> | null = null;
+/** Guards against a stale subscription's callbacks landing after a restart. */
+let liveGeneration = 0;
+
+function flushLiveRows(): void {
+  liveFlushTimer = null;
+  if (livePending.length === 0) return;
+  const batch = livePending;
+  livePending = [];
+  setLiveRows((prev) => {
+    const next = appendCapped(prev, batch, LIVE_ROW_CAP);
+    const lost = prev.length + batch.length - next.length;
+    if (lost > 0) setLiveDropped((n) => n + lost);
+    return next;
+  });
+}
+
+function scheduleLiveFlush(): void {
+  if (liveFlushTimer !== null) return;
+  liveFlushTimer = setTimeout(flushLiveRows, LIVE_FLUSH_MS);
+}
+
+function admitLiveRow(row: LogRow): void {
+  if (!liveSeamKnown) {
+    // The history query is still running; we don't yet know what it will
+    // cover. Hold the record rather than guess.
+    liveHeld.push(row);
+    return;
+  }
+  if (!isAfterSeam(row, liveSeam)) return;
+  livePending.push(row);
+  scheduleLiveFlush();
+}
+
+/** Called once the history query lands: release everything held behind it. */
+function openLiveSeam(seam: bigint | null): void {
+  liveSeam = seam;
+  liveSeamKnown = true;
+  const held = liveHeld;
+  liveHeld = [];
+  for (const row of held) {
+    if (isAfterSeam(row, seam)) livePending.push(row);
+  }
+  if (livePending.length > 0) scheduleLiveFlush();
+}
+
+/** The matcher specs for a subscription — the query bar's tokens, in the
+ *  grammar `scry-match` parses server-side. */
+function liveMatchers(): string[] {
+  return state.matchers
+    .map((m) => ({ name: m.name.trim(), value: m.value }))
+    .filter((m) => m.name !== "")
+    .map((m) => equalityMatcher(m.name, m.value));
+}
+
+/** Connect, and keep reconnecting while the user still wants a live view. */
+async function pumpLive(generation: number, signal: AbortSignal): Promise<void> {
+  let backoff = LIVE_RECONNECT_MIN_MS;
+  const transport = await getTransport();
+  const dest = inBrowser ? state.target.trim() : state.addr.trim();
+
+  while (!signal.aborted && generation === liveGeneration) {
+    try {
+      await runTail(
+        transport,
+        dest,
+        { matchers: liveMatchers() },
+        __APP_VERSION__,
+        {
+          onSubscribed: () => {
+            if (generation === liveGeneration) {
+              backoff = LIVE_RECONNECT_MIN_MS;
+              setLiveStatus("streaming");
+              setLiveError(null);
+            }
+          },
+          onRecord: (rec) => {
+            if (generation === liveGeneration) admitLiveRow(tailRecordToLogRow(rec));
+          },
+        },
+        signal,
+      );
+    } catch (e) {
+      if (signal.aborted || generation !== liveGeneration) return;
+      if (e instanceof UnauthorizedError) {
+        setAuthed(false);
+        stopLive("Session expired — please log in again.");
+        return;
+      }
+      // A protocol refusal or a missing endpoint will fail identically on every
+      // retry, so say so and stop rather than reconnect-looping.
+      if (e instanceof TailError || e instanceof LiveUnavailableError) {
+        stopLive(e.message);
+        return;
+      }
+      setLiveError(e instanceof Error ? e.message : String(e));
+    }
+    if (signal.aborted || generation !== liveGeneration) return;
+
+    // The stream ended (server hang-up, relay timeout, network blip). Records
+    // logged during the gap are gone — the tail has no replay.
+    setLiveStatus("reconnecting");
+    await new Promise((r) => setTimeout(r, backoff));
+    backoff = Math.min(backoff * 2, LIVE_RECONNECT_MAX_MS);
+  }
+}
+
+/**
+ * Turn the live view on: subscribe, then run the history query underneath it.
+ *
+ * Safe to call when already live — it restarts cleanly, which is what the
+ * matcher/target-changed path wants.
+ */
+export async function startLive(): Promise<void> {
+  const reason = liveUnavailableReason();
+  if (reason !== null) {
+    setLiveStatus("error");
+    setLiveError(reason);
+    return;
+  }
+
+  stopLive();
+  const generation = ++liveGeneration;
+  const controller = new AbortController();
+  liveAbort = controller;
+  liveSeam = null;
+  liveSeamKnown = false;
+  liveHeld = [];
+  livePending = [];
+  setLiveRows([]);
+  setLiveDropped(0);
+  setLiveError(null);
+  setLiveStatus("connecting");
+
+  // Subscribe first — anything logged from here on is captured, even while the
+  // history query below is still running.
+  void pumpLive(generation, controller.signal);
+
+  await runCurrentQuery();
+  if (generation !== liveGeneration) return; // restarted while we waited
+  const table = resultTable();
+  const seam =
+    table && isLogTable(table) ? newestTs(decodeLogRows(table, MAX_LOG_ROWS)) : null;
+  openLiveSeam(seam);
+}
+
+/** Turn the live view off. `reason` (when given) explains an involuntary stop
+ *  and puts the toggle in its error state; a plain stop clears it. */
+export function stopLive(reason?: string): void {
+  liveGeneration++;
+  if (liveAbort) {
+    liveAbort.abort();
+    liveAbort = null;
+  }
+  if (liveFlushTimer !== null) {
+    clearTimeout(liveFlushTimer);
+    liveFlushTimer = null;
+  }
+  livePending = [];
+  liveHeld = [];
+  liveSeamKnown = false;
+  liveSeam = null;
+  if (reason !== undefined) {
+    setLiveStatus("error");
+    setLiveError(reason);
+  } else {
+    setLiveStatus("off");
+    setLiveError(null);
+  }
+}
+
+/** The Live pill's click handler. */
+export function toggleLive(): void {
+  if (liveActive()) stopLive();
+  else void startLive();
+}
+
+// ── Auto-refresh (the non-logs answer to Live) ───────────────────────
+//
+// The server tails logs only, so the other three signals get the honest
+// alternative: re-run the same query on a timer. Cheap for a repeated range
+// (queryd caches results), and it is what a dashboard does anyway.
+//
+// A tick re-applies the *quick range* before re-running, so a "last 15m" view
+// slides forward instead of freezing at the minute it was picked. With a
+// manually-typed range there is nothing to slide, so we just re-run the same
+// bounds — a refresh still picks up newly-flushed blocks inside them.
+
+/** Auto-refresh choices for the query bar's select. `0` = off. */
+export const REFRESH_INTERVALS: { label: string; ms: number }[] = [
+  { label: "off", ms: 0 },
+  { label: "5s", ms: 5_000 },
+  { label: "10s", ms: 10_000 },
+  { label: "30s", ms: 30_000 },
+  { label: "1m", ms: 60_000 },
+];
+
+/** The span of a quick-range label, or `null` when it isn't one of ours.
+ *  Pure — the slide step of an auto-refresh tick, isolated for testing. */
+export function quickRangeMs(label: string | null): number | null {
+  if (label === null) return null;
+  const hit = QUICK_RANGES.find((r) => r.label === label);
+  return hit ? hit.ms : null;
+}
+
+const [refreshMs, setRefreshMs] = createSignal(0);
+export { refreshMs };
+
+let refreshTimer: ReturnType<typeof setInterval> | null = null;
+
+/** One auto-refresh tick. Exported for tests; the timer is what calls it. */
+export function refreshTick(): void {
+  // A run already in flight means the interval is shorter than the query takes.
+  // Skipping (rather than queueing) keeps a slow query from stacking ticks.
+  if (state.status === "running") return;
+  // Logs with a live stream attached are already current; a re-run would reset
+  // the seam and blank the pane for no gain.
+  if (liveActive()) return;
+  const ms = quickRangeMs(activeRange());
+  if (ms !== null) applyQuickRange(ms, activeRange()!);
+  void runCurrentQuery();
+}
+
+/** Set (or clear, with `0`) the auto-refresh period. */
+export function setRefreshInterval(ms: number): void {
+  setRefreshMs(ms);
+  if (refreshTimer !== null) {
+    clearInterval(refreshTimer);
+    refreshTimer = null;
+  }
+  if (ms > 0) refreshTimer = setInterval(refreshTick, ms);
 }
 
 // ── Logs volume histogram (Part B) ───────────────────────────────────

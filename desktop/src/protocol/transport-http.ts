@@ -8,7 +8,8 @@
 //! pick its default target. The session cookie rides along automatically with
 //! `credentials: "same-origin"`.
 
-import type { Transport } from "./transport";
+import { FrameStream } from "./framing";
+import { LiveUnavailableError, type FrameHandler, type Transport } from "./transport";
 
 /** Thrown on a 401 so the UI can drop back to the login screen. */
 export class UnauthorizedError extends Error {
@@ -47,5 +48,63 @@ export class HttpTransport implements Transport {
     }
     const buf = await res.arrayBuffer();
     return new Uint8Array(buf);
+  }
+
+  async tail(
+    addr: string,
+    request: Uint8Array,
+    onFrame: FrameHandler,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const headers: Record<string, string> = {
+      "content-type": "application/octet-stream",
+    };
+    const target = addr.trim();
+    if (target !== "") headers["x-scry-target"] = target;
+
+    let res: Response;
+    try {
+      res = await fetch("/api/tail", {
+        method: "POST",
+        headers,
+        body: request as BodyInit,
+        credentials: "same-origin",
+        signal,
+      });
+    } catch (e) {
+      // An abort during setup is an ordinary stop, not a failure.
+      if (signal.aborted) return;
+      throw e;
+    }
+    if (res.status === 401) throw new UnauthorizedError();
+    if (res.status === 409) {
+      throw new LiveUnavailableError(
+        "this target has no live-tail endpoint configured (scry web needs --queryd-tail)",
+      );
+    }
+    if (!res.ok) {
+      throw new Error(`tail relay failed: HTTP ${res.status}`);
+    }
+    if (!res.body) {
+      throw new Error("tail relay returned no response stream");
+    }
+
+    // Read the relay's chunks as they arrive. This is the whole reason the
+    // tail path exists separately from `query`, which buffers to completion.
+    const reader = res.body.getReader();
+    const frames = new FrameStream();
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value) continue;
+        for (const body of frames.push(value)) onFrame(body);
+      }
+    } catch (e) {
+      if (signal.aborted) return;
+      throw e;
+    } finally {
+      reader.releaseLock();
+    }
   }
 }
