@@ -36,6 +36,7 @@
 import {
   MAX_SERIES,
   fpHex,
+  labelsToName,
   type AggFn,
   type MetricSeriesLine,
   type MetricsChartData,
@@ -178,17 +179,21 @@ export class LiveBuckets {
   }
 }
 
-/** Build a legend label from a live sample's labels, matching the stored
- *  half's convention: the metric name plus its distinguishing labels. Returns
- *  `""` when there is nothing useful to show. */
+/**
+ * Build a legend label from a live sample's labels.
+ *
+ * Delegates to the stored half's `labelsToName` so a series named from the
+ * wire is indistinguishable from one named by the `decodeSeriesNames` lookup.
+ * They *can* both happen in one legend — `decodeSeriesNames` only resolves the
+ * fingerprints its own (bounded) query returned, so a chart routinely mixes
+ * resolved `{k="v"}` names with bare `#fp` fallbacks — and two spellings of the
+ * same series would read as two different series.
+ *
+ * `__name__` is dropped, as it is there: it is the chart's subject, identical
+ * on every line. Returns `""` when nothing distinguishing is left.
+ */
 export function liveSampleName(sample: TailSample): string {
-  const name = sample.labels.find(([k]) => k === "__name__")?.[1] ?? "";
-  const rest = sample.labels
-    .filter(([k]) => k !== "__name__")
-    .map(([k, v]) => `${k}=${v}`)
-    .join(", ");
-  if (name === "") return rest;
-  return rest === "" ? name : `${name}{${rest}}`;
+  return labelsToName(sample.labels);
 }
 
 /**

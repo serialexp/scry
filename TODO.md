@@ -54,6 +54,16 @@
 - [ ] Traces/profiles stay untailable (both the server and the relay refuse
       them). A span stream is plausible; a pprof blob stream is not.
 
+## scry tail: SIGPIPE (pre-existing, found 2026-08-29)
+- [ ] `scry tail ... | head -5` panics instead of exiting quietly:
+      `failed printing to stdout: Broken pipe (os error 32)`. Rust ignores
+      SIGPIPE and `println!` panics once the reader closes, so piping a tail
+      into `head`/`grep -m`/`less` and quitting always ends in a panic message.
+      Affects the logs tail identically — not introduced by D-065, just noticed
+      while exercising it. Fix: treat a `BrokenPipe` write error on stdout as a
+      clean exit in the tail print loop (write via `Stdout::write_all` and match
+      the error, rather than `println!`).
+
 ## Web UI / desktop (mobile)
 - [ ] Collapsible sidebar: let the query form collapse entirely (toggle) so the
       results pane can use the full width on mobile. Current `@media (max-width:720px)`

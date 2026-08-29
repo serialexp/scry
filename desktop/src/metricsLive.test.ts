@@ -8,7 +8,7 @@ import {
   mergeLiveIntoChart,
   reduceAcc,
 } from "./metricsLive";
-import type { MetricsChartData } from "./metricsChart";
+import { labelsToName, type MetricsChartData } from "./metricsChart";
 import type { TailSample } from "./protocol/tail";
 
 const STEP = 10_000; // 10s buckets
@@ -124,15 +124,22 @@ describe("LiveBuckets.evictBefore", () => {
 });
 
 describe("liveSampleName", () => {
-  it("renders __name__ with its other labels", () => {
-    expect(
-      liveSampleName(sample(0, 1, 1n, [["__name__", "reqs"], ["job", "api"]])),
-    ).toBe("reqs{job=api}");
+  // One legend routinely mixes stored names (resolved by `decodeSeriesNames`)
+  // with live ones, so both halves must spell a series the same way or the
+  // same series reads as two.
+  it("spells a series exactly as the stored half's labelsToName does", () => {
+    const pairs: [string, string][] = [
+      ["__name__", "reqs"],
+      ["job", "api"],
+      ["env", "dev"],
+    ];
+    expect(liveSampleName(sample(0, 1, 1n, pairs))).toBe(labelsToName(pairs));
+    expect(liveSampleName(sample(0, 1, 1n, pairs))).toBe('{env="dev", job="api"}');
   });
 
-  it("handles a bare metric name and a nameless series", () => {
-    expect(liveSampleName(sample(0, 1, 1n, [["__name__", "reqs"]]))).toBe("reqs");
-    expect(liveSampleName(sample(0, 1, 1n, [["job", "api"]]))).toBe("job=api");
+  it("drops __name__ — it is the chart's subject, not a distinguisher", () => {
+    expect(liveSampleName(sample(0, 1, 1n, [["__name__", "reqs"]]))).toBe("");
+    expect(liveSampleName(sample(0, 1, 1n, [["job", "api"]]))).toBe('{job="api"}');
     expect(liveSampleName(sample(0, 1, 1n, []))).toBe("");
   });
 });
@@ -184,15 +191,30 @@ describe("mergeLiveIntoChart", () => {
       truncated: 0,
     };
     const live = new LiveBuckets();
-    live.push(sample(10_000, 5, 2n, [["__name__", "new"]]), STEP, true, 0);
+    live.push(
+      sample(10_000, 5, 2n, [["__name__", "reqs"], ["job", "new"]]),
+      STEP,
+      true,
+      0,
+    );
     const merged = mergeLiveIntoChart(grouped, live, "max", STEP)!;
 
     expect(merged.series).toHaveLength(2);
     // The stored series stays first, so its palette colour doesn't shift.
     expect(merged.series[0]!.key).toBe("#00000001");
     expect(merged.series[0]!.points).toEqual([1, null]);
-    expect(merged.series[1]!.name).toBe("new");
+    // Named from the wire, in the stored half's spelling.
+    expect(merged.series[1]!.name).toBe('{job="new"}');
     expect(merged.series[1]!.points).toEqual([null, 5]);
+  });
+
+  it("falls back to the fingerprint when a live series has no distinguishing label", () => {
+    const live = new LiveBuckets();
+    live.push(sample(10_000, 5, 2n, [["__name__", "reqs"]]), STEP, true, null);
+    const merged = mergeLiveIntoChart(null, live, "max", STEP)!;
+
+    expect(merged.series).toHaveLength(1);
+    expect(merged.series[0]!.name).toBe("#00000002");
   });
 
   it("applies the chosen reducer to live buckets", () => {
