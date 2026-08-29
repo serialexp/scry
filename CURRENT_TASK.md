@@ -31,6 +31,15 @@ Production accumulated ~319k block metadata sidecars because coordinated compact
 1. Add/finish deterministic Rust coverage for targeted-repair single-flight, concurrency/stability bounds, and mid-scan fault injection. TypeScript multi-attempt fixtures now cover successful discard/restart and malformed transitions.
 2. Implement conservative lineage pruning only after an authoritative stable partition reconcile can prove no extant or pending descendant needs each claim. Lineage row-count telemetry is now exposed; claims are deliberately retained meanwhile.
 3. Add richer repair/reset counters and latency telemetry beyond logs and catalog lineage size.
-4. Run deployment smokes and stage the fleet with grace retained before enabling zero grace. D-061 and architecture documentation are now recorded, but rollout/operator evidence remains outstanding.
+4. ~~Run deployment smokes and stage the fleet with grace retained before
+   enabling zero grace.~~ **Done — the rollout gate is closed.** Verified
+   against the live `gothab` cluster on 2026-08-29: `scry-server-0`'s
+   StatefulSet args carry `--compact-grace=0` (with `--ttl=90d
+   --retention-apply`), on image `serialexp/scry:v0.17.0`; all five scry pods
+   Running with 0 restarts at 4d10h; 24h of `scry-server` logs show active
+   compaction and no panic / "pass failed", and `scry-queryd` logs show no
+   supersession-related error (the only ERROR-ish lines on either side are
+   `object_store` 503/timeout retries against Garage, logged at INFO and
+   retried). So zero grace is live and has been stable for days.
 
-Do not deploy or mutate production without Bart's explicit confirmation. The design intentionally retains production grace as a non-blocking eligibility timestamp until the fleet rollout gate is complete.
+Do not deploy or mutate production without Bart's explicit confirmation.
