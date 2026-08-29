@@ -215,11 +215,14 @@ const QueryBar: Component = () => {
           </For>
         </div>
 
-        {/* Live tail (logs) / auto-refresh (everything else). Only ever one of
-            the two is offered, because only one of them is real: the server
-            tails logs and nothing else. */}
+        {/* Live tail (logs + metrics) / auto-refresh (traces, profiles). Only
+            ever one of the two is offered, because only one of them is real:
+            the server taps the logs and metrics ingest paths and nothing else
+            (D-050, D-065). Within a tailable signal the pill can still be
+            disabled — see `liveUnavailableReason` — with the reason as its
+            tooltip. */}
         <Show
-          when={state.signal === "Logs"}
+          when={state.signal === "Logs" || state.signal === "Metrics"}
           fallback={
             <select
               class="refresh-select"

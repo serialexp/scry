@@ -33,8 +33,26 @@
       a drift without needing Garage+Valkey. The dedup *selector* is already
       unit-tested (`live_record_is_durable`).
 - [ ] Extend the merged view to metrics/traces/profiles (logs-only in v1).
+      **Still open after D-065** — that widened the best-effort *tail* to
+      metrics, not this exact, watermark-deduplicated `--live` query. The
+      metrics chart's live half is a client-side approximation of `date_bin`
+      with a strictly-newer-bucket seam; an exact merged metrics query would
+      replace it.
 - [ ] `scry get` one-shot live-merge (daemon-only today, mirroring D-053's tail
       front-door).
+
+## D-065 metrics live tail (follow-ups, non-blocking)
+- [ ] Labels repeat on every `TailSample`, as they do on every `TailRecord`. For
+      a wide metrics tail that is real bandwidth; a per-connection series
+      dictionary (send labels once per fingerprint, then samples reference it)
+      would fix it for both frames. Deferred: the drop-on-full channel already
+      bounds the server, and consistency with `TailRecord` won for now.
+- [ ] Surface the server-side drop count to the client. A wide-open metrics tail
+      with no matchers drops heavily and currently just looks sparse; the count
+      exists on the server (logged) but never reaches the CLI or the UI, so
+      backpressure reads as data loss.
+- [ ] Traces/profiles stay untailable (both the server and the relay refuse
+      them). A span stream is plausible; a pprof blob stream is not.
 
 ## Web UI / desktop (mobile)
 - [ ] Collapsible sidebar: let the query form collapse entirely (toggle) so the

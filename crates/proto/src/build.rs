@@ -25,7 +25,7 @@
 use crate::generated::{
     AgentStatusInput, BatchAckInput, BatchInput, ErrorInput, FlowControlInput, Frame, FrameMsg,
     GoodbyeInput, HelloAckInput, HelloInput, LabelPair, LiveBatchInput, LiveQueryInput, LiveRecord,
-    MatcherSpec, PingInput, PongInput, SubscribeInput, TailRecordInput,
+    MatcherSpec, PingInput, PongInput, SubscribeInput, TailRecordInput, TailSampleInput,
 };
 
 pub struct HelloArgs<'a> {
@@ -251,6 +251,35 @@ pub fn tail_record(a: TailRecordArgs) -> Frame {
                 labels: a.labels,
                 body: a.body,
                 attributes: a.attributes,
+            }
+            .into(),
+        ),
+    }
+}
+
+pub struct TailSampleArgs {
+    pub signal: u8,
+    pub ts_unix_nano: u64,
+    pub metric_type: u8,
+    pub series_fingerprint: u64,
+    pub value: f64,
+    pub labels: Vec<LabelPair>,
+}
+
+/// A single live metric sample streamed back to a subscriber — the
+/// [`tail_record`] counterpart for the metrics signal (D-065). Same
+/// best-effort contract: no ordering, no completeness, no relationship to
+/// stored blocks.
+pub fn tail_sample(a: TailSampleArgs) -> Frame {
+    Frame {
+        msg: FrameMsg::TailSample(
+            TailSampleInput {
+                signal: a.signal,
+                ts_unix_nano: a.ts_unix_nano,
+                metric_type: a.metric_type,
+                series_fingerprint: a.series_fingerprint,
+                value: a.value,
+                labels: a.labels,
             }
             .into(),
         ),

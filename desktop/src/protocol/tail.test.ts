@@ -9,13 +9,20 @@ import { describe, expect, it } from "vitest";
 
 import { FrameDecoder, FrameEncoder, type FrameInput } from "../proto/generated-ingest";
 import { deframe, frame } from "./framing";
-import { PROTOCOL_VERSION_V0, SIGNAL_BIT_LOGS, Signal, TailErrCode } from "./constants";
+import {
+  PROTOCOL_VERSION_V0,
+  SIGNAL_BIT_LOGS,
+  SIGNAL_BIT_METRICS,
+  Signal,
+  TailErrCode,
+} from "./constants";
 import {
   TailError,
   buildSubscribeRequest,
   equalityMatcher,
   runTail,
   type TailRecord,
+  type TailSample,
 } from "./tail";
 import type { FrameHandler, Transport } from "./transport";
 
@@ -91,6 +98,18 @@ describe("buildSubscribeRequest", () => {
     const sub = new FrameDecoder(frames[1]!).decode() as any;
     expect(sub.msg.value.matchers).toEqual([]);
   });
+
+  it("announces the metrics bit and signal when tailing metrics (D-065)", () => {
+    const frames = deframe(
+      buildSubscribeRequest({ matchers: [], signal: Signal.Metrics }, "1.0.0"),
+    );
+    const hello = new FrameDecoder(frames[0]!).decode() as any;
+    const sub = new FrameDecoder(frames[1]!).decode() as any;
+    // The handshake gates which signals the connection may carry, so the
+    // Hello bit and the Subscribe signal have to agree.
+    expect(hello.msg.value.signals).toBe(SIGNAL_BIT_METRICS);
+    expect(sub.msg.value.signal).toBe(Signal.Metrics);
+  });
 });
 
 describe("equalityMatcher", () => {
@@ -129,6 +148,60 @@ describe("runTail", () => {
       attrs: [["stream", "stdout"]],
     });
     expect(transport.request).not.toBeNull();
+  });
+
+  it("decodes pushed metric samples, fingerprint and value intact", async () => {
+    const sample = encode("TailSample", {
+      signal: Signal.Metrics,
+      ts_unix_nano: 1_700_000_000_000_000_000n,
+      metric_type: 2,
+      series_fingerprint: 0x0123_4567_89ab_cdefn,
+      // Not representable in binary32 — proves the f64 survives the wire.
+      value: 0.1 + 0.2,
+      labels: [
+        { key: "__name__", value: "reqs" },
+        { key: "job", value: "api" },
+      ],
+    });
+    const transport = new ReplayTransport([HELLO_ACK, sample]);
+    const seen: TailSample[] = [];
+
+    await runTail(
+      transport,
+      "target",
+      { matchers: [], signal: Signal.Metrics },
+      "1.2.3",
+      { onSample: (s) => seen.push(s) },
+      new AbortController().signal,
+    );
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toEqual({
+      tsUnixNano: 1_700_000_000_000_000_000n,
+      metricType: 2,
+      seriesFingerprint: 0x0123_4567_89ab_cdefn,
+      value: 0.1 + 0.2,
+      labels: [
+        ["__name__", "reqs"],
+        ["job", "api"],
+      ],
+    });
+  });
+
+  /// A logs subscription with no `onSample` must not crash when a stray sample
+  /// arrives, and vice versa — both callbacks are optional.
+  it("ignores a record shape the caller did not ask for", async () => {
+    const transport = new ReplayTransport([HELLO_ACK, record("one", 5n)]);
+    const samples: TailSample[] = [];
+    await runTail(
+      transport,
+      "target",
+      { matchers: [], signal: Signal.Metrics },
+      "1.0.0",
+      { onSample: (s) => samples.push(s) },
+      new AbortController().signal,
+    );
+    expect(samples).toEqual([]);
   });
 
   /// A Valkey-less query daemon refuses rather than streaming nothing — the UI

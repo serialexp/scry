@@ -151,6 +151,80 @@ mod tests {
         }
     }
 
+    /// D-065: a metric sample rides its own frame rather than a widened
+    /// `TailRecord`. The value is an f64 on the wire, so this pins both the
+    /// assigned tag and that the float survives the round trip bit-for-bit
+    /// (a `f64` compared with `==` — any lossy re-encode would show up here).
+    #[tokio::test]
+    async fn roundtrip_tail_sample() {
+        let mut buf = Vec::new();
+        let frame = build::tail_sample(build::TailSampleArgs {
+            signal: crate::constants::Signal::Metrics as u8,
+            ts_unix_nano: 1_700_000_000_123_456_789,
+            metric_type: 2,
+            series_fingerprint: 0x0123_4567_89AB_CDEF,
+            // Not representable in binary32 — catches an f32 narrowing.
+            value: 0.1 + 0.2,
+            labels: vec![
+                crate::generated::LabelPair {
+                    key: "__name__".to_string(),
+                    value: "http_requests_total".to_string(),
+                },
+                crate::generated::LabelPair {
+                    key: "job".to_string(),
+                    value: "api".to_string(),
+                },
+            ],
+        });
+        write_frame(&mut buf, &frame).await.unwrap();
+        assert_eq!(buf[4], 0x54, "TailSample keeps its assigned wire tag");
+
+        let mut cursor = std::io::Cursor::new(buf);
+        let back: Frame = read_frame(&mut cursor).await.unwrap();
+        match back.msg {
+            FrameMsg::TailSample(s) => {
+                assert_eq!(s.signal, crate::constants::Signal::Metrics as u8);
+                assert_eq!(s.ts_unix_nano, 1_700_000_000_123_456_789);
+                assert_eq!(s.metric_type, 2);
+                assert_eq!(s.series_fingerprint, 0x0123_4567_89AB_CDEF);
+                assert_eq!(s.value, 0.1 + 0.2);
+                assert_eq!(s.labels.len(), 2);
+                assert_eq!(s.labels[0].key, "__name__");
+                assert_eq!(s.labels[0].value, "http_requests_total");
+                assert_eq!(s.labels[1].key, "job");
+            }
+            other => panic!("expected TailSample, got {:?}", other),
+        }
+    }
+
+    /// The union is decoded by trying variants in order, each guarded by its
+    /// const tag byte. Adding `TailSample` (0x54) next to `TailRecord` (0x51)
+    /// must not make a logs record decode as a sample or vice versa.
+    #[tokio::test]
+    async fn tail_record_and_tail_sample_do_not_alias() {
+        let mut buf = Vec::new();
+        write_frame(
+            &mut buf,
+            &build::tail_record(build::TailRecordArgs {
+                signal: crate::constants::Signal::Logs as u8,
+                ts_unix_nano: 5,
+                severity: 9,
+                labels: vec![],
+                body: "hello".to_string(),
+                attributes: vec![],
+            }),
+        )
+        .await
+        .unwrap();
+        let mut cursor = std::io::Cursor::new(buf);
+        let back: Frame = read_frame(&mut cursor).await.unwrap();
+        assert!(
+            matches!(back.msg, FrameMsg::TailRecord(ref r) if r.body == "hello"),
+            "a TailRecord must still decode as a TailRecord, got {:?}",
+            back.msg
+        );
+    }
+
     #[tokio::test]
     async fn rejects_oversized_frame() {
         let mut buf = Vec::new();

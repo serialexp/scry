@@ -3373,3 +3373,114 @@ historical keys verbatim; two namespaces share no key; glob and separator
 characters are rejected) and a real-Valkey integration test that runs two
 clients in different namespaces and asserts they share no lease, no tail
 registration, no staged deletion, and no pub/sub channel.
+
+---
+
+## D-065: Metrics are tailable, through a sibling frame
+
+**Date:** 2026-08-29
+**Status:** accepted
+
+Live tail (D-050/D-052/D-053) has been logs-only since it shipped, hard-coded
+in four places: the queryd relay refused any non-Logs `Subscribe`, the CLI
+rejected any `--signal` but `logs`, the ingest server only wrapped the logs
+decode branch in a tap, and the UI's Live pill reported "logs-only" for
+everything else. Underneath, though, the machinery was already
+signal-parameterised — `SubscriptionRegistry` stores a `signal: u8` per
+subscriber and snapshots per signal, the `Subscribe` frame carries a signal
+byte, `dial_subscribe` takes one. Metrics tailing was a matter of filling in
+the signal-specific parts.
+
+Metrics are the natural second signal: they are the other one with a
+high-frequency ingest path worth watching live, and the UI already has a chart
+to put them in. Traces and profiles stay untailable — a span or a pprof blob is
+not something a scrolling stream serves well — and both the server and the
+relay now refuse them explicitly rather than accepting a subscription that
+would never yield a record.
+
+### A sibling frame, not a widened one
+
+A log record is a *body* with a severity. A metric sample is a *float*.
+`TailRecord` has `severity: u8` and `body: string` and nowhere to put an f64.
+Three options:
+
+1. **Widen `TailRecord`** with a `value: float64`. One frame, one decode branch
+   — but 8 dead bytes on every log record forever, and each signal ignoring
+   half the struct.
+2. **Stringify the value into `body`.** No schema change at all, and Rust's
+   `{}` on f64 is shortest-round-trip so nothing is lost numerically. But the
+   frame's field names would lie about their contents and every client would
+   parse a float back out of text.
+3. **A sibling `TailSample` frame** (tag `0x54`) in the same union.
+
+We took (3). The union is already how this schema models "different message,
+different shape" — `LiveQuery`/`LiveBatch` are their own variants rather than
+flags on an existing frame — and it keeps `TailRecord` byte-identical, so a
+logs tail pays literally nothing for a feature it does not use. The cost is
+that each client learns a second record frame, which is a `match` arm.
+
+```
+TailSample: tag(0x54) | signal u8 | ts_unix_nano u64 | metric_type u8
+          | series_fingerprint u64 | value float64 | labels [LabelPair]
+```
+
+`series_fingerprint` is the server's own xxh3-64 over the sorted labels. It
+rides along because the UI chart's grouped mode keys its lines on exactly that
+column, so without it a live line could not be matched to a stored series
+without re-deriving the hash client-side. `metric_type` comes off the series
+dictionary entry, not the sample, so the tap caches it per fingerprint
+alongside the labels.
+
+Labels repeat per sample, as they already do per `TailRecord`. For metrics that
+is a real cost — a wide scrape has thousands of series — but the tail is
+bounded by its drop-on-full channel, not by its encoding, and consistency with
+the existing frame beat the byte saving. The UI mitigates it differently: a
+live metrics subscription always carries the `__name__` matcher of the charted
+metric, so the server sends only the series being drawn.
+
+### The client-side seam
+
+The chart's stored half is **already aggregated**: queryd runs `date_bin(...)`
+plus `avg/sum/min/max/count` and returns one value per (series, bucket). The
+tail pushes **raw samples**. So the browser has to redo the server's bucketing
+and reduction for the live half, and do it identically or the newest bucket
+would visibly jump when the next refresh replaces a live value with a stored
+one.
+
+Two rules make that work (`desktop/src/metricsLive.ts`):
+
+- **Accumulate, don't pre-reduce.** Each (series, bucket) keeps
+  `{sum, count, min, max}`, not a running reduced value. That is what makes
+  `avg` exact — you cannot average a stream of averages without their counts,
+  and a bucket keeps receiving samples for as long as it is the newest one.
+- **Live owns only strictly-newer buckets.** History covers up to some newest
+  bucket `H`. A live sample landing *inside* `H` would give that bucket two
+  competing values, and ours — computed over the sliver we saw — would be wrong
+  and flickery. So samples at or before `H` are dropped; `H` keeps its stored
+  value until a refresh completes it.
+
+This is the same best-effort honesty as the logs seam, for the same reason: the
+tail is lossy by construction, so the live tip of the chart answers "what is
+happening right now", not "here is an exact aggregate".
+
+Unlike logs, a live metrics view still runs the periodic refresh underneath
+itself. Logs accumulate rows and a re-run would only reset the seam and blank
+the pane; metrics need the stored half to keep advancing, or the chart freezes
+everywhere except its right edge and the window never slides. `runMetricsChart`
+re-bases the seam and evicts the live buckets the refresh has just made
+authoritative, so the two compose. Live buckets are also evicted below the
+window's lower bound on every re-derive, so a stream with refresh switched off
+still cannot grow an unbounded bucket set.
+
+**Not done here:** D-054's *merged history+live query* (`--live`) stays
+logs-only — that is an exact, deduplicated surface with a WAL-segment
+watermark, and giving metrics the same treatment is a separate piece of work.
+This is the best-effort tail only.
+
+**Sealed by** `scripts/smoke-tail-metrics.sh` (direct tail, front-door relay,
+filter, well-formed `<ts> <metric> {labels} <value>` lines with numeric values,
+logs unaffected and not cross-delivered, untailable signals refused), a
+`TailSample` round-trip in `scry-proto::framing` that pins the tag and proves
+the f64 survives bit-for-bit, four metrics-tap unit tests mirroring the logs
+tap's, and 18 vitest cases over the bucket accumulator, the seam rule, eviction
+and the merge.

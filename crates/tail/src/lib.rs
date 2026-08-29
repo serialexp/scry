@@ -1,8 +1,10 @@
-//! `scry tail` — live log tailing.
+//! `scry tail` — live log and metric tailing.
 //!
 //! Opens one TCP connection per `--ingest` server, performs the native
-//! handshake, sends a `Subscribe`, and prints every `TailRecord` the server
-//! sprays back until interrupted (Ctrl-C) or the servers hang up.
+//! handshake, sends a `Subscribe`, and prints every record the server sprays
+//! back until interrupted (Ctrl-C) or the servers hang up. Logs arrive as
+//! `TailRecord` frames, metrics as `TailSample` frames (D-065) — [`TailFrame`]
+//! is the one channel type carrying both.
 //!
 //! This is a **separate, best-effort surface**: the records here come
 //! straight off the ingest hot path *before* they are sealed into a block,
@@ -17,7 +19,7 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use scry_proto::{
     build,
-    constants::{Signal, PROTOCOL_VERSION_V0, SIGNAL_BIT_LOGS},
+    constants::{Signal, PROTOCOL_VERSION_V0, SIGNAL_BIT_LOGS, SIGNAL_BIT_METRICS},
     framing::{read_frame, write_frame, FrameError},
     Frame, FrameMsg, LabelPair,
 };
@@ -54,7 +56,8 @@ pub struct Args {
     #[arg(value_name = "MATCHER")]
     pub matchers: Vec<String>,
 
-    /// Signal to tail. Only `logs` is supported today.
+    /// Signal to tail: `logs` or `metrics`. These are the two signals with an
+    /// ingest tap; traces and profiles are not tailable.
     #[arg(long, default_value = "logs")]
     pub signal: String,
 }
@@ -65,11 +68,41 @@ struct Line {
     text: String,
 }
 
+/// One record pushed by a tail endpoint. Logs and metrics have different
+/// record shapes and therefore different frames, so the channel between
+/// [`dial_subscribe`] and its consumer carries either.
+#[derive(Debug)]
+pub enum TailFrame {
+    /// A log entry (`TailRecord`, signal = Logs).
+    Record(scry_proto::generated::TailRecordOutput),
+    /// A metric sample (`TailSample`, signal = Metrics, D-065).
+    Sample(scry_proto::generated::TailSampleOutput),
+}
+
+/// The Hello `signals` bitmask to announce for a tail of `signal`. The
+/// handshake gates which signals a connection may carry, so announcing the
+/// wrong bit gets the subscription refused.
+pub fn signal_bit(signal: u8) -> u8 {
+    if signal == Signal::Metrics as u8 {
+        SIGNAL_BIT_METRICS
+    } else {
+        SIGNAL_BIT_LOGS
+    }
+}
+
+/// Parse a `--signal` value into the signal it names. Only logs and metrics
+/// have an ingest tap (`crates/server/src/tail.rs`); the others would open a
+/// connection that silently never yields a record.
+pub fn parse_tailable_signal(s: &str) -> Result<Signal> {
+    match s {
+        "logs" => Ok(Signal::Logs),
+        "metrics" => Ok(Signal::Metrics),
+        other => bail!("unsupported --signal {other:?}: expected 'logs' or 'metrics'"),
+    }
+}
+
 pub async fn run(args: Args) -> Result<()> {
-    let signal = match args.signal.as_str() {
-        "logs" => Signal::Logs,
-        other => bail!("unsupported --signal {other:?}: only 'logs' is supported today"),
-    };
+    let signal = parse_tailable_signal(&args.signal)?;
 
     // Fail fast on a bad matcher before opening any connections — the
     // server re-validates, but a local parse gives a cleaner error.
@@ -144,7 +177,7 @@ async fn tail_one(
     out_tx: mpsc::Sender<Line>,
 ) -> Result<()> {
     // Raw records flow dial → formatter; the oneshot signals "subscription live".
-    let (rec_tx, mut rec_rx) = mpsc::channel::<scry_proto::generated::TailRecordOutput>(4096);
+    let (rec_tx, mut rec_rx) = mpsc::channel::<TailFrame>(4096);
     let (sub_tx, sub_rx) = oneshot::channel::<()>();
 
     let origin = addr.to_string();
@@ -152,7 +185,10 @@ async fn tail_one(
         while let Some(rec) = rec_rx.recv().await {
             let line = Line {
                 origin: origin.clone(),
-                text: format_record(&rec),
+                text: match &rec {
+                    TailFrame::Record(r) => format_record(r),
+                    TailFrame::Sample(s) => format_sample(s),
+                },
             };
             if out_tx.send(line).await.is_err() {
                 break; // printer gone → shutting down
@@ -175,18 +211,22 @@ async fn tail_one(
 
 /// Connect to one server that speaks the tail sub-protocol (an ingester, or the
 /// queryd relay), perform the native handshake, `Subscribe`, and forward every
-/// `TailRecord` it sprays back onto `tx` until the connection ends.
+/// record it sprays back onto `tx` until the connection ends.
 ///
 /// This is the reusable core shared by the `scry tail` CLI and the queryd
 /// front-door relay (D-053): the relay dials each discovered ingester with this
 /// and re-frames the raw records downstream to its own client. `on_subscribed`
 /// (if provided) fires once the `Subscribe` has been sent and accepted, so a
 /// caller can wait for the stream to be live.
+///
+/// `signal` selects both the subscription and the frame the server replies
+/// with — `TailRecord` for logs, `TailSample` for metrics — which is why the
+/// channel carries the [`TailFrame`] sum rather than one concrete record type.
 pub async fn dial_subscribe(
     addr: &str,
     signal: u8,
     matchers: &[String],
-    tx: mpsc::Sender<scry_proto::generated::TailRecordOutput>,
+    tx: mpsc::Sender<TailFrame>,
     on_subscribed: Option<oneshot::Sender<()>>,
 ) -> Result<()> {
     let stream = TcpStream::connect(addr)
@@ -197,8 +237,10 @@ pub async fn dial_subscribe(
     let mut rd = BufReader::new(rd);
     let mut wr = BufWriter::new(wr);
 
-    // Hello: announce logs (the only tailable signal). agent_id is a
-    // throwaway per-invocation UUID; a tail client never writes.
+    // Hello: announce the signal being tailed — the handshake gates which
+    // signals the connection may carry, so a metrics tail that announced
+    // logs would be refused. agent_id is a throwaway per-invocation UUID;
+    // a tail client never writes.
     write_frame(
         &mut wr,
         &build::hello(build::HelloArgs {
@@ -206,7 +248,7 @@ pub async fn dial_subscribe(
             agent_id: uuid::Uuid::now_v7().into_bytes(),
             agent_version: env!("CARGO_PKG_VERSION"),
             hostname: &hostname_string(),
-            signals: SIGNAL_BIT_LOGS,
+            signals: signal_bit(signal),
             capabilities: 0,
             resource_attrs: Vec::new(),
         }),
@@ -236,7 +278,12 @@ pub async fn dial_subscribe(
             Ok(frame) => match frame.msg {
                 FrameMsg::TailRecord(t) => {
                     // If the sink is gone, we're shutting down.
-                    if tx.send(t).await.is_err() {
+                    if tx.send(TailFrame::Record(t)).await.is_err() {
+                        break;
+                    }
+                }
+                FrameMsg::TailSample(s) => {
+                    if tx.send(TailFrame::Sample(s)).await.is_err() {
                         break;
                     }
                 }
@@ -262,6 +309,38 @@ fn format_record(t: &scry_proto::generated::TailRecordOutput) -> String {
         format!("{ts} {level} {}", t.body)
     } else {
         format!("{ts} {level} {labels} {}", t.body)
+    }
+}
+
+/// Render one metric sample as `<rfc3339 ts> <metric-name> {k=v,…} <value>`
+/// — the `format_record` counterpart for the metrics signal (D-065).
+///
+/// `__name__` is lifted out of the label set and printed in the slot a log
+/// line uses for its level, because it is the one label that identifies *what*
+/// the number is; the rest stay in the brace group. A series without a
+/// `__name__` (which the agent's scrape path always sets, but the wire does
+/// not require) prints `-` there rather than silently losing the sample.
+fn format_sample(s: &scry_proto::generated::TailSampleOutput) -> String {
+    let ts = format_ts(s.ts_unix_nano);
+    let name = s
+        .labels
+        .iter()
+        .find(|p| p.key == "__name__")
+        .map(|p| p.value.as_str())
+        .unwrap_or("-");
+    let rest: Vec<LabelPair> = s
+        .labels
+        .iter()
+        .filter(|p| p.key != "__name__")
+        .cloned()
+        .collect();
+    let labels = format_labels(&rest);
+    // `{}` on f64 is shortest-round-trip in Rust, so the printed text parses
+    // back to the same bits — no precision is invented or lost.
+    if labels.is_empty() {
+        format!("{ts} {name} {}", s.value)
+    } else {
+        format!("{ts} {name} {labels} {}", s.value)
     }
 }
 

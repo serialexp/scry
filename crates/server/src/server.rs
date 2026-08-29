@@ -42,7 +42,7 @@ use uuid::Uuid;
 use crate::live_ring::{LiveLogRecord, LiveRing, RetainingLogsAppender};
 use crate::pipeline::{DecodeFn, Pipeline, ShardedPipeline};
 use crate::stats::ServerMetrics;
-use crate::tail::{SubscriptionRegistry, TappingLogsAppender};
+use crate::tail::{SubscriptionRegistry, TailPayload, TappingLogsAppender, TappingMetricsAppender};
 
 /// Per-subscriber live-tail delivery channel depth. Bounds how many
 /// records can queue for a slow tail client before the ingest tap starts
@@ -790,7 +790,31 @@ async fn handle(
                             }
                             let (decode_fn, scratch) = metrics_scratch.as_mut().unwrap();
                             // Phase 1: decode into private scratch, no lock held.
-                            match decode_fn(&decompressed, scratch) {
+                            // The tail tap (D-065) optionally wraps the scratch
+                            // to forward matching samples to live subscribers.
+                            // Storage semantics are identical either way — the
+                            // decorator only observes what flows into the
+                            // scratch builder — so the block written is
+                            // byte-identical to the untapped path. There is no
+                            // live-ring equivalent here: D-054's merged query
+                            // is logs-only.
+                            let decoded = if tail.subscriber_count() > 0 {
+                                let mut tap = TappingMetricsAppender::new(
+                                    scratch,
+                                    tail.as_ref(),
+                                    Signal::Metrics as u8,
+                                )
+                                .await;
+                                scry_proto::streaming::decode_metrics_batch_into(
+                                    &decompressed,
+                                    &mut tap,
+                                )
+                                .map(|(_series, samples)| samples)
+                                .map_err(|e| anyhow::anyhow!("MetricsBatch: {e}"))
+                            } else {
+                                decode_fn(&decompressed, scratch)
+                            };
+                            match decoded {
                                 Ok(n) => {
                                     // Phase 2: commit (WAL append + merge) under lock.
                                     let mut guard = pipe.lock().await;
@@ -811,14 +835,29 @@ async fn handle(
                             // No metrics pipeline: validate + count
                             // samples (series are dictionary entries,
                             // not records — same accounting as the
-                            // pipeline path).
+                            // pipeline path). Live tail still works here —
+                            // a storage-less ingester can serve `scry tail`.
                             let mut counter = CountMetricsAppender::default();
-                            scry_proto::streaming::decode_metrics_batch_into(
-                                &decompressed,
-                                &mut counter,
-                            )
-                            .map(|(_series, samples)| samples as u64)
-                            .map_err(|e| anyhow::anyhow!("MetricsBatch: {e}"))
+                            let decoded = if tail.subscriber_count() > 0 {
+                                let mut tap = TappingMetricsAppender::new(
+                                    &mut counter,
+                                    tail.as_ref(),
+                                    Signal::Metrics as u8,
+                                )
+                                .await;
+                                scry_proto::streaming::decode_metrics_batch_into(
+                                    &decompressed,
+                                    &mut tap,
+                                )
+                            } else {
+                                scry_proto::streaming::decode_metrics_batch_into(
+                                    &decompressed,
+                                    &mut counter,
+                                )
+                            };
+                            decoded
+                                .map(|(_series, samples)| samples as u64)
+                                .map_err(|e| anyhow::anyhow!("MetricsBatch: {e}"))
                         }
                     }
                     Signal::Logs => {
@@ -1159,6 +1198,22 @@ async fn handle(
                 // one-way delivery stream: we spray matching `TailRecord`s
                 // down `wr` until the client hangs up (EOF/Goodbye) or the
                 // registry channel closes. Best-effort — see `tail` + D-050.
+                // Only logs and metrics have an ingest tap. Anything else
+                // would register a subscriber that nothing ever feeds, so
+                // refuse it rather than hold a silent connection open.
+                if sub.signal != Signal::Logs as u8 && sub.signal != Signal::Metrics as u8 {
+                    warn!(%peer, signal = sub.signal, "tail subscribe for an untailable signal");
+                    let _ = write_frame(
+                        &mut wr,
+                        &build::error(
+                            ERR_BAD_MATCHER,
+                            "only the logs and metrics signals are tailable",
+                        ),
+                    )
+                    .await;
+                    let _ = wr.flush().await;
+                    break;
+                }
                 let specs: Vec<String> = sub.matchers.into_iter().map(|m| m.spec).collect();
                 let filter = match scry_match::LabelFilter::parse(&specs) {
                     Ok(f) => f,
@@ -1184,14 +1239,34 @@ async fn handle(
                         item = rx.recv() => {
                             match item {
                                 Some(it) => {
-                                    let frame = build::tail_record(build::TailRecordArgs {
-                                        signal: it.signal,
-                                        ts_unix_nano: it.ts_unix_nano,
-                                        severity: it.severity,
-                                        labels: (*it.labels).clone(),
-                                        body: it.body.clone(),
-                                        attributes: it.attributes.clone(),
-                                    });
+                                    // Each signal gets its own frame: a log
+                                    // line is a body, a metric sample is a
+                                    // float. See D-065 for why these are
+                                    // siblings rather than one widened frame.
+                                    let frame = match &it.payload {
+                                        TailPayload::Log { severity, body, attributes } => {
+                                            build::tail_record(build::TailRecordArgs {
+                                                signal: it.signal,
+                                                ts_unix_nano: it.ts_unix_nano,
+                                                severity: *severity,
+                                                labels: (*it.labels).clone(),
+                                                body: body.clone(),
+                                                attributes: attributes.clone(),
+                                            })
+                                        }
+                                        TailPayload::Sample {
+                                            metric_type,
+                                            series_fingerprint,
+                                            value,
+                                        } => build::tail_sample(build::TailSampleArgs {
+                                            signal: it.signal,
+                                            ts_unix_nano: it.ts_unix_nano,
+                                            metric_type: *metric_type,
+                                            series_fingerprint: *series_fingerprint,
+                                            value: *value,
+                                            labels: (*it.labels).clone(),
+                                        }),
+                                    };
                                     if write_frame(&mut wr, &frame).await.is_err()
                                         || wr.flush().await.is_err()
                                     {
@@ -1432,6 +1507,7 @@ fn short_msg_name(m: &FrameMsg) -> &'static str {
         FrameMsg::Error(_) => "Error",
         FrameMsg::Subscribe(_) => "Subscribe",
         FrameMsg::TailRecord(_) => "TailRecord",
+        FrameMsg::TailSample(_) => "TailSample",
         FrameMsg::LiveQuery(_) => "LiveQuery",
         FrameMsg::LiveBatch(_) => "LiveBatch",
     }

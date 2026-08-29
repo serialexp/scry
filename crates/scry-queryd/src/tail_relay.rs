@@ -31,7 +31,7 @@ use scry_proto::{
     framing::{read_frame, write_frame},
     Frame, FrameMsg,
 };
-use scry_tail::dial_subscribe;
+use scry_tail::{dial_subscribe, TailFrame};
 use scry_valkey::{discover_tail_endpoints, ValkeyClient};
 use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
@@ -185,16 +185,22 @@ async fn serve_conn(
         }
     };
 
-    // v1: logs only.
-    if sub.signal != Signal::Logs as u8 {
+    // Only logs and metrics have an ingest tap to relay (D-065). Refusing
+    // anything else here matches what the ingesters would say, so the client
+    // gets one clear error instead of a connection that streams nothing.
+    if sub.signal != Signal::Logs as u8 && sub.signal != Signal::Metrics as u8 {
         let _ = write_frame(
             &mut wr,
-            &build::error(ERR_BAD_MATCHER, "only the logs signal is tailable"),
+            &build::error(
+                ERR_BAD_MATCHER,
+                "only the logs and metrics signals are tailable",
+            ),
         )
         .await;
         let _ = wr.flush().await;
         return Ok(());
     }
+    let signal = sub.signal;
 
     let specs: Vec<String> = sub.matchers.into_iter().map(|m| m.spec).collect();
     // Validate locally for a clean error (each upstream re-validates too).
@@ -227,7 +233,16 @@ async fn serve_conn(
     };
 
     info!(%peer, matchers = specs.len(), "tail relay: fanning in from discovered ingesters");
-    relay(peer, &mut rd, &mut wr, valkey, Arc::new(specs), rediscover).await
+    relay(
+        peer,
+        &mut rd,
+        &mut wr,
+        valkey,
+        Arc::new(specs),
+        rediscover,
+        signal,
+    )
+    .await
 }
 
 /// The fan-in loop: rediscover ingesters on a tick, keep one upstream
@@ -240,12 +255,15 @@ async fn relay<R, W>(
     valkey: ValkeyClient,
     matchers: Arc<Vec<String>>,
     rediscover: Duration,
+    // The signal the client subscribed to; every upstream is dialed with it
+    // and the reply frame type follows from it.
+    signal: u8,
 ) -> Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let (tx, mut rx) = mpsc::channel::<scry_proto::generated::TailRecordOutput>(RELAY_CHANNEL_CAP);
+    let (tx, mut rx) = mpsc::channel::<TailFrame>(RELAY_CHANNEL_CAP);
     // addr → upstream task. We keep a `tx` clone alive here, so `rx` never
     // closes while the client is connected even with zero upstreams.
     let mut upstreams: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
@@ -258,15 +276,28 @@ where
             // Downstream: record → frame → client.
             rec = rx.recv() => {
                 match rec {
-                    Some(r) => {
-                        let frame = build::tail_record(build::TailRecordArgs {
-                            signal: r.signal,
-                            ts_unix_nano: r.ts_unix_nano,
-                            severity: r.severity,
-                            labels: r.labels,
-                            body: r.body,
-                            attributes: r.attributes,
-                        });
+                    Some(rec) => {
+                        // Re-frame verbatim; the relay adds nothing and drops
+                        // nothing, it only fans several upstreams into one
+                        // socket. Each signal keeps its own frame type.
+                        let frame = match rec {
+                            TailFrame::Record(r) => build::tail_record(build::TailRecordArgs {
+                                signal: r.signal,
+                                ts_unix_nano: r.ts_unix_nano,
+                                severity: r.severity,
+                                labels: r.labels,
+                                body: r.body,
+                                attributes: r.attributes,
+                            }),
+                            TailFrame::Sample(s) => build::tail_sample(build::TailSampleArgs {
+                                signal: s.signal,
+                                ts_unix_nano: s.ts_unix_nano,
+                                metric_type: s.metric_type,
+                                series_fingerprint: s.series_fingerprint,
+                                value: s.value,
+                                labels: s.labels,
+                            }),
+                        };
                         if write_frame(wr, &frame).await.is_err() || wr.flush().await.is_err() {
                             break Ok(()); // client gone
                         }
@@ -277,7 +308,7 @@ where
             // Periodic rediscovery: reconcile the upstream set.
             _ = tick.tick() => {
                 match discover_tail_endpoints(&valkey).await {
-                    Ok(addrs) => reconcile(&addrs, &mut upstreams, &tx, &matchers),
+                    Ok(addrs) => reconcile(&addrs, &mut upstreams, &tx, &matchers, signal),
                     Err(e) => warn!(%peer, error = %e, "tail rediscovery failed; keeping current upstreams"),
                 }
             }
@@ -305,8 +336,9 @@ where
 fn reconcile(
     addrs: &[String],
     upstreams: &mut HashMap<String, tokio::task::JoinHandle<()>>,
-    tx: &mpsc::Sender<scry_proto::generated::TailRecordOutput>,
+    tx: &mpsc::Sender<TailFrame>,
     matchers: &Arc<Vec<String>>,
+    signal: u8,
 ) {
     use std::collections::HashSet;
     let desired: HashSet<&str> = addrs.iter().map(String::as_str).collect();
@@ -333,9 +365,7 @@ fn reconcile(
         let matchers = matchers.clone();
         debug!(upstream = %addr_owned, "tail relay dialing ingester");
         let handle = tokio::spawn(async move {
-            if let Err(e) =
-                dial_subscribe(&addr_owned, Signal::Logs as u8, &matchers, tx, None).await
-            {
+            if let Err(e) = dial_subscribe(&addr_owned, signal, &matchers, tx, None).await {
                 debug!(upstream = %addr_owned, error = %format!("{e:#}"), "tail upstream ended");
             }
         });

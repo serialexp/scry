@@ -30,6 +30,7 @@ import {
   TailError,
   equalityMatcher,
   runTail,
+  type TailSample,
 } from "./protocol/tail";
 import {
   MAX_LOG_ROWS,
@@ -55,6 +56,7 @@ import {
   type AggFn,
   type MetricsChartData,
 } from "./metricsChart";
+import { LiveBuckets, mergeLiveIntoChart } from "./metricsLive";
 
 export type { AggFn } from "./metricsChart";
 
@@ -719,14 +721,36 @@ export { liveStatus, liveError, liveRows, liveDropped };
  *  reports what the connection is actually doing.) */
 export const liveActive = () => liveStatus() !== "off" && liveStatus() !== "error";
 
+/** Whether the form has a usable [ts_min, ts_max]. The metrics chart derives
+ *  its bucket width from the span, so a live metrics view needs one. */
+function isBoundedRange(): boolean {
+  try {
+    const lo = parseBigIntOpt(state.tsMin);
+    const hi = parseBigIntOpt(state.tsMax);
+    return lo !== undefined && hi !== undefined && hi > lo;
+  } catch {
+    return false;
+  }
+}
+
 /** Why live tailing is not available for the current form, or `null` when it
  *  is. Drives the toggle's disabled state and its tooltip. */
 export function liveUnavailableReason(): string | null {
-  if (state.signal !== "Logs") {
-    return "Live tailing is logs-only — the server has no tail for other signals.";
+  if (state.signal !== "Logs" && state.signal !== "Metrics") {
+    return "Live tailing covers logs and metrics — the server has no tail for traces or profiles.";
   }
   if (state.sql.trim() !== "") {
     return "Live tailing can't apply custom SQL; clear it to stream.";
+  }
+  if (state.signal === "Metrics") {
+    // The chart is per-metric, and an unfiltered metrics tail would spray
+    // every series on the wire only for us to discard nearly all of it.
+    if (selectedMetric() === "") {
+      return "Pick a metric to chart before streaming it live.";
+    }
+    if (!isBoundedRange()) {
+      return "Live metrics need a bounded time range to size the chart's buckets.";
+    }
   }
   if (inBrowser) {
     const t = targets().find((x) => x.id === state.target);
@@ -750,8 +774,15 @@ let liveFlushTimer: ReturnType<typeof setTimeout> | null = null;
 /** Guards against a stale subscription's callbacks landing after a restart. */
 let liveGeneration = 0;
 
+/** The coalesced flush: one DOM update per ~4 Hz tick regardless of how many
+ *  records arrived. Serves both signals — logs append rows, metrics re-derive
+ *  the merged chart. */
 function flushLiveRows(): void {
   liveFlushTimer = null;
+  if (liveMetricsDirty) {
+    liveMetricsDirty = false;
+    rebuildLiveMetricsChart();
+  }
   if (livePending.length === 0) return;
   const batch = livePending;
   livePending = [];
@@ -793,12 +824,70 @@ function openLiveSeam(seam: bigint | null): void {
 }
 
 /** The matcher specs for a subscription — the query bar's tokens, in the
- *  grammar `scry-match` parses server-side. */
+ *  grammar `scry-match` parses server-side. For metrics this already includes
+ *  the `__name__` matcher naming the charted metric, so the server sends only
+ *  the series being drawn instead of everything the ingester sees. */
 function liveMatchers(): string[] {
   return state.matchers
     .map((m) => ({ name: m.name.trim(), value: m.value }))
     .filter((m) => m.name !== "")
     .map((m) => equalityMatcher(m.name, m.value));
+}
+
+// ── Live metrics (D-065) ─────────────────────────────────────────────
+//
+// Metrics take a different path from logs: instead of a growing row list,
+// samples are bucketed client-side and merged onto the stored chart. The
+// stored half is kept separately in `metricsHistory` so a merge never
+// compounds onto its own previous output.
+
+const liveBuckets = new LiveBuckets();
+/** The last purely-server-computed chart, i.e. the merge's left operand. */
+let metricsHistory: MetricsChartData | null = null;
+/** Bucket width the live samples are being folded at — the same `stepMs` the
+ *  history query used, so live and stored buckets line up exactly. */
+let liveMetricsStep = 0;
+/** Newest bucket the history covers; live only owns buckets after it. */
+let liveMetricsSeam: number | null = null;
+/** Grouping mode captured at subscribe time (changing it re-runs the chart). */
+let liveMetricsGrouped = false;
+/** Set when samples have arrived since the last chart re-derive. */
+let liveMetricsDirty = false;
+
+/** Re-derive `metricsChartData` from the stored chart plus the live buckets.
+ *  Cheap enough to run on the same ~4 Hz cadence as the log flush. */
+function rebuildLiveMetricsChart(): void {
+  // Bound the accumulator: buckets that start before the chart's window are
+  // off the left edge and would never be drawn. Without this a live stream
+  // with auto-refresh off would grow a bucket set forever.
+  try {
+    const lo = parseBigIntOpt(state.tsMin);
+    if (lo !== undefined) liveBuckets.evictBefore(Number(lo / 1_000_000n));
+  } catch {
+    // An unparseable bound just means no eviction this tick.
+  }
+  const merged = mergeLiveIntoChart(
+    metricsHistory,
+    liveBuckets,
+    metricAgg(),
+    liveMetricsStep,
+  );
+  setMetricsChartData(merged);
+  if (merged !== null && merged.buckets.length > 0) {
+    setMetricsChartStatus("ready");
+  }
+}
+
+function admitLiveSample(sample: TailSample): void {
+  // Before the history query lands we do not know the bucket width, so there
+  // is nothing meaningful to fold into. Samples in that window are dropped
+  // rather than bucketed at a width we would immediately have to redo — the
+  // history query covers that span anyway.
+  if (liveMetricsStep <= 0) return;
+  if (liveBuckets.push(sample, liveMetricsStep, liveMetricsGrouped, liveMetricsSeam)) {
+    liveMetricsDirty = true;
+    scheduleLiveFlush();
+  }
 }
 
 /** Connect, and keep reconnecting while the user still wants a live view. */
@@ -812,7 +901,10 @@ async function pumpLive(generation: number, signal: AbortSignal): Promise<void> 
       await runTail(
         transport,
         dest,
-        { matchers: liveMatchers() },
+        {
+          matchers: liveMatchers(),
+          signal: state.signal === "Metrics" ? Signal.Metrics : Signal.Logs,
+        },
         __APP_VERSION__,
         {
           onSubscribed: () => {
@@ -824,6 +916,9 @@ async function pumpLive(generation: number, signal: AbortSignal): Promise<void> 
           },
           onRecord: (rec) => {
             if (generation === liveGeneration) admitLiveRow(tailRecordToLogRow(rec));
+          },
+          onSample: (s) => {
+            if (generation === liveGeneration) admitLiveSample(s);
           },
         },
         signal,
@@ -877,15 +972,34 @@ export async function startLive(): Promise<void> {
   livePending = [];
   setLiveRows([]);
   setLiveDropped(0);
+  liveBuckets.clear();
+  liveMetricsStep = 0;
+  liveMetricsSeam = null;
+  liveMetricsDirty = false;
+  liveMetricsGrouped = metricGrouped();
   setLiveError(null);
   setLiveStatus("connecting");
 
-  // Subscribe first — anything logged from here on is captured, even while the
-  // history query below is still running.
+  // Subscribe first — anything recorded from here on is captured, even while
+  // the history query below is still running.
   void pumpLive(generation, controller.signal);
 
+  // `runCurrentQuery` also runs the metrics chart for the Metrics signal, so
+  // by the time it resolves `metricsHistory` holds the stored half.
   await runCurrentQuery();
   if (generation !== liveGeneration) return; // restarted while we waited
+
+  if (state.signal === "Metrics") {
+    // The seam is the newest bucket the history covers. Samples inside it are
+    // dropped: the server computed that bucket over the whole of it, and our
+    // sliver would be both wrong and visibly jumpy.
+    const hist = metricsHistory;
+    liveMetricsStep = hist?.stepMs ?? 0;
+    liveMetricsSeam =
+      hist && hist.buckets.length > 0 ? hist.buckets[hist.buckets.length - 1]! : null;
+    return;
+  }
+
   const table = resultTable();
   const seam =
     table && isLogTable(table) ? newestTs(decodeLogRows(table, MAX_LOG_ROWS)) : null;
@@ -908,6 +1022,12 @@ export function stopLive(reason?: string): void {
   liveHeld = [];
   liveSeamKnown = false;
   liveSeam = null;
+  // Live metric buckets are dropped too: on restart the history query is
+  // re-run, and keeping stale buckets would double-draw the tip.
+  liveBuckets.clear();
+  liveMetricsStep = 0;
+  liveMetricsSeam = null;
+  liveMetricsDirty = false;
   if (reason !== undefined) {
     setLiveStatus("error");
     setLiveError(reason);
@@ -963,7 +1083,13 @@ export function refreshTick(): void {
   if (state.status === "running") return;
   // Logs with a live stream attached are already current; a re-run would reset
   // the seam and blank the pane for no gain.
-  if (liveActive()) return;
+  //
+  // Live *metrics* are the opposite: the tail only owns buckets after the
+  // seam, so without a periodic re-run the stored half of the chart freezes
+  // and the window never slides. `runMetricsChart` re-bases the seam and
+  // evicts the live buckets the refresh has made authoritative, so the two
+  // compose rather than fight.
+  if (liveActive() && state.signal !== "Metrics") return;
   const ms = quickRangeMs(activeRange());
   if (ms !== null) applyQuickRange(ms, activeRange()!);
   void runCurrentQuery();
@@ -1175,6 +1301,8 @@ let metricsChartSeq = 0;
 
 function clearMetricsChart(): void {
   metricsChartSeq++;
+  metricsHistory = null;
+  liveBuckets.clear();
   setMetricsChartData(null);
   setMetricsChartStatus("idle");
 }
@@ -1282,8 +1410,25 @@ export async function runMetricsChart(): Promise<void> {
     }
 
     const decoded = decodeMetricsChart(res.table, stepMs, grouped, names);
-    setMetricsChartData(decoded);
-    setMetricsChartStatus(decoded.buckets.length === 0 ? "no-data" : "ready");
+    // Keep the purely-server-computed chart as the merge's left operand, so a
+    // live re-derive never folds onto its own previous output (D-065).
+    metricsHistory = decoded;
+    if (liveActive() && state.signal === "Metrics") {
+      // A refresh underneath a live stream: the newly-covered buckets are now
+      // authoritative, so re-base the seam and drop live buckets it subsumes.
+      liveMetricsStep = decoded.stepMs;
+      liveMetricsGrouped = grouped;
+      liveMetricsSeam =
+        decoded.buckets.length > 0 ? decoded.buckets[decoded.buckets.length - 1]! : null;
+      if (liveMetricsSeam !== null) liveBuckets.evictBefore(liveMetricsSeam + decoded.stepMs);
+      rebuildLiveMetricsChart();
+      setMetricsChartStatus(
+        metricsChartData()?.buckets.length ? "ready" : "no-data",
+      );
+    } else {
+      setMetricsChartData(decoded);
+      setMetricsChartStatus(decoded.buckets.length === 0 ? "no-data" : "ready");
+    }
   } catch (e) {
     if (seq !== metricsChartSeq) return;
     if (e instanceof UnauthorizedError) {

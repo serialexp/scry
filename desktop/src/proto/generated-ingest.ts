@@ -23,7 +23,7 @@ export interface FrameInput {
    * @remarks
    *
    * Discriminator: peek uint8
-   * Variants: 14
+   * Variants: 15
    * - Hello (when value === 0x01)
    * - HelloAck (when value === 0x02)
    * - Batch (when value === 0x10)
@@ -37,9 +37,10 @@ export interface FrameInput {
    * - TailRecord (when value === 0x51)
    * - LiveQuery (when value === 0x52)
    * - LiveBatch (when value === 0x53)
+   * - TailSample (when value === 0x54)
    * - Error (when value === 0xF0)
    */
-  msg: { type: 'Hello'; value: HelloInput } | { type: 'HelloAck'; value: HelloAckInput } | { type: 'Batch'; value: BatchInput } | { type: 'BatchAck'; value: BatchAckInput } | { type: 'FlowControl'; value: FlowControlInput } | { type: 'AgentStatus'; value: AgentStatusInput } | { type: 'Ping'; value: PingInput } | { type: 'Pong'; value: PongInput } | { type: 'Goodbye'; value: GoodbyeInput } | { type: 'Subscribe'; value: SubscribeInput } | { type: 'TailRecord'; value: TailRecordInput } | { type: 'LiveQuery'; value: LiveQueryInput } | { type: 'LiveBatch'; value: LiveBatchInput } | { type: 'Error'; value: Error_Input };
+  msg: { type: 'Hello'; value: HelloInput } | { type: 'HelloAck'; value: HelloAckInput } | { type: 'Batch'; value: BatchInput } | { type: 'BatchAck'; value: BatchAckInput } | { type: 'FlowControl'; value: FlowControlInput } | { type: 'AgentStatus'; value: AgentStatusInput } | { type: 'Ping'; value: PingInput } | { type: 'Pong'; value: PongInput } | { type: 'Goodbye'; value: GoodbyeInput } | { type: 'Subscribe'; value: SubscribeInput } | { type: 'TailRecord'; value: TailRecordInput } | { type: 'LiveQuery'; value: LiveQueryInput } | { type: 'LiveBatch'; value: LiveBatchInput } | { type: 'TailSample'; value: TailSampleInput } | { type: 'Error'; value: Error_Input };
 }
 
 /**
@@ -53,7 +54,7 @@ export interface FrameOutput {
    * @remarks
    *
    * Discriminator: peek uint8
-   * Variants: 14
+   * Variants: 15
    * - Hello (when value === 0x01)
    * - HelloAck (when value === 0x02)
    * - Batch (when value === 0x10)
@@ -67,9 +68,10 @@ export interface FrameOutput {
    * - TailRecord (when value === 0x51)
    * - LiveQuery (when value === 0x52)
    * - LiveBatch (when value === 0x53)
+   * - TailSample (when value === 0x54)
    * - Error (when value === 0xF0)
    */
-  msg: { type: 'Hello'; value: HelloOutput } | { type: 'HelloAck'; value: HelloAckOutput } | { type: 'Batch'; value: BatchOutput } | { type: 'BatchAck'; value: BatchAckOutput } | { type: 'FlowControl'; value: FlowControlOutput } | { type: 'AgentStatus'; value: AgentStatusOutput } | { type: 'Ping'; value: PingOutput } | { type: 'Pong'; value: PongOutput } | { type: 'Goodbye'; value: GoodbyeOutput } | { type: 'Subscribe'; value: SubscribeOutput } | { type: 'TailRecord'; value: TailRecordOutput } | { type: 'LiveQuery'; value: LiveQueryOutput } | { type: 'LiveBatch'; value: LiveBatchOutput } | { type: 'Error'; value: Error_Output };
+  msg: { type: 'Hello'; value: HelloOutput } | { type: 'HelloAck'; value: HelloAckOutput } | { type: 'Batch'; value: BatchOutput } | { type: 'BatchAck'; value: BatchAckOutput } | { type: 'FlowControl'; value: FlowControlOutput } | { type: 'AgentStatus'; value: AgentStatusOutput } | { type: 'Ping'; value: PingOutput } | { type: 'Pong'; value: PongOutput } | { type: 'Goodbye'; value: GoodbyeOutput } | { type: 'Subscribe'; value: SubscribeOutput } | { type: 'TailRecord'; value: TailRecordOutput } | { type: 'LiveQuery'; value: LiveQueryOutput } | { type: 'LiveBatch'; value: LiveBatchOutput } | { type: 'TailSample'; value: TailSampleOutput } | { type: 'Error'; value: Error_Output };
 }
 
 export type Frame = FrameOutput;
@@ -91,6 +93,7 @@ export const enum FrameMsgVariant {
   TailRecord = 'TailRecord',
   LiveQuery = 'LiveQuery',
   LiveBatch = 'LiveBatch',
+  TailSample = 'TailSample',
   Error = 'Error',
 }
 
@@ -196,6 +199,13 @@ export class FrameEncoder extends BitStreamEncoder {
         this.writeUint8(byte);
       }
     }
+    else if (value.msg.type === 'TailSample') {
+      const encoder_value = new TailSampleEncoder();
+      const encoded_value = encoder_value.encode(value.msg.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
+    }
     else if (value.msg.type === 'Error') {
       const encoder_value = new Error_Encoder();
       const encoded_value = encoder_value.encode(value.msg.value);
@@ -264,6 +274,10 @@ export class FrameEncoder extends BitStreamEncoder {
     }
     else if (value.msg.type === 'LiveBatch') {
       const _enc = new LiveBatchEncoder();
+      size += _enc.calculateSize(value.msg.value);
+    }
+    else if (value.msg.type === 'TailSample') {
+      const _enc = new TailSampleEncoder();
       size += _enc.calculateSize(value.msg.value);
     }
     else if (value.msg.type === 'Error') {
@@ -364,6 +378,12 @@ export class FrameDecoder extends SeekableBitStreamDecoder {
       const decodedValue = decoder.decode();
       this.byteOffset += decoder.byteOffset;
       value.msg = { type: 'LiveBatch', value: decodedValue };
+    }
+    else if (discriminator === 0x54) {
+      const decoder = new TailSampleDecoder(this.bytes.slice(this.byteOffset), value);
+      const decodedValue = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.msg = { type: 'TailSample', value: decodedValue };
     }
     else if (discriminator === 0xF0) {
       const decoder = new Error_Decoder(this.bytes.slice(this.byteOffset), value);
@@ -1641,7 +1661,7 @@ export class Error_Decoder extends SeekableBitStreamDecoder {
 }
 
 /**
- * Live-tail subscription request (scry tail, D-050). After the Hello handshake a tail client sends this to switch the connection into server-push mode: the server sprays matching TailRecord frames back down the same connection until the client closes it. Best-effort — records may be dropped under load; there is no ack and no durability.
+ * Live-tail subscription request (scry tail, D-050). After the Hello handshake a tail client sends this to switch the connection into server-push mode: the server sprays matching records back down the same connection until the client closes it. The reply frame depends on `signal`: Logs (2) yields TailRecord, Metrics (1) yields TailSample (D-065). Best-effort — records may be dropped under load; there is no ack and no durability.
  */
 export interface SubscribeInput {
   /**
@@ -1662,7 +1682,7 @@ export interface SubscribeInput {
 }
 
 /**
- * Live-tail subscription request (scry tail, D-050). After the Hello handshake a tail client sends this to switch the connection into server-push mode: the server sprays matching TailRecord frames back down the same connection until the client closes it. Best-effort — records may be dropped under load; there is no ack and no durability.
+ * Live-tail subscription request (scry tail, D-050). After the Hello handshake a tail client sends this to switch the connection into server-push mode: the server sprays matching records back down the same connection until the client closes it. The reply frame depends on `signal`: Logs (2) yields TailRecord, Metrics (1) yields TailSample (D-065). Best-effort — records may be dropped under load; there is no ack and no durability.
  */
 export interface SubscribeOutput {
   /**
@@ -1838,7 +1858,7 @@ export class MatcherSpecDecoder extends SeekableBitStreamDecoder {
 }
 
 /**
- * Server-to-client push of one record matching a live-tail Subscribe. Currently only logs (signal = Logs): carries the stream labels, entry timestamp/severity/body, and per-entry attributes. Fire-and-forget; the client never acks.
+ * Server-to-client push of one LOG record matching a live-tail Subscribe (signal = Logs): the stream labels, entry timestamp/severity/body, and per-entry attributes. Metrics use the sibling TailSample frame instead of widening this one, so a logs tail carries no bytes it does not use. Fire-and-forget; the client never acks.
  */
 export interface TailRecordInput {
   /**
@@ -1885,7 +1905,7 @@ export interface TailRecordInput {
 }
 
 /**
- * Server-to-client push of one record matching a live-tail Subscribe. Currently only logs (signal = Logs): carries the stream labels, entry timestamp/severity/body, and per-entry attributes. Fire-and-forget; the client never acks.
+ * Server-to-client push of one LOG record matching a live-tail Subscribe (signal = Logs): the stream labels, entry timestamp/severity/body, and per-entry attributes. Metrics use the sibling TailSample frame instead of widening this one, so a logs tail carries no bytes it does not use. Fire-and-forget; the client never acks.
  */
 export interface TailRecordOutput {
   /**
@@ -2065,6 +2085,181 @@ export class TailRecordDecoder extends SeekableBitStreamDecoder {
         throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
       }
       value.attributes.push(attributes__iter);
+    }
+    return value;
+  }
+}
+
+/**
+ * Server-to-client push of one METRIC sample matching a live-tail Subscribe (signal = Metrics, D-065) — the TailRecord sibling for a signal whose record is a float, not a body. `series_fingerprint` is the server's own xxh3-64 over the sorted labels, carried so a client can line a live line up with a stored series (the UI chart groups on exactly this column) without re-deriving it. `metric_type` mirrors SeriesDictEntry.metric_type. `labels` repeats per sample, as it does per TailRecord: a tail is bounded by its drop-on-full channel, not by its encoding. Fire-and-forget; the client never acks.
+ */
+export interface TailSampleInput {
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  signal: number;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  ts_unix_nano: bigint;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  metric_type: number;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  series_fingerprint: bigint;
+  /**
+   * 64-bit Floating Point
+   * IEEE 754 double-precision floating point (64-bit). Provides ~15 decimal digits of precision.
+   */
+  value: number;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint16
+   */
+  labels: LabelPairInput[];
+}
+
+/**
+ * Server-to-client push of one METRIC sample matching a live-tail Subscribe (signal = Metrics, D-065) — the TailRecord sibling for a signal whose record is a float, not a body. `series_fingerprint` is the server's own xxh3-64 over the sorted labels, carried so a client can line a live line up with a stored series (the UI chart groups on exactly this column) without re-deriving it. `metric_type` mirrors SeriesDictEntry.metric_type. `labels` repeats per sample, as it does per TailRecord: a tail is bounded by its drop-on-full channel, not by its encoding. Fire-and-forget; the client never acks.
+ */
+export interface TailSampleOutput {
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  tag: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  signal: number;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  ts_unix_nano: bigint;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  metric_type: number;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  series_fingerprint: bigint;
+  /**
+   * 64-bit Floating Point
+   * IEEE 754 double-precision floating point (64-bit). Provides ~15 decimal digits of precision.
+   */
+  value: number;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint16
+   */
+  labels: LabelPairOutput[];
+}
+
+export type TailSample = TailSampleOutput;
+
+export class TailSampleEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("msb_first");
+  }
+
+  encode(value: TailSampleInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint8(84);
+    this.writeUint8(value.signal);
+    this.writeUint64(value.ts_unix_nano, "big_endian");
+    this.writeUint8(value.metric_type);
+    this.writeUint64(value.series_fingerprint, "big_endian");
+    this.writeFloat64(value.value, "big_endian");
+    this.writeUint16(value.labels.length, "big_endian");
+    for (let value_labels__iter_index = 0; value_labels__iter_index < value.labels.length; value_labels__iter_index++) {
+      const value_labels__iter = value.labels[value_labels__iter_index];
+      const encoder_value_labels__iter = new LabelPairEncoder();
+      const encoded_value_labels__iter = encoder_value_labels__iter.encode(value_labels__iter);
+      for (const byte of encoded_value_labels__iter) {
+        this.writeUint8(byte);
+      }
+    }
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a TailSample value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: TailSample): number {
+    let size = 0;
+    size += 27; // tag (const) + signal + ts_unix_nano + metric_type + series_fingerprint + value
+    // labels: array (kind: length_prefixed)
+    for (const item of value.labels) {
+      const labels_itemEncoder = new LabelPairEncoder();
+      size += labels_itemEncoder.calculateSize(item);
+    }
+    size += 2; // length prefix (uint16)
+    return size;
+  }
+}
+
+export class TailSampleDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "msb_first");
+  }
+
+  decode(): TailSampleOutput {
+    const value: any = {};
+
+    value.tag = this.readUint8();
+    value.signal = this.readUint8();
+    value.ts_unix_nano = this.readUint64("big_endian");
+    value.metric_type = this.readUint8();
+    value.series_fingerprint = this.readUint64("big_endian");
+    value.value = this.readFloat64("big_endian");
+    value.labels = [];
+    const labels_length = this.readUint16("big_endian");
+    for (let i = 0; i < labels_length; i++) {
+      let labels__iter: any;
+      labels__iter = {};
+      const labels__iter_key_length = this.readUint8();
+      const labels__iter_key_bytes = this.readBytesSlice(labels__iter_key_length);
+      try {
+        labels__iter.key = new TextDecoder("utf-8", { fatal: true }).decode(labels__iter_key_bytes);
+      } catch (e) {
+        throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
+      }
+      const labels__iter_value_length = this.readUint16("big_endian");
+      const labels__iter_value_bytes = this.readBytesSlice(labels__iter_value_length);
+      try {
+        labels__iter.value = new TextDecoder("utf-8", { fatal: true }).decode(labels__iter_value_bytes);
+      } catch (e) {
+        throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
+      }
+      value.labels.push(labels__iter);
     }
     return value;
   }

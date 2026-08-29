@@ -57,8 +57,17 @@ export const MAX_FRAME_BYTES = 32 * 1024 * 1024;
 /** `Hello.protocol_version` — the only negotiation point on the ingest wire. */
 export const PROTOCOL_VERSION_V0 = 0x0001;
 
-/** `Hello.signals` bitmask. A tail client announces logs and nothing else. */
+/** `Hello.signals` bitmask. A tail client announces exactly the signal it is
+ *  about to subscribe to — the handshake gates which signals a connection may
+ *  carry, so announcing the wrong bit gets the subscription refused. */
+export const SIGNAL_BIT_METRICS = 0x01;
 export const SIGNAL_BIT_LOGS = 0x02;
+
+/** The `Hello.signals` bit to announce when tailing `signal`. Only logs and
+ *  metrics have an ingest tap (D-065). */
+export function tailSignalBit(signal: SignalByte): number {
+  return signal === Signal.Metrics ? SIGNAL_BIT_METRICS : SIGNAL_BIT_LOGS;
+}
 
 /** ERR_* codes carried by an ingest-wire `Error` frame. */
 export const TailErrCode = {

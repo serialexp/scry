@@ -32,6 +32,7 @@
             { "type": "TailRecord",  "when": "value === 0x51" },
             { "type": "LiveQuery",   "when": "value === 0x52" },
             { "type": "LiveBatch",   "when": "value === 0x53" },
+            { "type": "TailSample",  "when": "value === 0x54" },
             { "type": "Error",       "when": "value === 0xF0" }
           ]
         }
@@ -152,7 +153,7 @@
     },
 
     "Subscribe": {
-      "description": "Live-tail subscription request (scry tail, D-050). After the Hello handshake a tail client sends this to switch the connection into server-push mode: the server sprays matching TailRecord frames back down the same connection until the client closes it. Best-effort — records may be dropped under load; there is no ack and no durability.",
+      "description": "Live-tail subscription request (scry tail, D-050). After the Hello handshake a tail client sends this to switch the connection into server-push mode: the server sprays matching records back down the same connection until the client closes it. The reply frame depends on `signal`: Logs (2) yields TailRecord, Metrics (1) yields TailSample (D-065). Best-effort — records may be dropped under load; there is no ack and no durability.",
       "sequence": [
         { "name": "tag", "type": "uint8", "const": 80 },
         { "name": "signal", "type": "uint8" },
@@ -168,7 +169,7 @@
     },
 
     "TailRecord": {
-      "description": "Server-to-client push of one record matching a live-tail Subscribe. Currently only logs (signal = Logs): carries the stream labels, entry timestamp/severity/body, and per-entry attributes. Fire-and-forget; the client never acks.",
+      "description": "Server-to-client push of one LOG record matching a live-tail Subscribe (signal = Logs): the stream labels, entry timestamp/severity/body, and per-entry attributes. Metrics use the sibling TailSample frame instead of widening this one, so a logs tail carries no bytes it does not use. Fire-and-forget; the client never acks.",
       "sequence": [
         { "name": "tag", "type": "uint8", "const": 81 },
         { "name": "signal", "type": "uint8" },
@@ -177,6 +178,19 @@
         { "name": "labels", "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "LabelPair" } },
         { "name": "body", "type": "string", "kind": "length_prefixed", "length_type": "uint32", "encoding": "utf8" },
         { "name": "attributes", "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "LabelPair" } }
+      ]
+    },
+
+    "TailSample": {
+      "description": "Server-to-client push of one METRIC sample matching a live-tail Subscribe (signal = Metrics, D-065) — the TailRecord sibling for a signal whose record is a float, not a body. `series_fingerprint` is the server's own xxh3-64 over the sorted labels, carried so a client can line a live line up with a stored series (the UI chart groups on exactly this column) without re-deriving it. `metric_type` mirrors SeriesDictEntry.metric_type. `labels` repeats per sample, as it does per TailRecord: a tail is bounded by its drop-on-full channel, not by its encoding. Fire-and-forget; the client never acks.",
+      "sequence": [
+        { "name": "tag", "type": "uint8", "const": 84 },
+        { "name": "signal", "type": "uint8" },
+        { "name": "ts_unix_nano", "type": "uint64" },
+        { "name": "metric_type", "type": "uint8" },
+        { "name": "series_fingerprint", "type": "uint64" },
+        { "name": "value", "type": "float64" },
+        { "name": "labels", "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "LabelPair" } }
       ]
     },
 

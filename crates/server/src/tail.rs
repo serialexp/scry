@@ -1,5 +1,14 @@
-//! Live-tail plumbing: a process-local subscription registry plus a
-//! `LogsAppender` decorator that taps the ingest hot path.
+//! Live-tail plumbing: a process-local subscription registry plus the
+//! per-signal appender decorators that tap the ingest hot path.
+//!
+//! # Two signals, two record shapes
+//!
+//! Logs and metrics are both tailable (D-050, D-065). They share the registry,
+//! the filter evaluation, and the drop-on-full delivery; they differ only in
+//! what a record *is* — a body with a severity versus a float with a series
+//! fingerprint. That difference lives in [`TailPayload`], and on the wire in
+//! two sibling frames (`TailRecord` / `TailSample`), so neither signal carries
+//! fields belonging to the other.
 //!
 //! # Why this exists
 //!
@@ -33,7 +42,7 @@ use std::sync::{
 
 use scry_match::LabelFilter;
 use scry_proto::generated::LabelPair;
-use scry_proto::streaming::LogsAppender;
+use scry_proto::streaming::{LogsAppender, MetricsAppender};
 use std::collections::HashMap;
 use tokio::sync::{mpsc, RwLock};
 
@@ -42,18 +51,37 @@ use tokio::sync::{mpsc, RwLock};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SubId(u64);
 
+/// The signal-specific half of a [`TailItem`] — what distinguishes a log line
+/// from a metric sample once the timestamp and labels are accounted for.
+#[derive(Debug)]
+pub enum TailPayload {
+    /// A log entry: severity, body, and per-entry attributes.
+    Log {
+        severity: u8,
+        body: String,
+        attributes: Vec<LabelPair>,
+    },
+    /// A metric sample: the series' type + fingerprint and the observed value.
+    /// The fingerprint is carried so a client can line a live series up with a
+    /// stored one without re-deriving the hash.
+    Sample {
+        metric_type: u8,
+        series_fingerprint: u64,
+        value: f64,
+    },
+}
+
 /// A single record forwarded from the ingest tap to a subscriber. Cheap to
 /// clone-by-`Arc` across multiple matching subscribers; the stream-level
-/// `labels` are shared, only the per-entry `body`/`attributes` are owned.
+/// `labels` are shared, only the per-record payload is owned.
 #[derive(Debug)]
 pub struct TailItem {
     pub signal: u8,
     pub ts_unix_nano: u64,
-    pub severity: u8,
-    /// Stream-level labels (shared across every entry of the same stream).
+    /// Stream/series-level labels (shared across every record of the same
+    /// stream or series).
     pub labels: Arc<Vec<LabelPair>>,
-    pub body: String,
-    pub attributes: Vec<LabelPair>,
+    pub payload: TailPayload,
 }
 
 /// One registered subscriber. `filter` and `labels` are matched per entry;
@@ -239,16 +267,18 @@ impl<A: LogsAppender> LogsAppender for TappingLogsAppender<'_, A> {
                         Arc::new(TailItem {
                             signal: s.signal,
                             ts_unix_nano,
-                            severity,
                             labels: Arc::clone(labels),
-                            body: String::from_utf8_lossy(&body).into_owned(),
-                            attributes: attributes
-                                .iter()
-                                .map(|(k, v)| LabelPair {
-                                    key: String::from_utf8_lossy(k).into_owned(),
-                                    value: String::from_utf8_lossy(v).into_owned(),
-                                })
-                                .collect(),
+                            payload: TailPayload::Log {
+                                severity,
+                                body: String::from_utf8_lossy(&body).into_owned(),
+                                attributes: attributes
+                                    .iter()
+                                    .map(|(k, v)| LabelPair {
+                                        key: String::from_utf8_lossy(k).into_owned(),
+                                        value: String::from_utf8_lossy(v).into_owned(),
+                                    })
+                                    .collect(),
+                            },
                         })
                     });
                     if s.tx.try_send(Arc::clone(it)).is_err() {
@@ -260,6 +290,104 @@ impl<A: LogsAppender> LogsAppender for TappingLogsAppender<'_, A> {
         // Storage path is authoritative and unchanged.
         self.inner
             .append_entry(fingerprint, ts_unix_nano, severity, body, attributes);
+    }
+}
+
+/// A [`MetricsAppender`] decorator that forwards matching samples to live-tail
+/// subscribers while delegating **all** storage semantics to `inner`
+/// unchanged — the exact counterpart of [`TappingLogsAppender`] for the
+/// metrics signal (D-065).
+///
+/// Series labels observed via [`observe_series`](MetricsAppender::observe_series)
+/// are cached by fingerprint — together with the series' `metric_type`, which
+/// arrives on the dictionary entry and not on the sample — so
+/// [`append_sample`](MetricsAppender::append_sample) can attach both to each
+/// forwarded record.
+pub struct TappingMetricsAppender<'a, A: MetricsAppender> {
+    inner: &'a mut A,
+    registry: &'a SubscriptionRegistry,
+    subs: Vec<SubHandle>,
+    /// fingerprint → (metric_type, series labels shared across its samples).
+    series: HashMap<u64, (u8, Arc<Vec<LabelPair>>)>,
+}
+
+impl<'a, A: MetricsAppender> TappingMetricsAppender<'a, A> {
+    /// Wrap `inner`, snapshotting the current metrics subscribers from
+    /// `registry`. Call this only when `registry.subscriber_count() > 0`.
+    pub async fn new(
+        inner: &'a mut A,
+        registry: &'a SubscriptionRegistry,
+        signal: u8,
+    ) -> TappingMetricsAppender<'a, A> {
+        let subs = registry.snapshot_for(signal).await;
+        TappingMetricsAppender {
+            inner,
+            registry,
+            subs,
+            series: HashMap::new(),
+        }
+    }
+
+    /// Whether any subscriber survived the snapshot.
+    pub fn has_subs(&self) -> bool {
+        !self.subs.is_empty()
+    }
+}
+
+impl<A: MetricsAppender> MetricsAppender for TappingMetricsAppender<'_, A> {
+    fn observe_series(
+        &mut self,
+        fingerprint: u64,
+        metric_type: u8,
+        labels: Vec<(Vec<u8>, Vec<u8>)>,
+    ) {
+        if !self.subs.is_empty() {
+            // Cold path — a handful of series per batch, shared across their
+            // samples via Arc. Same lossy UTF-8 policy as the block builder.
+            let pairs: Vec<LabelPair> = labels
+                .iter()
+                .map(|(k, v)| LabelPair {
+                    key: String::from_utf8_lossy(k).into_owned(),
+                    value: String::from_utf8_lossy(v).into_owned(),
+                })
+                .collect();
+            self.series
+                .insert(fingerprint, (metric_type, Arc::new(pairs)));
+        }
+        // Storage path is authoritative and unchanged.
+        self.inner.observe_series(fingerprint, metric_type, labels);
+    }
+
+    fn append_sample(&mut self, fingerprint: u64, ts_unix_nano: u64, value: f64) {
+        if !self.subs.is_empty() {
+            if let Some((metric_type, labels)) = self.series.get(&fingerprint) {
+                // Does *any* subscriber want this? Build the item once,
+                // lazily, and only if so.
+                let mut item: Option<Arc<TailItem>> = None;
+                for s in &self.subs {
+                    if !s.filter.keeps(labels) {
+                        continue;
+                    }
+                    let it = item.get_or_insert_with(|| {
+                        Arc::new(TailItem {
+                            signal: s.signal,
+                            ts_unix_nano,
+                            labels: Arc::clone(labels),
+                            payload: TailPayload::Sample {
+                                metric_type: *metric_type,
+                                series_fingerprint: fingerprint,
+                                value,
+                            },
+                        })
+                    });
+                    if s.tx.try_send(Arc::clone(it)).is_err() {
+                        self.registry.dropped.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+        // Storage path is authoritative and unchanged.
+        self.inner.append_sample(fingerprint, ts_unix_nano, value);
     }
 }
 
@@ -293,6 +421,28 @@ mod tests {
 
     fn kv(k: &str, v: &str) -> (Vec<u8>, Vec<u8>) {
         (k.as_bytes().to_vec(), v.as_bytes().to_vec())
+    }
+
+    /// The body of a forwarded log item, panicking if it isn't one — the
+    /// logs tests only ever produce `TailPayload::Log`, so a `Sample` here
+    /// would mean the tap built the wrong payload.
+    fn body_of(item: &TailItem) -> &str {
+        match &item.payload {
+            TailPayload::Log { body, .. } => body,
+            TailPayload::Sample { .. } => panic!("expected a Log payload, got a Sample"),
+        }
+    }
+
+    /// The `(metric_type, fingerprint, value)` of a forwarded sample.
+    fn sample_of(item: &TailItem) -> (u8, u64, f64) {
+        match &item.payload {
+            TailPayload::Sample {
+                metric_type,
+                series_fingerprint,
+                value,
+            } => (*metric_type, *series_fingerprint, *value),
+            TailPayload::Log { .. } => panic!("expected a Sample payload, got a Log"),
+        }
     }
 
     #[tokio::test]
@@ -335,7 +485,7 @@ mod tests {
 
         // Exactly one forwarded item: the matching stream's entry.
         let got = rx.try_recv().expect("one forwarded record");
-        assert_eq!(got.body, "hello");
+        assert_eq!(body_of(&got), "hello");
         assert_eq!(got.ts_unix_nano, 100);
         assert!(rx.try_recv().is_err(), "no second forwarded record");
 
@@ -361,8 +511,8 @@ mod tests {
             tap.append_entry(1, 1, 0, b"a".to_vec(), vec![]);
             tap.append_entry(1, 2, 0, b"b".to_vec(), vec![]);
         }
-        assert_eq!(rx.try_recv().unwrap().body, "a");
-        assert_eq!(rx.try_recv().unwrap().body, "b");
+        assert_eq!(body_of(&rx.try_recv().unwrap()), "a");
+        assert_eq!(body_of(&rx.try_recv().unwrap()), "b");
         assert!(rx.try_recv().is_err());
     }
 
@@ -386,6 +536,117 @@ mod tests {
         assert_eq!(reg.dropped_total(), 2);
         // Storage still saw all three.
         assert_eq!(inner.entries.len(), 3);
+    }
+
+    // ── Metrics tap (D-065) ────────────────────────────────────────────
+    //
+    // The same five properties the logs tap is held to, for the metrics
+    // appender: filter match/miss, storage delegated unchanged, the series
+    // dictionary carried onto each sample, drop accounting, and per-signal
+    // isolation.
+
+    /// A minimal inner metrics appender recording what storage received.
+    #[derive(Default)]
+    struct RecordingMetrics {
+        series: Vec<(u64, u8, usize)>,
+        samples: Vec<(u64, u64, f64)>,
+    }
+    impl MetricsAppender for RecordingMetrics {
+        fn observe_series(&mut self, fp: u64, metric_type: u8, labels: Vec<(Vec<u8>, Vec<u8>)>) {
+            self.series.push((fp, metric_type, labels.len()));
+        }
+        fn append_sample(&mut self, fp: u64, ts: u64, value: f64) {
+            self.samples.push((fp, ts, value));
+        }
+    }
+
+    #[tokio::test]
+    async fn matching_sample_is_forwarded_non_matching_is_not() {
+        let reg = SubscriptionRegistry::new();
+        let signal = 0x01; // Signal::Metrics
+        let filter = LabelFilter::parse(&["job=\"api\"".to_string()]).unwrap();
+        let (_id, mut rx) = reg.register(signal, filter, 16).await;
+
+        let mut inner = RecordingMetrics::default();
+        {
+            let mut tap = TappingMetricsAppender::new(&mut inner, &reg, signal).await;
+            assert!(tap.has_subs());
+
+            tap.observe_series(1, 2, vec![kv("__name__", "reqs"), kv("job", "api")]);
+            tap.observe_series(2, 2, vec![kv("__name__", "reqs"), kv("job", "worker")]);
+            tap.append_sample(1, 100, 1.5);
+            tap.append_sample(2, 101, 9.5);
+        }
+
+        // Exactly one forwarded sample: the matching series'.
+        let got = rx.try_recv().expect("one forwarded sample");
+        assert_eq!(got.ts_unix_nano, 100);
+        // The dictionary's metric_type and the fingerprint ride along, so a
+        // client can match a live line to a stored series without re-hashing.
+        assert_eq!(sample_of(&got), (2, 1, 1.5));
+        assert!(rx.try_recv().is_err(), "no second forwarded sample");
+
+        // Inner storage saw *both* series + both samples, unchanged.
+        assert_eq!(inner.series.len(), 2);
+        assert_eq!(inner.samples, vec![(1, 100, 1.5), (2, 101, 9.5)]);
+    }
+
+    /// A sample whose fingerprint was never announced in the dictionary has
+    /// no labels to filter on, so it cannot be forwarded — but it must still
+    /// reach storage, which resolves the fingerprint by other means.
+    #[tokio::test]
+    async fn sample_without_a_series_entry_is_stored_but_not_forwarded() {
+        let reg = SubscriptionRegistry::new();
+        let signal = 0x01;
+        let (_id, mut rx) = reg
+            .register(signal, LabelFilter::parse(&[]).unwrap(), 8)
+            .await;
+        let mut inner = RecordingMetrics::default();
+        {
+            let mut tap = TappingMetricsAppender::new(&mut inner, &reg, signal).await;
+            tap.append_sample(42, 7, 0.25); // never observed as a series
+        }
+        assert!(rx.try_recv().is_err(), "unknown series must not forward");
+        assert_eq!(inner.samples, vec![(42, 7, 0.25)]);
+    }
+
+    #[tokio::test]
+    async fn full_channel_drops_and_counts_samples() {
+        let reg = SubscriptionRegistry::new();
+        let signal = 0x01;
+        let (_id, _rx) = reg
+            .register(signal, LabelFilter::parse(&[]).unwrap(), 1)
+            .await;
+        let mut inner = RecordingMetrics::default();
+        {
+            let mut tap = TappingMetricsAppender::new(&mut inner, &reg, signal).await;
+            tap.observe_series(1, 0, vec![kv("__name__", "g")]);
+            tap.append_sample(1, 1, 1.0);
+            tap.append_sample(1, 2, 2.0);
+            tap.append_sample(1, 3, 3.0);
+        }
+        // One slot filled, the other two dropped — ingest never blocked.
+        assert_eq!(reg.dropped_total(), 2);
+        assert_eq!(inner.samples.len(), 3);
+    }
+
+    /// A logs subscriber must not receive metric samples: the registry
+    /// snapshot is taken per signal, so the metrics tap sees nobody.
+    #[tokio::test]
+    async fn a_logs_subscriber_receives_no_samples() {
+        let reg = SubscriptionRegistry::new();
+        let (_id, mut rx) = reg
+            .register(0x02, LabelFilter::parse(&[]).unwrap(), 8)
+            .await;
+        let mut inner = RecordingMetrics::default();
+        {
+            let mut tap = TappingMetricsAppender::new(&mut inner, &reg, 0x01).await;
+            assert!(!tap.has_subs());
+            tap.observe_series(1, 0, vec![kv("__name__", "g")]);
+            tap.append_sample(1, 1, 1.0);
+        }
+        assert!(rx.try_recv().is_err());
+        assert_eq!(inner.samples.len(), 1);
     }
 
     #[tokio::test]

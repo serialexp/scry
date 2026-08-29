@@ -22,6 +22,7 @@ pub enum FrameMsg {
     TailRecord(TailRecordOutput),
     LiveQuery(LiveQueryOutput),
     LiveBatch(LiveBatchOutput),
+    TailSample(TailSampleOutput),
     Error(ErrorOutput),
 }
 
@@ -186,6 +187,18 @@ impl FrameMsg {
                     item.encode_into(encoder)?;
                 }
             }
+            FrameMsg::TailSample(v) => {
+                encoder.write_uint8(84);
+                encoder.write_uint8(v.signal);
+                encoder.write_uint64(v.ts_unix_nano, Endianness::BigEndian);
+                encoder.write_uint8(v.metric_type);
+                encoder.write_uint64(v.series_fingerprint, Endianness::BigEndian);
+                encoder.write_float64(v.value, Endianness::BigEndian);
+                encoder.write_uint16(v.labels.len() as u16, Endianness::BigEndian);
+                for item in &v.labels {
+                    item.encode_into(encoder)?;
+                }
+            }
             FrameMsg::Error(v) => {
                 encoder.write_uint8(240);
                 encoder.write_uint16(v.code, Endianness::BigEndian);
@@ -214,6 +227,7 @@ impl FrameMsg {
             FrameMsg::TailRecord(_) => "TailRecord",
             FrameMsg::LiveQuery(_) => "LiveQuery",
             FrameMsg::LiveBatch(_) => "LiveBatch",
+            FrameMsg::TailSample(_) => "TailSample",
             FrameMsg::Error(_) => "Error",
         }
     }
@@ -276,6 +290,10 @@ impl FrameMsg {
         decoder.seek(start_pos)?;
         if let Ok(v) = LiveBatchOutput::decode_with_decoder(decoder) {
             return Ok(FrameMsg::LiveBatch(v));
+        }
+        decoder.seek(start_pos)?;
+        if let Ok(v) = TailSampleOutput::decode_with_decoder(decoder) {
+            return Ok(FrameMsg::TailSample(v));
         }
         decoder.seek(start_pos)?;
         if let Ok(v) = ErrorOutput::decode_with_decoder(decoder) {
@@ -1554,6 +1572,119 @@ impl From<TailRecordInput> for TailRecordOutput {
             labels: i.labels,
             body: i.body,
             attributes: i.attributes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TailSampleInput {
+    pub signal: u8,
+    pub ts_unix_nano: u64,
+    pub metric_type: u8,
+    pub series_fingerprint: u64,
+    pub value: f64,
+    pub labels: Vec<LabelPair>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TailSampleOutput {
+    pub tag: u8,
+    pub signal: u8,
+    pub ts_unix_nano: u64,
+    pub metric_type: u8,
+    pub series_fingerprint: u64,
+    pub value: f64,
+    pub labels: Vec<LabelPair>,
+}
+
+pub type TailSample = TailSampleOutput;
+
+impl TailSampleInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(84);
+        encoder.write_byte(self.signal);
+        encoder.write_u64_be(self.ts_unix_nano);
+        encoder.write_byte(self.metric_type);
+        encoder.write_u64_be(self.series_fingerprint);
+        encoder.write_u64_be((self.value).to_bits());
+        encoder.write_u16_be(self.labels.len() as u16);
+        for item in &self.labels {
+            item.encode_into(encoder)?;
+        }
+        Ok(())
+    }
+
+}
+
+impl TailSampleOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let tag = decoder.read_byte()?;
+        if tag != 84u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 84, got {}", tag)));
+        }
+        let signal = decoder.read_byte()?;
+        let ts_unix_nano = decoder.read_u64_be()?;
+        let metric_type = decoder.read_byte()?;
+        let series_fingerprint = decoder.read_u64_be()?;
+        let value = f64::from_bits(decoder.read_u64_be()?);
+        let length = decoder.read_u16_be()? as usize;
+        let mut labels = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = LabelPair::decode_with_decoder(decoder)?;
+            labels.push(item);
+        }
+        Ok(Self {
+            tag,
+            signal,
+            ts_unix_nano,
+            metric_type,
+            series_fingerprint,
+            value,
+            labels,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        TailSampleInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        TailSampleInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<TailSampleOutput> for TailSampleInput {
+    fn from(o: TailSampleOutput) -> Self {
+        Self {
+            signal: o.signal,
+            ts_unix_nano: o.ts_unix_nano,
+            metric_type: o.metric_type,
+            series_fingerprint: o.series_fingerprint,
+            value: o.value,
+            labels: o.labels,
+        }
+    }
+}
+
+impl From<TailSampleInput> for TailSampleOutput {
+    fn from(i: TailSampleInput) -> Self {
+        Self {
+            tag: 84u8,
+            signal: i.signal,
+            ts_unix_nano: i.ts_unix_nano,
+            metric_type: i.metric_type,
+            series_fingerprint: i.series_fingerprint,
+            value: i.value,
+            labels: i.labels,
         }
     }
 }

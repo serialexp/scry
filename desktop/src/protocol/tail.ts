@@ -5,13 +5,17 @@
 //! ingesters already emit. Hence the separate `../proto/generated-ingest`
 //! bindings.
 //!
-//! The sub-protocol is Hello → HelloAck → Subscribe → `TailRecord`*, which
+//! The sub-protocol is Hello → HelloAck → Subscribe → record*, which
 //! looks like it needs a round trip in the middle. It doesn't: the server
 //! reads frames sequentially off a buffered reader and does not care that the
 //! Subscribe arrived before it had replied. So we **pipeline** — one write of
 //! both frames — and validate the ordering on the way back. That keeps a tail
 //! the same "send bytes, read a stream" shape as a query, which is what lets
 //! `scry web` relay it without knowing any protocol.
+//!
+//! Two signals are tailable, and each has its own record frame: logs push
+//! `TailRecord`, metrics push `TailSample` (D-065). Neither carries fields
+//! belonging to the other, so the client decodes them separately.
 //!
 //! Records are best-effort by design: dropped under load, unordered across
 //! ingesters, never deduplicated against stored history. This is "what is
@@ -23,6 +27,7 @@ import {
   type FrameInput,
   type HelloAckOutput,
   type TailRecordOutput,
+  type TailSampleOutput,
   // Named `Error_Output` because binschema renames a schema type that collides
   // with a JS global (`Error` → `Error_`). That rename is deliberate and now
   // consistent across declaration and reference sites, so we import the real
@@ -33,9 +38,10 @@ import {
 import { frame } from "./framing";
 import {
   PROTOCOL_VERSION_V0,
-  SIGNAL_BIT_LOGS,
   Signal,
   tailErrName,
+  tailSignalBit,
+  type SignalByte,
 } from "./constants";
 import type { Transport } from "./transport";
 
@@ -45,6 +51,7 @@ import type { Transport } from "./transport";
 type TaggedFrame =
   | { type: "HelloAck"; value: HelloAckOutput }
   | { type: "TailRecord"; value: TailRecordOutput }
+  | { type: "TailSample"; value: TailSampleOutput }
   | { type: "Goodbye"; value: GoodbyeOutput }
   | { type: "Error"; value: ErrorOutput }
   | { type: string; value: unknown };
@@ -69,10 +76,24 @@ export class TailError extends Error {
   }
 }
 
+/** One live metric sample, as pushed by the server (D-065). */
+export interface TailSample {
+  tsUnixNano: bigint;
+  metricType: number;
+  /** The server's own fingerprint over the sorted labels, so a live line can
+   *  be matched to a stored series without re-deriving the hash. */
+  seriesFingerprint: bigint;
+  value: number;
+  labels: [string, string][];
+}
+
 /** What the UI has to say to describe a subscription. */
 export interface TailSpec {
   /** Prometheus-style matcher specs, ANDed server-side by `scry-match`. */
   matchers: string[];
+  /** Which signal to tail. Only `Signal.Logs` and `Signal.Metrics` have an
+   *  ingest tap; defaults to logs. */
+  signal?: SignalByte;
 }
 
 /** Render a label name/value pair as a matcher spec the server will parse.
@@ -96,6 +117,7 @@ function randomAgentId(): number[] {
  * back to back, each length-prefixed.
  */
 export function buildSubscribeRequest(spec: TailSpec, version: string): Uint8Array {
+  const signal = spec.signal ?? Signal.Logs;
   const hello = frame(
     new FrameEncoder().encode({
       msg: {
@@ -105,8 +127,8 @@ export function buildSubscribeRequest(spec: TailSpec, version: string): Uint8Arr
           agent_id: randomAgentId(),
           agent_version: version,
           hostname: "scry-ui",
-          // Logs is the only tailable signal today.
-          signals: SIGNAL_BIT_LOGS,
+          // Announce exactly the signal we are about to subscribe to.
+          signals: tailSignalBit(signal),
           capabilities: 0,
           resource_attrs: [],
         },
@@ -118,7 +140,7 @@ export function buildSubscribeRequest(spec: TailSpec, version: string): Uint8Arr
       msg: {
         type: "Subscribe",
         value: {
-          signal: Signal.Logs,
+          signal,
           matchers: spec.matchers.map((m) => ({ spec: m })),
         },
       },
@@ -146,11 +168,24 @@ export function decodeTailRecord(value: TailRecordOutput): TailRecord {
   };
 }
 
+/** Decode a `TailSample` frame body into the UI's sample shape (D-065). */
+export function decodeTailSample(value: TailSampleOutput): TailSample {
+  return {
+    tsUnixNano: value.ts_unix_nano,
+    metricType: value.metric_type,
+    seriesFingerprint: value.series_fingerprint,
+    value: value.value,
+    labels: toPairs(value.labels),
+  };
+}
+
 export interface TailCallbacks {
   /** Fires once the server has acknowledged the handshake. */
   onSubscribed?: () => void;
-  /** Fires per pushed record. */
-  onRecord: (record: TailRecord) => void;
+  /** Fires per pushed log record. Absent when tailing metrics. */
+  onRecord?: (record: TailRecord) => void;
+  /** Fires per pushed metric sample. Absent when tailing logs. */
+  onSample?: (sample: TailSample) => void;
 }
 
 /**
@@ -192,7 +227,14 @@ export async function runTail(
             failure = new Error("record received before the handshake completed");
             break;
           }
-          callbacks.onRecord(decodeTailRecord(msg.value as TailRecordOutput));
+          callbacks.onRecord?.(decodeTailRecord(msg.value as TailRecordOutput));
+          break;
+        case "TailSample":
+          if (!sawHelloAck) {
+            failure = new Error("record received before the handshake completed");
+            break;
+          }
+          callbacks.onSample?.(decodeTailSample(msg.value as TailSampleOutput));
           break;
         case "Goodbye":
           // Server-initiated close; the stream ends on its own right after.
