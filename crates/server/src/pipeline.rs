@@ -1180,9 +1180,30 @@ mod tests {
             })
         };
 
-        // Let it run into the wall. With uploads stuck, progress must
-        // plateau at MAX_INFLIGHT_UPLOADS (the rest of ingest is blocked
-        // acquiring a permit).
+        // Let it run into the wall. Two separate properties here, and they
+        // need separate treatment:
+        //
+        //   liveness — progress *reaches* CAP. How long that takes is up to
+        //   the scheduler, so poll for it. A fixed sleep makes a loaded CI
+        //   runner look like a bug: this asserted `== CAP` after 300ms and
+        //   failed at 1 of 2 when the driver task simply had not been
+        //   scheduled twice yet.
+        //
+        //   safety — progress then *stops* at CAP. This is the actual
+        //   backpressure guarantee, and it needs a real wait, because it is
+        //   an assertion about something not happening.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while progress.load(Ordering::Relaxed) < CAP as u64 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "ingest never reached CAP={CAP}; stuck at {}",
+                progress.load(Ordering::Relaxed)
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        // With the gate shut no upload completes, so no permit is ever
+        // returned and the CAP+1-th ingest must stay blocked.
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert_eq!(
             progress.load(Ordering::Relaxed),
