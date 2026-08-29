@@ -1,9 +1,10 @@
 name: Release
 
 # One tag, everything built. Push a `vX.Y.Z` tag (or run manually) and this:
-#   • builds + pushes the server container image via Depot (`depot bake`), and
-#   • builds the CLI/server tarballs per platform, attaching them to a GitHub
-#     Release, which the final `publish` job then flips out of draft.
+#   • `prepare` creates the draft Release (once — see the job for why),
+#   • `image` builds + pushes the server container via Depot (`depot bake`),
+#   • `cli` builds the per-platform tarballs and appends them to that draft,
+#   • `publish` flips it out of draft once all of the above succeeded.
 #
 # The Release is assembled as a **draft** and published only once every job has
 # succeeded. That ordering is deliberate: `install.sh` resolves the version from
@@ -140,15 +141,55 @@ jobs:
           prerelease: false
           args: ${{ matrix.args }}
 
+  # ── Create the draft Release, once ────────────────────────────────────
+  # Every uploader must append to ONE release, and the only reliable way to
+  # guarantee that is to create it before anything can race.
+  #
+  # `GET /releases/tags/{tag}` returns 404 for a draft. So a get-or-create by
+  # tag never finds a draft it did not just create, and N concurrent uploaders
+  # make N drafts: v0.10.1 has three, holding 3/4/2 of its nine assets, because
+  # three desktop legs started within the same second. Splitting assets across
+  # invisible duplicates is bad on its own; it would also stall `publish`, which
+  # resolves one release by tag and counts what is attached.
+  #
+  # Staggered build times are the only reason this has not recurred since. That
+  # is luck, not design, so create the draft up front and let the matrix append.
+  prepare:
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write          # create the Release
+    steps:
+      - name: Create the draft release (idempotent)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # `gh release view` reads the list endpoint, which DOES see drafts —
+          # unlike the by-tag endpoint softprops/tauri-action fall back on. Safe
+          # to re-run: a re-dispatched tag reuses the existing release.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists; reusing it"
+          else
+            gh release create "$TAG" --draft --title "$TAG" --generate-notes
+            echo "created draft release $TAG"
+          fi
+
   # ── CLI / server binary tarballs (static musl Linux + native macOS) ────
-  # Ships the headless `scry` multicall binary as per-platform tarballs
-  # attached to the SAME draft Release the desktop job creates (softprops is
-  # get-or-create-by-tag and idempotently appends assets). Installed by the
+  # Ships the headless `scry` multicall binary as per-platform tarballs, all
+  # appended to the single draft Release `prepare` created. Installed by the
   # repo-root install.sh. Linux legs are fully-static musl builds (scry is
   # rustls-only, no OpenSSL) via `cross`, so one binary per arch runs on any
   # distro regardless of glibc; macOS builds natively on the Apple-Silicon
   # runner (the x86_64 leg cross-compiles, same as the desktop matrix).
   cli:
+    # On a tag, wait for the draft to exist. On a manual dispatch `prepare` is
+    # skipped and this still runs — the tarballs go to workflow artifacts, not
+    # to a release, so there is nothing to race over.
+    needs: [prepare]
+    if: always() && (needs.prepare.result == 'success' || needs.prepare.result == 'skipped')
     permissions:
       contents: write          # upload assets to the Release
     strategy:
@@ -243,11 +284,13 @@ jobs:
         if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v2
         with:
-          # Same tag ⇒ same Release across all four matrix legs (softprops is
-          # get-or-create-by-tag and appends assets). Draft while the legs race:
-          # `/releases/latest` skips drafts, so install.sh cannot resolve a
-          # release whose tarballs are still uploading. The `publish` job below
-          # flips it once every leg is green.
+          # Appends to the single draft `prepare` created — never creates one,
+          # so the four legs cannot split their assets across duplicates.
+          # `draft: true` keeps it a draft as softprops updates it: the release
+          # must stay invisible to `/releases/latest` (which skips drafts) until
+          # every tarball is attached, or install.sh could resolve a version
+          # whose asset for the caller's platform is still building. The
+          # `publish` job flips it once every leg is green.
           draft: true
           files: |
             ${{ steps.package.outputs.ASSET }}
