@@ -127,7 +127,34 @@ async fn run_logs_query(
     store: Arc<dyn ObjectStore>,
     q: &Query,
 ) -> Vec<arrow::record_batch::RecordBatch> {
-    let ctx = SessionContext::new();
+    run_logs_query_with(catalog, store, q, SessionContext::new()).await
+}
+
+/// `run_logs_query` on a **single-partition** context, so the collected row
+/// order is the order the scan streamed them — i.e. the block's on-disk order.
+///
+/// The default context targets one partition per core, and DataFusion splits a
+/// parquet file's row groups across them; `collect` then coalesces those
+/// streams in whatever order they finish, which interleaves. That is fine for
+/// the value-equality assertions (they sort first) but destroys the one thing
+/// the ordering assertion exists to prove — that `merge_blocks`' `ORDER BY`
+/// actually wrote a sorted file. Sorting the rows before checking would make
+/// the assertion vacuous; pinning the partition count keeps it honest.
+async fn run_logs_query_ordered(
+    catalog: &Catalog,
+    store: Arc<dyn ObjectStore>,
+    q: &Query,
+) -> Vec<arrow::record_batch::RecordBatch> {
+    let cfg = datafusion::execution::config::SessionConfig::new().with_target_partitions(1);
+    run_logs_query_with(catalog, store, q, SessionContext::new_with_config(cfg)).await
+}
+
+async fn run_logs_query_with(
+    catalog: &Catalog,
+    store: Arc<dyn ObjectStore>,
+    q: &Query,
+    ctx: SessionContext,
+) -> Vec<arrow::record_batch::RecordBatch> {
     register_logs_table(&ctx, catalog, store, q).await.unwrap();
     let df = ctx.table(LOGS_TABLE_NAME).await.unwrap();
     let physical = df.create_physical_plan().await.unwrap();
@@ -276,10 +303,12 @@ async fn logs_compaction_is_lossless_and_reaps_inputs() {
         "every input row survives the merge"
     );
 
-    // The merged main parquet is ordered by (stream_fingerprint, ts);
-    // the scan preserves file order, so the streamed rows are sorted.
-    let fps = collect_u64(&post_all, "stream_fingerprint");
-    let tss = collect_u64(&post_all, "ts_unix_nano");
+    // The merged main parquet is ordered by (stream_fingerprint, ts). Read it
+    // back on a single-partition context so the collected order IS the file
+    // order — see `run_logs_query_ordered`.
+    let post_ordered = run_logs_query_ordered(&catalog, store.clone(), &q_all).await;
+    let fps = collect_u64(&post_ordered, "stream_fingerprint");
+    let tss = collect_u64(&post_ordered, "ts_unix_nano");
     let mut prev = (0u64, 0u64);
     for (fp, ts) in fps.iter().zip(tss.iter()) {
         assert!(

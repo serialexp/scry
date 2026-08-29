@@ -69,15 +69,6 @@
       results pane can use the full width on mobile. Current `@media (max-width:720px)`
       only stacks form-above-results; a manual collapse would be better.
 
-## Test flakes
-- [ ] `crates/compact/tests/compaction_e2e.rs:285` `logs_compaction_is_lossless_and_reaps_inputs`
-      intermittently fails the "merged rows must be sorted by (fp, ts)" assertion under full
-      `cargo test --workspace` parallel load; passes reliably in isolation. The assertion
-      assumes the merged block scans as a single ordered partition, but DataFusion may split
-      the scan across partitions under load, interleaving batch order in the collected result.
-      Pre-existing (not from the metrics with_labels work). Fix: either sort the collected rows
-      before the monotonicity check, or force target_partitions=1 for that query's SessionContext.
-
 ## Query result cache (pre-existing, found 2026-08-28)
 - [ ] The D-059 default-query-window clamp defeats the result cache for any
       query with no explicit `--from`/`--until`. `apply_default_window`
