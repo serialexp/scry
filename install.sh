@@ -55,9 +55,11 @@ detect_platform() {
     echo "${os}-${arch}"
 }
 
-# Latest *published* release tag (the '/latest' endpoint skips drafts and
-# pre-releases — correct here, since a release is published manually after
-# review). Matches all first-party tags (`vX.Y.Z`).
+# Latest *published* release tag. The '/latest' endpoint skips drafts and
+# pre-releases, which is exactly the property this relies on: the release
+# workflow builds every asset into a draft and only publishes once the image
+# and all four tarballs are attached, so whatever '/latest' returns here is
+# guaranteed complete. Matches all first-party tags (`vX.Y.Z`).
 get_latest_version() {
     local version
     version=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" |

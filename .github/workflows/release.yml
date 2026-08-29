@@ -2,8 +2,15 @@ name: Release
 
 # One tag, everything built. Push a `vX.Y.Z` tag (or run manually) and this:
 #   • builds + pushes the server container image via Depot (`depot bake`), and
-#   • builds the Tauri desktop app bundles for macOS / Linux / Windows and
-#     attaches them to a draft GitHub Release.
+#   • builds the CLI/server tarballs per platform, attaching them to a GitHub
+#     Release, which the final `publish` job then flips out of draft.
+#
+# The Release is assembled as a **draft** and published only once every job has
+# succeeded. That ordering is deliberate: `install.sh` resolves the version from
+# `/releases/latest`, which excludes drafts, so a release becomes installable at
+# exactly the moment it is complete — never while three of four tarballs are
+# still building. It also fails safe: if any leg breaks, the release stays a
+# draft rather than going public half-built.
 #
 # Both run on Depot infrastructure. The `serialexp` org is connected to Depot
 # GitHub Actions runners (used by the desktop matrix); the image build uses
@@ -236,8 +243,11 @@ jobs:
         if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v2
         with:
-          # Same tag ⇒ same (draft) Release the desktop job created; assets are
-          # appended. Kept draft so Bart publishes once after review.
+          # Same tag ⇒ same Release across all four matrix legs (softprops is
+          # get-or-create-by-tag and appends assets). Draft while the legs race:
+          # `/releases/latest` skips drafts, so install.sh cannot resolve a
+          # release whose tarballs are still uploading. The `publish` job below
+          # flips it once every leg is green.
           draft: true
           files: |
             ${{ steps.package.outputs.ASSET }}
@@ -251,3 +261,40 @@ jobs:
           path: |
             ${{ steps.package.outputs.ASSET }}
             ${{ steps.package.outputs.ASSET }}.sha256
+
+  # ── Publish ───────────────────────────────────────────────────────────
+  # The single point where a release stops being a draft. Gated on `image` and
+  # every `cli` leg, so the release goes public only with the container image
+  # pushed and all four tarballs (plus their .sha256) attached — which is the
+  # contract install.sh depends on when it reads `/releases/latest`.
+  #
+  # `desktop` is deliberately NOT in `needs`: it is disabled (`if: false`), and
+  # a skipped job in `needs` would skip this one too, leaving every release a
+  # draft forever.
+  publish:
+    if: github.ref_type == 'tag'
+    needs: [image, cli]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write          # flip the Release out of draft
+    steps:
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Assert the assets are actually there before going public. A green
+          # matrix with a missing upload would otherwise publish a release that
+          # 404s for one platform — the exact failure the draft gate prevents.
+          expected=8   # 4 tarballs + 4 .sha256
+          actual=$(gh release view "$TAG" --json assets -q '.assets | length')
+          echo "release $TAG has $actual asset(s), expecting $expected"
+          if [ "$actual" -lt "$expected" ]; then
+            gh release view "$TAG" --json assets -q '.assets[].name'
+            echo "refusing to publish an incomplete release" >&2
+            exit 1
+          fi
+          gh release edit "$TAG" --draft=false
+          echo "published $TAG"
