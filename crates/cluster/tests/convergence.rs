@@ -823,3 +823,282 @@ async fn a_reaped_deletion_is_no_longer_re_announced() {
         "a reaped block is not re-announced"
     );
 }
+
+// ── D-066: the walk must not re-fetch what the catalog already has ────
+//
+// gothab's queryd walked 346,386 sidecars per pass, reporting `inserted=0`
+// every time: one GET per block, forever, to learn nothing. At ~5 GETs/sec a
+// pass took 15-20 hours on a 30-minute timer, so it ran permanently and
+// starved live queries of object-store throughput. These tests pin the three
+// properties that fix it.
+
+/// An `InMemory` store that records every `get` and can be told to fail one.
+#[derive(Debug)]
+struct ProbeStore {
+    inner: InMemory,
+    gets: Mutex<Vec<String>>,
+    fail_path: Mutex<Option<String>>,
+}
+
+impl ProbeStore {
+    fn new() -> Self {
+        Self {
+            inner: InMemory::new(),
+            gets: Mutex::new(Vec::new()),
+            fail_path: Mutex::new(None),
+        }
+    }
+
+    /// GETs of block sidecars only — parquet reads are noise for these tests.
+    fn meta_gets(&self) -> usize {
+        self.gets
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.ends_with(".meta.json"))
+            .count()
+    }
+
+    fn reset(&self) {
+        self.gets.lock().unwrap().clear();
+    }
+
+    fn fail(&self, path: Option<String>) {
+        *self.fail_path.lock().unwrap() = path;
+    }
+}
+
+impl std::fmt::Display for ProbeStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ProbeStore")
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for ProbeStore {
+    async fn put_opts(
+        &self,
+        p: &object_store::path::Path,
+        v: object_store::PutPayload,
+        o: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(p, v, o).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        p: &object_store::path::Path,
+        o: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(p, o).await
+    }
+
+    async fn get_opts(
+        &self,
+        p: &object_store::path::Path,
+        o: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.gets.lock().unwrap().push(p.as_ref().to_string());
+        if self.fail_path.lock().unwrap().as_deref() == Some(p.as_ref()) {
+            // Deliberately NOT NotFound: that path means "the block is gone",
+            // which is a legitimate outcome the walk already tolerated. This
+            // is the "I could not read it" case that used to abort the pass.
+            return Err(object_store::Error::Generic {
+                store: "ProbeStore",
+                source: "injected transient failure".into(),
+            });
+        }
+        self.inner.get_opts(p, o).await
+    }
+
+    async fn get_ranges(
+        &self,
+        p: &object_store::path::Path,
+        r: &[std::ops::Range<u64>],
+    ) -> object_store::Result<Vec<bytes::Bytes>> {
+        self.inner.get_ranges(p, r).await
+    }
+
+    fn delete_stream(
+        &self,
+        paths: futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(paths)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+        offset: &object_store::path::Path,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        o: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, o).await
+    }
+
+    async fn rename_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        o: object_store::RenameOptions,
+    ) -> object_store::Result<()> {
+        self.inner.rename_opts(from, to, o).await
+    }
+}
+
+#[tokio::test]
+async fn converged_full_walk_fetches_no_sidecars_at_all() {
+    let probe = Arc::new(ProbeStore::new());
+    let store: Arc<dyn ObjectStore> = probe.clone();
+    let writer = Uuid::now_v7();
+    build_logs_block(&store, writer, 0xA001, NOW, 20).await;
+    build_logs_block(&store, writer, 0xB001, NOW + 50, 20).await;
+    build_logs_block(&store, writer, 0xC001, NOW + 100, 20).await;
+
+    let (catalog, _tmp) = open_catalog();
+
+    // Cold: nothing is known, so every sidecar is genuinely needed.
+    probe.reset();
+    let cold = full_walk(store.as_ref(), &catalog, BUCKET).await.unwrap();
+    assert_eq!(cold.inserted, 3, "cold walk discovers all three");
+    assert_eq!(cold.skipped, 0, "nothing to skip against an empty catalog");
+    assert_eq!(probe.meta_gets(), 3, "cold walk pays one GET per block");
+
+    // Warm: the catalog has all three, and the UUID is readable off the
+    // object key, so the pass costs a LIST and *zero* GETs.
+    probe.reset();
+    let warm = full_walk(store.as_ref(), &catalog, BUCKET).await.unwrap();
+    assert_eq!(warm.inserted, 0);
+    assert_eq!(warm.skipped, 3, "every listed block was already known");
+    assert_eq!(
+        probe.meta_gets(),
+        0,
+        "a converged walk must not fetch a single sidecar"
+    );
+
+    // Cursor bookkeeping still happens, derived from the key alone.
+    let date = date_dir(NOW);
+    assert!(
+        catalog.get_cursor("logs", writer, &date).unwrap().is_some(),
+        "skipping a fetch must not skip the cursor advance"
+    );
+}
+
+#[tokio::test]
+async fn superseded_and_soft_deleted_blocks_count_as_known() {
+    // The skip filter keys off "we have a row", not "we would serve it".
+    // Using the live-only `list_blocks` predicate instead would re-fetch every
+    // superseded compaction input on every pass forever, and — far worse —
+    // re-`insert_block` soft-deleted rows, resurrecting blocks a peer has
+    // staged for deletion (D-063) as though they were new discoveries.
+    let probe = Arc::new(ProbeStore::new());
+    let store: Arc<dyn ObjectStore> = probe.clone();
+    let writer = Uuid::now_v7();
+    let b1 = build_logs_block(&store, writer, 0xA001, NOW, 20).await;
+    let b2 = build_logs_block(&store, writer, 0xB001, NOW + 50, 20).await;
+    let b3 = build_logs_block(&store, writer, 0xC001, NOW + 100, 20).await;
+
+    let (catalog, _tmp) = open_catalog();
+    full_walk(store.as_ref(), &catalog, BUCKET).await.unwrap();
+
+    // b1 merged away by b3; b2 soft-deleted by a peer's retention pass.
+    catalog.mark_superseded(&[b1.uuid], b3.uuid).unwrap();
+    catalog
+        .mark_deleted(&[b2.uuid], NOW + 500, NOW + 600)
+        .unwrap();
+    let live_before = catalog.list_blocks().unwrap().len();
+    assert_eq!(live_before, 1, "only b3 is live");
+
+    probe.reset();
+    let walk = full_walk(store.as_ref(), &catalog, BUCKET).await.unwrap();
+    assert_eq!(walk.skipped, 3, "hidden blocks are still *known* blocks");
+    assert_eq!(walk.inserted, 0, "nothing is rediscovered");
+    assert_eq!(
+        probe.meta_gets(),
+        0,
+        "a superseded or soft-deleted block must not be re-fetched"
+    );
+    assert_eq!(
+        catalog.list_blocks().unwrap().len(),
+        live_before,
+        "the walk must not resurrect hidden blocks"
+    );
+}
+
+#[tokio::test]
+async fn a_transient_sidecar_failure_neither_aborts_the_pass_nor_skips_the_block() {
+    let probe = Arc::new(ProbeStore::new());
+    let store: Arc<dyn ObjectStore> = probe.clone();
+    let writer = Uuid::now_v7();
+    let b1 = build_logs_block(&store, writer, 0xA001, NOW, 20).await;
+    let b2 = build_logs_block(&store, writer, 0xB001, NOW + 50, 20).await;
+    let b3 = build_logs_block(&store, writer, 0xC001, NOW + 100, 20).await;
+    assert!(
+        b1.uuid < b2.uuid && b2.uuid < b3.uuid,
+        "UUIDv7 is monotonic"
+    );
+
+    let (catalog, _tmp) = open_catalog();
+    let b2_meta = scry_block::block_path(
+        &b2.signal,
+        b2.ts_min_unix_nano,
+        b2.writer_id,
+        b2.uuid,
+        "meta.json",
+    );
+    probe.fail(Some(b2_meta));
+
+    // The pass completes rather than returning Err. Before D-066 one flaky GET
+    // aborted the walk and discarded every cursor advance it had earned — on
+    // gothab, up to 15 hours of work, three times in two days.
+    let r1 = full_walk(store.as_ref(), &catalog, BUCKET).await.unwrap();
+    assert_eq!(r1.fetch_failed, 1, "the failure is counted, not fatal");
+    assert_eq!(r1.inserted, 2, "the other two blocks still land");
+    assert!(catalog.get_block(b2.uuid).unwrap().is_none());
+
+    // And the cursor is held behind the gap. b3 succeeded and sorts *after*
+    // b2, so advancing to it would put the incremental poll permanently past
+    // a block that never made it into the catalog.
+    let date = date_dir(NOW);
+    assert_eq!(
+        catalog.get_cursor("logs", writer, &date).unwrap(),
+        None,
+        "a prefix with an unapplied block must not advance its cursor"
+    );
+
+    // Cleared failure ⇒ the next pass picks up exactly the missing block.
+    probe.fail(None);
+    let r2 = full_walk(store.as_ref(), &catalog, BUCKET).await.unwrap();
+    assert_eq!(r2.inserted, 1, "the retry recovers b2");
+    assert_eq!(
+        r2.skipped, 2,
+        "and does not re-fetch the two it already has"
+    );
+    assert!(catalog.get_block(b2.uuid).unwrap().is_some());
+    assert_eq!(
+        catalog.get_cursor("logs", writer, &date).unwrap(),
+        Some(b3.uuid),
+        "with the gap filled the cursor advances to the prefix head"
+    );
+}

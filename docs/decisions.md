@@ -3485,6 +3485,94 @@ the f64 survives bit-for-bit, four metrics-tap unit tests mirroring the logs
 tap's, and 18 vitest cases over the bucket accumulator, the seam rule, eviction
 and the merge.
 
+## D-066: The full walk lists to learn UUIDs, and query timing rides its own frame
+
+**Date:** 2026-08-30
+**Status:** accepted. The walk half is complete. The timing half has the schema,
+the frame, the round-trip tests and the CLI trailer; the server does not emit
+`QueryStats` yet, so the tag is reserved and no client sees one in the wild.
+
+### Part 1 — the full walk fetched 346,000 sidecars to learn nothing
+
+Read off the running gothab cluster, not inferred: both scry pods were
+permanently inside a full-bucket catalog walk. `scry-queryd` was walking
+346,386 sidecar objects and `scry-server-0` 347,484, against the same Garage.
+`poll.rs` fetched them in a plain sequential loop at roughly 5 GETs/sec, so one
+walk took 15–20 hours — and the schedule was a fixed-rate 30-minute
+`tokio::time::interval`, which a 15-hour job is always overdue for, so the walk
+restarted the instant it finished. It had been running continuously for five
+days. Every pass logged `inserted=0`.
+
+The fix is that we were never required to fetch those objects at all.
+`block_path` puts the block UUID **in the object key**
+(`{signal}/{yyyy}/{mm}/{dd}/{writer_id}/{block_uuid}.meta.json`), so the
+listing already names every block. The walk now loads the catalog's known UUIDs
+once per pass and GETs only the listed keys that are not in that set. In a
+converged steady state that is approximately zero GETs, which is precisely what
+`inserted=0` had been reporting for five days.
+
+**"Known" deliberately means every row in `blocks`, with no liveness filter** —
+`Catalog::known_block_uuids()` exists as a separate method rather than reusing
+`list_blocks()`, whose `superseded_by IS NULL AND deleted_at IS NULL` filter
+would make the walk re-fetch every superseded block forever *and* re-insert
+soft-deleted ones, silently undoing D-063's staged deletions on every pass.
+That trap has its own test.
+
+Three smaller corrections ride along. The walk now sleeps **after** completion
+rather than on a fixed tick, so an overrunning walk idles instead of restarting
+— independently correct even now that walks are cheap. A transient non-404 GET
+error is counted and skipped instead of aborting the pass with `Err`, matching
+what the unparseable-sidecar path already did; a single flaky GET had three
+times in two days discarded ~15 hours of cursor progress. And the residual GETs
+run under bounded concurrency (`buffer_unordered`, 16). The concurrency is last
+on purpose: on its own it would only make a pointless walk hit the object store
+harder, and it is safe only because the walk is now small.
+
+One subtlety worth pinning: on a snapshot-restored boot (D-055) the boot seed
+walk is skipped and a restored catalog carries no poll cursors, so the periodic
+walk's immediate first tick is the only thing that seeds them. Sleeping *after*
+the walk rather than before preserves that.
+
+### Part 2 — timings are a separate frame, not fields on `EndOfStream`
+
+Adding the phase breakdown to `EndOfStream` would have been the smaller diff
+and would have been wrong. `EndOfStream` is written through `write_and_tee` and
+is therefore baked into the result-cache entry, so timings living inside it
+would replay the *original* query's breakdown on every 2 ms cache hit —
+misleading exactly when someone is reading the number to chase a slow query.
+
+`QueryStats` (tag `0x1E`) is its own frame, written outside the tee and always
+fresh. It is emitted immediately **before** `EndOfStream`, so the terminator
+stays the terminator and every existing client's "saw terminator → stop" loop
+keeps its shape; a client that does not know the tag skips one frame.
+
+Units are **microseconds**, not milliseconds: ms would round the entire
+cache-hit path to 0. The frame is always sent, never opt-in — it is ~120 bytes
+once per query, and an opt-in flag guarantees the number is absent precisely
+when it is wanted.
+
+**Nothing is smeared.** `server_total_us` is measured independently of the
+phases, and the client renders `total − Σphases` as an explicit `other` bucket
+rather than distributing the remainder across named phases. DataFusion's
+`time_elapsed_opening` / `time_elapsed_scanning_total` / `elapsed_compute` are
+summed *across partitions* and can legitimately exceed the wall-clock phase
+containing them, so they are a separately labelled group and never timeline
+slices.
+
+**A query is not spread across queriers**, contrary to the assumption that
+prompted this: each daemon converges its own catalog and reads blocks itself,
+and the webui picks exactly one upstream per request via `X-Scry-Target`. The
+only outbound fan-out is `fetch_live_from_ingester`, which dials **ingesters**
+for the `--live` merge — so per-node timing means that live fan-out (a
+`LiveNodeTiming { addr, elapsed_us, rows, ok }` list) plus the
+browser → `scry web` → queryd relay hop.
+
+**Consequence, when the emit path lands:** the result cache must stop caching
+the `EndOfStream` frame, so `Entry` gains a `rows` beside its `bytes` and the
+server synthesizes a fresh `QueryStats | EndOfStream` after replaying the
+cached blob. That also fixes a pre-existing wart where `rows_total` stays 0 on
+a cache hit and `scan_complete` under-reports rows on every hit.
+
 ## D-067: gateway fleet status and exact forwarding-stage telemetry
 
 **The problem.** D-041 deliberately acknowledges gateway inbounds after a

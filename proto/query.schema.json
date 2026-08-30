@@ -2,7 +2,7 @@
   "meta": {
     "title": "scry query wire protocol",
     "description": "Client to query-daemon wire protocol for issuing DataFusion-backed metrics queries against a scry deployment. Long-lived TCP stream, length-framed messages, one request frame from client triggers a stream of response frames (schema + zero or more batches + end-of-stream). Arrow IPC payload carried verbatim inside the binschema envelope — binschema is purely the framing/control plane.",
-    "version": "0.2.0"
+    "version": "0.3.0"
   },
 
   "config": {
@@ -12,7 +12,7 @@
 
   "types": {
     "QueryFrame": {
-      "description": "Top-level discriminated union of all query-protocol messages. Peek-discriminated on the message-type byte; each variant struct begins with a const-tagged uint8 that matches the discriminator. Client → server: Request (exactly one). Server → client: SchemaMsg (exactly one), then BatchMsg* , then EndOfStream OR StreamError (exactly one terminator).",
+      "description": "Top-level discriminated union of all query-protocol messages. Peek-discriminated on the message-type byte; each variant struct begins with a const-tagged uint8 that matches the discriminator. Client → server: Request (exactly one). Server → client: SchemaMsg (exactly one), then BatchMsg* , then an optional QueryStats, then EndOfStream OR StreamError (exactly one terminator). QueryStats is non-terminal and sits immediately before EndOfStream so that a client's 'read until terminator' loop keeps its shape; a client that does not know the tag skips the frame and still terminates correctly.",
       "sequence": [
         {
           "name": "msg",
@@ -26,6 +26,7 @@
             { "type": "SchemaMsg",          "when": "value === 0x10" },
             { "type": "BatchMsg",           "when": "value === 0x11" },
             { "type": "ResponseSuperseded", "when": "value === 0x12" },
+            { "type": "QueryStats",         "when": "value === 0x1E" },
             { "type": "EndOfStream",        "when": "value === 0x1F" },
             { "type": "LabelNamesResponse", "when": "value === 0x20" },
             { "type": "LabelValuesResponse","when": "value === 0x21" },
@@ -149,6 +150,51 @@
         { "name": "superseded_attempt", "type": "uint32" },
         { "name": "next_attempt",       "type": "uint32" },
         { "name": "reason",             "type": "uint8" }
+      ]
+    },
+
+    "LiveNodeTiming": {
+      "description": "One ingester's contribution to a `live: true` logs query (D-054). A query is NOT scattered across query daemons — each daemon converges its own catalog and reads blocks itself — so this is the only server-side fan-out there is, and it exists only for the live merge.",
+      "sequence": [
+        { "name": "addr",       "type": "string", "kind": "length_prefixed", "length_type": "uint16", "encoding": "ascii" },
+        { "name": "elapsed_us", "type": "uint64" },
+        { "name": "rows",       "type": "uint64" },
+        { "name": "ok",         "type": "uint8" }
+      ]
+    },
+
+    "QueryStats": {
+      "description": "Server → client. Non-terminal per-query timing breakdown, sent immediately before EndOfStream. Answers 'was that transfer, planning, or execution?' without reading the daemon's logs. All durations are MICROseconds (milliseconds would round an entire cache-hit path to 0) and are measured on the server that served this query. Sent unconditionally rather than behind an opt-in flag: it is ~120 bytes once per query, and an opt-in would make the numbers missing exactly when someone is chasing a slow query.\n\nDeliberately its OWN frame rather than extra fields on EndOfStream: the terminator is written through the result cache's tee and is therefore part of the cached entry, so timings living inside it would replay the original miss's breakdown on every subsequent 2 ms cache hit — stale precisely when it matters. QueryStats is written outside the tee and is always fresh; on a cache hit it reports the hit's own (small) numbers with cache_hit = 1.\n\nNOTHING IS SMEARED: server_total_us is measured independently of the phases, so a client should render `server_total_us - Σ(phases)` as an explicit 'other' bucket rather than distributing it. The df_* fields are DataFusion's own leaf metrics summed ACROSS PARTITIONS and can legitimately exceed the wall-clock phase that contains them — they are a labelled detail group, never timeline slices. A phase that did not run is 0 (e.g. live_fetch_us on a non-live query, plan_us on a cache hit).",
+      "sequence": [
+        { "name": "tag", "type": "uint8", "const": 30 },
+
+        { "name": "server_total_us",   "type": "uint64" },
+        { "name": "admission_wait_us", "type": "uint64" },
+        { "name": "catalog_us",        "type": "uint64" },
+        { "name": "cache_lookup_us",   "type": "uint64" },
+        { "name": "live_fetch_us",     "type": "uint64" },
+        { "name": "register_us",       "type": "uint64" },
+        { "name": "plan_us",           "type": "uint64" },
+        { "name": "execute_us",        "type": "uint64" },
+        { "name": "serialize_us",      "type": "uint64" },
+        { "name": "write_us",          "type": "uint64" },
+
+        { "name": "postings_fetch_us", "type": "uint64" },
+        { "name": "bloom_fetch_us",    "type": "uint64" },
+
+        { "name": "df_opening_us",  "type": "uint64" },
+        { "name": "df_scanning_us", "type": "uint64" },
+        { "name": "df_compute_us",  "type": "uint64" },
+
+        { "name": "cache_hit",         "type": "uint8" },
+        { "name": "attempts",          "type": "uint32" },
+        { "name": "blocks_considered", "type": "uint32" },
+        { "name": "blocks_scanned",    "type": "uint32" },
+        { "name": "bytes_scanned",     "type": "uint64" },
+
+        { "name": "node_id", "type": "string", "kind": "length_prefixed", "length_type": "uint16", "encoding": "ascii" },
+
+        { "name": "live_nodes", "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "LiveNodeTiming" } }
       ]
     },
 

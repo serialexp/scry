@@ -567,6 +567,35 @@ impl Catalog {
         Ok(res)
     }
 
+    /// Every block UUID this catalog has a row for, **regardless of liveness**.
+    ///
+    /// The convergence walk uses this to decide which listed sidecars it can
+    /// skip fetching: a block whose UUID is already here has nothing new to
+    /// tell us, and its UUID is readable straight off the object key.
+    ///
+    /// Deliberately *not* filtered by `deleted_at IS NULL AND superseded = 0`
+    /// the way [`list_blocks`](Self::list_blocks) is, and the difference
+    /// matters in both directions. Filtering to live rows would make
+    /// every superseded compaction input look unknown, so the walk would
+    /// re-fetch all of them on every pass forever — and worse, re-`insert_block`
+    /// soft-deleted rows, resurrecting blocks a peer has staged for deletion
+    /// (D-063) as if they were new. "Known" here means "we have a row", not
+    /// "we would serve it".
+    pub fn known_block_uuids(&self) -> Result<HashSet<Uuid>> {
+        let mut stmt = self.conn.prepare("SELECT uuid FROM blocks")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = HashSet::new();
+        for r in rows {
+            // A row whose uuid text is unparseable is not something we can
+            // match a key against; treat it as unknown so the walk re-fetches
+            // and repairs rather than silently skipping the block forever.
+            if let Ok(uuid) = Uuid::parse_str(&r?) {
+                out.insert(uuid);
+            }
+        }
+        Ok(out)
+    }
+
     /// Count of logical live blocks (queryable, neither retained nor superseded).
     pub fn block_count(&self) -> Result<usize> {
         let n: i64 = self.conn.query_row(

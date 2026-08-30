@@ -13,7 +13,7 @@ import { evaluateExpression } from "./expression-evaluator.js";
 import { BinSchemaError, ErrorCode } from "./errors.js";
 
 /**
- * Top-level discriminated union of all query-protocol messages. Peek-discriminated on the message-type byte; each variant struct begins with a const-tagged uint8 that matches the discriminator. Client → server: Request (exactly one). Server → client: SchemaMsg (exactly one), then BatchMsg* , then EndOfStream OR StreamError (exactly one terminator).
+ * Top-level discriminated union of all query-protocol messages. Peek-discriminated on the message-type byte; each variant struct begins with a const-tagged uint8 that matches the discriminator. Client → server: Request (exactly one). Server → client: SchemaMsg (exactly one), then BatchMsg* , then an optional QueryStats, then EndOfStream OR StreamError (exactly one terminator). QueryStats is non-terminal and sits immediately before EndOfStream so that a client's 'read until terminator' loop keeps its shape; a client that does not know the tag skips the frame and still terminates correctly.
  */
 export interface QueryFrameInput {
   /**
@@ -23,7 +23,7 @@ export interface QueryFrameInput {
    * @remarks
    *
    * Discriminator: peek uint8
-   * Variants: 12
+   * Variants: 13
    * - QueryRequest (when value === 0x01)
    * - LabelNamesRequest (when value === 0x02)
    * - LabelValuesRequest (when value === 0x03)
@@ -31,17 +31,18 @@ export interface QueryFrameInput {
    * - SchemaMsg (when value === 0x10)
    * - BatchMsg (when value === 0x11)
    * - ResponseSuperseded (when value === 0x12)
+   * - QueryStats (when value === 0x1E)
    * - EndOfStream (when value === 0x1F)
    * - LabelNamesResponse (when value === 0x20)
    * - LabelValuesResponse (when value === 0x21)
    * - FleetStatusResponse (when value === 0x22)
    * - StreamError (when value === 0xF0)
    */
-  msg: { type: 'QueryRequest'; value: QueryRequestInput } | { type: 'LabelNamesRequest'; value: LabelNamesRequestInput } | { type: 'LabelValuesRequest'; value: LabelValuesRequestInput } | { type: 'FleetStatusRequest'; value: FleetStatusRequestInput } | { type: 'SchemaMsg'; value: SchemaMsgInput } | { type: 'BatchMsg'; value: BatchMsgInput } | { type: 'ResponseSuperseded'; value: ResponseSupersededInput } | { type: 'EndOfStream'; value: EndOfStreamInput } | { type: 'LabelNamesResponse'; value: LabelNamesResponseInput } | { type: 'LabelValuesResponse'; value: LabelValuesResponseInput } | { type: 'FleetStatusResponse'; value: FleetStatusResponseInput } | { type: 'StreamError'; value: StreamErrorInput };
+  msg: { type: 'QueryRequest'; value: QueryRequestInput } | { type: 'LabelNamesRequest'; value: LabelNamesRequestInput } | { type: 'LabelValuesRequest'; value: LabelValuesRequestInput } | { type: 'FleetStatusRequest'; value: FleetStatusRequestInput } | { type: 'SchemaMsg'; value: SchemaMsgInput } | { type: 'BatchMsg'; value: BatchMsgInput } | { type: 'ResponseSuperseded'; value: ResponseSupersededInput } | { type: 'QueryStats'; value: QueryStatsInput } | { type: 'EndOfStream'; value: EndOfStreamInput } | { type: 'LabelNamesResponse'; value: LabelNamesResponseInput } | { type: 'LabelValuesResponse'; value: LabelValuesResponseInput } | { type: 'FleetStatusResponse'; value: FleetStatusResponseInput } | { type: 'StreamError'; value: StreamErrorInput };
 }
 
 /**
- * Top-level discriminated union of all query-protocol messages. Peek-discriminated on the message-type byte; each variant struct begins with a const-tagged uint8 that matches the discriminator. Client → server: Request (exactly one). Server → client: SchemaMsg (exactly one), then BatchMsg* , then EndOfStream OR StreamError (exactly one terminator).
+ * Top-level discriminated union of all query-protocol messages. Peek-discriminated on the message-type byte; each variant struct begins with a const-tagged uint8 that matches the discriminator. Client → server: Request (exactly one). Server → client: SchemaMsg (exactly one), then BatchMsg* , then an optional QueryStats, then EndOfStream OR StreamError (exactly one terminator). QueryStats is non-terminal and sits immediately before EndOfStream so that a client's 'read until terminator' loop keeps its shape; a client that does not know the tag skips the frame and still terminates correctly.
  */
 export interface QueryFrameOutput {
   /**
@@ -51,7 +52,7 @@ export interface QueryFrameOutput {
    * @remarks
    *
    * Discriminator: peek uint8
-   * Variants: 12
+   * Variants: 13
    * - QueryRequest (when value === 0x01)
    * - LabelNamesRequest (when value === 0x02)
    * - LabelValuesRequest (when value === 0x03)
@@ -59,13 +60,14 @@ export interface QueryFrameOutput {
    * - SchemaMsg (when value === 0x10)
    * - BatchMsg (when value === 0x11)
    * - ResponseSuperseded (when value === 0x12)
+   * - QueryStats (when value === 0x1E)
    * - EndOfStream (when value === 0x1F)
    * - LabelNamesResponse (when value === 0x20)
    * - LabelValuesResponse (when value === 0x21)
    * - FleetStatusResponse (when value === 0x22)
    * - StreamError (when value === 0xF0)
    */
-  msg: { type: 'QueryRequest'; value: QueryRequestOutput } | { type: 'LabelNamesRequest'; value: LabelNamesRequestOutput } | { type: 'LabelValuesRequest'; value: LabelValuesRequestOutput } | { type: 'FleetStatusRequest'; value: FleetStatusRequestOutput } | { type: 'SchemaMsg'; value: SchemaMsgOutput } | { type: 'BatchMsg'; value: BatchMsgOutput } | { type: 'ResponseSuperseded'; value: ResponseSupersededOutput } | { type: 'EndOfStream'; value: EndOfStreamOutput } | { type: 'LabelNamesResponse'; value: LabelNamesResponseOutput } | { type: 'LabelValuesResponse'; value: LabelValuesResponseOutput } | { type: 'FleetStatusResponse'; value: FleetStatusResponseOutput } | { type: 'StreamError'; value: StreamErrorOutput };
+  msg: { type: 'QueryRequest'; value: QueryRequestOutput } | { type: 'LabelNamesRequest'; value: LabelNamesRequestOutput } | { type: 'LabelValuesRequest'; value: LabelValuesRequestOutput } | { type: 'FleetStatusRequest'; value: FleetStatusRequestOutput } | { type: 'SchemaMsg'; value: SchemaMsgOutput } | { type: 'BatchMsg'; value: BatchMsgOutput } | { type: 'ResponseSuperseded'; value: ResponseSupersededOutput } | { type: 'QueryStats'; value: QueryStatsOutput } | { type: 'EndOfStream'; value: EndOfStreamOutput } | { type: 'LabelNamesResponse'; value: LabelNamesResponseOutput } | { type: 'LabelValuesResponse'; value: LabelValuesResponseOutput } | { type: 'FleetStatusResponse'; value: FleetStatusResponseOutput } | { type: 'StreamError'; value: StreamErrorOutput };
 }
 
 export type QueryFrame = QueryFrameOutput;
@@ -81,6 +83,7 @@ export const enum QueryFrameMsgVariant {
   SchemaMsg = 'SchemaMsg',
   BatchMsg = 'BatchMsg',
   ResponseSuperseded = 'ResponseSuperseded',
+  QueryStats = 'QueryStats',
   EndOfStream = 'EndOfStream',
   LabelNamesResponse = 'LabelNamesResponse',
   LabelValuesResponse = 'LabelValuesResponse',
@@ -143,6 +146,13 @@ export class QueryFrameEncoder extends BitStreamEncoder {
     }
     else if (value.msg.type === 'ResponseSuperseded') {
       const encoder_value = new ResponseSupersededEncoder();
+      const encoded_value = encoder_value.encode(value.msg.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
+    }
+    else if (value.msg.type === 'QueryStats') {
+      const encoder_value = new QueryStatsEncoder();
       const encoded_value = encoder_value.encode(value.msg.value);
       for (const byte of encoded_value) {
         this.writeUint8(byte);
@@ -220,6 +230,10 @@ export class QueryFrameEncoder extends BitStreamEncoder {
     }
     else if (value.msg.type === 'ResponseSuperseded') {
       const _enc = new ResponseSupersededEncoder();
+      size += _enc.calculateSize(value.msg.value);
+    }
+    else if (value.msg.type === 'QueryStats') {
+      const _enc = new QueryStatsEncoder();
       size += _enc.calculateSize(value.msg.value);
     }
     else if (value.msg.type === 'EndOfStream') {
@@ -300,6 +314,12 @@ export class QueryFrameDecoder extends SeekableBitStreamDecoder {
       const decodedValue = decoder.decode();
       this.byteOffset += decoder.byteOffset;
       value.msg = { type: 'ResponseSuperseded', value: decodedValue };
+    }
+    else if (discriminator === 0x1E) {
+      const decoder = new QueryStatsDecoder(this.bytes.slice(this.byteOffset), value);
+      const decodedValue = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.msg = { type: 'QueryStats', value: decodedValue };
     }
     else if (discriminator === 0x1F) {
       const decoder = new EndOfStreamDecoder(this.bytes.slice(this.byteOffset), value);
@@ -1683,6 +1703,489 @@ export class ResponseSupersededDecoder extends SeekableBitStreamDecoder {
     value.superseded_attempt = this.readUint32("big_endian");
     value.next_attempt = this.readUint32("big_endian");
     value.reason = this.readUint8();
+    return value;
+  }
+}
+
+/**
+ * One ingester's contribution to a `live: true` logs query (D-054). A query is NOT scattered across query daemons — each daemon converges its own catalog and reads blocks itself — so this is the only server-side fan-out there is, and it exists only for the live merge.
+ */
+export interface LiveNodeTimingInput {
+  /**
+   * String kind: length_prefixed
+   * Encoding: ascii
+   * Length prefix type: uint16
+   */
+  addr: string;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  elapsed_us: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  rows: bigint;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  ok: number;
+}
+
+/**
+ * One ingester's contribution to a `live: true` logs query (D-054). A query is NOT scattered across query daemons — each daemon converges its own catalog and reads blocks itself — so this is the only server-side fan-out there is, and it exists only for the live merge.
+ */
+export interface LiveNodeTimingOutput {
+  /**
+   * String kind: length_prefixed
+   * Encoding: ascii
+   * Length prefix type: uint16
+   */
+  addr: string;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  elapsed_us: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  rows: bigint;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  ok: number;
+}
+
+export type LiveNodeTiming = LiveNodeTimingOutput;
+
+export class LiveNodeTimingEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("msb_first");
+  }
+
+  encode(value: LiveNodeTimingInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    const value_addr_bytes = Array.from(value.addr, c => c.charCodeAt(0));
+    this.writeUint16(value_addr_bytes.length, "big_endian");
+    for (const byte of value_addr_bytes) {
+      this.writeUint8(byte);
+    }
+    this.writeUint64(value.elapsed_us, "big_endian");
+    this.writeUint64(value.rows, "big_endian");
+    this.writeUint8(value.ok);
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a LiveNodeTiming value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: LiveNodeTiming): number {
+    let size = 0;
+    // addr: string (ascii)
+    size += value.addr.length;
+    size += 17; // elapsed_us + rows + ok
+    return size;
+  }
+}
+
+export class LiveNodeTimingDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "msb_first");
+  }
+
+  decode(): LiveNodeTimingOutput {
+    const value: any = {};
+
+    const addr_length = this.readUint16("big_endian");
+    const addr_bytes = this.readBytesSlice(addr_length);
+    value.addr = String.fromCharCode(...addr_bytes);
+    value.elapsed_us = this.readUint64("big_endian");
+    value.rows = this.readUint64("big_endian");
+    value.ok = this.readUint8();
+    return value;
+  }
+}
+
+/**
+ * Server → client. Non-terminal per-query timing breakdown, sent immediately before EndOfStream. Answers 'was that transfer, planning, or execution?' without reading the daemon's logs. All durations are MICROseconds (milliseconds would round an entire cache-hit path to 0) and are measured on the server that served this query. Sent unconditionally rather than behind an opt-in flag: it is ~120 bytes once per query, and an opt-in would make the numbers missing exactly when someone is chasing a slow query.
+ * Deliberately its OWN frame rather than extra fields on EndOfStream: the terminator is written through the result cache's tee and is therefore part of the cached entry, so timings living inside it would replay the original miss's breakdown on every subsequent 2 ms cache hit — stale precisely when it matters. QueryStats is written outside the tee and is always fresh; on a cache hit it reports the hit's own (small) numbers with cache_hit = 1.
+ * NOTHING IS SMEARED: server_total_us is measured independently of the phases, so a client should render `server_total_us - Σ(phases)` as an explicit 'other' bucket rather than distributing it. The df_* fields are DataFusion's own leaf metrics summed ACROSS PARTITIONS and can legitimately exceed the wall-clock phase that contains them — they are a labelled detail group, never timeline slices. A phase that did not run is 0 (e.g. live_fetch_us on a non-live query, plan_us on a cache hit).
+ */
+export interface QueryStatsInput {
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  server_total_us: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  admission_wait_us: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  catalog_us: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  cache_lookup_us: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  live_fetch_us: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  register_us: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  plan_us: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  execute_us: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  serialize_us: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  write_us: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  postings_fetch_us: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  bloom_fetch_us: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  df_opening_us: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  df_scanning_us: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  df_compute_us: bigint;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  cache_hit: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  attempts: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  blocks_considered: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  blocks_scanned: number;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  bytes_scanned: bigint;
+  /**
+   * String kind: length_prefixed
+   * Encoding: ascii
+   * Length prefix type: uint16
+   */
+  node_id: string;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint16
+   */
+  live_nodes: LiveNodeTimingInput[];
+}
+
+/**
+ * Server → client. Non-terminal per-query timing breakdown, sent immediately before EndOfStream. Answers 'was that transfer, planning, or execution?' without reading the daemon's logs. All durations are MICROseconds (milliseconds would round an entire cache-hit path to 0) and are measured on the server that served this query. Sent unconditionally rather than behind an opt-in flag: it is ~120 bytes once per query, and an opt-in would make the numbers missing exactly when someone is chasing a slow query.
+ * Deliberately its OWN frame rather than extra fields on EndOfStream: the terminator is written through the result cache's tee and is therefore part of the cached entry, so timings living inside it would replay the original miss's breakdown on every subsequent 2 ms cache hit — stale precisely when it matters. QueryStats is written outside the tee and is always fresh; on a cache hit it reports the hit's own (small) numbers with cache_hit = 1.
+ * NOTHING IS SMEARED: server_total_us is measured independently of the phases, so a client should render `server_total_us - Σ(phases)` as an explicit 'other' bucket rather than distributing it. The df_* fields are DataFusion's own leaf metrics summed ACROSS PARTITIONS and can legitimately exceed the wall-clock phase that contains them — they are a labelled detail group, never timeline slices. A phase that did not run is 0 (e.g. live_fetch_us on a non-live query, plan_us on a cache hit).
+ */
+export interface QueryStatsOutput {
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  tag: number;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  server_total_us: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  admission_wait_us: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  catalog_us: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  cache_lookup_us: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  live_fetch_us: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  register_us: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  plan_us: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  execute_us: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  serialize_us: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  write_us: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  postings_fetch_us: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  bloom_fetch_us: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  df_opening_us: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  df_scanning_us: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  df_compute_us: bigint;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  cache_hit: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  attempts: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  blocks_considered: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  blocks_scanned: number;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  bytes_scanned: bigint;
+  /**
+   * String kind: length_prefixed
+   * Encoding: ascii
+   * Length prefix type: uint16
+   */
+  node_id: string;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint16
+   */
+  live_nodes: LiveNodeTimingOutput[];
+}
+
+export type QueryStats = QueryStatsOutput;
+
+export class QueryStatsEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("msb_first");
+  }
+
+  encode(value: QueryStatsInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint8(30);
+    this.writeUint64(value.server_total_us, "big_endian");
+    this.writeUint64(value.admission_wait_us, "big_endian");
+    this.writeUint64(value.catalog_us, "big_endian");
+    this.writeUint64(value.cache_lookup_us, "big_endian");
+    this.writeUint64(value.live_fetch_us, "big_endian");
+    this.writeUint64(value.register_us, "big_endian");
+    this.writeUint64(value.plan_us, "big_endian");
+    this.writeUint64(value.execute_us, "big_endian");
+    this.writeUint64(value.serialize_us, "big_endian");
+    this.writeUint64(value.write_us, "big_endian");
+    this.writeUint64(value.postings_fetch_us, "big_endian");
+    this.writeUint64(value.bloom_fetch_us, "big_endian");
+    this.writeUint64(value.df_opening_us, "big_endian");
+    this.writeUint64(value.df_scanning_us, "big_endian");
+    this.writeUint64(value.df_compute_us, "big_endian");
+    this.writeUint8(value.cache_hit);
+    this.writeUint32(value.attempts, "big_endian");
+    this.writeUint32(value.blocks_considered, "big_endian");
+    this.writeUint32(value.blocks_scanned, "big_endian");
+    this.writeUint64(value.bytes_scanned, "big_endian");
+    const value_node_id_bytes = Array.from(value.node_id, c => c.charCodeAt(0));
+    this.writeUint16(value_node_id_bytes.length, "big_endian");
+    for (const byte of value_node_id_bytes) {
+      this.writeUint8(byte);
+    }
+    this.writeUint16(value.live_nodes.length, "big_endian");
+    for (let value_live_nodes__iter_index = 0; value_live_nodes__iter_index < value.live_nodes.length; value_live_nodes__iter_index++) {
+      const value_live_nodes__iter = value.live_nodes[value_live_nodes__iter_index];
+      const encoder_value_live_nodes__iter = new LiveNodeTimingEncoder();
+      const encoded_value_live_nodes__iter = encoder_value_live_nodes__iter.encode(value_live_nodes__iter);
+      for (const byte of encoded_value_live_nodes__iter) {
+        this.writeUint8(byte);
+      }
+    }
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a QueryStats value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: QueryStats): number {
+    let size = 0;
+    size += 142; // tag (const) + server_total_us + admission_wait_us + catalog_us + cache_lookup_us + live_fetch_us + register_us + plan_us + execute_us + serialize_us + write_us + postings_fetch_us + bloom_fetch_us + df_opening_us + df_scanning_us + df_compute_us + cache_hit + attempts + blocks_considered + blocks_scanned + bytes_scanned
+    // node_id: string (ascii)
+    size += value.node_id.length;
+    // live_nodes: array (kind: length_prefixed)
+    for (const item of value.live_nodes) {
+      const live_nodes_itemEncoder = new LiveNodeTimingEncoder();
+      size += live_nodes_itemEncoder.calculateSize(item);
+    }
+    size += 2; // length prefix (uint16)
+    return size;
+  }
+}
+
+export class QueryStatsDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "msb_first");
+  }
+
+  decode(): QueryStatsOutput {
+    const value: any = {};
+
+    value.tag = this.readUint8();
+    value.server_total_us = this.readUint64("big_endian");
+    value.admission_wait_us = this.readUint64("big_endian");
+    value.catalog_us = this.readUint64("big_endian");
+    value.cache_lookup_us = this.readUint64("big_endian");
+    value.live_fetch_us = this.readUint64("big_endian");
+    value.register_us = this.readUint64("big_endian");
+    value.plan_us = this.readUint64("big_endian");
+    value.execute_us = this.readUint64("big_endian");
+    value.serialize_us = this.readUint64("big_endian");
+    value.write_us = this.readUint64("big_endian");
+    value.postings_fetch_us = this.readUint64("big_endian");
+    value.bloom_fetch_us = this.readUint64("big_endian");
+    value.df_opening_us = this.readUint64("big_endian");
+    value.df_scanning_us = this.readUint64("big_endian");
+    value.df_compute_us = this.readUint64("big_endian");
+    value.cache_hit = this.readUint8();
+    value.attempts = this.readUint32("big_endian");
+    value.blocks_considered = this.readUint32("big_endian");
+    value.blocks_scanned = this.readUint32("big_endian");
+    value.bytes_scanned = this.readUint64("big_endian");
+    const node_id_length = this.readUint16("big_endian");
+    const node_id_bytes = this.readBytesSlice(node_id_length);
+    value.node_id = String.fromCharCode(...node_id_bytes);
+    value.live_nodes = [];
+    const live_nodes_length = this.readUint16("big_endian");
+    for (let i = 0; i < live_nodes_length; i++) {
+      let live_nodes__iter: any;
+      live_nodes__iter = {};
+      const live_nodes__iter_addr_length = this.readUint16("big_endian");
+      const live_nodes__iter_addr_bytes = this.readBytesSlice(live_nodes__iter_addr_length);
+      live_nodes__iter.addr = String.fromCharCode(...live_nodes__iter_addr_bytes);
+      live_nodes__iter.elapsed_us = this.readUint64("big_endian");
+      live_nodes__iter.rows = this.readUint64("big_endian");
+      live_nodes__iter.ok = this.readUint8();
+      value.live_nodes.push(live_nodes__iter);
+    }
     return value;
   }
 }

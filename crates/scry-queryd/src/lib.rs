@@ -757,10 +757,25 @@ pub async fn run(args: Args) -> Result<()> {
         let cat = conv_catalog.clone();
         let interval = Duration::from_secs(args.full_walk_interval.max(1));
         bg_tasks.push(tokio::spawn(async move {
-            let mut tick = tokio::time::interval(interval);
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                tick.tick().await;
+                // Walk first, then sleep — so the gap is measured from the end
+                // of a walk, not on a fixed schedule (D-066).
+                //
+                // A fixed-rate `tokio::time::interval` is what let gothab walk
+                // its bucket continuously for five days: a pass took 15-20
+                // hours against a 30-minute period, so the next tick was always
+                // already due and the walk restarted the instant it finished.
+                // Measuring from completion means an overrunning walk idles
+                // afterwards instead.
+                //
+                // The *first* pass still runs immediately, and that is
+                // deliberate. On a snapshot-restored boot (D-055) the boot seed
+                // walk is skipped, and a restored catalog carries no poll
+                // cursors — so this walk is the only thing that seeds them.
+                // Without it `poll_once` has no prefixes to poll and the
+                // incremental path is blind until the first full interval
+                // elapses. It is cheap now: a converged walk costs a LIST and
+                // no GETs.
                 match full_walk(store.as_ref(), cat.as_ref(), &bucket).await {
                     Ok(r) if r.inserted > 0 => info!(
                         inserted = r.inserted,
@@ -776,6 +791,7 @@ pub async fn run(args: Args) -> Result<()> {
                     "full-walk",
                 )
                 .await;
+                tokio::time::sleep(interval).await;
             }
         }));
     }

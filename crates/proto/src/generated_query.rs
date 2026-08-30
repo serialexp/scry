@@ -16,6 +16,7 @@ pub enum QueryFrameMsg {
     SchemaMsg(SchemaMsgOutput),
     BatchMsg(BatchMsgOutput),
     ResponseSuperseded(ResponseSupersededOutput),
+    QueryStats(QueryStatsOutput),
     EndOfStream(EndOfStreamOutput),
     LabelNamesResponse(LabelNamesResponseOutput),
     LabelValuesResponse(LabelValuesResponseOutput),
@@ -113,6 +114,38 @@ impl QueryFrameMsg {
                 encoder.write_uint32(v.next_attempt, Endianness::BigEndian);
                 encoder.write_uint8(v.reason);
             }
+            QueryFrameMsg::QueryStats(v) => {
+                encoder.write_uint8(30);
+                encoder.write_uint64(v.server_total_us, Endianness::BigEndian);
+                encoder.write_uint64(v.admission_wait_us, Endianness::BigEndian);
+                encoder.write_uint64(v.catalog_us, Endianness::BigEndian);
+                encoder.write_uint64(v.cache_lookup_us, Endianness::BigEndian);
+                encoder.write_uint64(v.live_fetch_us, Endianness::BigEndian);
+                encoder.write_uint64(v.register_us, Endianness::BigEndian);
+                encoder.write_uint64(v.plan_us, Endianness::BigEndian);
+                encoder.write_uint64(v.execute_us, Endianness::BigEndian);
+                encoder.write_uint64(v.serialize_us, Endianness::BigEndian);
+                encoder.write_uint64(v.write_us, Endianness::BigEndian);
+                encoder.write_uint64(v.postings_fetch_us, Endianness::BigEndian);
+                encoder.write_uint64(v.bloom_fetch_us, Endianness::BigEndian);
+                encoder.write_uint64(v.df_opening_us, Endianness::BigEndian);
+                encoder.write_uint64(v.df_scanning_us, Endianness::BigEndian);
+                encoder.write_uint64(v.df_compute_us, Endianness::BigEndian);
+                encoder.write_uint8(v.cache_hit);
+                encoder.write_uint32(v.attempts, Endianness::BigEndian);
+                encoder.write_uint32(v.blocks_considered, Endianness::BigEndian);
+                encoder.write_uint32(v.blocks_scanned, Endianness::BigEndian);
+                encoder.write_uint64(v.bytes_scanned, Endianness::BigEndian);
+                encoder.write_uint16(v.node_id.chars().count() as u16, Endianness::BigEndian);
+                let string_bytes: Vec<u8> = v.node_id.chars().map(|c| c as u8).collect();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.live_nodes.len() as u16, Endianness::BigEndian);
+                for item in &v.live_nodes {
+                    item.encode_into(encoder)?;
+                }
+            }
             QueryFrameMsg::EndOfStream(v) => {
                 encoder.write_uint8(31);
                 encoder.write_uint64(v.total_rows, Endianness::BigEndian);
@@ -169,6 +202,7 @@ impl QueryFrameMsg {
             QueryFrameMsg::SchemaMsg(_) => "SchemaMsg",
             QueryFrameMsg::BatchMsg(_) => "BatchMsg",
             QueryFrameMsg::ResponseSuperseded(_) => "ResponseSuperseded",
+            QueryFrameMsg::QueryStats(_) => "QueryStats",
             QueryFrameMsg::EndOfStream(_) => "EndOfStream",
             QueryFrameMsg::LabelNamesResponse(_) => "LabelNamesResponse",
             QueryFrameMsg::LabelValuesResponse(_) => "LabelValuesResponse",
@@ -211,6 +245,10 @@ impl QueryFrameMsg {
         decoder.seek(start_pos)?;
         if let Ok(v) = ResponseSupersededOutput::decode_with_decoder(decoder) {
             return Ok(QueryFrameMsg::ResponseSuperseded(v));
+        }
+        decoder.seek(start_pos)?;
+        if let Ok(v) = QueryStatsOutput::decode_with_decoder(decoder) {
+            return Ok(QueryFrameMsg::QueryStats(v));
         }
         decoder.seek(start_pos)?;
         if let Ok(v) = EndOfStreamOutput::decode_with_decoder(decoder) {
@@ -1278,6 +1316,285 @@ impl From<ResponseSupersededInput> for ResponseSupersededOutput {
             superseded_attempt: i.superseded_attempt,
             next_attempt: i.next_attempt,
             reason: i.reason,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiveNodeTiming {
+    pub addr: std::string::String,
+    pub elapsed_us: u64,
+    pub rows: u64,
+    pub ok: u8,
+}
+
+impl LiveNodeTiming {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u16_be(self.addr.chars().count() as u16);
+        let string_bytes: Vec<u8> = self.addr.chars().map(|c| c as u8).collect();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u64_be(self.elapsed_us);
+        encoder.write_u64_be(self.rows);
+        encoder.write_byte(self.ok);
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let length = decoder.read_u16_be()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let addr: std::string::String = bytes.iter().map(|&b| b as char).collect();
+        let elapsed_us = decoder.read_u64_be()?;
+        let rows = decoder.read_u64_be()?;
+        let ok = decoder.read_byte()?;
+        Ok(Self {
+            addr,
+            elapsed_us,
+            rows,
+            ok,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueryStatsInput {
+    pub server_total_us: u64,
+    pub admission_wait_us: u64,
+    pub catalog_us: u64,
+    pub cache_lookup_us: u64,
+    pub live_fetch_us: u64,
+    pub register_us: u64,
+    pub plan_us: u64,
+    pub execute_us: u64,
+    pub serialize_us: u64,
+    pub write_us: u64,
+    pub postings_fetch_us: u64,
+    pub bloom_fetch_us: u64,
+    pub df_opening_us: u64,
+    pub df_scanning_us: u64,
+    pub df_compute_us: u64,
+    pub cache_hit: u8,
+    pub attempts: u32,
+    pub blocks_considered: u32,
+    pub blocks_scanned: u32,
+    pub bytes_scanned: u64,
+    pub node_id: std::string::String,
+    pub live_nodes: Vec<LiveNodeTiming>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueryStatsOutput {
+    pub tag: u8,
+    pub server_total_us: u64,
+    pub admission_wait_us: u64,
+    pub catalog_us: u64,
+    pub cache_lookup_us: u64,
+    pub live_fetch_us: u64,
+    pub register_us: u64,
+    pub plan_us: u64,
+    pub execute_us: u64,
+    pub serialize_us: u64,
+    pub write_us: u64,
+    pub postings_fetch_us: u64,
+    pub bloom_fetch_us: u64,
+    pub df_opening_us: u64,
+    pub df_scanning_us: u64,
+    pub df_compute_us: u64,
+    pub cache_hit: u8,
+    pub attempts: u32,
+    pub blocks_considered: u32,
+    pub blocks_scanned: u32,
+    pub bytes_scanned: u64,
+    pub node_id: std::string::String,
+    pub live_nodes: Vec<LiveNodeTiming>,
+}
+
+pub type QueryStats = QueryStatsOutput;
+
+impl QueryStatsInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(30);
+        encoder.write_u64_be(self.server_total_us);
+        encoder.write_u64_be(self.admission_wait_us);
+        encoder.write_u64_be(self.catalog_us);
+        encoder.write_u64_be(self.cache_lookup_us);
+        encoder.write_u64_be(self.live_fetch_us);
+        encoder.write_u64_be(self.register_us);
+        encoder.write_u64_be(self.plan_us);
+        encoder.write_u64_be(self.execute_us);
+        encoder.write_u64_be(self.serialize_us);
+        encoder.write_u64_be(self.write_us);
+        encoder.write_u64_be(self.postings_fetch_us);
+        encoder.write_u64_be(self.bloom_fetch_us);
+        encoder.write_u64_be(self.df_opening_us);
+        encoder.write_u64_be(self.df_scanning_us);
+        encoder.write_u64_be(self.df_compute_us);
+        encoder.write_byte(self.cache_hit);
+        encoder.write_u32_be(self.attempts);
+        encoder.write_u32_be(self.blocks_considered);
+        encoder.write_u32_be(self.blocks_scanned);
+        encoder.write_u64_be(self.bytes_scanned);
+        encoder.write_u16_be(self.node_id.chars().count() as u16);
+        let string_bytes: Vec<u8> = self.node_id.chars().map(|c| c as u8).collect();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_be(self.live_nodes.len() as u16);
+        for item in &self.live_nodes {
+            item.encode_into(encoder)?;
+        }
+        Ok(())
+    }
+
+}
+
+impl QueryStatsOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let tag = decoder.read_byte()?;
+        if tag != 30u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 30, got {}", tag)));
+        }
+        let server_total_us = decoder.read_u64_be()?;
+        let admission_wait_us = decoder.read_u64_be()?;
+        let catalog_us = decoder.read_u64_be()?;
+        let cache_lookup_us = decoder.read_u64_be()?;
+        let live_fetch_us = decoder.read_u64_be()?;
+        let register_us = decoder.read_u64_be()?;
+        let plan_us = decoder.read_u64_be()?;
+        let execute_us = decoder.read_u64_be()?;
+        let serialize_us = decoder.read_u64_be()?;
+        let write_us = decoder.read_u64_be()?;
+        let postings_fetch_us = decoder.read_u64_be()?;
+        let bloom_fetch_us = decoder.read_u64_be()?;
+        let df_opening_us = decoder.read_u64_be()?;
+        let df_scanning_us = decoder.read_u64_be()?;
+        let df_compute_us = decoder.read_u64_be()?;
+        let cache_hit = decoder.read_byte()?;
+        let attempts = decoder.read_u32_be()?;
+        let blocks_considered = decoder.read_u32_be()?;
+        let blocks_scanned = decoder.read_u32_be()?;
+        let bytes_scanned = decoder.read_u64_be()?;
+        let length = decoder.read_u16_be()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let node_id: std::string::String = bytes.iter().map(|&b| b as char).collect();
+        let length = decoder.read_u16_be()? as usize;
+        let mut live_nodes = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = LiveNodeTiming::decode_with_decoder(decoder)?;
+            live_nodes.push(item);
+        }
+        Ok(Self {
+            tag,
+            server_total_us,
+            admission_wait_us,
+            catalog_us,
+            cache_lookup_us,
+            live_fetch_us,
+            register_us,
+            plan_us,
+            execute_us,
+            serialize_us,
+            write_us,
+            postings_fetch_us,
+            bloom_fetch_us,
+            df_opening_us,
+            df_scanning_us,
+            df_compute_us,
+            cache_hit,
+            attempts,
+            blocks_considered,
+            blocks_scanned,
+            bytes_scanned,
+            node_id,
+            live_nodes,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        QueryStatsInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        QueryStatsInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<QueryStatsOutput> for QueryStatsInput {
+    fn from(o: QueryStatsOutput) -> Self {
+        Self {
+            server_total_us: o.server_total_us,
+            admission_wait_us: o.admission_wait_us,
+            catalog_us: o.catalog_us,
+            cache_lookup_us: o.cache_lookup_us,
+            live_fetch_us: o.live_fetch_us,
+            register_us: o.register_us,
+            plan_us: o.plan_us,
+            execute_us: o.execute_us,
+            serialize_us: o.serialize_us,
+            write_us: o.write_us,
+            postings_fetch_us: o.postings_fetch_us,
+            bloom_fetch_us: o.bloom_fetch_us,
+            df_opening_us: o.df_opening_us,
+            df_scanning_us: o.df_scanning_us,
+            df_compute_us: o.df_compute_us,
+            cache_hit: o.cache_hit,
+            attempts: o.attempts,
+            blocks_considered: o.blocks_considered,
+            blocks_scanned: o.blocks_scanned,
+            bytes_scanned: o.bytes_scanned,
+            node_id: o.node_id,
+            live_nodes: o.live_nodes,
+        }
+    }
+}
+
+impl From<QueryStatsInput> for QueryStatsOutput {
+    fn from(i: QueryStatsInput) -> Self {
+        Self {
+            tag: 30u8,
+            server_total_us: i.server_total_us,
+            admission_wait_us: i.admission_wait_us,
+            catalog_us: i.catalog_us,
+            cache_lookup_us: i.cache_lookup_us,
+            live_fetch_us: i.live_fetch_us,
+            register_us: i.register_us,
+            plan_us: i.plan_us,
+            execute_us: i.execute_us,
+            serialize_us: i.serialize_us,
+            write_us: i.write_us,
+            postings_fetch_us: i.postings_fetch_us,
+            bloom_fetch_us: i.bloom_fetch_us,
+            df_opening_us: i.df_opening_us,
+            df_scanning_us: i.df_scanning_us,
+            df_compute_us: i.df_compute_us,
+            cache_hit: i.cache_hit,
+            attempts: i.attempts,
+            blocks_considered: i.blocks_considered,
+            blocks_scanned: i.blocks_scanned,
+            bytes_scanned: i.bytes_scanned,
+            node_id: i.node_id,
+            live_nodes: i.live_nodes,
         }
     }
 }

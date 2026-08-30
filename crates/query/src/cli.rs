@@ -625,6 +625,12 @@ async fn run_remote(
         .or_else(|| addr.strip_prefix("https://"))
         .unwrap_or(addr);
 
+    // Client-observed wall clock, started before the connect. The server
+    // reports its own total separately, so `wall - server_total` is the
+    // connect + transport + local-decode cost — the part of a slow query that
+    // no amount of server-side instrumentation can see.
+    let wall_start = std::time::Instant::now();
+
     let sock = TcpStream::connect(host_port)
         .await
         .with_context(|| format!("connecting to {host_port}"))?;
@@ -662,6 +668,7 @@ async fn run_remote(
     let mut total_rows: usize = 0;
     let mut active_attempt: u32 = 0;
     let mut awaiting_schema = true;
+    let mut timing: Option<scry_proto::QueryStatsOutput> = None;
 
     let server_total_rows: u64 = loop {
         let frame: QueryFrame = read_frame(&mut r).await.context("reading response frame")?;
@@ -710,6 +717,16 @@ async fn run_remote(
                 decoder = StreamDecoder::new();
                 total_rows = 0;
                 awaiting_schema = true;
+                // A superseded attempt's timings describe work whose results
+                // we just threw away. Drop them with the rows, or we would
+                // report the discarded attempt's breakdown for the one that
+                // actually answered.
+                timing = None;
+            }
+            QueryFrameMsg::QueryStats(s) => {
+                // Non-terminal, and always the *last* stats frame wins: a
+                // restarted attempt re-sends its own.
+                timing = Some(s);
             }
             QueryFrameMsg::EndOfStream(end) => {
                 if awaiting_schema {
@@ -748,7 +765,102 @@ async fn run_remote(
         "remote query row-count mismatch: decoded {total_rows}, server reported {server_total_rows}"
     );
     eprintln!("# scan: {server_total_rows} {signal_name} rows total (via remote {host_port})");
+    if let Some(stats) = timing {
+        print_remote_timing(&stats, wall_start.elapsed());
+    }
     Ok(())
+}
+
+/// Microseconds → a `123.4ms` string. The wire carries microseconds because
+/// milliseconds round an entire cache-hit path to zero; we print milliseconds
+/// because that is the unit the slow queries live in.
+fn ms(us: u64) -> String {
+    format!("{:.1}ms", us as f64 / 1000.0)
+}
+
+/// Print the server's per-phase breakdown as `# timing:` lines on stderr,
+/// beside the existing `# scan:` / `# pool:` trailers.
+///
+/// Three deliberate properties:
+///
+/// * **Nothing is smeared.** `server_total_us` is measured independently of
+///   the phases, so whatever the named phases don't account for is printed as
+///   an explicit `other` term rather than distributed across them. If `other`
+///   is large, that is a finding — most likely connection setup and the
+///   request read, which happen before the server starts its timer.
+/// * **The transport hop is visible.** `wall` is measured on this side around
+///   the connect, so `wall − server` is the network + local Arrow decode. That
+///   is the half of "why was that 9 seconds?" the daemon cannot answer.
+/// * **DataFusion's own numbers are a separate line, never a timeline.** They
+///   are summed across partitions and can legitimately exceed the wall-clock
+///   phase that contains them, so showing them as slices would be a lie.
+fn print_remote_timing(s: &scry_proto::QueryStatsOutput, wall: std::time::Duration) {
+    let phases = [
+        ("admission", s.admission_wait_us),
+        ("catalog", s.catalog_us),
+        ("cache-lookup", s.cache_lookup_us),
+        ("live-fetch", s.live_fetch_us),
+        ("register", s.register_us),
+        ("plan", s.plan_us),
+        ("execute", s.execute_us),
+        ("serialize", s.serialize_us),
+        ("write", s.write_us),
+    ];
+    let named: u64 = phases.iter().map(|(_, us)| *us).sum();
+    // Saturating: the phases are timed independently of the total, and a
+    // scheduling hiccup between the two could in principle make them sum to
+    // slightly more. Report 0 rather than underflow-panicking in a release
+    // build's debug twin.
+    let other = s.server_total_us.saturating_sub(named);
+
+    let breakdown = phases
+        .iter()
+        .filter(|(_, us)| *us > 0)
+        .map(|(name, us)| format!("{name} {}", ms(*us)))
+        .chain(std::iter::once(format!("other {}", ms(other))))
+        .collect::<Vec<_>>()
+        .join(" + ");
+
+    let wall_us = wall.as_micros().min(u64::MAX as u128) as u64;
+    eprintln!(
+        "# timing: wall {} = server {} + transport {}",
+        ms(wall_us),
+        ms(s.server_total_us),
+        ms(wall_us.saturating_sub(s.server_total_us)),
+    );
+    eprintln!("# timing: server {} = {breakdown}", ms(s.server_total_us));
+    eprintln!(
+        "# timing: sidecars: postings {} bloom {} | datafusion (summed over partitions, not a \
+         timeline): opening {} scanning {} compute {}",
+        ms(s.postings_fetch_us),
+        ms(s.bloom_fetch_us),
+        ms(s.df_opening_us),
+        ms(s.df_scanning_us),
+        ms(s.df_compute_us),
+    );
+    eprintln!(
+        "# timing: blocks {} considered / {} scanned | {} bytes | result cache {} | attempt {} | \
+         node {}",
+        s.blocks_considered,
+        s.blocks_scanned,
+        s.bytes_scanned,
+        if s.cache_hit == 1 { "hit" } else { "miss" },
+        s.attempts,
+        if s.node_id.is_empty() {
+            "-"
+        } else {
+            &s.node_id
+        },
+    );
+    for n in &s.live_nodes {
+        eprintln!(
+            "# timing: live node {} {} {} rows {}",
+            n.addr,
+            ms(n.elapsed_us),
+            n.rows,
+            if n.ok == 1 { "ok" } else { "FAILED" },
+        );
+    }
 }
 
 /// Walk the physical plan, finding the deepest node that exposes

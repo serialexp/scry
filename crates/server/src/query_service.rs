@@ -560,6 +560,7 @@ impl QueryService {
                     QueryFrameMsg::SchemaMsg(_) => "SchemaMsg",
                     QueryFrameMsg::BatchMsg(_) => "BatchMsg",
                     QueryFrameMsg::ResponseSuperseded(_) => "ResponseSuperseded",
+                    QueryFrameMsg::QueryStats(_) => "QueryStats",
                     QueryFrameMsg::EndOfStream(_) => "EndOfStream",
                     QueryFrameMsg::LabelNamesResponse(_) => "LabelNamesResponse",
                     QueryFrameMsg::LabelValuesResponse(_) => "LabelValuesResponse",

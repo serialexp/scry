@@ -318,6 +318,152 @@ mod tests {
         }
     }
 
+    /// A `QueryStats` frame carries every phase plus the live fan-out list, and
+    /// sits *before* `EndOfStream` without disturbing it — a client's
+    /// "read until terminator" loop must still see exactly one terminator, and
+    /// must see it last.
+    #[tokio::test]
+    async fn query_stats_frame_round_trips_ahead_of_the_terminator() {
+        let stats = crate::QueryStatsInput {
+            server_total_us: 9_868_300,
+            admission_wait_us: 5_600_000,
+            catalog_us: 1_200,
+            cache_lookup_us: 40,
+            live_fetch_us: 0,
+            register_us: 250_000,
+            plan_us: 3_100,
+            execute_us: 3_900_000,
+            serialize_us: 12_000,
+            write_us: 800,
+            postings_fetch_us: 210_000,
+            bloom_fetch_us: 0,
+            // Summed across DataFusion partitions, so this legitimately exceeds
+            // `execute_us`. It is a detail metric, never a timeline slice.
+            df_opening_us: 5_500_000,
+            df_scanning_us: 7_100_000,
+            df_compute_us: 900_000,
+            cache_hit: 0,
+            attempts: 1,
+            blocks_considered: 27,
+            blocks_scanned: 27,
+            bytes_scanned: 680_000,
+            node_id: "queryd-0".into(),
+            live_nodes: vec![
+                crate::LiveNodeTiming {
+                    addr: "10.0.0.1:4000".into(),
+                    elapsed_us: 4_200,
+                    rows: 13,
+                    ok: 1,
+                },
+                crate::LiveNodeTiming {
+                    addr: "10.0.0.2:4000".into(),
+                    elapsed_us: 1_000_000,
+                    rows: 0,
+                    ok: 0,
+                },
+            ],
+        };
+
+        let mut buf = Vec::new();
+        write_frame(
+            &mut buf,
+            &QueryFrame {
+                msg: QueryFrameMsg::QueryStats(stats.clone().into()),
+            },
+        )
+        .await
+        .unwrap();
+        // Tag byte lives right after the u32 length prefix.
+        assert_eq!(buf[4], 0x1E);
+
+        write_frame(
+            &mut buf,
+            &QueryFrame {
+                msg: QueryFrameMsg::EndOfStream(crate::EndOfStreamInput { total_rows: 13 }.into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut cursor = std::io::Cursor::new(buf);
+        match read_frame::<QueryFrame, _>(&mut cursor).await.unwrap().msg {
+            QueryFrameMsg::QueryStats(s) => {
+                assert_eq!(s.server_total_us, 9_868_300);
+                assert_eq!(s.admission_wait_us, 5_600_000);
+                assert_eq!(s.execute_us, 3_900_000);
+                assert_eq!(s.postings_fetch_us, 210_000);
+                assert_eq!(s.df_scanning_us, 7_100_000);
+                assert_eq!(s.cache_hit, 0);
+                assert_eq!(s.blocks_considered, 27);
+                assert_eq!(s.bytes_scanned, 680_000);
+                assert_eq!(s.node_id, "queryd-0");
+                assert_eq!(s.live_nodes.len(), 2);
+                assert_eq!(s.live_nodes[0].addr, "10.0.0.1:4000");
+                assert_eq!(s.live_nodes[0].rows, 13);
+                assert_eq!(s.live_nodes[1].ok, 0);
+            }
+            other => panic!("expected QueryStats, got {other:?}"),
+        }
+        match read_frame::<QueryFrame, _>(&mut cursor).await.unwrap().msg {
+            QueryFrameMsg::EndOfStream(eos) => assert_eq!(eos.total_rows, 13),
+            other => panic!("expected EndOfStream after QueryStats, got {other:?}"),
+        }
+    }
+
+    /// An empty `live_nodes` array is the common case (a non-live query) and
+    /// must not be confused with the frame ending early.
+    #[tokio::test]
+    async fn query_stats_frame_round_trips_with_no_live_nodes() {
+        let stats = crate::QueryStatsInput {
+            server_total_us: 2_100,
+            admission_wait_us: 30,
+            catalog_us: 900,
+            cache_lookup_us: 60,
+            live_fetch_us: 0,
+            register_us: 0,
+            plan_us: 0,
+            execute_us: 0,
+            serialize_us: 0,
+            write_us: 1_000,
+            postings_fetch_us: 0,
+            bloom_fetch_us: 0,
+            df_opening_us: 0,
+            df_scanning_us: 0,
+            df_compute_us: 0,
+            // A cache hit: it reports its own small numbers, not the
+            // originating miss's — which is the whole reason this is a
+            // separate frame rather than fields on the cached terminator.
+            cache_hit: 1,
+            attempts: 1,
+            blocks_considered: 0,
+            blocks_scanned: 0,
+            bytes_scanned: 0,
+            node_id: String::new(),
+            live_nodes: Vec::new(),
+        };
+
+        let mut buf = Vec::new();
+        write_frame(
+            &mut buf,
+            &QueryFrame {
+                msg: QueryFrameMsg::QueryStats(stats.into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut cursor = std::io::Cursor::new(buf);
+        match read_frame::<QueryFrame, _>(&mut cursor).await.unwrap().msg {
+            QueryFrameMsg::QueryStats(s) => {
+                assert_eq!(s.cache_hit, 1);
+                assert_eq!(s.server_total_us, 2_100);
+                assert!(s.live_nodes.is_empty());
+                assert_eq!(s.node_id, "");
+            }
+            other => panic!("expected QueryStats, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn query_fleet_status_frames_round_trip() {
         let request = QueryFrame {

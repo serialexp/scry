@@ -885,11 +885,26 @@ if [[ "${QCACHE:-1}" == "1" ]] \
         # The volume histogram query: buckets × severity counts over the range.
         VOL_SQL="SELECT date_bin(INTERVAL '1 hour', to_timestamp_nanos(ts_unix_nano)) AS bucket, severity, count(*) AS n FROM logs GROUP BY bucket, severity ORDER BY bucket"
 
+        # Both runs pass an explicit --ts-min, and that is the whole point of
+        # this leg: the cache is keyed on the *effective* query, so two runs
+        # only share a key if they ask the same question.
+        #
+        # When this leg was written a bounds-less query meant "all time", which
+        # is stable across runs. D-059 then made a bounds-less query mean "the
+        # last hour, from now" (apply_default_window), so back-to-back runs
+        # became genuinely different queries — different ts_min, different key,
+        # two honest misses. That is the cache behaving correctly; it was this
+        # assertion that had gone stale, and it sat red from 2026-08-21 until
+        # someone read the two ts_min values in the log.
+        #
+        # `--ts-min 1` is one nanosecond after the epoch, so it re-establishes
+        # the original "everything" range without re-introducing a `now` the
+        # key would change with.
         vol1=$(./target/release/scry-query-probe \
-            --addr "$QUERYD_LISTEN" --signal logs \
+            --addr "$QUERYD_LISTEN" --signal logs --ts-min 1 \
             --sql "$VOL_SQL" --request-id smoke-vol-1 2>"$SMOKE_DIR/probe1.err" || true)
         vol2=$(./target/release/scry-query-probe \
-            --addr "$QUERYD_LISTEN" --signal logs \
+            --addr "$QUERYD_LISTEN" --signal logs --ts-min 1 \
             --sql "$VOL_SQL" --request-id smoke-vol-2 2>"$SMOKE_DIR/probe2.err" || true)
 
         echo "[smoke] volume query rows  : run1=${vol1:-<none>} run2=${vol2:-<none>} (bucket×severity groups)"

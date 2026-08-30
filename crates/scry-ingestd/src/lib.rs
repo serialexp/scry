@@ -797,10 +797,14 @@ pub async fn run(args: Args) -> Result<()> {
             let interval = Duration::from_secs(args.full_walk_interval.max(1));
             let reap_grace = Duration::from_secs(args.compact_grace.unwrap_or(600));
             bg_tasks.push(tokio::spawn(async move {
-                let mut tick = tokio::time::interval(interval);
-                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
-                    tick.tick().await;
+                    // Walk first, then sleep: the gap is measured from the end
+                    // of a walk, not on a fixed schedule (D-066) — see the
+                    // matching loop in scry-queryd for the full reasoning.
+                    // Short version: a fixed rate turns any walk that overruns
+                    // its interval into a permanent one, and the first pass
+                    // must stay immediate because it is what seeds the poll
+                    // cursors when the boot path didn't walk.
                     match scry_cluster::poll::full_walk_with_grace(
                         store.as_ref(),
                         cat.as_ref(),
@@ -823,6 +827,7 @@ pub async fn run(args: Args) -> Result<()> {
                         "full-walk",
                     )
                     .await;
+                    tokio::time::sleep(interval).await;
                 }
             }));
         }

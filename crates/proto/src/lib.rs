@@ -51,8 +51,9 @@ pub use generated_query::{
     FleetStatusResponseInput, FleetStatusResponseOutput, LabelNamesRequest, LabelNamesRequestInput,
     LabelNamesRequestOutput, LabelNamesResponse, LabelNamesResponseInput, LabelNamesResponseOutput,
     LabelValuesRequest, LabelValuesRequestInput, LabelValuesRequestOutput, LabelValuesResponse,
-    LabelValuesResponseInput, LabelValuesResponseOutput, Matcher, QueryFrame, QueryFrameMsg,
-    QueryRequest, QueryRequestInput, QueryRequestOutput, ResponseSuperseded,
-    ResponseSupersededInput, ResponseSupersededOutput, SchemaMsg, SchemaMsgInput, SchemaMsgOutput,
-    StreamError, StreamErrorInput, StreamErrorOutput,
+    LabelValuesResponseInput, LabelValuesResponseOutput, LiveNodeTiming, Matcher, QueryFrame,
+    QueryFrameMsg, QueryRequest, QueryRequestInput, QueryRequestOutput, QueryStats,
+    QueryStatsInput, QueryStatsOutput, ResponseSuperseded, ResponseSupersededInput,
+    ResponseSupersededOutput, SchemaMsg, SchemaMsgInput, SchemaMsgOutput, StreamError,
+    StreamErrorInput, StreamErrorOutput,
 };
