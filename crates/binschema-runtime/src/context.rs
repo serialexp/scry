@@ -58,9 +58,9 @@ impl FieldValue {
     pub fn len(&self) -> usize {
         match self {
             FieldValue::Bytes(b) => b.len(),
-            FieldValue::String(s) => s.as_bytes().len(), // UTF-8 byte length
+            FieldValue::String(s) => s.len(), // UTF-8 byte length
             FieldValue::TypeSizes(entries) => entries.len(), // Number of array items
-            FieldValue::Items(items) => items.len(),     // Number of array items
+            FieldValue::Items(items) => items.len(), // Number of array items
             _ => 0,
         }
     }
@@ -187,7 +187,7 @@ impl FieldValue {
                 }
             }
             FieldValue::Bytes(b) => b.len(),
-            FieldValue::String(s) => s.as_bytes().len(),
+            FieldValue::String(s) => s.len(),
             FieldValue::TypeSizes(entries) => entries.len(),
             FieldValue::Items(items) => items.len(),
         }
@@ -308,6 +308,8 @@ impl IntoFieldValue for &[u8] {
 /// that reference parent fields (e.g., `length_of("../data")`), the parent
 /// struct builds a context with its field values and passes it to the nested
 /// struct's encoder.
+type CompressionDictionary = Rc<RefCell<HashMap<Vec<u8>, usize>>>;
+
 #[derive(Debug, Clone, Default)]
 pub struct EncodeContext {
     /// Stack of parent field maps. Last element is immediate parent.
@@ -332,7 +334,7 @@ pub struct EncodeContext {
     /// Shared compression dictionary for back_reference encoding (DNS-style compression).
     /// Maps encoded target bytes to their absolute byte offset in the output stream.
     /// Uses Rc<RefCell> for shared mutable access across nested encoders.
-    compression_dict: Option<Rc<RefCell<HashMap<Vec<u8>, usize>>>>,
+    compression_dict: Option<CompressionDictionary>,
 
     /// Base byte offset from the start of the message/output.
     /// Used to compute absolute offsets for compression dictionary entries.
@@ -489,7 +491,7 @@ impl EncodeContext {
     }
 
     /// Get a reference to the compression dictionary (if it exists).
-    pub fn compression_dict(&self) -> Option<&Rc<RefCell<HashMap<Vec<u8>, usize>>>> {
+    pub fn compression_dict(&self) -> Option<&CompressionDictionary> {
         self.compression_dict.as_ref()
     }
 

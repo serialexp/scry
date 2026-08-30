@@ -37,11 +37,9 @@ pub async fn handle(
         )
     })?;
 
-    let batch = map_traces(req);
-
     // Best-effort fan-out: enqueue to every sink and return success. A slow/down
     // downstream never fails the request (see crate::sink / D-041).
-    state.offer_traces(batch);
+    accept(&state, req);
 
     Ok(ok_response())
 }
@@ -55,6 +53,14 @@ fn ok_response() -> Response {
         body,
     )
         .into_response()
+}
+
+/// Accept one decoded OTLP trace export from either HTTP or gRPC.
+///
+/// Both transports deliberately converge here so mapping, empty-batch handling,
+/// fan-out, and best-effort acknowledgement semantics cannot drift.
+pub fn accept(state: &AppState, req: ExportTraceServiceRequest) {
+    state.offer_traces(map_traces(req));
 }
 
 /// Pure mapping: OTLP `ExportTraceServiceRequest` → our `TracesBatch`.

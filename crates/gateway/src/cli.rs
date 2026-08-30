@@ -1,7 +1,7 @@
 //! `scry gateway` — the fan-out hub entry point (was the `scry-gateway` bin).
 //!
-//! Accepts records over the native binschema wire **and** the foreign HTTP push
-//! protocols (OTLP traces, Pyroscope profiles, Prometheus remote-write) and
+//! Accepts records over the native binschema wire, OTLP/gRPC, **and** the foreign
+//! HTTP push protocols (OTLP traces, Pyroscope profiles, Prometheus remote-write) and
 //! forwards every record, best-effort, to every configured downstream sink.
 //! Each sink is opt-in (at least one required): the scry ingest server
 //! (`--upstream`), Grafana Loki, OpenSearch, and Mimir.
@@ -17,6 +17,7 @@ use crate::{
     loki::LokiSink,
     mimir::MimirSink,
     opensearch::{OpenSearchConfig, OpenSearchSink},
+    otlp_grpc::serve as serve_otlp_grpc,
     router, serve_wire,
     sink::{spawn_sink, AppState, SinkHandle, ACCEPT_ALL},
     sink_scry::{ScryConnect, ScrySink},
@@ -31,12 +32,17 @@ use tokio::sync::watch;
 /// CLI arguments for the `scry gateway` subcommand.
 #[derive(Parser, Debug)]
 #[command(
-    about = "fan-out push gateway for scry (native + OTLP + Pyroscope + remote-write in; scry + Loki + OpenSearch + Mimir out)"
+    about = "fan-out push gateway for scry (native + OTLP/HTTP + OTLP/gRPC + Pyroscope + remote-write in; scry + Loki + OpenSearch + Mimir out)"
 )]
 pub struct Args {
     /// HTTP listen address (foreign protocols: /v1/traces, /ingest, /api/v1/write).
     #[arg(long, default_value = "0.0.0.0:4318")]
     listen: String,
+
+    /// OTLP/gRPC trace listen address. Opt-in: when unset, the gateway accepts
+    /// OTLP/HTTP protobuf only. Use 0.0.0.0:4317 for standard OTel exporters.
+    #[arg(long)]
+    listen_otlp_grpc: Option<String>,
 
     /// Native binschema ingest listen address (scry-agent and other native
     /// producers point here). Opt-in: when unset, no native listener is bound
@@ -248,6 +254,7 @@ pub async fn run(args: Args) -> Result<()> {
     let sink_names: Vec<&str> = sinks.iter().map(|s| s.name()).collect();
     tracing::info!(
         listen = %args.listen,
+        listen_otlp_grpc = args.listen_otlp_grpc.as_deref().unwrap_or("(disabled)"),
         listen_wire = args.listen_wire.as_deref().unwrap_or("(disabled)"),
         upstream = args.upstream.as_deref().unwrap_or("(disabled)"),
         sinks = ?sink_names,
@@ -285,18 +292,44 @@ pub async fn run(args: Args) -> Result<()> {
         }
     };
 
-    // ── Native wire server (opt-in via --listen-wire) ──────────────────
-    match args.listen_wire.clone() {
-        Some(addr) => {
+    // ── Optional OTLP/gRPC + native wire servers ──────────────────────
+    match (args.listen_otlp_grpc.clone(), args.listen_wire.clone()) {
+        (Some(grpc_addr), Some(wire_addr)) => {
+            let mut grpc_rx = shutdown_rx.clone();
+            let grpc_fut = serve_otlp_grpc(grpc_addr, state.clone(), async move {
+                let _ = grpc_rx.changed().await;
+            });
+            let mut wire_rx = shutdown_rx.clone();
+            let wire_fut = serve_wire(
+                wire_addr,
+                state.clone(),
+                args.wire_max_connections,
+                async move {
+                    let _ = wire_rx.changed().await;
+                },
+            );
+            tokio::try_join!(http_fut, grpc_fut, wire_fut)?;
+        }
+        (Some(grpc_addr), None) => {
             let mut rx = shutdown_rx.clone();
-            let wire_fut = serve_wire(addr, state.clone(), args.wire_max_connections, async move {
+            let grpc_fut = serve_otlp_grpc(grpc_addr, state.clone(), async move {
                 let _ = rx.changed().await;
             });
+            tokio::try_join!(http_fut, grpc_fut)?;
+        }
+        (None, Some(wire_addr)) => {
+            let mut rx = shutdown_rx.clone();
+            let wire_fut = serve_wire(
+                wire_addr,
+                state.clone(),
+                args.wire_max_connections,
+                async move {
+                    let _ = rx.changed().await;
+                },
+            );
             tokio::try_join!(http_fut, wire_fut)?;
         }
-        None => {
-            http_fut.await?;
-        }
+        (None, None) => http_fut.await?,
     }
 
     tracing::info!("scry-gateway shutting down");

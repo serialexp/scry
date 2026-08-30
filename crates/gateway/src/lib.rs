@@ -7,6 +7,7 @@
 //! - [`wire`]: the native binschema ingest listener — `scry-agent` and any other
 //!   native producer point here.
 //! - [`otlp`]: OTLP/HTTP protobuf trace push (`POST /v1/traces`).
+//! - [`otlp_grpc`]: OTLP/gRPC trace push (the standard TraceService).
 //! - [`pyroscope`]: legacy Pyroscope profile ingest (`POST /ingest`).
 //! - [`promwrite`]: Prometheus remote-write (`POST /api/v1/write`, `/api/v1/push`).
 //!
@@ -28,6 +29,7 @@ pub mod loki;
 pub mod mimir;
 pub mod opensearch;
 pub mod otlp;
+pub mod otlp_grpc;
 pub mod promwrite;
 pub mod pyroscope;
 pub mod sink;

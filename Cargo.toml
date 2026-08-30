@@ -106,9 +106,11 @@ mimalloc  = { version = "0.1", default-features = false }
 mime_guess = "2"
 num_cpus  = "1"
 object_store = "0.13"
-opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "trace"] }
+opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "trace"] }
 parquet   = "58"
 prost     = "0.14"
+tonic     = "0.14"
+tonic-prost = "0.14"
 rand      = "0.8"
 rand_distr = "0.4"
 regex     = "1"

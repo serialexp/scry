@@ -376,6 +376,12 @@ To accept foreign push protocols, run the gateway alongside the server:
 # Terminates OTLP/Pyroscope/remote-write on :4318, forwards to the server:
 ./target/release/scry gateway --listen 0.0.0.0:4318 --upstream 127.0.0.1:4000
 
+# Add the standard OTLP/gRPC listener (for Caddy and other gRPC exporters).
+# HTTP protobuf and gRPC feed the same mapping + best-effort fan-out path:
+./target/release/scry gateway \
+  --listen 0.0.0.0:4318 --listen-otlp-grpc 0.0.0.0:4317 \
+  --upstream 127.0.0.1:4000
+
 # Fan-out hub: also accept the native wire (so the agent can point here) and
 # tee logs to Loki + OpenSearch alongside scry (all in → all out):
 ./target/release/scry gateway \
@@ -412,9 +418,9 @@ To accept foreign push protocols, run the gateway alongside the server:
 ```
 
 Every sink is opt-in (`--upstream`, `--loki-url`, `--opensearch-url`,
-`--mimir-url`); at least one must be configured. `--listen-wire` is opt-in too:
-with no native listener bound, the gateway serves only the foreign HTTP
-protocols. The scry sink connects lazily, so a down/absent scry server never
+`--mimir-url`); at least one must be configured. `--listen-wire` and
+`--listen-otlp-grpc` are opt-in; with neither bound, the gateway serves only the
+foreign HTTP protocols. The scry sink connects lazily, so a down/absent scry server never
 blocks startup. Loki/OpenSearch are logs-only; Mimir is metrics-only (remote-
 write to `{url}/api/v1/push`); traces and profiles go to the scry sink alone.
 `--ca-cert` (a PEM bundle) adds a custom CA on top of the built-in roots for
