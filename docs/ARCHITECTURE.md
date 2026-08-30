@@ -135,7 +135,11 @@ Valkey instance, used for:
   sealing).
 
 Valkey is a **cache-invalidation hint**, not a system of record;
-object storage is always the source of truth. Valkey unavailability
+object storage is always the source of truth. The same deployment namespace
+also carries ephemeral Fleet status heartbeats for ingest, query, and gateway
+roles. Those snapshots are operator telemetry only: gateway snapshots preserve
+separate inbound, queue-admission, and final-delivery counters (D-067), and are
+never a correctness input. Valkey unavailability
 gracefully degrades to polling-based discovery; no correctness is
 lost.
 

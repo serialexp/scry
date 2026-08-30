@@ -265,6 +265,13 @@ pub struct OpenSearchConfig {
     pub signer: Option<Arc<SigV4Signer>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BulkOutcome {
+    Delivered,
+    PartialFailure,
+    SkippedEmpty,
+}
+
 /// Worker that ships fanned-out log batches to OpenSearch and (by default)
 /// self-manages the per-prefix lifecycle assets.
 pub struct OpenSearchSink {
@@ -285,10 +292,15 @@ pub struct OpenSearchSink {
     /// AWS SigV4 signer applied to every request when targeting Amazon
     /// OpenSearch Service / Serverless; `None` for a self-hosted cluster.
     signer: Option<Arc<SigV4Signer>>,
+    reporter: crate::metrics::SinkReporter,
 }
 
 impl OpenSearchSink {
-    pub fn new(http: reqwest::Client, cfg: OpenSearchConfig) -> Self {
+    pub fn new(
+        http: reqwest::Client,
+        cfg: OpenSearchConfig,
+        reporter: crate::metrics::SinkReporter,
+    ) -> Self {
         let prefix = sanitize_prefix(&cfg.prefix);
         Self {
             http,
@@ -303,6 +315,7 @@ impl OpenSearchSink {
             ensured: HashSet::new(),
             needs_reconcile: false,
             signer: cfg.signer,
+            reporter,
         }
     }
 
@@ -332,10 +345,17 @@ impl OpenSearchSink {
                     let Fanout::Logs(batch) = item else {
                         continue; // mask is logs-only; ignore anything else defensively
                     };
-                    if let Err(e) = self.handle(&batch).await {
-                        warn!(error = %e, "opensearch sink batch failed; dropping batch");
-                        if self.manage {
-                            self.needs_reconcile = true;
+                    let signal = crate::metrics::GatewaySignal::Logs;
+                    self.reporter.attempt(signal);
+                    match self.handle(&batch).await {
+                        Ok(BulkOutcome::Delivered) => self.reporter.delivered(signal),
+                        Ok(BulkOutcome::SkippedEmpty) => self.reporter.skipped_empty(signal),
+                        Ok(BulkOutcome::PartialFailure) => self.reporter.partial_failure(signal),
+                        Err(e) => {
+                            self.reporter.attempt_failed(signal);
+                            self.reporter.failed(signal);
+                            warn!(error = %e, "opensearch sink batch failed; dropping batch");
+                            if self.manage { self.needs_reconcile = true; }
                         }
                     }
                 }
@@ -352,7 +372,7 @@ impl OpenSearchSink {
         info!("opensearch sink worker exiting (queue closed)");
     }
 
-    async fn handle(&mut self, batch: &LogsBatch) -> anyhow::Result<()> {
+    async fn handle(&mut self, batch: &LogsBatch) -> anyhow::Result<BulkOutcome> {
         if self.manage {
             for name in distinct_targets(batch, &self.prefix) {
                 if self.ensured.contains(&name) {
@@ -375,10 +395,10 @@ impl OpenSearchSink {
 
     /// Ship one batch via `_bulk`. Returns `Err` on a transport/non-2xx failure
     /// (which triggers a reconcile); per-item `"errors":true` is logged only.
-    async fn ship(&self, batch: &LogsBatch) -> anyhow::Result<()> {
+    async fn ship(&self, batch: &LogsBatch) -> anyhow::Result<BulkOutcome> {
         let body = to_bulk_ndjson(batch, &self.prefix);
         if body.is_empty() {
-            return Ok(());
+            return Ok(BulkOutcome::SkippedEmpty);
         }
         let resp = self
             .send(
@@ -398,8 +418,9 @@ impl OpenSearchSink {
                 "opensearch bulk reported per-item errors: {}",
                 snippet(&text)
             );
+            return Ok(BulkOutcome::PartialFailure);
         }
-        Ok(())
+        Ok(BulkOutcome::Delivered)
     }
 
     /// Assert the managed assets: ISM policy (drift-corrected), then index

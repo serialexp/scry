@@ -415,6 +415,11 @@ To accept foreign push protocols, run the gateway alongside the server:
   --upstream scry-server:4000 \
   --mimir-url https://mimir:9009 --mimir-tenant team-a \
   --ca-cert /etc/scry/internal-ca.pem
+
+# Publish gateway forwarding status into Fleet and expose the same view locally:
+./target/release/scry gateway --upstream scry-server:4000 \
+  --valkey-url redis://valkey:6379 --valkey-namespace production \
+  --stats-listen 127.0.0.1:4098
 ```
 
 Every sink is opt-in (`--upstream`, `--loki-url`, `--opensearch-url`,
@@ -426,7 +431,12 @@ write to `{url}/api/v1/push`); traces and profiles go to the scry sink alone.
 `--ca-cert` (a PEM bundle) adds a custom CA on top of the built-in roots for
 the Loki/OpenSearch/Mimir HTTPS clients. Delivery is best-effort and
 independent per sink — a slow or down sink drops + counts without blocking
-the inbound or the other sinks (D-041).
+the inbound or the other sinks (D-041). With `--valkey-url` (or
+`SCRY_VALKEY_URL`) the gateway appears in Fleet; `--valkey-namespace` follows
+the daemon namespace convention. `--stats-listen` independently serves a local
+`/stats.json` + dashboard. Gateway status separates protocol/transport inbound
+accept/reject counts, queue admission drops, retries, and final downstream
+outcomes rather than inferring delivery from access logs.
 
 End-to-end smoke tests (require a local Garage — `scripts/dev-garage-up.sh`):
 

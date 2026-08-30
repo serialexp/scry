@@ -1,9 +1,8 @@
 //! The per-instance status registry — how any daemon's status page (D-057)
 //! renders the whole fleet.
 //!
-//! Every ingest / query instance that has Valkey configured heartbeats its full
-//! status snapshot (a JSON [`scry_server::StatusSnapshot`], produced by the
-//! daemon) into a per-instance key:
+//! Every Valkey-connected ingest, query, or gateway instance heartbeats its
+//! full canonical status snapshot JSON into a per-instance key:
 //!
 //! ```text
 //! SET <namespace>/status/<instance_uuid> "<snapshot-json>" PX <ttl_ms>

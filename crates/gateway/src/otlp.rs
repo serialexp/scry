@@ -31,12 +31,18 @@ pub async fn handle(
     body: Bytes,
 ) -> Result<Response, (StatusCode, String)> {
     let req = ExportTraceServiceRequest::decode(body).map_err(|e| {
+        if let Some(metrics) = state.metrics() {
+            metrics.inbound_rejected(crate::metrics::Inbound::OtlpHttp);
+        }
         (
             StatusCode::BAD_REQUEST,
             format!("OTLP protobuf decode failed: {e}"),
         )
     })?;
 
+    if let Some(metrics) = state.metrics() {
+        metrics.inbound_accepted(crate::metrics::Inbound::OtlpHttp);
+    }
     // Best-effort fan-out: enqueue to every sink and return success. A slow/down
     // downstream never fails the request (see crate::sink / D-041).
     accept(&state, req);

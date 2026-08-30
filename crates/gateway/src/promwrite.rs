@@ -77,6 +77,9 @@ pub async fn handle(
         snap::raw::Decoder::new()
             .decompress_vec(&body)
             .map_err(|e| {
+                if let Some(metrics) = state.metrics() {
+                    metrics.inbound_rejected(crate::metrics::Inbound::PromRemoteWriteHttp);
+                }
                 (
                     StatusCode::BAD_REQUEST,
                     format!("snappy decompress failed: {e}"),
@@ -87,12 +90,18 @@ pub async fn handle(
     };
 
     let req = WriteRequest::decode(raw.as_slice()).map_err(|e| {
+        if let Some(metrics) = state.metrics() {
+            metrics.inbound_rejected(crate::metrics::Inbound::PromRemoteWriteHttp);
+        }
         (
             StatusCode::BAD_REQUEST,
             format!("remote-write protobuf decode failed: {e}"),
         )
     })?;
 
+    if let Some(metrics) = state.metrics() {
+        metrics.inbound_accepted(crate::metrics::Inbound::PromRemoteWriteHttp);
+    }
     let batch = map_remote_write(req);
 
     // Best-effort fan-out to every configured sink (see crate::sink / D-041).

@@ -78,18 +78,25 @@ pub struct MimirSink {
     http: reqwest::Client,
     endpoint: String,
     tenant: Option<String>,
+    reporter: crate::metrics::SinkReporter,
 }
 
 impl MimirSink {
     /// `base` is the Mimir base URL (e.g. `http://mimir:9009`); the distributor
     /// remote-write path is appended. `tenant`, when set, is sent as the
     /// `X-Scope-OrgID` header for multi-tenant Mimir.
-    pub fn new(http: reqwest::Client, base: &str, tenant: Option<String>) -> Self {
+    pub fn new(
+        http: reqwest::Client,
+        base: &str,
+        tenant: Option<String>,
+        reporter: crate::metrics::SinkReporter,
+    ) -> Self {
         let endpoint = format!("{}/api/v1/push", base.trim_end_matches('/'));
         Self {
             http,
             endpoint,
             tenant,
+            reporter,
         }
     }
 
@@ -98,8 +105,18 @@ impl MimirSink {
             let Fanout::Metrics(batch) = item else {
                 continue; // mask is metrics-only; ignore anything else defensively
             };
+            let signal = crate::metrics::GatewaySignal::Metrics;
+            if to_write_request(&batch).timeseries.is_empty() {
+                self.reporter.skipped_empty(signal);
+                continue;
+            }
+            self.reporter.attempt(signal);
             if let Err(e) = self.ship(&batch).await {
+                self.reporter.attempt_failed(signal);
+                self.reporter.failed(signal);
                 warn!(error = %e, "mimir sink push failed; dropping batch");
+            } else {
+                self.reporter.delivered(signal);
             }
         }
         info!("mimir sink worker exiting (queue closed)");

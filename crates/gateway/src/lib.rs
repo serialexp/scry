@@ -26,6 +26,7 @@
 
 pub mod cli;
 pub mod loki;
+pub mod metrics;
 pub mod mimir;
 pub mod opensearch;
 pub mod otlp;
@@ -34,6 +35,7 @@ pub mod promwrite;
 pub mod pyroscope;
 pub mod sink;
 pub mod sink_scry;
+pub mod status;
 pub mod wire;
 
 use axum::{routing::post, Router};

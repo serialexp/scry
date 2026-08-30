@@ -25,9 +25,11 @@ tracing        = { workspace = true }
 uuid           = { workspace = true }
 
 [dev-dependencies]
-scry-proto = { workspace = true }
-scry-query = { workspace = true }
-tempfile   = "3"
+async-trait = { workspace = true }
+bytes       = { workspace = true }
+scry-proto  = { workspace = true }
+scry-query  = { workspace = true }
+tempfile    = "3"
 
 [lints]
 workspace = true

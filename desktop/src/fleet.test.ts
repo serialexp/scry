@@ -31,6 +31,7 @@ describe("fetchFleetStatus", () => {
       role: "agent",
       instance_id: "agent/node-a",
       addr: "node-a",
+      version: "0.18.0",
       now_unix_ms: 123,
       uptime_secs: 42,
       rss_kib: 2048,
@@ -52,6 +53,23 @@ describe("fetchFleetStatus", () => {
       code: 0x0006,
       serverMessage: "fleet unavailable",
     });
+  });
+
+  it("accepts snapshots from pre-version-field binaries", async () => {
+    const snapshot = {
+      role: "query",
+      instance_id: "query-old",
+      addr: "127.0.0.1:4100",
+      now_unix_ms: 123,
+      uptime_secs: 42,
+      rss_kib: null,
+      data: {},
+    };
+    const transport = new StubTransport(
+      response("FleetStatusResponse", { instances_json: [JSON.stringify(snapshot)] }),
+    );
+
+    await expect(fetchFleetStatus(transport, "target")).resolves.toEqual([snapshot]);
   });
 
   it("rejects malformed status documents", async () => {

@@ -35,6 +35,9 @@ impl TraceService for OtlpTraceService {
         &self,
         request: Request<ExportTraceServiceRequest>,
     ) -> Result<Response<ExportTraceServiceResponse>, Status> {
+        if let Some(metrics) = self.state.metrics() {
+            metrics.inbound_accepted(crate::metrics::Inbound::OtlpGrpc);
+        }
         otlp::accept(&self.state, request.into_inner());
         Ok(Response::new(ExportTraceServiceResponse::default()))
     }

@@ -3484,3 +3484,35 @@ logs unaffected and not cross-delivered, untailable signals refused), a
 the f64 survives bit-for-bit, four metrics-tap unit tests mirroring the logs
 tap's, and 18 vitest cases over the bucket accumulator, the seam rule, eviction
 and the merge.
+
+## D-067: gateway fleet status and exact forwarding-stage telemetry
+
+**The problem.** D-041 deliberately acknowledges gateway inbounds after a
+non-blocking offer into independent sink queues. Access logs therefore cannot
+tell an operator whether a request decoded, whether every compatible sink
+queued it, or whether a worker ultimately delivered it. D-057's Fleet registry
+covered daemon roles but explicitly deferred the gateway.
+
+**Decision.** A gateway with `--valkey-url` publishes the same canonical
+`StatusSnapshot` heartbeat as other roles under `<namespace>/status/<uuid>`;
+`--stats-listen` independently serves the shared local/fleet status page. The
+gateway remains fully usable without Valkey. Generic status plumbing lives in
+the leaf `scry-status` crate and `scry-server` re-exports it, avoiding a
+DataFusion/query dependency in the gateway.
+
+Gateway counters describe three separate stages and never collapse them:
+protocol+transport inbound accepted/rejected work; per-sink bounded-queue
+enqueued/full/closed disposition; and final worker delivery, failure, partial
+failure, retry, or local-empty skip. An inbound success still has D-041's
+ACK-on-offer meaning and does not imply downstream durability. OTLP/HTTP,
+OTLP/gRPC, remote-write/HTTP, Pyroscope/HTTP, and native wire remain distinct.
+OpenSearch bulk `errors:true` is a partial failure, not success. Counters use
+fixed enum-indexed relaxed atomics; status serialization names them off the hot
+path, avoiding per-record allocation and unbounded labels.
+
+The SolidJS Fleet view renders a dedicated gateway card showing these stages
+per protocol and configured sink. Status is process-lifetime and ephemeral: no
+history, Prometheus exporter, or recursive self-ingestion is introduced.
+
+Sealed by focused `scry-status`/gateway/frontend tests and the gateway leg in
+`scripts/smoke-status.sh`. Full design contract: `docs/design/gateway-status.md`.

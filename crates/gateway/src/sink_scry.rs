@@ -49,14 +49,16 @@ pub struct ScrySink {
     /// connection is found dead so the next item triggers a fresh connect.
     client: Option<Client>,
     batch_id: u64,
+    reporter: crate::metrics::SinkReporter,
 }
 
 impl ScrySink {
-    pub fn new(conn: ScryConnect) -> Self {
+    pub fn new(conn: ScryConnect, reporter: crate::metrics::SinkReporter) -> Self {
         Self {
             conn,
             client: None,
             batch_id: 0,
+            reporter,
         }
     }
 
@@ -67,14 +69,22 @@ impl ScrySink {
                 continue; // empty batch (offer guards this, but be defensive)
             };
             let signal = encoded.signal;
-            if let Err(e) = self.send(encoded).await {
+            let gateway_signal = item.signal();
+            if let Err(e) = self.send(encoded, gateway_signal).await {
+                self.reporter.failed(gateway_signal);
                 warn!(error = %e, signal = signal.name(), "scry sink send failed; dropping batch");
+            } else {
+                self.reporter.delivered(gateway_signal);
             }
         }
         info!("scry sink worker exiting (queue closed)");
     }
 
-    async fn send(&mut self, encoded: EncodedBatch) -> anyhow::Result<()> {
+    async fn send(
+        &mut self,
+        encoded: EncodedBatch,
+        gateway_signal: crate::metrics::GatewaySignal,
+    ) -> anyhow::Result<()> {
         let EncodedBatch {
             signal,
             record_count,
@@ -105,8 +115,12 @@ impl ScrySink {
         // Lazy connect: a down/absent upstream at startup (or after a prior
         // drop) surfaces here as a per-item connect error, not a fatal boot
         // error — the best-effort contract.
+        self.reporter.attempt(gateway_signal);
         if self.client.is_none() {
-            self.client = Some(self.connect().await?);
+            self.client = Some(self.connect().await.map_err(|error| {
+                self.reporter.attempt_failed(gateway_signal);
+                error
+            })?);
         }
 
         // First attempt against the live client.
@@ -125,8 +139,12 @@ impl ScrySink {
         // land and, more importantly, so the client is healthy for the next
         // item. No backoff loop here — a longer outage surfaces as repeated
         // single-attempt drops, which is the best-effort contract.
+        self.reporter.attempt_failed(gateway_signal);
+        self.reporter.retry(gateway_signal);
+        self.reporter.attempt(gateway_signal);
         warn!("upstream send failed; reconnecting once");
         if let Err(e) = self.client.as_mut().unwrap().reconnect().await {
+            self.reporter.attempt_failed(gateway_signal);
             // Connection is dead; forget it so the next item connects afresh.
             self.client = None;
             return Err(e);
@@ -139,6 +157,7 @@ impl ScrySink {
             .send_batch_stamped(&mut frame)
             .await;
         if resend.is_err() {
+            self.reporter.attempt_failed(gateway_signal);
             self.client = None;
         }
         resend

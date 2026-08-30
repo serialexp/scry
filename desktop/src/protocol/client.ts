@@ -309,12 +309,14 @@ export async function fetchLabelValues(
 
 // ── Fleet status ─────────────────────────────────────────────────────
 
-/** Common status envelope published by agents, ingestd, and queryd. `data`
- * remains role-specific so new counters can be added without a wire change. */
+/** Common status envelope published by agents, ingestd, queryd, and gateways.
+ * `data` remains role-specific so new counters can be added without a wire change. */
 export interface FleetInstance {
   role: string;
   instance_id: string;
   addr: string;
+  /** Absent only for status documents published by pre-version-field binaries. */
+  version?: string;
   now_unix_ms: number;
   uptime_secs: number;
   rss_kib: number | null;
@@ -346,6 +348,7 @@ export async function fetchFleetStatus(
       typeof parsed.role !== "string" ||
       typeof parsed.instance_id !== "string" ||
       typeof parsed.addr !== "string" ||
+      (parsed.version !== undefined && typeof parsed.version !== "string") ||
       typeof parsed.now_unix_ms !== "number" ||
       typeof parsed.uptime_secs !== "number" ||
       (parsed.rss_kib !== null && typeof parsed.rss_kib !== "number") ||

@@ -209,6 +209,7 @@ mod tests {
                 role: "agent".into(),
                 instance_id: "agent/node-1".into(),
                 addr: "node-1".into(),
+                version: env!("CARGO_PKG_VERSION").into(),
                 now_unix_ms: marker,
                 uptime_secs: 1.0,
                 rss_kib: None,

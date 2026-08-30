@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { FleetInstance } from "../protocol/client";
+import { fleetVersion } from "./Fleet";
 import { fleetFields } from "./fleetFields";
 
 function instance(role: string, data: Record<string, unknown>): FleetInstance {
@@ -63,6 +64,29 @@ describe("fleetFields", () => {
     expect(fields.get("postings hit rate")).toBe("90%");
   });
 
+  it("renders gateway inbound and per-sink forwarding stages", () => {
+    const fields = new Map(fleetFields(instance("gateway", {
+      inbound: { otlp_http: { accepted: 12, rejected: 2 } },
+      records: { traces: 44 },
+      sinks: {
+        scry: {
+          queue_depth: 3,
+          queue_capacity: 16,
+          signals: {
+            traces: { enqueued: 12, dropped_full: 1, dropped_closed: 0, delivered: 10, failed: 1, partial_failure: 0, retries: 2 },
+          },
+        },
+      },
+    })));
+    expect(fields.get("OTLP HTTP accepted")).toBe("12");
+    expect(fields.get("OTLP HTTP rejected")).toBe("2");
+    expect(fields.get("traces mapped")).toBe("44");
+    expect(fields.get("scry queue")).toBe("3 / 16");
+    expect(fields.get("scry queue dropped")).toBe("1");
+    expect(fields.get("scry delivered")).toBe("10");
+    expect(fields.get("scry retries")).toBe("2");
+  });
+
   it("does not fabricate zeros for old fleet payloads", () => {
     const ingest = new Map(fleetFields(instance("ingest", { active_connections: 1 })));
     const query = new Map(fleetFields(instance("query", { queries_total: 1 })));
@@ -74,5 +98,12 @@ describe("fleetFields", () => {
   it("keeps scalar fallback fields for unknown roles", () => {
     expect(fleetFields(instance("future", { one: 1, nested: { ignored: true }, ok: true })))
       .toEqual([["one", "1"], ["ok", "yes"]]);
+  });
+
+  it("prefers the envelope version and supports legacy agent payloads", () => {
+    expect(fleetVersion({ ...instance("agent", { version: "0.17.1" }), version: "0.18.0" }))
+      .toBe("0.18.0");
+    expect(fleetVersion(instance("agent", { version: "0.17.1" }))).toBe("0.17.1");
+    expect(fleetVersion(instance("query", {}))).toBe("—");
   });
 });

@@ -7,6 +7,7 @@
 //! (`--upstream`), Grafana Loki, OpenSearch, and Mimir.
 
 use scry_duration::parse_duration;
+use scry_status::LocalStatus;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{bail, Context, Result};
@@ -15,12 +16,14 @@ use uuid::Uuid;
 
 use crate::{
     loki::LokiSink,
+    metrics::{GatewayMetrics, SinkKind, SinkReporter},
     mimir::MimirSink,
     opensearch::{OpenSearchConfig, OpenSearchSink},
     otlp_grpc::serve as serve_otlp_grpc,
     router, serve_wire,
-    sink::{spawn_sink, AppState, SinkHandle, ACCEPT_ALL},
+    sink::{spawn_sink_instrumented, AppState, SinkHandle, ACCEPT_ALL},
     sink_scry::{ScryConnect, ScrySink},
+    status::{GatewayStatus, ValkeyFleetSource},
 };
 use scry_httpsig::{build_http_client, build_sigv4_signer};
 use scry_proto::{
@@ -142,11 +145,32 @@ pub struct Args {
     /// HTTP client timeout for the Loki/OpenSearch/Mimir sinks.
     #[arg(long, value_parser = parse_duration, default_value = "30s")]
     sink_http_timeout: Duration,
+
+    /// Valkey URL used to publish this gateway into Fleet. Falls back to
+    /// SCRY_VALKEY_URL; absent means no fleet publication.
+    #[arg(long)]
+    valkey_url: Option<String>,
+
+    /// Deployment namespace for Valkey keys. Falls back to
+    /// SCRY_VALKEY_NAMESPACE, then `scry`.
+    #[arg(long)]
+    valkey_namespace: Option<String>,
+
+    /// Local status HTTP endpoint. A bare flag binds 127.0.0.1:4098.
+    #[arg(long, num_args = 0..=1, default_missing_value = "127.0.0.1:4098")]
+    stats_listen: Option<String>,
 }
 
 /// Run the fan-out gateway: build the configured sinks, serve the foreign HTTP
 /// protocols (+ the native wire if `--listen-wire`), and tee every record.
 pub async fn run(args: Args) -> Result<()> {
+    let valkey_url = args
+        .valkey_url
+        .clone()
+        .or_else(|| std::env::var(scry_valkey::VALKEY_URL_ENV).ok());
+    let status_enabled = valkey_url.is_some() || args.stats_listen.is_some();
+    let metrics = status_enabled.then(|| Arc::new(GatewayMetrics::default()));
+
     // ── Build the sinks ────────────────────────────────────────────────
     // Every sink is opt-in; at least one must be configured. The scry sink is
     // not special — a gateway that only tees logs to Loki/OpenSearch needs no
@@ -166,11 +190,13 @@ pub async fn run(args: Args) -> Result<()> {
                 value: "scry-gateway".into(),
             }],
         };
-        sinks.push(spawn_sink(
+        let reporter = SinkReporter::new(metrics.clone(), SinkKind::Scry);
+        sinks.push(spawn_sink_instrumented(
             "scry",
             ACCEPT_ALL,
             args.sink_queue_cap,
-            move |rx| ScrySink::new(conn).run(rx),
+            metrics.clone(),
+            move |rx| ScrySink::new(conn, reporter).run(rx),
         ));
     }
 
@@ -180,11 +206,13 @@ pub async fn run(args: Args) -> Result<()> {
         let http = build_http_client(args.sink_http_timeout, args.ca_cert.as_deref())?;
 
         if let Some(url) = args.loki_url.clone() {
-            let sink = LokiSink::new(http.clone(), &url);
-            sinks.push(spawn_sink(
+            let reporter = SinkReporter::new(metrics.clone(), SinkKind::Loki);
+            let sink = LokiSink::new(http.clone(), &url, reporter);
+            sinks.push(spawn_sink_instrumented(
                 "loki",
                 SIGNAL_BIT_LOGS,
                 args.sink_queue_cap,
+                metrics.clone(),
                 move |rx| sink.run(rx),
             ));
             tracing::info!(url = %url, "loki sink enabled (logs)");
@@ -202,6 +230,7 @@ pub async fn run(args: Args) -> Result<()> {
             } else {
                 None
             };
+            let reporter = SinkReporter::new(metrics.clone(), SinkKind::OpenSearch);
             let sink = OpenSearchSink::new(
                 http.clone(),
                 OpenSearchConfig {
@@ -213,11 +242,13 @@ pub async fn run(args: Args) -> Result<()> {
                     reconcile_interval: args.opensearch_reconcile_interval,
                     signer,
                 },
+                reporter,
             );
-            sinks.push(spawn_sink(
+            sinks.push(spawn_sink_instrumented(
                 "opensearch",
                 SIGNAL_BIT_LOGS,
                 args.sink_queue_cap,
+                metrics.clone(),
                 move |rx| sink.run(rx),
             ));
             tracing::info!(
@@ -229,11 +260,13 @@ pub async fn run(args: Args) -> Result<()> {
             );
         }
         if let Some(url) = args.mimir_url.clone() {
-            let sink = MimirSink::new(http.clone(), &url, args.mimir_tenant.clone());
-            sinks.push(spawn_sink(
+            let reporter = SinkReporter::new(metrics.clone(), SinkKind::Mimir);
+            let sink = MimirSink::new(http.clone(), &url, args.mimir_tenant.clone(), reporter);
+            sinks.push(spawn_sink_instrumented(
                 "mimir",
                 SIGNAL_BIT_METRICS,
                 args.sink_queue_cap,
+                metrics.clone(),
                 move |rx| sink.run(rx),
             ));
             tracing::info!(
@@ -261,7 +294,48 @@ pub async fn run(args: Args) -> Result<()> {
         "scry-gateway ready"
     );
 
-    let state = AppState::new(sinks);
+    let state = match &metrics {
+        Some(metrics) => AppState::with_metrics(sinks, metrics.clone()),
+        None => AppState::new(sinks),
+    };
+    let instance_uuid = Uuid::now_v7();
+    let status: Option<Arc<GatewayStatus>> = metrics.clone().map(|metrics| {
+        Arc::new(GatewayStatus::new(
+            instance_uuid.to_string(),
+            args.listen.clone(),
+            args.listen_otlp_grpc.clone(),
+            args.listen_wire.clone(),
+            state.clone(),
+            metrics,
+        ))
+    });
+    let keys = scry_valkey::Keyspace::resolve(args.valkey_namespace.as_deref())?;
+    let valkey = match valkey_url {
+        Some(url) => Some(
+            scry_valkey::ValkeyClient::connect(&url, instance_uuid, keys)
+                .await
+                .with_context(|| format!("connecting gateway to Valkey at {url}"))?,
+        ),
+        None => None,
+    };
+    let registration = match (&valkey, &status) {
+        (Some(client), Some(status)) => {
+            let source = status.clone();
+            let producer: scry_valkey::StatusProducer = Arc::new(move || {
+                serde_json::to_string(&source.snapshot()).expect("gateway status serializes")
+            });
+            Some(
+                scry_valkey::StatusRegistration::spawn(
+                    client,
+                    instance_uuid,
+                    scry_valkey::STATUS_TTL,
+                    producer,
+                )
+                .await?,
+            )
+        }
+        _ => None,
+    };
 
     // ── Shutdown plumbing: one signal (SIGINT or SIGTERM) fans out to
     //    every server. SIGTERM matters in k8s, where the agent→gateway
@@ -272,6 +346,32 @@ pub async fn run(args: Args) -> Result<()> {
         tracing::info!("shutdown signal received");
         let _ = shutdown_tx.send(true);
     });
+
+    let status_fut = {
+        let status = status.clone();
+        let fleet = valkey
+            .clone()
+            .map(|client| Arc::new(ValkeyFleetSource(client)) as Arc<dyn scry_status::FleetSource>);
+        let listen = args.stats_listen.clone();
+        let mut rx = shutdown_rx.clone();
+        async move {
+            if let (Some(local), Some(listen)) = (status, listen) {
+                scry_status::serve_status(
+                    listen,
+                    local,
+                    fleet,
+                    instance_uuid.to_string(),
+                    async move {
+                        let _ = rx.changed().await;
+                    },
+                )
+                .await?;
+            } else {
+                let _ = rx.changed().await;
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+    };
 
     // ── HTTP (foreign) server ──────────────────────────────────────────
     let http_fut = {
@@ -293,47 +393,59 @@ pub async fn run(args: Args) -> Result<()> {
     };
 
     // ── Optional OTLP/gRPC + native wire servers ──────────────────────
-    match (args.listen_otlp_grpc.clone(), args.listen_wire.clone()) {
-        (Some(grpc_addr), Some(wire_addr)) => {
-            let mut grpc_rx = shutdown_rx.clone();
-            let grpc_fut = serve_otlp_grpc(grpc_addr, state.clone(), async move {
-                let _ = grpc_rx.changed().await;
-            });
-            let mut wire_rx = shutdown_rx.clone();
-            let wire_fut = serve_wire(
-                wire_addr,
-                state.clone(),
-                args.wire_max_connections,
-                async move {
-                    let _ = wire_rx.changed().await;
-                },
-            );
-            tokio::try_join!(http_fut, grpc_fut, wire_fut)?;
-        }
-        (Some(grpc_addr), None) => {
-            let mut rx = shutdown_rx.clone();
-            let grpc_fut = serve_otlp_grpc(grpc_addr, state.clone(), async move {
-                let _ = rx.changed().await;
-            });
-            tokio::try_join!(http_fut, grpc_fut)?;
-        }
-        (None, Some(wire_addr)) => {
-            let mut rx = shutdown_rx.clone();
-            let wire_fut = serve_wire(
-                wire_addr,
-                state.clone(),
-                args.wire_max_connections,
-                async move {
+    let serve_result: Result<()> = async {
+        match (args.listen_otlp_grpc.clone(), args.listen_wire.clone()) {
+            (Some(grpc_addr), Some(wire_addr)) => {
+                let mut grpc_rx = shutdown_rx.clone();
+                let grpc_fut = serve_otlp_grpc(grpc_addr, state.clone(), async move {
+                    let _ = grpc_rx.changed().await;
+                });
+                let mut wire_rx = shutdown_rx.clone();
+                let wire_fut = serve_wire(
+                    wire_addr,
+                    state.clone(),
+                    args.wire_max_connections,
+                    async move {
+                        let _ = wire_rx.changed().await;
+                    },
+                );
+                tokio::try_join!(http_fut, grpc_fut, wire_fut, status_fut)?;
+            }
+            (Some(grpc_addr), None) => {
+                let mut rx = shutdown_rx.clone();
+                let grpc_fut = serve_otlp_grpc(grpc_addr, state.clone(), async move {
                     let _ = rx.changed().await;
-                },
-            );
-            tokio::try_join!(http_fut, wire_fut)?;
+                });
+                tokio::try_join!(http_fut, grpc_fut, status_fut)?;
+            }
+            (None, Some(wire_addr)) => {
+                let mut rx = shutdown_rx.clone();
+                let wire_fut = serve_wire(
+                    wire_addr,
+                    state.clone(),
+                    args.wire_max_connections,
+                    async move {
+                        let _ = rx.changed().await;
+                    },
+                );
+                tokio::try_join!(http_fut, wire_fut, status_fut)?;
+            }
+            (None, None) => {
+                tokio::try_join!(http_fut, status_fut)?;
+            }
         }
-        (None, None) => http_fut.await?,
+        Ok(())
     }
+    .await;
 
+    if let Some(registration) = registration {
+        let _ = tokio::time::timeout(Duration::from_secs(2), registration.deregister()).await;
+    }
+    if let Some(client) = valkey {
+        let _ = tokio::time::timeout(Duration::from_secs(2), client.quit()).await;
+    }
     tracing::info!("scry-gateway shutting down");
-    Ok(())
+    serve_result
 }
 
 /// Resolve when the process receives SIGINT (ctrl_c) or SIGTERM.

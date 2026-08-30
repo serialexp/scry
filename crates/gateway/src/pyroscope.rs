@@ -59,11 +59,19 @@ pub async fn handle(
         }
     }
 
-    let data = data.ok_or((
-        StatusCode::BAD_REQUEST,
-        "missing multipart 'profile' field".to_string(),
-    ))?;
+    let data = data.ok_or_else(|| {
+        if let Some(metrics) = state.metrics() {
+            metrics.inbound_rejected(crate::metrics::Inbound::PyroscopeHttp);
+        }
+        (
+            StatusCode::BAD_REQUEST,
+            "missing multipart 'profile' field".to_string(),
+        )
+    })?;
 
+    if let Some(metrics) = state.metrics() {
+        metrics.inbound_accepted(crate::metrics::Inbound::PyroscopeHttp);
+    }
     let blob = ProfileBlob {
         ts_unix_nano: meta.ts_unix_nano,
         duration_nano: meta.duration_nano,

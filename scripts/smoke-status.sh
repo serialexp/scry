@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# smoke-status.sh — end-to-end exercise of the daemon status pages + the
-# Valkey-aggregated fleet view (D-057).
+# smoke-status.sh — end-to-end exercise of daemon/gateway status pages + the
+# Valkey-aggregated fleet view (D-057, D-067).
 #
 # Both `scry ingest` and `scry query` expose an opt-in status HTTP endpoint
 # (`--stats-listen`, bare ⇒ 127.0.0.1:4098). When both are on the same Valkey,
@@ -45,6 +45,8 @@ SQ="${SQ:-127.0.0.1:14443}"          # queryd stats port
 LQ="${LQ:-127.0.0.1:14444}"          # local-fallback queryd wire port
 SL="${SL:-127.0.0.1:14445}"          # local-fallback queryd stats port
 S3_PORT="${S3_PORT:-127.0.0.1:14446}" # stub object store (always-empty bucket)
+GW="${GW:-127.0.0.1:14447}"          # gateway HTTP push port
+SG="${SG:-127.0.0.1:14448}"          # gateway local stats port
 
 TMP="$(mktemp -d)"
 PIDS=()
@@ -113,22 +115,32 @@ RUST_LOG=info "$SCRY" query --listen "$QQ" --catalog "$TMP/queryd.sqlite" \
   --poll-interval 999999 --full-walk-interval 999999 >"$TMP/queryd.log" 2>&1 &
 PIDS+=($!)
 
+echo "-- starting gateway ($GW, stats $SG), heartbeating status --"
+RUST_LOG=info "$SCRY" gateway --listen "$GW" --upstream 127.0.0.1:1 \
+  --valkey-url "$VALKEY_URL" --stats-listen "$SG" >"$TMP/gateway.log" 2>&1 &
+PIDS+=($!)
+
 wait_bind "$SI" || fail "ingester stats endpoint never bound"
 wait_bind "$SQ" || fail "queryd stats endpoint never bound"
-ok "both status endpoints listening"
+wait_bind "$SG" || fail "gateway stats endpoint never bound"
+ok "all status endpoints listening"
 
-# Give both a beat to publish their first heartbeat + let each SCAN the other.
+# Drive one definite rejected OTLP/HTTP request and let status heartbeat.
+curl -s -o /dev/null -w '%{http_code}' -X POST --data-binary 'not-protobuf' "http://$GW/v1/traces" | grep -q '^400$' \
+  || fail "gateway did not reject malformed OTLP/HTTP"
 sleep 2
 
 curl -sf "http://$SI/stats.json" >"$TMP/ingest.json" || fail "ingest /stats.json fetch failed"
 curl -sf "http://$SQ/stats.json" >"$TMP/queryd.json" || fail "queryd /stats.json fetch failed"
-ok "fetched both /stats.json documents"
+curl -sf "http://$SG/stats.json" >"$TMP/gateway.json" || fail "gateway /stats.json fetch failed"
+ok "fetched all /stats.json documents"
 
-python3 - "$TMP/ingest.json" "$TMP/queryd.json" <<'PY' || fail "fleet assertions failed (see above)"
+python3 - "$TMP/ingest.json" "$TMP/queryd.json" "$TMP/gateway.json" <<'PY' || fail "fleet assertions failed (see above)"
 import json, sys
 
 ingest = json.load(open(sys.argv[1]))
 query  = json.load(open(sys.argv[2]))
+gateway = json.load(open(sys.argv[3]))
 
 def roles_by_id(doc):
     return {i["instance_id"]: i["role"] for i in doc["instances"]}
@@ -154,14 +166,23 @@ check(ing_self != qry_self, "ingest and query self_ids differ")
 
 ing_map = roles_by_id(ingest)
 qry_map = roles_by_id(query)
+gw_map = roles_by_id(gateway)
+gw_self = gateway.get("self_id")
 
 # The reporting instance must appear in its own fleet with the right role.
 check(ing_map.get(ing_self) == "ingest", "ingest self appears as role=ingest in ingest page")
 check(qry_map.get(qry_self) == "query",  "query self appears as role=query in query page")
+check(gw_map.get(gw_self) == "gateway", "gateway self appears as role=gateway")
 
-# Cross-visibility: each page lists BOTH instances with correct roles.
+# Cross-visibility: every page lists the gateway and the two daemon roles.
 check(ing_map.get(qry_self) == "query",  "ingest page lists the query instance as role=query")
 check(qry_map.get(ing_self) == "ingest", "query page lists the ingest instance as role=ingest")
+check(any(v == "gateway" for v in ing_map.values()), "ingest page lists gateway")
+check(any(v == "gateway" for v in qry_map.values()), "query page lists gateway")
+check(any(v == "ingest" for v in gw_map.values()) and any(v == "query" for v in gw_map.values()), "gateway page lists ingest and query")
+gw = next(i for i in gateway["instances"] if i["instance_id"] == gw_self)
+check(gw.get("version"), "gateway reports version")
+check(gw["data"]["inbound"]["otlp_http"]["rejected"] >= 1, "gateway reports rejected OTLP/HTTP request")
 
 # self_id resolves to exactly one listed instance (the page marks it client-side).
 check(list(ing_map).count(ing_self) == 1, "ingest self_id resolves to exactly one entry")

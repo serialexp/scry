@@ -1136,6 +1136,7 @@ async fn handle(
                         snapshot.role = "agent".into();
                         snapshot.instance_id = agent_instance_id.clone();
                         snapshot.addr = hello.hostname.clone();
+                        snapshot.version = hello.agent_version.clone();
                         snapshot.now_unix_ms = crate::stats::unix_ms_now();
                         if !snapshot.data.is_object() {
                             snapshot.data = serde_json::json!({});
@@ -1147,10 +1148,6 @@ async fn handle(
                         data.insert(
                             "boot_id".into(),
                             serde_json::Value::String(boot_id.to_string()),
-                        );
-                        data.insert(
-                            "version".into(),
-                            serde_json::Value::String(hello.agent_version.clone()),
                         );
                         relay.report(RemoteAgentStatus {
                             instance_id: agent_instance_id.clone(),

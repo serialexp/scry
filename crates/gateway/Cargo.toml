@@ -13,6 +13,7 @@ path = "src/bin/probe.rs"
 
 [dependencies]
 anyhow               = { workspace = true }
+async-trait           = { workspace = true }
 axum                 = { workspace = true }
 binschema-runtime   = { workspace = true }
 bytes               = { workspace = true }
@@ -25,6 +26,8 @@ scry-duration         = { workspace = true }
 scry-client         = { workspace = true }
 scry-httpsig        = { workspace = true }
 scry-proto          = { workspace = true }
+scry-status         = { workspace = true }
+scry-valkey         = { workspace = true }
 serde               = { workspace = true, features = ["derive"] }
 serde_json          = { workspace = true }
 snap                = { workspace = true }

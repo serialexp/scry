@@ -4532,6 +4532,8 @@ name = "scry-cluster"
 version = "0.18.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "bytes",
  "futures",
  "object_store",
  "rand 0.8.6",
@@ -4583,6 +4585,7 @@ name = "scry-gateway"
 version = "0.18.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "binschema-runtime",
  "bytes",
@@ -4595,6 +4598,8 @@ dependencies = [
  "scry-duration",
  "scry-httpsig",
  "scry-proto",
+ "scry-status",
+ "scry-valkey",
  "serde",
  "serde_json",
  "snap",
@@ -4802,6 +4807,7 @@ dependencies = [
  "scry-objstore",
  "scry-proto",
  "scry-query",
+ "scry-status",
  "scry-wal",
  "serde",
  "serde_json",
@@ -4810,6 +4816,18 @@ dependencies = [
  "tracing",
  "uuid",
  "zstd",
+]
+
+[[package]]
+name = "scry-status"
+version = "0.18.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

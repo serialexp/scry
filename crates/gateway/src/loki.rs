@@ -130,14 +130,19 @@ fn sanitize_label(key: &str) -> String {
 pub struct LokiSink {
     http: reqwest::Client,
     endpoint: String,
+    reporter: crate::metrics::SinkReporter,
 }
 
 impl LokiSink {
     /// `base` is the Loki base URL (e.g. `http://loki:3100`); the push path is
     /// appended.
-    pub fn new(http: reqwest::Client, base: &str) -> Self {
+    pub fn new(http: reqwest::Client, base: &str, reporter: crate::metrics::SinkReporter) -> Self {
         let endpoint = format!("{}/loki/api/v1/push", base.trim_end_matches('/'));
-        Self { http, endpoint }
+        Self {
+            http,
+            endpoint,
+            reporter,
+        }
     }
 
     pub async fn run(self, mut rx: mpsc::Receiver<Fanout>) {
@@ -146,8 +151,14 @@ impl LokiSink {
                 continue; // mask is logs-only; ignore anything else defensively
             };
             let req = to_push_request(&batch);
+            self.reporter.attempt(crate::metrics::GatewaySignal::Logs);
             if let Err(e) = self.ship(&req).await {
+                self.reporter
+                    .attempt_failed(crate::metrics::GatewaySignal::Logs);
+                self.reporter.failed(crate::metrics::GatewaySignal::Logs);
                 warn!(error = %e, "loki sink push failed; dropping batch");
+            } else {
+                self.reporter.delivered(crate::metrics::GatewaySignal::Logs);
             }
         }
         info!("loki sink worker exiting (queue closed)");

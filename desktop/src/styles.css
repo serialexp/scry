@@ -266,12 +266,13 @@ body {
 .fleet-card h2 { margin-top: 7px; overflow: hidden; font-family: var(--mono); font-size: 13px; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
 .fleet-role { padding: 2px 6px; border-radius: 3px; background: rgba(143, 138, 125, 0.14); color: var(--muted); font-family: var(--mono); font-size: 9px; text-transform: uppercase; }
 .fleet-role-agent { background: rgba(91, 182, 168, 0.12); color: var(--secondary); }
+.fleet-role-gateway { background: rgba(98, 145, 232, 0.14); color: #82aaff; }
 .fleet-role-ingest { background: rgba(232, 163, 61, 0.12); color: var(--accent); }
 .fleet-role-query { background: rgba(143, 138, 125, 0.14); color: var(--text); }
 .fleet-health { color: var(--secondary); font-family: var(--mono); font-size: 10px; text-transform: uppercase; }
 .fleet-health.stale { color: var(--accent); }
 .fleet-address { margin: 10px 0 14px; overflow: hidden; color: var(--muted); font-family: var(--mono); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
-.fleet-basics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 0 0 14px; }
+.fleet-basics { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin: 0 0 14px; }
 .fleet-basics > div { align-items: flex-start; flex-direction: column; gap: 3px; padding: 8px; border-radius: 4px; background: var(--panel-2); }
 .fleet-basics dt,
 .fleet-data dt { color: var(--faint); font-size: 9px; text-transform: uppercase; }

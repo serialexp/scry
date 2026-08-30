@@ -76,16 +76,25 @@ where
             let permit = match permits.clone().try_acquire_owned() {
                 Ok(permit) => permit,
                 Err(_) => {
+                    if let Some(metrics) = state.metrics() {
+                        metrics.wire_connection_rejected();
+                    }
                     tokio::spawn(reject_overloaded(sock));
                     continue;
                 }
             };
             let session_id = next_session_id.fetch_add(1, Ordering::Relaxed);
+            if let Some(metrics) = state.metrics() {
+                metrics.wire_connection_accepted();
+            }
             let state = state.clone();
             tokio::spawn(async move {
                 let _permit = permit;
-                if let Err(e) = handle_conn(sock, peer, session_id, state).await {
+                if let Err(e) = handle_conn(sock, peer, session_id, state.clone()).await {
                     warn!(%peer, error = %e, "wire connection ended with error");
+                }
+                if let Some(metrics) = state.metrics() {
+                    metrics.wire_connection_closed();
                 }
             });
         }
@@ -215,6 +224,9 @@ async fn handle_conn(
                     )
                     .await;
                     let _ = wr.flush().await;
+                    if let Some(metrics) = state.metrics() {
+                        metrics.inbound_rejected(crate::metrics::Inbound::NativeWire);
+                    }
                     break;
                 }
 
@@ -230,6 +242,9 @@ async fn handle_conn(
                     None => false,
                 };
                 if !announced_ok {
+                    if let Some(metrics) = state.metrics() {
+                        metrics.inbound_rejected(crate::metrics::Inbound::NativeWire);
+                    }
                     reject(
                         &mut wr,
                         session_id,
@@ -242,6 +257,9 @@ async fn handle_conn(
                 }
 
                 if b.uncompressed_size > DEFAULT_MAX_BATCH_BYTES {
+                    if let Some(metrics) = state.metrics() {
+                        metrics.inbound_rejected(crate::metrics::Inbound::NativeWire);
+                    }
                     reject(
                         &mut wr,
                         session_id,
@@ -269,6 +287,9 @@ async fn handle_conn(
                             _ => (REJECT_BAD_SCHEMA, "invalid compressed payload"),
                         };
                         warn!(%peer, batch_id = b.batch_id, error = %e, "payload decompression rejected");
+                        if let Some(metrics) = state.metrics() {
+                            metrics.inbound_rejected(crate::metrics::Inbound::NativeWire);
+                        }
                         reject(&mut wr, session_id, b.batch_id, code, message).await?;
                         continue;
                     }
@@ -294,6 +315,9 @@ async fn handle_conn(
 
                 match decode_result {
                     Ok(()) => {
+                        if let Some(metrics) = state.metrics() {
+                            metrics.inbound_accepted(crate::metrics::Inbound::NativeWire);
+                        }
                         write_frame(
                             &mut wr,
                             &build::batch_ack(session_id, b.batch_id, ACK_ACCEPTED, 0, 0, ""),
@@ -302,6 +326,9 @@ async fn handle_conn(
                     }
                     Err(e) => {
                         warn!(%peer, batch_id = b.batch_id, error = %e, "payload decode failed");
+                        if let Some(metrics) = state.metrics() {
+                            metrics.inbound_rejected(crate::metrics::Inbound::NativeWire);
+                        }
                         write_frame(
                             &mut wr,
                             &build::batch_ack(

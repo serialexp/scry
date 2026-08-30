@@ -29,6 +29,12 @@ function formatDuration(seconds: number): string {
   return `${Math.floor(seconds / 86_400)}d ${Math.floor((seconds % 86_400) / 3600)}h`;
 }
 
+export function fleetVersion(instance: FleetInstance): string {
+  if (instance.version) return instance.version;
+  const legacy = instance.data.version;
+  return typeof legacy === "string" && legacy ? legacy : "—";
+}
+
 const FleetCard: Component<{ instance: FleetInstance }> = (props) => {
   const fields = createMemo(() => fleetFields(props.instance));
   const age = createMemo(() => Math.max(0, Date.now() - props.instance.now_unix_ms));
@@ -46,6 +52,7 @@ const FleetCard: Component<{ instance: FleetInstance }> = (props) => {
       </header>
       <div class="fleet-address">{props.instance.addr || "No advertised address"}</div>
       <dl class="fleet-basics">
+        <div><dt>Version</dt><dd>{fleetVersion(props.instance)}</dd></div>
         <div><dt>Uptime</dt><dd>{formatDuration(props.instance.uptime_secs)}</dd></div>
         <div><dt>RSS</dt><dd>{formatBytes(props.instance.rss_kib)}</dd></div>
         <div><dt>Report age</dt><dd>{Math.floor(age() / 1000)}s</dd></div>

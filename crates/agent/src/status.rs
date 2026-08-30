@@ -79,11 +79,11 @@ impl AgentRuntimeStats {
             "role": "agent",
             "instance_id": format!("agent/{}", inputs.node),
             "addr": inputs.node,
+            "version": env!("CARGO_PKG_VERSION"),
             "now_unix_ms": unix_ms(),
             "uptime_secs": self.started.elapsed().as_secs_f64(),
             "rss_kib": rss_kib(),
             "data": {
-                "version": env!("CARGO_PKG_VERSION"),
                 "server_addr": inputs.server_addr,
                 "log_batches": self.log_batches,
                 "metric_batches": self.metric_batches,
@@ -153,6 +153,7 @@ mod tests {
             metric_dropped: 6,
         });
         assert_eq!(snapshot["instance_id"], "agent/worker-1");
+        assert_eq!(snapshot["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(snapshot["data"]["metric_samples"], 12);
         assert_eq!(snapshot["data"]["metric_queue_depth"], 1);
         assert_eq!(snapshot["data"]["reconnect_attempts"], 2);

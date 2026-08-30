@@ -93,6 +93,51 @@ function ingestFields(data: Data): FleetField[] {
   ];
 }
 
+function gatewayFields(data: Data): FleetField[] {
+  const inbound = object(data.inbound);
+  const records = object(data.records);
+  const sinks = object(data.sinks);
+  const fields: FleetField[] = [];
+  for (const [key, label] of [
+    ["otlp_http", "OTLP HTTP"],
+    ["otlp_grpc", "OTLP gRPC"],
+    ["prom_remote_write_http", "remote-write HTTP"],
+    ["pyroscope_http", "Pyroscope HTTP"],
+    ["native_wire", "native wire"],
+  ] as const) {
+    const protocol = object(inbound[key]);
+    fields.push([`${label} accepted`, count(number(protocol, "accepted"))]);
+    fields.push([`${label} rejected`, count(number(protocol, "rejected"))]);
+  }
+  for (const signal of ["logs", "metrics", "traces", "profiles"] as const) {
+    fields.push([`${signal} mapped`, count(number(records, signal))]);
+  }
+  for (const [name, raw] of Object.entries(sinks)) {
+    const sink = object(raw);
+    const signals = object(sink.signals);
+    let enqueued: number | null = null;
+    let dropped: number | null = null;
+    let delivered: number | null = null;
+    let failed: number | null = null;
+    let retries: number | null = null;
+    for (const rawSignal of Object.values(signals)) {
+      const signal = object(rawSignal);
+      enqueued = sumOrMissing(enqueued, number(signal, "enqueued"));
+      dropped = sumOrMissing(dropped, number(signal, "dropped_full"), number(signal, "dropped_closed"));
+      delivered = sumOrMissing(delivered, number(signal, "delivered"));
+      failed = sumOrMissing(failed, number(signal, "failed"), number(signal, "partial_failure"));
+      retries = sumOrMissing(retries, number(signal, "retries"));
+    }
+    fields.push([`${name} queue`, `${count(number(sink, "queue_depth"))} / ${count(number(sink, "queue_capacity"))}`]);
+    fields.push([`${name} enqueued`, count(enqueued)]);
+    fields.push([`${name} queue dropped`, count(dropped)]);
+    fields.push([`${name} delivered`, count(delivered)]);
+    fields.push([`${name} failed / partial`, count(failed)]);
+    fields.push([`${name} retries`, count(retries)]);
+  }
+  return fields;
+}
+
 function queryFields(data: Data): FleetField[] {
   const latency = object(data.query_latency);
   const ranges = object(data.query_ranges);
@@ -127,5 +172,6 @@ function queryFields(data: Data): FleetField[] {
 export function fleetFields(instance: FleetInstance): FleetField[] {
   if (instance.role === "ingest") return ingestFields(instance.data);
   if (instance.role === "query") return queryFields(instance.data);
+  if (instance.role === "gateway") return gatewayFields(instance.data);
   return genericFields(instance.data);
 }
