@@ -204,18 +204,71 @@ Docs are current: D-066 in `docs/decisions.md` covers both halves and the first
 measurements, and the `scry-cluster` / `scry-ingestd` / `scry-queryd` /
 `scry-query` bullets in `CLAUDE.md` are updated.
 
-## Also found, not addressed
+## Compaction: re-measured, cause identified (investigation only — no fix made)
 
-- **Compaction is losing ground badly** — ~7 blocks reclaimed per 17 minutes
-  against continuous ingest, so 346k blocks keeps growing. The merge itself is
-  only 1.6-45 s; ~16 of every 17 minutes is spent *outside* it, suspects being
-  `reconcile_partition`'s per-partition bucket LIST and `catalog.list_blocks()`
-  re-run inside the loop at `maintain.rs:184` over a 346k-row table. Likely a
-  *victim* of the same contention — re-measure after Part A ships. Bart asked
-  for investigation only, no changes.
-- `scry-gateway` was in CrashLoopBackOff on `--listen-otlp-grpc`; that is just
-  the manifest running ahead of the deployed v0.17.0 image (commit `1637e0a`
-  added the flag). Not a bug.
+Harness: `crates/cluster/tests/partition_cost.rs`, two `#[ignore]`d measurement
+tests (they stay out of `cargo test`; 2 ignored, 0 run). Run with
+`source docker/garage/.env` then
+`cargo test -p scry-cluster --test partition_cost -- --ignored --nocapture`;
+`N_BLOCKS` scales the partition.
+
+**Verdict: `reconcile_partition` is the whole gap. `list_blocks()` is not.**
+
+`run_compaction_pass` does three things per planned partition — reconcile,
+`list_blocks()`, merge. Timing them separately:
+
+| | 2k blocks | 22k blocks |
+|---|---|---|
+| reconcile **cold** | 0.7 s | 7.6 s |
+| reconcile **warm** | 0.5 s | 5.7 s |
+| full walk, warm (D-066 path) | 0.1 s | 0.7 s |
+| `list_blocks()` | 4.8 ms | 49 ms |
+
+Warm ≈ cold, and both grow linearly with partition size, because
+`reconcile_partition` calls `fetch_and_apply` with **`known: None`**
+(`poll.rs:191`) — deliberately unfiltered, and commented as such, since it runs
+under a partition lease to establish authoritative truth before a merge
+commits. So unlike the full walk, it GETs *every* sidecar in the
+`(signal, date)` prefix on every merge and never gets cheaper as the catalog
+converges. The walk over the same objects skipped 22,000 and fetched 1.
+
+`list_blocks()` scales fine and is **cleared**: 10k→24 ms, 50k→156 ms,
+150k→489 ms, **350k→1.2 s**. Real, but not minutes.
+
+**The gothab arithmetic closes.** Live logs (still v0.17.0) show merges taking
+1.2–20.6 s with the *next* merge starting 11–19 min later, marching one date
+partition at a time (07-26, 07-27, 07-28, …). At the ~5 GETs/sec measured while
+the two runaway walks were saturating Garage, a 13-min gap = ~3,900 sidecars
+per metrics date partition — and ~3,900 × ~90 daily partitions ≈ 350k, which is
+the observed bucket size. Metrics dominates the bucket.
+
+**D-066 probably helps this a lot without having aimed at it.** A4 put
+`buffer_unordered(16)` inside `fetch_and_apply`, and `reconcile_partition` goes
+through the same function, so it inherits 16× concurrency; and with the walks
+no longer saturating Garage the per-GET rate should recover too. Both effects
+are unverified until v0.18.0 actually runs — **that is the measurement to take
+after deploying**, not another local one.
+
+**Structural issue that remains regardless:** the cost is O(blocks in the
+partition) per merge, on the partition compaction exists to shrink. It
+self-heals as levels build, but slowly. No change made — Bart asked for
+investigation only.
+
+## Also found, not addressed
+- **The v0.18.0 deploy never took, and the reason is a config override.**
+  `serialexp/scry:v0.18.0` exists on Docker Hub (pushed 2026-08-29 01:11) and
+  the GitHub release is published with all 8 CLI assets, so the build side is
+  fine. But `deploy/pulumi/config.ts:185-187` reads
+  `cfg.get("scryMaintenanceImage") ?? defaultScryImage`, and
+  `Pulumi.prod.yaml:84-87` **sets all three keys to `serialexp/scry:v0.17.0`**.
+  Stack config wins over the default, so bumping `defaultScryImage` to v0.18.0
+  changed nothing. All five scry pods still run v0.17.0. There is also a stale
+  `scryImage: v0.16.1` at line 53. Not changed — production deploy config,
+  Bart's call.
+- `scry-gateway` is in CrashLoopBackOff (45 restarts) on
+  `error: unexpected argument '--listen-otlp-grpc'` — the manifest passes a
+  flag only v0.18.0 has. Same root cause as above: fixing the image pin fixes
+  the gateway.
 - gothab still runs **v0.17.0** and was only ever read, never modified.
 
 ---
