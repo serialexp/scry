@@ -3488,9 +3488,10 @@ and the merge.
 ## D-066: The full walk lists to learn UUIDs, and query timing rides its own frame
 
 **Date:** 2026-08-30
-**Status:** accepted. The walk half is complete. The timing half has the schema,
-the frame, the round-trip tests and the CLI trailer; the server does not emit
-`QueryStats` yet, so the tag is reserved and no client sees one in the wild.
+**Status:** accepted, both halves complete — the walk fix, and the timing frame
+end to end: schema, server emit, round-trip tests, the `# timing:` CLI trailer,
+the browser decode, and the query-bar disclosure. Local `scry get` is the one
+uninstrumented path (it does not go through `QueryService`).
 
 ### Part 1 — the full walk fetched 346,000 sidecars to learn nothing
 
@@ -3567,11 +3568,28 @@ for the `--live` merge — so per-node timing means that live fan-out (a
 `LiveNodeTiming { addr, elapsed_us, rows, ok }` list) plus the
 browser → `scry web` → queryd relay hop.
 
-**Consequence, when the emit path lands:** the result cache must stop caching
-the `EndOfStream` frame, so `Entry` gains a `rows` beside its `bytes` and the
-server synthesizes a fresh `QueryStats | EndOfStream` after replaying the
-cached blob. That also fixes a pre-existing wart where `rows_total` stays 0 on
-a cache hit and `scan_complete` under-reports rows on every hit.
+**Consequence: the result cache no longer caches the `EndOfStream` frame.** A
+cached blob is `SchemaMsg | BatchMsg…` and the server synthesizes a fresh
+`QueryStats | EndOfStream` after replaying it, so `Entry` carries a `rows`
+beside its `bytes`. That also fixes a pre-existing wart where `rows_total`
+stayed 0 on a hit and `scan_complete` under-reported rows on every one.
+
+**Where the phases come from.** `run_query` records nine of them in a
+`PhaseTimers`; `admission_wait` is passed *in*, because queueing behind the
+connection semaphore happens before the per-query stopwatch starts and would
+otherwise be invisible — it is the phase most likely to be the whole answer on
+a loaded daemon. `postings_fetch_us`/`bloom_fetch_us` are obtained without
+threading timers through four `register_*_table_from_candidates` functions: a
+`fetch_nanos: AtomicU64` on each cache rides the `CacheStarts` delta that
+already existed, timed around `get_or_try_init` so it reflects what the caller
+waited for (own fill, joined single-flight, or permit wait) and recorded on the
+error arm too, so a slow failing store does not read as fast.
+
+**What it said on first measurement**, which is the point of building it: on a
+cache miss `execute` was 96.6% of the query (205,724 of 213,027 µs) — the
+DataFusion scan, not transfer and not planning. On a hit, `catalog` was 96%
+(140 of 146 µs) — the catalog SELECT. Unattributed `other` was 0.26% and 24 µs
+respectively, so the phases really do account for the time.
 
 ## D-067: gateway fleet status and exact forwarding-stage telemetry
 

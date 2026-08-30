@@ -154,6 +154,26 @@ async fn main() -> Result<()> {
                 active_attempt = reset.next_attempt;
                 saw_schema = false;
             }
+            // Per-phase timings (D-066), sent just before the terminator. The
+            // probe's stdout contract is "the row count and nothing else", so
+            // this goes to stderr — visible when a smoke run is slow, invisible
+            // to every caller that captures stdout.
+            QueryFrameMsg::QueryStats(s) => {
+                eprintln!(
+                    "probe timing: total={}us cache={} admission={}us catalog={}us \
+                     register={}us plan={}us execute={}us blocks={}/{} bytes={}",
+                    s.server_total_us,
+                    if s.cache_hit == 1 { "hit" } else { "miss" },
+                    s.admission_wait_us,
+                    s.catalog_us,
+                    s.register_us,
+                    s.plan_us,
+                    s.execute_us,
+                    s.blocks_scanned,
+                    s.blocks_considered,
+                    s.bytes_scanned,
+                );
+            }
             QueryFrameMsg::EndOfStream(end) if saw_schema => break end.total_rows,
             QueryFrameMsg::StreamError(err) => {
                 bail!(

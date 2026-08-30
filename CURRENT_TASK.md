@@ -75,7 +75,7 @@ compiles (my `QueryStats` match arm isn't needed until the generated enum
 variant arrives in commit 2). Mine goes on top. No lock was hand-edited and
 nothing was stashed.
 
-## Part B — per-phase query timing: PARTIALLY DONE
+## Part B — per-phase query timing: DONE (uncommitted)
 
 Plan in `~/.claude/plans/snappy-leaping-meteor.md`. Key decisions already made:
 a separate **`QueryStats` frame (tag `0x1E`) before `EndOfStream`**, *not*
@@ -159,14 +159,50 @@ landed, so that block is lifted** and the rest of Part B is unblocked.
   default window entirely — with a comment saying why. The cache is correct.
   **The real target is still the *first* query being slow, not the second.**
 
-### Still to do in Part B
-`run_query` phase timers + emitting the frame (`query_service.rs`), the result
-cache no longer caching `EndOfStream` (`Entry` gains `rows`), `fetch_nanos` on
-the postings/bloom cache stats, the `client.ts` decode + `tableFromIPC` timing,
-and the `QueryBar.tsx` waterfall disclosure. Docs are **done**: D-066 is
-written in `docs/decisions.md` (both halves, with the emit path explicitly
-marked as not yet landed) and the `scry-cluster` / `scry-ingestd` /
-`scry-queryd` / `scry-query` bullets in `CLAUDE.md` are updated.
+### The rest of Part B, now also done
+- **B1 — the result cache stopped caching `EndOfStream`.** A cached blob is
+  `SchemaMsg | BatchMsg…`; `Entry` gained `rows: u64` and `get` returns a
+  `CachedResponse { bytes, rows }`, so the server synthesizes a fresh
+  `QueryStats | EndOfStream` after a replay. Also fixes the pre-existing wart
+  where a hit logged `rows=0`.
+- **B2 — `fetch_nanos: AtomicU64`** on the postings and bloom cache stats,
+  timed **around `get_or_try_init`** (not the raw GET) so it measures what the
+  *caller* waited for — own fill, joined single-flight, or permit wait — and
+  recorded on the `Err` arm too, so a slow failing store can't read as fast. It
+  rides the `CacheStarts` delta that already existed, so no timer is threaded
+  through the four `register_*_table_from_candidates` functions. The assertion
+  lives in `query_e2e.rs`, not a unit test: `postings_cache.rs`'s unit tests
+  replicate the cache internals rather than driving `get_or_fetch`, so a test
+  there would not have touched this code.
+- **B3 — `run_query` phase timers + the emit.** `PhaseTimers` (9 phases) +
+  `PlanTimings`; `handle_connection`/`run_query` now take `admission_wait` as a
+  parameter because queueing happens *before* the per-query stopwatch and is
+  the phase most likely to be the whole answer on a loaded daemon.
+  `fetch_live_logs` returns per-peer `LiveNodeTiming` (failures included,
+  sorted by addr for a stable UI). `QueryStats` is written **untee'd** on both
+  the cache-hit and the normal path. `emit_scan_complete` logs the phases too.
+- **B4 — `client.ts`** decodes the frame and times `tableFromIPC` separately,
+  so `elapsedMs − server_total − decode` is the transport hop; `buildQueryTiming`
+  is pure and unit-tested (11 cases).
+- **B5 — the disclosure.** `resultTiming` signal in `store.ts` (a signal, not
+  the store: the store's run outcome carries *scalars*, matching `resultTable`),
+  and a new `TimingPopover.tsx` behind the `{rows} · {ms}ms` chip. Bars are a
+  timeline that sums to the whole, with `other` as its own bar; DataFusion's
+  counters are figures in a labelled aside, never slices, because they are
+  summed across partitions and can exceed the phase containing them.
+
+**Trap for whoever touches the e2e tests:** the moment the server started
+emitting `QueryStats`, five `query_e2e` tests failed with "unexpected frame".
+That is the correct symptom, not a regression — any exhaustive frame drain
+needs a `QueryStats` arm. `probe.rs` was fixed pre-emptively for the same
+reason; it would have `bail!`ed and broken `smoke-live.sh`.
+
+**Not instrumented: local `scry get`.** It does not go through `QueryService`,
+so it would need its own separate instrumentation. Flagged, not started.
+
+Docs are current: D-066 in `docs/decisions.md` covers both halves and the first
+measurements, and the `scry-cluster` / `scry-ingestd` / `scry-queryd` /
+`scry-query` bullets in `CLAUDE.md` are updated.
 
 ## Also found, not addressed
 

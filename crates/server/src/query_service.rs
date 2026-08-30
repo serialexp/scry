@@ -61,8 +61,9 @@ use scry_proto::{
     },
     framing::{read_frame, write_frame, Framed, MAX_FRAME_BYTES},
     BatchMsgInput, EndOfStreamInput, FleetStatusResponseInput, LabelNamesRequestOutput,
-    LabelNamesResponseInput, LabelValuesRequestOutput, LabelValuesResponseInput, QueryFrame,
-    QueryFrameMsg, ResponseSupersededInput, SchemaMsgInput, StreamErrorInput,
+    LabelNamesResponseInput, LabelValuesRequestOutput, LabelValuesResponseInput, LiveNodeTiming,
+    QueryFrame, QueryFrameMsg, QueryStatsInput, ResponseSupersededInput, SchemaMsgInput,
+    StreamErrorInput,
 };
 use scry_query::{
     collect_label_names, collect_label_values, hash128, list_metrics_candidates,
@@ -170,6 +171,76 @@ struct CacheStarts {
     result: QueryResultCacheStats,
 }
 
+/// Wall-clock time attributed to each phase of one query, accumulated as the
+/// query runs and shipped to the client in a [`QueryStats`] frame.
+///
+/// Two rules govern everything here, and both exist so the numbers can be
+/// trusted rather than merely displayed:
+///
+/// 1. **Nothing is smeared.** `server_total` is measured independently, from a
+///    single stopwatch spanning the whole query, and is *not* the sum of these
+///    fields. The client renders `server_total − Σphases` as an explicit
+///    `other` bucket. If some cost is unaccounted for, it shows up as `other`
+///    and prompts a real question — it is never quietly distributed across the
+///    phases that happen to be named.
+/// 2. **These are wall-clock and sequential.** Each field measures a stretch of
+///    the query's own timeline, so summing them is meaningful. The
+///    object-store and DataFusion counters that ride alongside in the frame are
+///    *not* like this — they are summed across concurrent work and can exceed
+///    the phase containing them, which is why they are reported separately and
+///    never as timeline slices.
+///
+/// `execute`/`serialize`/`write` interleave per batch, so each accumulates
+/// across the streaming loop rather than being a single span.
+#[derive(Debug, Clone, Copy, Default)]
+struct PhaseTimers {
+    /// Time queued for an active permit before the request was even read.
+    /// Happens entirely outside the per-query stopwatch, so it is added to
+    /// `server_total` rather than carved out of it.
+    admission_wait: Duration,
+    /// Listing candidate blocks: one indexed catalog SELECT.
+    catalog: Duration,
+    /// Fanning out to ingesters for the `--live` merge.
+    live_fetch: Duration,
+    /// Probing the result cache.
+    cache_lookup: Duration,
+    /// Registering the signal's table — where sidecar GETs happen.
+    register: Duration,
+    /// Logical planning through `create_physical_plan` + `execute_stream`.
+    plan: Duration,
+    /// Awaiting batches from the DataFusion stream.
+    execute: Duration,
+    /// Arrow IPC encoding of schema + batches.
+    serialize: Duration,
+    /// Writing frames to the socket, including the terminal flush.
+    write: Duration,
+}
+
+impl PhaseTimers {
+    /// Sum of the phases actually inside the per-query stopwatch — i.e.
+    /// everything except `admission_wait`, which precedes it.
+    fn measured_total(&self) -> Duration {
+        self.catalog
+            + self.live_fetch
+            + self.cache_lookup
+            + self.register
+            + self.plan
+            + self.execute
+            + self.serialize
+            + self.write
+    }
+}
+
+/// How long `plan_and_execute` spent in each of its two halves. Returned
+/// alongside the stream because both halves live inside that call and the
+/// caller cannot otherwise see the boundary between "fetching sidecars" and
+/// "planning", which are the two very different reasons a miss can be slow.
+#[derive(Debug, Clone, Copy, Default)]
+struct PlanTimings {
+    register: Duration,
+    plan: Duration,
+}
+
 /// Long-lived query service. One instance per daemon process. All
 /// fields are `Arc`'d / `Clone` so per-connection captures are cheap.
 pub struct QueryService {
@@ -235,6 +306,12 @@ pub struct QueryService {
     /// server-level trait so this crate has no direct Valkey dependency. `None`
     /// deliberately means "fleet unavailable", not a one-instance fallback.
     fleet: Option<Arc<dyn crate::stats::FleetSource>>,
+    /// Identifier stamped into every `QueryStats` frame so a client can tell
+    /// *which* daemon produced a breakdown. Empty unless the daemon sets one
+    /// (`scry query` passes its ephemeral instance uuid — the same id it uses
+    /// for the Valkey status registry, so a slow node found here can be looked
+    /// up on the fleet page). Purely descriptive; nothing routes on it.
+    node_id: String,
     /// Default query look-back window in nanoseconds. When a request carries no
     /// time bounds at all, `ts_min` is clamped to `now - this` before candidate
     /// selection so a boundless query doesn't fan out over the whole catalog.
@@ -295,6 +372,7 @@ impl QueryService {
                 TargetedRepairLimits::default().get_concurrency,
             )),
             targeted_repair_slots: Arc::new(Mutex::new(HashMap::new())),
+            node_id: String::new(),
         }
     }
 
@@ -302,6 +380,14 @@ impl QueryService {
     /// before wrapping the service in an `Arc`.
     pub fn with_metrics(mut self, metrics: Option<Arc<QueryMetrics>>) -> Self {
         self.metrics = metrics;
+        self
+    }
+
+    /// Stamp an identifier into every `QueryStats` frame this service emits, so
+    /// a client reading a slow breakdown can say *which* daemon was slow.
+    /// Builder-style — call before wrapping the service in an `Arc`.
+    pub fn with_node_id(mut self, node_id: impl Into<String>) -> Self {
+        self.node_id = node_id.into();
         self
     }
 
@@ -435,7 +521,9 @@ impl QueryService {
                     Ok(permit) => {
                         tokio::spawn(async move {
                             let _permit = permit;
-                            if let Err(e) = svc.handle_connection(sock, peer).await {
+                            // Admitted immediately — no queue wait to report.
+                            if let Err(e) = svc.handle_connection(sock, peer, Duration::ZERO).await
+                            {
                                 warn!(%peer, error = %e, "connection ended with error");
                             }
                         });
@@ -446,11 +534,20 @@ impl QueryService {
                             Ok(wait_permit) => tokio::spawn(async move {
                                 let wait_started =
                                     svc.metrics.as_ref().map(|m| m.admission_wait_started());
+                                // Measured unconditionally, not just when the
+                                // status page is on: this is the interval a
+                                // query spends queued behind other work, and it
+                                // is invisible to the per-query `t0` (which only
+                                // starts once the request has been read). A slow
+                                // query that was actually a *waiting* query is
+                                // exactly the confusion QueryStats exists to end.
+                                let queued_at = Instant::now();
                                 let active = tokio::time::timeout(
                                     svc.query_queue_timeout,
                                     svc.query_active_permits.clone().acquire_owned(),
                                 )
                                 .await;
+                                let admission_wait = queued_at.elapsed();
                                 drop(wait_permit);
                                 if let (Some(metrics), Some(started)) =
                                     (svc.metrics.as_ref(), wait_started)
@@ -460,7 +557,9 @@ impl QueryService {
                                 match active {
                                     Ok(Ok(permit)) => {
                                         let _permit = permit;
-                                        if let Err(e) = svc.handle_connection(sock, peer).await {
+                                        if let Err(e) =
+                                            svc.handle_connection(sock, peer, admission_wait).await
+                                        {
                                             warn!(%peer, error = %e, "queued connection ended with error");
                                         }
                                     }
@@ -500,7 +599,17 @@ impl QueryService {
     /// query life-cycle (`register_metrics_table_done`,
     /// `physical_plan_done`, `scan_complete`) gets the same
     /// correlation id.
-    async fn handle_connection(self: Arc<Self>, sock: TcpStream, peer: SocketAddr) -> Result<()> {
+    /// `admission_wait` is how long this connection sat in the query queue
+    /// before it got an active permit (`Duration::ZERO` when it was admitted
+    /// straight away). It is threaded down to `run_query` because it happens
+    /// entirely *before* the per-query stopwatch starts, so without it a query
+    /// that merely waited its turn is indistinguishable from a slow one.
+    async fn handle_connection(
+        self: Arc<Self>,
+        sock: TcpStream,
+        peer: SocketAddr,
+        admission_wait: Duration,
+    ) -> Result<()> {
         sock.set_nodelay(true)?;
         let (rd, wr) = sock.into_split();
         let mut rd = BufReader::new(rd);
@@ -674,7 +783,7 @@ impl QueryService {
         // it emits (`register_metrics_table_done` etc.) land in the
         // right trace.
         let svc = self.clone();
-        async move { svc.run_query(signal, req, wr).await }
+        async move { svc.run_query(signal, req, wr, admission_wait).await }
             .instrument(span)
             .await
     }
@@ -815,7 +924,7 @@ impl QueryService {
         req: &QueryRequest,
         candidates: &[CatalogEntry],
         persistent_watermarks: &std::collections::HashMap<(Uuid, u32), u64>,
-    ) -> std::result::Result<Vec<LiveLogRow>, (u16, String)> {
+    ) -> std::result::Result<(Vec<LiveLogRow>, Vec<LiveNodeTiming>), (u16, String)> {
         // Discovery failure = the live half can't be served → refuse.
         let endpoints = discovery.discover().await.map_err(|e| {
             (
@@ -845,6 +954,11 @@ impl QueryService {
             let matchers = matchers.clone();
             let body_contains = body_contains.clone();
             async move {
+                // Per-node wall time. This is the one place a query really does
+                // fan out across machines, so it is the one place a per-node
+                // breakdown means anything — and a single slow or timing-out
+                // ingester dragging the whole merge is precisely what it is for.
+                let started = Instant::now();
                 let result = tokio::time::timeout(
                     LIVE_FETCH_DEADLINE,
                     fetch_live_from_ingester(
@@ -857,7 +971,7 @@ impl QueryService {
                     ),
                 )
                 .await;
-                (addr, result)
+                (addr, started.elapsed(), result)
             }
         }))
         .buffer_unordered(self.live_fetch_limits.concurrency);
@@ -893,14 +1007,33 @@ impl QueryService {
         }
         let mut rows: Vec<LiveLogRow> = Vec::new();
         let mut retained_bytes = 0usize;
-        while let Some((addr, result)) = fetches.next().await {
+        let mut node_timings: Vec<LiveNodeTiming> = Vec::new();
+        while let Some((addr, elapsed, result)) = fetches.next().await {
+            // Recorded for every peer including the failures: a node that
+            // errored or timed out still cost the merge its time, and leaving
+            // it out of the list would hide the reason the merge was slow.
+            let mut note = |rows: u64, ok: bool| {
+                node_timings.push(LiveNodeTiming {
+                    addr: addr.clone(),
+                    elapsed_us: elapsed.as_micros() as u64,
+                    rows,
+                    ok: u8::from(ok),
+                });
+            };
             let batch = match result {
-                Ok(Ok(batch)) => batch,
+                Ok(Ok(batch)) => {
+                    // Records the node returned, before our watermark dedup —
+                    // the node's own output, not what we kept from it.
+                    note(batch.records.len() as u64, true);
+                    batch
+                }
                 Ok(Err(e)) => {
+                    note(0, false);
                     warn!(%addr, error = %format!("{e:#}"), "live fetch from ingester failed; skipping");
                     continue;
                 }
                 Err(_) => {
+                    note(0, false);
                     warn!(%addr, "live fetch from ingester timed out; skipping");
                     continue;
                 }
@@ -966,7 +1099,12 @@ impl QueryService {
                 })?;
             }
         }
-        Ok(rows)
+        // Stable order so two consecutive queries against the same fleet render
+        // their per-node rows in the same order; `buffer_unordered` yields by
+        // completion, which would otherwise reshuffle the list every query and
+        // make the slow node hard to spot.
+        node_timings.sort_by(|a, b| a.addr.cmp(&b.addr));
+        Ok((rows, node_timings))
     }
 
     async fn plan_and_execute(
@@ -976,12 +1114,20 @@ impl QueryService {
         store: Arc<dyn ObjectStore>,
         candidates: Vec<CatalogEntry>,
         live_rows: Option<Vec<LiveLogRow>>,
-    ) -> std::result::Result<(SendableRecordBatchStream, Arc<dyn ExecutionPlan>), (u16, String)>
-    {
+    ) -> std::result::Result<
+        (
+            SendableRecordBatchStream,
+            Arc<dyn ExecutionPlan>,
+            PlanTimings,
+        ),
+        (u16, String),
+    > {
+        let mut timings = PlanTimings::default();
         let ctx =
             SessionContext::new_with_config_rt(SessionConfig::new(), self.runtime_env.clone());
 
         // ── Register the signal's table (sidecar GETs happen here) ────
+        let register_started = Instant::now();
         let register_result = match signal {
             Signal::Metrics => {
                 register_metrics_table_from_candidates(
@@ -1039,12 +1185,17 @@ impl QueryService {
                 "BUG: unsupported signal {other:?} reached run_query"
             )),
         };
+        // Recorded before the `?`: a registration that failed still spent the
+        // time, and dropping it would make a failing object store look instant.
+        timings.register = register_started.elapsed();
         register_result.map_err(|e| {
             (
                 QUERY_ERR_INTERNAL,
                 format!("register_{}_table: {e:#}", signal_name(signal)),
             )
         })?;
+
+        let plan_started = Instant::now();
 
         // ── Build the DataFrame (SQL or default SELECT *) ────────────
         let default_table = match signal {
@@ -1078,7 +1229,11 @@ impl QueryService {
         let task_ctx = ctx.task_ctx();
         let stream = execute_stream(physical.clone(), task_ctx)
             .map_err(|e| (QUERY_ERR_INTERNAL, format!("execute_stream: {e:#}")))?;
-        Ok((stream, physical))
+        // `execute_stream` only *starts* execution — the batches are pulled by
+        // the caller's streaming loop and land in `PhaseTimers::execute`. So
+        // this covers planning proper, not the scan.
+        timings.plan = plan_started.elapsed();
+        Ok((stream, physical, timings))
     }
 
     async fn list_partition_meta_objects(
@@ -1698,6 +1853,7 @@ impl QueryService {
         signal: Signal,
         req: QueryRequest,
         mut wr: BufWriter<W>,
+        admission_wait: Duration,
     ) -> Result<()>
     where
         W: tokio::io::AsyncWrite + Unpin,
@@ -1712,6 +1868,12 @@ impl QueryService {
             result: self.result_cache.stats(),
         };
         let t0 = Instant::now();
+        // Phase attribution (D-066). `admission_wait` is seeded from before the
+        // request was read; every other field is filled in as the query runs.
+        let mut phases = PhaseTimers {
+            admission_wait,
+            ..Default::default()
+        };
         // Status-page accounting (D-057): count this query and track it
         // in-flight. The guard folds wall-time into the latency total on drop
         // and, unless `mark_ok` is called at a success terminator, counts an
@@ -1737,6 +1899,7 @@ impl QueryService {
                     cache_start,
                     "miss",
                     t0.elapsed(),
+                    &phases,
                 );
                 return Ok(());
             }
@@ -1760,10 +1923,14 @@ impl QueryService {
         // (Traces/profiles resolve no sidecar at plan time, so their 404 only
         // surfaces mid-scan, below.)
         let mut active_attempt = 0u32;
+        let mut live_node_timings: Vec<LiveNodeTiming> = Vec::new();
         'attempt: loop {
             // Object-store misses, live rows, and Arrow dictionary state are
             // attempt-local: a reset must not inherit any provisional state.
             rows_total = 0;
+            // Same rule for the reported fan-out: a superseded attempt's peers
+            // and candidate count describe work that was thrown away.
+            live_node_timings.clear();
             if req.live && signal == Signal::Logs && self.live_discovery.is_none() {
                 let _ = emit_stream_error(
                     &mut wr,
@@ -1780,40 +1947,48 @@ impl QueryService {
             let mut repair_rounds = 0u8;
             let (mut stream, physical, cache_key, candidate_context) = loop {
                 // (1) Candidate blocks for this request.
-                let (candidates, persistent_watermarks) =
-                    match self.list_candidates_and_watermarks(signal, &req.query) {
-                        Ok(snapshot) => snapshot,
-                        Err((code, msg)) => {
-                            let _ = emit_stream_error(&mut wr, code, msg).await;
-                            let _ = wr.flush().await;
-                            self.emit_scan_complete(
-                                signal,
-                                None,
-                                rows_total,
-                                pool_start,
-                                cache_start,
-                                "miss",
-                                t0.elapsed(),
-                            );
-                            return Ok(());
-                        }
-                    };
+                let catalog_started = Instant::now();
+                let listed = self.list_candidates_and_watermarks(signal, &req.query);
+                phases.catalog += catalog_started.elapsed();
+                let (candidates, persistent_watermarks) = match listed {
+                    Ok(snapshot) => snapshot,
+                    Err((code, msg)) => {
+                        let _ = emit_stream_error(&mut wr, code, msg).await;
+                        let _ = wr.flush().await;
+                        self.emit_scan_complete(
+                            signal,
+                            None,
+                            rows_total,
+                            pool_start,
+                            cache_start,
+                            "miss",
+                            t0.elapsed(),
+                            &phases,
+                        );
+                        return Ok(());
+                    }
+                };
 
                 let candidate_context: Vec<(Uuid, String, String)> = candidates
                     .iter()
                     .map(|c| (c.meta.uuid, c.meta.signal.clone(), c.date.clone()))
                     .collect();
                 let live_rows = if req.live && signal == Signal::Logs {
-                    match self
+                    let live_started = Instant::now();
+                    let fetched = self
                         .fetch_live_logs(
                             self.live_discovery.as_ref().expect("checked above"),
                             &req,
                             &candidates,
                             &persistent_watermarks,
                         )
-                        .await
-                    {
-                        Ok(rows) => Some(rows),
+                        .await;
+                    phases.live_fetch += live_started.elapsed();
+                    match fetched {
+                        Ok((rows, timings)) => {
+                            live_node_timings = timings;
+                            Some(rows)
+                        }
                         Err((code, msg)) => {
                             let _ = emit_stream_error(&mut wr, code, msg).await;
                             let _ = wr.flush().await;
@@ -1831,24 +2006,65 @@ impl QueryService {
                     m.record_candidates(candidates.len() as u64);
                 }
 
-                // (2) Cache key + hit short-circuit. The cached value is the exact
-                // concatenation of the SchemaMsg + BatchMsg… + EndOfStream frames,
-                // so a hit is a single write_all. A `live` query is time-varying
-                // (fresh in-flight records every instant), so it never consults or
-                // populates the result cache.
+                // (2) Cache key + hit short-circuit. The cached value is the
+                // concatenated SchemaMsg + BatchMsg… frames — the response *body* —
+                // so a hit is one write_all plus a freshly-built terminator. A
+                // `live` query is time-varying (fresh in-flight records every
+                // instant), so it never consults or populates the result cache.
+                let cache_started = Instant::now();
                 let key = data_query_cache_key(signal, &req, &candidates);
-                if !req.live {
-                    if let Some(bytes) = self.result_cache.get(key) {
+                let cached = if req.live {
+                    None
+                } else {
+                    self.result_cache.get(key)
+                };
+                phases.cache_lookup += cache_started.elapsed();
+                {
+                    if let Some(hit) = cached {
                         if let Some(g) = inflight.as_mut() {
                             g.mark_ok();
                         }
-                        if let Err(e) = wr.write_all(&bytes).await {
+                        // The count comes from the entry, not from a replayed frame,
+                        // so `scan_complete` reports the real number on a hit rather
+                        // than the 0 it used to.
+                        rows_total = hit.rows;
+                        let write_started = Instant::now();
+                        if let Err(e) = wr.write_all(&hit.bytes).await {
                             warn!(error = %e, "client disconnected while writing cached response");
                         }
+                        phases.write += write_started.elapsed();
+                        // Freshly built, never replayed: this describes *this*
+                        // 2 ms hit, not the miss that populated the entry. That
+                        // distinction is the whole reason QueryStats is a
+                        // separate frame from the cached terminator (D-066).
+                        let stats_frame = self.build_query_stats(
+                            &phases,
+                            t0.elapsed(),
+                            true,
+                            active_attempt + 1,
+                            candidates.len(),
+                            // No plan exists on a hit — nothing was scanned, so
+                            // the DataFusion and byte counters are genuinely
+                            // zero rather than unknown.
+                            None,
+                            cache_start,
+                            Vec::new(),
+                        );
+                        if let Err(e) = write_frame_untee(&mut wr, &stats_frame).await {
+                            warn!(error = %e, "client disconnected while writing QueryStats after a cache hit");
+                        }
+                        let end_frame = QueryFrame {
+                            msg: QueryFrameMsg::EndOfStream(
+                                EndOfStreamInput {
+                                    total_rows: rows_total,
+                                }
+                                .into(),
+                            ),
+                        };
+                        if let Err(e) = write_frame_untee(&mut wr, &end_frame).await {
+                            warn!(error = %e, "client disconnected while writing EndOfStream after a cache hit");
+                        }
                         let _ = wr.flush().await;
-                        // total_rows is not recomputed on a hit (the count rides inside
-                        // the cached EndOfStream frame the client parses); `cache=hit`
-                        // marks the fast path in telemetry.
                         self.emit_scan_complete(
                             signal,
                             None,
@@ -1857,6 +2073,7 @@ impl QueryService {
                             cache_start,
                             "hit",
                             t0.elapsed(),
+                            &phases,
                         );
                         return Ok(());
                     }
@@ -1889,7 +2106,11 @@ impl QueryService {
                     .await
                 };
                 match planned {
-                    Ok((stream, physical)) => break (stream, physical, key, candidate_context),
+                    Ok((stream, physical, plan_timings)) => {
+                        phases.register += plan_timings.register;
+                        phases.plan += plan_timings.plan;
+                        break (stream, physical, key, candidate_context);
+                    }
                     Err((code, msg)) => {
                         let evicted = evict.take_evicted();
                         if repair_rounds < 3 && !evicted.is_empty() {
@@ -1938,6 +2159,7 @@ impl QueryService {
                             cache_start,
                             "miss",
                             t0.elapsed(),
+                            &phases,
                         );
                         return Ok(());
                     }
@@ -1987,6 +2209,7 @@ impl QueryService {
                     cache_start,
                     "miss",
                     t0.elapsed(),
+                    &phases,
                 );
                 return Ok(());
             }
@@ -1998,7 +2221,10 @@ impl QueryService {
                     .into(),
                 ),
             };
-            if let Err(e) = write_and_tee(&mut wr, &schema_frame, &mut tee).await {
+            let schema_write_started = Instant::now();
+            let schema_wrote = write_and_tee(&mut wr, &schema_frame, &mut tee).await;
+            phases.write += schema_write_started.elapsed();
+            if let Err(e) = schema_wrote {
                 warn!(error = %e, "client disconnected while writing SchemaMsg");
                 self.emit_scan_complete(
                     signal,
@@ -2008,6 +2234,7 @@ impl QueryService {
                     cache_start,
                     "miss",
                     t0.elapsed(),
+                    &phases,
                 );
                 return Ok(());
             }
@@ -2016,6 +2243,7 @@ impl QueryService {
             // guard so work outside DataFusion's reservation accounting cannot run
             // all the way into the cgroup OOM killer.
             loop {
+                let execute_started = Instant::now();
                 let next = if let Some(guard) = &self.memory_guard {
                     tokio::select! {
                         batch = stream.next() => batch,
@@ -2034,6 +2262,7 @@ impl QueryService {
                                 cache_start,
                                 "miss",
                                 t0.elapsed(),
+                                &phases,
                             );
                             return Ok(());
                         }
@@ -2041,6 +2270,12 @@ impl QueryService {
                 } else {
                     stream.next().await
                 };
+                // Accumulated per batch: the stream is pulled lazily, so
+                // "execute" is the sum of the waits between batches, not one
+                // span. The final `None` poll — which is where a scan's last
+                // work often lands — is counted too, hence timing before the
+                // `break`.
+                phases.execute += execute_started.elapsed();
                 let Some(batch_res) = next else { break };
                 let batch = match batch_res {
                     Ok(b) => b,
@@ -2126,6 +2361,7 @@ impl QueryService {
                             cache_start,
                             "miss",
                             t0.elapsed(),
+                            &phases,
                         );
                         return Ok(());
                     }
@@ -2135,33 +2371,39 @@ impl QueryService {
                 // Each is one IPC message — we frame each as its own
                 // BatchMsg so a single batch with new dictionaries lands
                 // as N+1 BatchMsg frames in order.
+                let serialize_started = Instant::now();
                 #[allow(deprecated)]
-                let (dict_batches, batch_enc) =
-                    match data_gen.encoded_batch(&batch, &mut dict_tracker, &options) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            let _ = emit_stream_error(
-                                &mut wr,
-                                QUERY_ERR_INTERNAL,
-                                format!("encoded_batch: {e}"),
-                            )
-                            .await;
-                            let _ = wr.flush().await;
-                            self.emit_scan_complete(
-                                signal,
-                                Some(physical.as_ref()),
-                                rows_total,
-                                pool_start,
-                                cache_start,
-                                "miss",
-                                t0.elapsed(),
-                            );
-                            return Ok(());
-                        }
-                    };
+                let encoded = data_gen.encoded_batch(&batch, &mut dict_tracker, &options);
+                phases.serialize += serialize_started.elapsed();
+                let (dict_batches, batch_enc) = match encoded {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = emit_stream_error(
+                            &mut wr,
+                            QUERY_ERR_INTERNAL,
+                            format!("encoded_batch: {e}"),
+                        )
+                        .await;
+                        let _ = wr.flush().await;
+                        self.emit_scan_complete(
+                            signal,
+                            Some(physical.as_ref()),
+                            rows_total,
+                            pool_start,
+                            cache_start,
+                            "miss",
+                            t0.elapsed(),
+                            &phases,
+                        );
+                        return Ok(());
+                    }
+                };
 
+                let write_started = Instant::now();
                 for d in dict_batches {
-                    if let Err(e) = write_one_batch(&mut wr, d, &options, &mut tee).await {
+                    let wrote = write_one_batch(&mut wr, d, &options, &mut tee).await;
+                    if let Err(e) = wrote {
+                        phases.write += write_started.elapsed();
                         warn!(error = %e, "client disconnected while writing BatchMsg (dict)");
                         self.emit_scan_complete(
                             signal,
@@ -2171,11 +2413,14 @@ impl QueryService {
                             cache_start,
                             "miss",
                             t0.elapsed(),
+                            &phases,
                         );
                         return Ok(());
                     }
                 }
-                if let Err(e) = write_one_batch(&mut wr, batch_enc, &options, &mut tee).await {
+                let wrote = write_one_batch(&mut wr, batch_enc, &options, &mut tee).await;
+                phases.write += write_started.elapsed();
+                if let Err(e) = wrote {
                     warn!(error = %e, "client disconnected while writing BatchMsg");
                     self.emit_scan_complete(
                         signal,
@@ -2185,6 +2430,7 @@ impl QueryService {
                         cache_start,
                         "miss",
                         t0.elapsed(),
+                        &phases,
                     );
                     return Ok(());
                 }
@@ -2194,6 +2440,30 @@ impl QueryService {
 
             // Normal completion: EndOfStream terminator. The attempt is final only
             // once both the frame write and the buffered socket flush succeed.
+            //
+            // Written *untee'd*: the cached blob deliberately stops after the last
+            // BatchMsg, and the row count rides in the cache entry instead so a hit
+            // can regenerate this frame. See `result_cache`'s module docs.
+            //
+            // `QueryStats` goes immediately before it — outside the tee, so the
+            // breakdown always describes the query that just ran — and the
+            // terminator stays the last frame, so a client's "saw terminator,
+            // stop" loop is unaffected and one that doesn't know the tag just
+            // skips a frame.
+            let stats_frame = self.build_query_stats(
+                &phases,
+                t0.elapsed(),
+                false,
+                active_attempt + 1,
+                candidate_context.len(),
+                Some(physical.as_ref()),
+                cache_start,
+                std::mem::take(&mut live_node_timings),
+            );
+            if let Err(e) = write_frame_untee(&mut wr, &stats_frame).await {
+                warn!(error = %e, "client disconnected while writing QueryStats");
+                return Ok(());
+            }
             let end_frame = QueryFrame {
                 msg: QueryFrameMsg::EndOfStream(
                     EndOfStreamInput {
@@ -2202,7 +2472,8 @@ impl QueryService {
                     .into(),
                 ),
             };
-            if let Err(e) = write_and_tee(&mut wr, &end_frame, &mut tee).await {
+            let terminator_started = Instant::now();
+            if let Err(e) = write_frame_untee(&mut wr, &end_frame).await {
                 warn!(error = %e, "client disconnected while writing EndOfStream");
                 return Ok(());
             }
@@ -2210,6 +2481,11 @@ impl QueryService {
                 warn!(error = %e, "client disconnected while flushing EndOfStream");
                 return Ok(());
             }
+            // The terminal flush is where a slow client shows up, so it belongs
+            // in `write` — but it lands after the stats frame was built, so it
+            // can only ever be reflected in `server_total`'s `other` bucket.
+            // Recorded anyway for the `scan_complete` log.
+            phases.write += terminator_started.elapsed();
             if let Some(g) = inflight.as_mut() {
                 g.mark_ok();
             }
@@ -2217,7 +2493,8 @@ impl QueryService {
             // Admit only this final, cleanly-completed attempt after EOS is known to
             // have reached the socket. Provisional attempt bytes never enter `tee`.
             if let Some(bytes) = tee.take() {
-                self.result_cache.insert(cache_key, bytes.into());
+                self.result_cache
+                    .insert(cache_key, bytes.into(), rows_total);
             }
 
             self.emit_scan_complete(
@@ -2228,8 +2505,86 @@ impl QueryService {
                 cache_start,
                 "miss",
                 t0.elapsed(),
+                &phases,
             );
             return Ok(());
+        }
+    }
+
+    /// Assemble the `QueryStats` frame for a completed query (D-066).
+    ///
+    /// Read the three groups of fields differently — they are not
+    /// interchangeable and presenting them as one list would mislead:
+    ///
+    /// - **Phases** are sequential wall-clock spans of this query's timeline.
+    ///   They sum to at most `server_total_us`, and the difference is the
+    ///   client's `other` bucket. Nothing here is smeared to make them add up.
+    /// - **Sidecar fetch totals** (`postings_fetch_us`, `bloom_fetch_us`) are
+    ///   summed across concurrent resolutions and can *exceed* the `register`
+    ///   phase that contains them. They answer "how much object-store work did
+    ///   this query wait on", not "where did the wall clock go".
+    /// - **DataFusion counters** (`df_*`) are summed across partitions and can
+    ///   likewise exceed `execute_us`. Same rule.
+    ///
+    /// `server_total_us` deliberately includes `admission_wait_us`, which
+    /// happened before the query's own stopwatch started: from the client's
+    /// point of view, time spent queued is time the server had the request.
+    #[allow(clippy::too_many_arguments)]
+    fn build_query_stats(
+        &self,
+        phases: &PhaseTimers,
+        elapsed: Duration,
+        cache_hit: bool,
+        attempts: u32,
+        blocks_considered: usize,
+        plan: Option<&dyn ExecutionPlan>,
+        cache_start: CacheStarts,
+        live_nodes: Vec<LiveNodeTiming>,
+    ) -> QueryFrame {
+        let postings_delta = self.postings_cache.stats().delta(cache_start.postings);
+        let bloom_delta = self.bloom_cache.stats().delta(cache_start.bloom);
+        let metrics = plan.and_then(collect_leaf_metrics);
+        let (_, _, files_pruned, bytes_scanned) = match metrics.as_ref() {
+            Some(m) => summarise_metrics(m),
+            None => (0, 0, 0, 0),
+        };
+        let (df_opening, df_scanning, df_compute) = match metrics.as_ref() {
+            Some(m) => summarise_datafusion_timing(m),
+            None => (0, 0, 0),
+        };
+        // A pruned file was never opened, so "scanned" is what survived pruning.
+        // Saturating because the two numbers come from different sources and a
+        // wrong sign here would be a confusing negative rather than a loud bug.
+        let blocks_scanned = blocks_considered.saturating_sub(files_pruned);
+
+        QueryFrame {
+            msg: QueryFrameMsg::QueryStats(
+                QueryStatsInput {
+                    server_total_us: (elapsed + phases.admission_wait).as_micros() as u64,
+                    admission_wait_us: phases.admission_wait.as_micros() as u64,
+                    catalog_us: phases.catalog.as_micros() as u64,
+                    cache_lookup_us: phases.cache_lookup.as_micros() as u64,
+                    live_fetch_us: phases.live_fetch.as_micros() as u64,
+                    register_us: phases.register.as_micros() as u64,
+                    plan_us: phases.plan.as_micros() as u64,
+                    execute_us: phases.execute.as_micros() as u64,
+                    serialize_us: phases.serialize.as_micros() as u64,
+                    write_us: phases.write.as_micros() as u64,
+                    postings_fetch_us: postings_delta.fetch_nanos / 1_000,
+                    bloom_fetch_us: bloom_delta.fetch_nanos / 1_000,
+                    df_opening_us: df_opening as u64 / 1_000,
+                    df_scanning_us: df_scanning as u64 / 1_000,
+                    df_compute_us: df_compute as u64 / 1_000,
+                    cache_hit: u8::from(cache_hit),
+                    attempts,
+                    blocks_considered: blocks_considered as u32,
+                    blocks_scanned: blocks_scanned as u32,
+                    bytes_scanned: bytes_scanned as u64,
+                    node_id: self.node_id.clone(),
+                    live_nodes,
+                }
+                .into(),
+            ),
         }
     }
 
@@ -2245,6 +2600,7 @@ impl QueryService {
         cache_start: CacheStarts,
         cache_status: &'static str,
         wall: Duration,
+        phases: &PhaseTimers,
     ) {
         let pool_end = self.pool.stats();
         let pool_delta = pool_end.delta(pool_start);
@@ -2307,6 +2663,23 @@ impl QueryService {
             query_memory_reserved_bytes_end = memory_reserved_bytes_end,
             pool_in_flight = pool_end.in_flight,
             wall_ms = wall.as_millis() as u64,
+            // Same breakdown the client gets in its QueryStats frame (D-066),
+            // in microseconds, so a slow query can be attributed straight from
+            // the daemon log without a client attached. `other_us` is the
+            // residual `wall − Σphases` and is never smeared into the named
+            // phases; a large one is a real finding, not rounding.
+            admission_wait_us = phases.admission_wait.as_micros() as u64,
+            catalog_us = phases.catalog.as_micros() as u64,
+            cache_lookup_us = phases.cache_lookup.as_micros() as u64,
+            live_fetch_us = phases.live_fetch.as_micros() as u64,
+            register_us = phases.register.as_micros() as u64,
+            plan_us = phases.plan.as_micros() as u64,
+            execute_us = phases.execute.as_micros() as u64,
+            serialize_us = phases.serialize.as_micros() as u64,
+            write_us = phases.write.as_micros() as u64,
+            other_us = wall.saturating_sub(phases.measured_total()).as_micros() as u64,
+            postings_fetch_us = cache_delta.fetch_nanos / 1_000,
+            bloom_fetch_us = bloom_delta.fetch_nanos / 1_000,
             "scan_complete"
         );
         // The Span wrapping the call site carries `request_id`; no
@@ -2412,6 +2785,24 @@ fn frame_to_wire(frame: &QueryFrame) -> Result<Vec<u8>> {
     out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
     out.extend_from_slice(&payload);
     Ok(out)
+}
+
+/// Write one frame straight to the socket, **bypassing the cache tee**.
+///
+/// This is how the two trailing frames — `QueryStats` and `EndOfStream` — are
+/// emitted. They are regenerated for every response rather than replayed from
+/// cache, because a replayed `QueryStats` would report the original miss's
+/// phase breakdown on every subsequent hit (see `result_cache`'s module docs),
+/// and the terminator has to agree with the stats frame that precedes it.
+async fn write_frame_untee<W>(wr: &mut BufWriter<W>, frame: &QueryFrame) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let wire = frame_to_wire(frame)?;
+    wr.write_all(&wire)
+        .await
+        .map_err(|e| anyhow::anyhow!("write_all: {e}"))?;
+    Ok(())
 }
 
 /// Write one frame to the socket and tee its bytes for caching.
@@ -2577,6 +2968,31 @@ fn collect_leaf_metrics(plan: &dyn ExecutionPlan) -> Option<MetricsSet> {
 /// Sum the pruning + bytes counters into the same trailer shape the
 /// CLI prints. `(row_groups_pruned, row_groups_matched, files_pruned,
 /// bytes_scanned)`.
+/// Pull DataFusion's three leaf timing metrics out of an executed plan, in
+/// nanoseconds: `(opening, scanning, compute)`.
+///
+/// **These are sums across partitions, not wall-clock durations.** A plan that
+/// scanned 8 partitions concurrently for 100 ms reports ~800 ms of compute. That
+/// is not a bug and must not be "corrected" by dividing — it is the actual CPU
+/// work done, and the ratio between it and the wall-clock `execute` phase is
+/// itself the useful signal (a ratio near 1 on a multi-partition plan means the
+/// scan was not actually parallel). The client renders them in their own group
+/// for exactly this reason, never as slices of a timeline.
+fn summarise_datafusion_timing(metrics: &MetricsSet) -> (usize, usize, usize) {
+    let agg = metrics.aggregate_by_name();
+    let by_name = |name: &str| -> usize {
+        agg.iter()
+            .find(|m| m.value().name() == name)
+            .map(|m| m.value().as_usize())
+            .unwrap_or(0)
+    };
+    (
+        by_name("time_elapsed_opening"),
+        by_name("time_elapsed_scanning_total"),
+        by_name("elapsed_compute"),
+    )
+}
+
 fn summarise_metrics(metrics: &MetricsSet) -> (usize, usize, usize, usize) {
     let agg = metrics.aggregate_by_name();
     let pruning = |name: &str| -> (usize, usize) {

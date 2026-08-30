@@ -652,6 +652,10 @@ pub async fn run(args: Args) -> Result<()> {
         )
         .with_live_discovery(live_discovery)
         .with_fleet_source(fleet_source.clone())
+        // Same id this instance publishes to the Valkey status registry, so a
+        // per-query timing breakdown can be traced back to a specific daemon on
+        // the fleet page rather than just "one of the queriers".
+        .with_node_id(instance_uuid.to_string())
         .with_metrics(Some(query_metrics.clone()))
         .with_default_window(args.default_query_window_secs)
         .with_live_fetch_limits(LiveFetchLimits {

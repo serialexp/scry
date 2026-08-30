@@ -24,6 +24,7 @@ import {
   type QuerySpec,
   type MetaScope,
   type FleetInstance,
+  type QueryTiming,
 } from "./protocol/client";
 import { LiveUnavailableError } from "./protocol/transport";
 import {
@@ -124,7 +125,13 @@ const [resultTable, setResultTable] = createSignal<Table | null>(null);
  *  the query, so the view dispatch doesn't have to sniff column names. */
 const [resultKind, setResultKind] = createSignal<"default" | "frames">("default");
 
-export { state, resultTable, resultKind };
+/** Per-phase timing for the last completed query (D-066), or `null` when no
+ *  query has run or the daemon is older than the `QueryStats` frame. Held in a
+ *  signal rather than the store for the same reason `resultTable` is: the store
+ *  carries run-outcome *scalars*, not structures. */
+const [resultTiming, setResultTiming] = createSignal<QueryTiming | null>(null);
+
+export { state, resultTable, resultKind, resultTiming };
 
 // ── Inspector selection ──────────────────────────────────────────────
 //
@@ -438,6 +445,7 @@ async function runSpec(spec: QuerySpec, kind: "default" | "frames"): Promise<voi
     const res = await runQuery(transport, dest, spec);
     setResultKind(kind);
     setResultTable(res.table);
+    setResultTiming(res.timing ?? null);
     setState({
       status: "done",
       error: null,
@@ -447,6 +455,7 @@ async function runSpec(spec: QuerySpec, kind: "default" | "frames"): Promise<voi
     });
   } catch (e) {
     setResultTable(null);
+    setResultTiming(null);
     // A 401 from the relay means our session lapsed mid-use: drop back to the
     // login screen rather than showing a cryptic query error.
     if (e instanceof UnauthorizedError) {

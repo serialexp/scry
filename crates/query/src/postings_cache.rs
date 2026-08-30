@@ -133,6 +133,16 @@ pub struct PostingsCacheStats {
     /// future retry. Useful telemetry for "is the object store
     /// unreliable?"
     pub fetch_errors: u64,
+    /// Total nanoseconds callers spent blocked on sidecar resolution: the
+    /// object-store fetch + parse for whoever wins the single-flight, and the
+    /// wait for everyone who joins it. A cache hit contributes ~0.
+    ///
+    /// **This is a sum across concurrent callers, not a wall-clock duration.**
+    /// Sidecars for a candidate set resolve concurrently, so a delta over one
+    /// query can legitimately exceed the wall-clock phase that contains it —
+    /// the same caveat the other deltas here already carry. Read it as "total
+    /// object-store work this query waited on", never as a timeline slice.
+    pub fetch_nanos: u64,
     pub bytes_in: usize,
     pub entries: usize,
     pub budget_bytes: usize,
@@ -145,6 +155,7 @@ impl PostingsCacheStats {
             misses: self.misses.saturating_sub(prior.misses),
             evictions: self.evictions.saturating_sub(prior.evictions),
             fetch_errors: self.fetch_errors.saturating_sub(prior.fetch_errors),
+            fetch_nanos: self.fetch_nanos.saturating_sub(prior.fetch_nanos),
             bytes_in: self.bytes_in,
             entries: self.entries,
             budget_bytes: self.budget_bytes,
@@ -287,6 +298,7 @@ pub struct PostingsCache {
     misses: AtomicU64,
     evictions: AtomicU64,
     fetch_errors: AtomicU64,
+    fetch_nanos: AtomicU64,
     fill_permits: Arc<Semaphore>,
 }
 
@@ -302,6 +314,7 @@ impl PostingsCache {
             misses: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
             fetch_errors: AtomicU64::new(0),
+            fetch_nanos: AtomicU64::new(0),
             fill_permits: Arc::new(Semaphore::new(cfg.max_concurrent_fills.max(1))),
         }
     }
@@ -323,6 +336,7 @@ impl PostingsCache {
             misses: self.misses.load(Ordering::Relaxed),
             evictions: self.evictions.load(Ordering::Relaxed),
             fetch_errors: self.fetch_errors.load(Ordering::Relaxed),
+            fetch_nanos: self.fetch_nanos.load(Ordering::Relaxed),
             bytes_in: state.bytes_in,
             entries: state.map.len(),
             budget_bytes: self.budget_bytes,
@@ -398,6 +412,13 @@ impl PostingsCache {
         let store_for_fetch = store.clone();
         let meta_for_fetch = meta.clone();
         let permits = self.fill_permits.clone();
+        // Timed around `get_or_try_init` rather than around the fetch itself, so
+        // the number covers what the *caller* actually waited for: the fill for
+        // the single-flight winner, the fill's remaining duration for anyone who
+        // joined it, and the permit wait when fills are saturated. An already
+        // resolved cell returns here immediately and contributes ~0, which is
+        // what makes a warm query's `postings_fetch_us` legibly near-zero.
+        let fetch_start = std::time::Instant::now();
         let init_result = cell
             .get_or_try_init(|| async move {
                 // The permit lives inside OnceCell's winning initializer, so
@@ -412,6 +433,11 @@ impl PostingsCache {
                     .map(Arc::new)
             })
             .await;
+        // Recorded on both arms: a failed fetch still consumed wall time, and
+        // omitting it would make an object store that is slow *and* failing look
+        // faster than one that is merely slow.
+        self.fetch_nanos
+            .fetch_add(fetch_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
         let index = match init_result {
             Ok(index) => index.clone(),

@@ -221,6 +221,9 @@ fn total_rows(batches: &[RecordBatch]) -> usize {
 struct QueryResult {
     batches: Vec<RecordBatch>,
     server_total_rows: u64,
+    /// The `QueryStats` frame that precedes the terminator (D-066). `None`
+    /// would mean the server never sent one.
+    stats: Option<scry_proto::QueryStatsOutput>,
 }
 
 /// Open a TCP connection to `addr`, send `req`, drain the response
@@ -241,10 +244,18 @@ async fn run_query(addr: std::net::SocketAddr, req: QueryRequest) -> QueryResult
 
     let mut decoder = StreamDecoder::new();
     let mut batches: Vec<RecordBatch> = Vec::new();
+    let mut stats: Option<scry_proto::QueryStatsOutput> = None;
 
     let server_total_rows: u64 = loop {
         let frame: QueryFrame = read_frame(&mut r).await.expect("read frame");
         match frame.msg {
+            QueryFrameMsg::QueryStats(s) => {
+                assert!(
+                    stats.is_none(),
+                    "server sent more than one QueryStats frame in one response"
+                );
+                stats = Some(s);
+            }
             QueryFrameMsg::SchemaMsg(s) => {
                 let mut buf = Buffer::from(s.ipc_bytes);
                 while !buf.is_empty() {
@@ -274,9 +285,17 @@ async fn run_query(addr: std::net::SocketAddr, req: QueryRequest) -> QueryResult
         }
     };
 
+    // The terminator must stay last: a client that stops at EndOfStream would
+    // never see a QueryStats emitted after it.
+    assert!(
+        stats.is_some(),
+        "server must send QueryStats before EndOfStream"
+    );
+
     QueryResult {
         batches,
         server_total_rows,
+        stats,
     }
 }
 
@@ -302,6 +321,7 @@ async fn run_query_with_supersession(
     let mut batches = Vec::new();
     let mut resets = Vec::new();
     let mut awaiting_schema = true;
+    let mut stats: Option<scry_proto::QueryStatsOutput> = None;
     let server_total_rows = loop {
         let frame: QueryFrame = read_frame(&mut r).await.expect("read frame");
         match frame.msg {
@@ -331,6 +351,12 @@ async fn run_query_with_supersession(
                 decoder = StreamDecoder::new();
                 awaiting_schema = true;
             }
+            QueryFrameMsg::QueryStats(s) => {
+                // A superseded attempt is discarded wholesale, so only the
+                // final attempt may contribute stats.
+                assert!(stats.is_none(), "more than one QueryStats in one response");
+                stats = Some(s);
+            }
             QueryFrameMsg::EndOfStream(end) => {
                 assert!(!awaiting_schema, "EOS before final schema");
                 break end.total_rows;
@@ -347,6 +373,7 @@ async fn run_query_with_supersession(
         QueryResult {
             batches,
             server_total_rows,
+            stats,
         },
     )
 }
@@ -665,6 +692,26 @@ async fn query_round_trip() {
         delta.hits
     );
 
+    // `fetch_nanos` is what feeds `QueryStats.postings_fetch_us`, and its whole
+    // job is to separate "the object store was slow" from "planning was slow".
+    // A counter that ticked on hits as well as misses could not do that, so
+    // assert it discriminates: the cold queries above paid real fetch+parse
+    // time, and this replay — which missed zero blocks — paid essentially none.
+    // The gap is orders of magnitude in practice (parquet decode vs. a resolved
+    // OnceCell read), so the comparison is not a tight race.
+    assert!(
+        cache_before.fetch_nanos > 0,
+        "cold queries must have recorded sidecar fetch time (got {}ns)",
+        cache_before.fetch_nanos
+    );
+    assert!(
+        delta.fetch_nanos < cache_before.fetch_nanos,
+        "an all-hits replay must not pay cold-fetch time again \
+         (replay {}ns vs cold {}ns)",
+        delta.fetch_nanos,
+        cache_before.fetch_nanos
+    );
+
     // ── Label metadata (discoverability) ───────────────────────────
     //
     // The two planted blocks carry labels `__name__` and `env` only.
@@ -914,6 +961,12 @@ async fn logs_round_trip() {
     // rows. Because the candidate block-UUID set is folded into the key,
     // this hit is provably for the same blocks — the whole invalidation
     // story in one assertion.
+    //
+    // The `server_total_rows` check below is doing double duty since the
+    // cached blob stopped including the terminator: it reads a frame the
+    // server *regenerates* on every hit, so a hit that forgot to write one
+    // would hang the client, and one that wrote a stale count would report
+    // 0 rows here rather than 20.
     let rc_before = service.result_cache().stats();
     let req_replay = QueryRequest {
         signal: Signal::Logs as u8,
@@ -947,6 +1000,45 @@ async fn logs_round_trip() {
         rc_delta.inserts, 0,
         "a cache hit must not re-insert (got inserts={})",
         rc_delta.inserts
+    );
+
+    // ── QueryStats on a hit describes the hit, not the miss (D-066) ─
+    //
+    // This is the whole reason the timings are a separate frame instead of
+    // fields on `EndOfStream`. The terminator is written through `write_and_tee`
+    // and would have been baked into the cache entry, so a widened terminator
+    // would replay the *original* query's breakdown — its planning, its scan,
+    // its bytes — on every subsequent 2 ms hit. That is misleading in exactly
+    // the situation someone is reading the number: chasing a slow query.
+    let hit_stats = result_replay.stats.as_ref().expect("QueryStats on a hit");
+    assert_eq!(hit_stats.cache_hit, 1, "replay must report itself as a hit");
+    assert_eq!(
+        hit_stats.plan_us, 0,
+        "a hit plans nothing; a non-zero plan time means the miss's stats were replayed"
+    );
+    assert_eq!(
+        hit_stats.register_us, 0,
+        "a hit resolves no sidecars; non-zero means replayed stats"
+    );
+    assert_eq!(
+        hit_stats.bytes_scanned, 0,
+        "a hit scans no bytes; non-zero means replayed stats"
+    );
+    // And the miss it was served from did do that work, so the two frames are
+    // genuinely different rather than both trivially zero.
+    let miss_stats = result.stats.as_ref().expect("QueryStats on the miss");
+    assert!(
+        miss_stats.plan_us > 0,
+        "the original miss should have recorded planning time (got {}us)",
+        miss_stats.plan_us
+    );
+    assert_eq!(miss_stats.cache_hit, 0, "the original query was a miss");
+    assert!(
+        hit_stats.server_total_us < miss_stats.server_total_us,
+        "a memory hit must be faster than the miss that populated it \
+         (hit {}us vs miss {}us)",
+        hit_stats.server_total_us,
+        miss_stats.server_total_us
     );
 
     // ── Clean shutdown ─────────────────────────────────────────────

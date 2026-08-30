@@ -2,11 +2,27 @@
 //!
 //! The query daemon exists because blocks are immutable, so per-block sidecars
 //! (postings, blooms) are worth caching after the first hit. This module takes
-//! the idea one level up: cache the **entire serialized response** (the
-//! concatenated `SchemaMsg` + `BatchMsg…` + `EndOfStream` frame bytes, or a
-//! single metadata response frame) so a repeated request — the shape a
-//! dashboard produces when it re-polls the same panel — is answered straight
-//! from memory without touching DataFusion or the object store at all.
+//! the idea one level up: cache the **serialized response body** (the
+//! concatenated `SchemaMsg` + `BatchMsg…` frame bytes) so a repeated request —
+//! the shape a dashboard produces when it re-polls the same panel — is answered
+//! straight from memory without touching DataFusion or the object store at all.
+//!
+//! ## What is deliberately *not* cached: the terminator
+//!
+//! The cached blob stops after the last `BatchMsg`. The trailing frames — the
+//! `QueryStats` timings and the `EndOfStream` terminator — are synthesized fresh
+//! on every hit, which is why [`Entry`] carries `rows` separately: it is the
+//! number the regenerated `EndOfStream` needs.
+//!
+//! This is not tidiness. A cached `QueryStats` would report the *original*
+//! query's phase breakdown — plan time, execute time, blocks scanned — on every
+//! subsequent 2 ms hit, so the one number an operator consults while chasing a
+//! slow query would describe work that did not happen. Since the two frames are
+//! adjacent and `EndOfStream` must stay last, the cut is made before both.
+//!
+//! Keeping `rows` here also fixes a wart that predates the timing work: the
+//! count used to ride only inside the cached terminator, so the server's own
+//! `scan_complete` log reported `total_rows=0` on every cache hit.
 //!
 //! ## Correctness: the candidate-set is part of the key
 //!
@@ -84,6 +100,18 @@ impl QueryResultCacheStats {
 struct Entry {
     bytes: Arc<[u8]>,
     weight: usize,
+    /// Row count the original response's `EndOfStream` carried. Stored beside
+    /// the bytes because the terminator itself is not cached — see the module
+    /// docs.
+    rows: u64,
+}
+
+/// A cache hit: the framed `SchemaMsg + BatchMsg…` body, plus the row count the
+/// caller needs to regenerate an `EndOfStream` for it.
+#[derive(Clone, Debug)]
+pub struct CachedResponse {
+    pub bytes: Arc<[u8]>,
+    pub rows: u64,
 }
 
 struct LruState {
@@ -147,19 +175,25 @@ impl QueryResultCache {
     }
 
     /// Look up a cached response, promoting it to MRU on a hit. Returns the
-    /// shared response bytes, ready to `write_all` to the socket. Counts a
-    /// hit / miss unless the cache is disabled (then always `None`, uncounted).
-    pub fn get(&self, key: u128) -> Option<Arc<[u8]>> {
+    /// shared response body — ready to `write_all` to the socket, after which
+    /// the caller must write its own terminator — and the row count that
+    /// terminator should carry. Counts a hit / miss unless the cache is
+    /// disabled (then always `None`, uncounted).
+    pub fn get(&self, key: u128) -> Option<CachedResponse> {
         if !self.enabled() {
             return None;
         }
         let mut state = self.state.lock().expect("result cache mutex poisoned");
         if state.map.contains_key(&key) {
             state.map.to_back(&key);
-            let bytes = state.map.get(&key).expect("present").bytes.clone();
+            let entry = state.map.get(&key).expect("present");
+            let hit = CachedResponse {
+                bytes: entry.bytes.clone(),
+                rows: entry.rows,
+            };
             drop(state);
             self.hits.fetch_add(1, Ordering::Relaxed);
-            Some(bytes)
+            Some(hit)
         } else {
             drop(state);
             self.misses.fetch_add(1, Ordering::Relaxed);
@@ -167,11 +201,12 @@ impl QueryResultCache {
         }
     }
 
-    /// Admit a fully-buffered response under `key`. No-op if the cache is
-    /// disabled or the entry alone would exceed the whole budget (query
-    /// results are recomputable, so admitting a budget-buster only thrashes).
-    /// Re-inserting an existing key refreshes its bytes + ordering.
-    pub fn insert(&self, key: u128, bytes: Arc<[u8]>) {
+    /// Admit a fully-buffered response body under `key`, together with the row
+    /// count its terminator carried. No-op if the cache is disabled or the
+    /// entry alone would exceed the whole budget (query results are
+    /// recomputable, so admitting a budget-buster only thrashes). Re-inserting
+    /// an existing key refreshes its bytes + ordering.
+    pub fn insert(&self, key: u128, bytes: Arc<[u8]>, rows: u64) {
         if !self.enabled() {
             return;
         }
@@ -185,7 +220,14 @@ impl QueryResultCache {
             state.bytes_in = state.bytes_in.saturating_sub(old.weight);
         }
         state.bytes_in = state.bytes_in.saturating_add(weight);
-        state.map.insert(key, Entry { bytes, weight });
+        state.map.insert(
+            key,
+            Entry {
+                bytes,
+                weight,
+                rows,
+            },
+        );
         self.inserts.fetch_add(1, Ordering::Relaxed);
         self.evict_to_budget(&mut state);
     }
@@ -243,10 +285,10 @@ mod tests {
     fn hit_after_insert_and_miss_when_absent() {
         let cache = QueryResultCache::with_budget_bytes(1 << 20);
         assert!(cache.get(1).is_none()); // miss
-        cache.insert(1, bytes(100, 0xAB));
+        cache.insert(1, bytes(100, 0xAB), 7);
         let got = cache.get(1).expect("hit");
-        assert_eq!(got.len(), 100);
-        assert_eq!(got[0], 0xAB);
+        assert_eq!(got.bytes.len(), 100);
+        assert_eq!(got.bytes[0], 0xAB);
         assert!(cache.get(2).is_none()); // miss
 
         let s = cache.stats();
@@ -261,7 +303,7 @@ mod tests {
         let cache = QueryResultCache::with_budget_bytes(0);
         assert!(!cache.enabled());
         assert!(cache.get(1).is_none());
-        cache.insert(1, bytes(10, 0));
+        cache.insert(1, bytes(10, 0), 7);
         assert!(cache.get(1).is_none());
         let s = cache.stats();
         assert_eq!(s.hits, 0);
@@ -275,11 +317,11 @@ mod tests {
         // Budget fits ~2 entries of 1000 bytes (+overhead).
         let each = 1000 + ENTRY_OVERHEAD_BYTES;
         let cache = QueryResultCache::with_budget_bytes(each * 2 + each / 2);
-        cache.insert(1, bytes(1000, 1));
-        cache.insert(2, bytes(1000, 2));
+        cache.insert(1, bytes(1000, 1), 7);
+        cache.insert(2, bytes(1000, 2), 14);
         assert_eq!(cache.stats().entries, 2);
         // Third insert overflows → evicts key 1 (LRU).
-        cache.insert(3, bytes(1000, 3));
+        cache.insert(3, bytes(1000, 3), 21);
         assert_eq!(cache.stats().entries, 2);
         assert_eq!(cache.stats().evictions, 1);
         assert!(cache.get(1).is_none());
@@ -291,11 +333,11 @@ mod tests {
     fn get_promotes_to_mru() {
         let each = 1000 + ENTRY_OVERHEAD_BYTES;
         let cache = QueryResultCache::with_budget_bytes(each * 2 + each / 2);
-        cache.insert(1, bytes(1000, 1));
-        cache.insert(2, bytes(1000, 2));
+        cache.insert(1, bytes(1000, 1), 7);
+        cache.insert(2, bytes(1000, 2), 14);
         // Touch key 1 → it becomes MRU, key 2 becomes LRU.
         assert!(cache.get(1).is_some());
-        cache.insert(3, bytes(1000, 3));
+        cache.insert(3, bytes(1000, 3), 21);
         // Key 2 should have been evicted, not key 1.
         assert!(cache.get(1).is_some());
         assert!(cache.get(3).is_some());
@@ -305,7 +347,7 @@ mod tests {
     #[test]
     fn oversized_entry_is_skipped() {
         let cache = QueryResultCache::with_budget_bytes(500);
-        cache.insert(1, bytes(1000, 1)); // larger than the whole budget
+        cache.insert(1, bytes(1000, 1), 7); // larger than the whole budget
         assert_eq!(cache.stats().entries, 0);
         assert_eq!(cache.stats().inserts, 0);
         assert!(cache.get(1).is_none());
@@ -314,12 +356,32 @@ mod tests {
     #[test]
     fn reinsert_refreshes_bytes_without_double_counting() {
         let cache = QueryResultCache::with_budget_bytes(1 << 20);
-        cache.insert(1, bytes(100, 1));
-        cache.insert(1, bytes(200, 2));
+        cache.insert(1, bytes(100, 1), 7);
+        cache.insert(1, bytes(200, 2), 9);
         let s = cache.stats();
         assert_eq!(s.entries, 1);
         assert_eq!(s.bytes_in, 200 + ENTRY_OVERHEAD_BYTES);
-        assert_eq!(cache.get(1).unwrap().len(), 200);
+        let got = cache.get(1).unwrap();
+        assert_eq!(got.bytes.len(), 200);
+        // The row count is refreshed along with the bytes — a stale count would
+        // make the regenerated terminator disagree with the batches it follows.
+        assert_eq!(got.rows, 9);
+    }
+
+    /// The row count is the reason the terminator can be left out of the cached
+    /// blob at all: a hit has to be able to rebuild an `EndOfStream` that says
+    /// the same thing the original one did. Nothing else carries that number,
+    /// so if it did not survive the round-trip every hit would report 0 rows.
+    #[test]
+    fn row_count_survives_the_round_trip_independently_of_the_bytes() {
+        let cache = QueryResultCache::with_budget_bytes(1 << 20);
+        cache.insert(1, bytes(64, 0), 1_000);
+        cache.insert(2, bytes(64, 0), 0);
+
+        // Identical payloads, different counts — the count is not derived from
+        // the bytes and two responses may legitimately share neither.
+        assert_eq!(cache.get(1).expect("hit").rows, 1_000);
+        assert_eq!(cache.get(2).expect("hit").rows, 0);
     }
 
     #[test]

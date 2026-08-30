@@ -40,7 +40,9 @@ import {
   REFRESH_INTERVALS,
   refreshMs,
   setRefreshInterval,
+  resultTiming,
 } from "../../store";
+import { TimingPopover } from "./TimingPopover";
 
 /** Signal tabs, in the mock's order. Dot colour distinguishes them at a
  *  glance; Profiles is appended (the app supports it; the mock showed three). */
@@ -194,7 +196,11 @@ const QueryBar: Component = () => {
           </datalist>
           <span class="token-count">
             <Show when={state.status === "done"}>
-              {state.totalRows.toLocaleString()} rows · {state.elapsedMs.toFixed(0)}ms
+              <TimingPopover
+                rows={state.totalRows}
+                elapsedMs={state.elapsedMs}
+                timing={resultTiming()}
+              />
             </Show>
           </span>
         </div>

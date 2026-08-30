@@ -20,7 +20,9 @@ import {
   QueryFrameDecoder,
   QueryFrameEncoder,
   type QueryStatsInput,
+  type QueryStatsOutput,
 } from "../proto/generated";
+import { buildQueryTiming } from "./client";
 
 function stats(over: Partial<QueryStatsInput> = {}): QueryStatsInput {
   return {
@@ -134,5 +136,96 @@ describe("QueryStats frame", () => {
       s.write_us;
     expect(phases).toBeLessThan(s.server_total_us);
     expect(s.server_total_us - phases).toBeGreaterThan(0n);
+  });
+});
+
+describe("buildQueryTiming", () => {
+  // `stats()` is a QueryStatsInput; the decoder's Output shape is structurally
+  // identical for these fields, so one fixture serves both.
+  const asOutput = (o: Partial<QueryStatsInput> = {}) =>
+    stats(o) as unknown as QueryStatsOutput;
+
+  it("makes the phases sum to serverMs exactly, via an explicit other bucket", () => {
+    // This is the property the whole waterfall rests on. The server measures
+    // its total independently of the parts, so the parts never quite add up —
+    // and the gap is shown as its own bar rather than being distributed across
+    // the named phases, which would silently inflate whichever phase absorbed
+    // it. A reader can therefore trust every bar they see.
+    const t = buildQueryTiming(asOutput(), 10_500, 300);
+    const summed = t.phases.reduce((acc, p) => acc + p.ms, 0);
+    expect(summed).toBeCloseTo(t.serverMs, 6);
+
+    const other = t.phases.find((p) => p.label === "other");
+    expect(other).toBeDefined();
+    expect(other!.ms).toBeGreaterThan(0);
+    // "other" is last so the waterfall reads left-to-right in time order,
+    // with the unattributed remainder at the end.
+    expect(t.phases[t.phases.length - 1]!.label).toBe("other");
+  });
+
+  it("omits zero phases but never omits other", () => {
+    // A phase that did not happen is noise in a breakdown; `other` is
+    // meaningful even at zero because its absence would be read as "the
+    // phases are complete" rather than "nothing was unaccounted for".
+    const t = buildQueryTiming(asOutput({ live_fetch_us: 0n }), 10_500, 300);
+    expect(t.phases.map((p) => p.label)).not.toContain("live-fetch");
+    expect(t.phases.map((p) => p.label)).toContain("other");
+  });
+
+  it("derives transport as the round trip minus the server and the decode", () => {
+    // 9868.3ms server + 300ms decode inside a 10,500ms round trip leaves
+    // 331.7ms on the network — the half a daemon log can never show.
+    const t = buildQueryTiming(asOutput(), 10_500, 300);
+    expect(t.serverMs).toBeCloseTo(9868.3, 3);
+    expect(t.decodeMs).toBe(300);
+    expect(t.transportMs).toBeCloseTo(331.7, 3);
+  });
+
+  it("clamps transport at zero rather than reporting negative time", () => {
+    // The server's clock and ours are independent, so a fast local query can
+    // report a server total marginally above our measured round trip. Negative
+    // transport would be nonsense on a chart; zero is honest.
+    const t = buildQueryTiming(asOutput(), 1, 0);
+    expect(t.transportMs).toBe(0);
+  });
+
+  it("keeps DataFusion counters out of the phase list", () => {
+    // They are summed across partitions and here deliberately exceed the whole
+    // server total. As timeline slices they would be a lie; as their own group
+    // they are the useful "was the scan actually parallel?" signal.
+    const t = buildQueryTiming(asOutput(), 10_500, 300);
+    const dfTotal =
+      t.datafusion.openingMs + t.datafusion.scanningMs + t.datafusion.computeMs;
+    expect(dfTotal).toBeGreaterThan(t.serverMs);
+    expect(t.phases.map((p) => p.label)).not.toContain("datafusion");
+  });
+
+  it("carries the live fan-out including the peers that failed", () => {
+    const t = buildQueryTiming(
+      asOutput({
+        live_nodes: [
+          { addr: "10.0.0.1:4000", elapsed_us: 4_200n, rows: 13n, ok: 1 },
+          { addr: "10.0.0.2:4000", elapsed_us: 1_000_000n, rows: 0n, ok: 0 },
+        ],
+      }),
+      10_500,
+      300,
+    );
+    expect(t.liveNodes).toHaveLength(2);
+    expect(t.liveNodes[0]).toEqual({
+      addr: "10.0.0.1:4000",
+      ms: 4.2,
+      rows: 13n,
+      ok: true,
+    });
+    // The slow, failed peer is the whole reason to look — it must not be
+    // filtered out for having returned nothing.
+    expect(t.liveNodes[1]!.ok).toBe(false);
+    expect(t.liveNodes[1]!.ms).toBe(1000);
+  });
+
+  it("reports a cache hit as a hit", () => {
+    expect(buildQueryTiming(asOutput({ cache_hit: 1 }), 5, 1).cacheHit).toBe(true);
+    expect(buildQueryTiming(asOutput({ cache_hit: 0 }), 5, 1).cacheHit).toBe(false);
   });
 });

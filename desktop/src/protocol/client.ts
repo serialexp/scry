@@ -27,6 +27,7 @@ import {
   type BatchMsgOutput,
   type ResponseSupersededOutput,
   type EndOfStreamOutput,
+  type QueryStatsOutput,
   type StreamErrorOutput,
 } from "../proto/generated";
 import { frame, deframe } from "./framing";
@@ -49,6 +50,7 @@ type TaggedFrame =
   | { type: "SchemaMsg"; value: SchemaMsgOutput }
   | { type: "BatchMsg"; value: BatchMsgOutput }
   | { type: "ResponseSuperseded"; value: ResponseSupersededOutput }
+  | { type: "QueryStats"; value: QueryStatsOutput }
   | { type: "EndOfStream"; value: EndOfStreamOutput }
   | { type: "LabelNamesResponse"; value: LabelNamesResponseOutput }
   | { type: "LabelValuesResponse"; value: LabelValuesResponseOutput }
@@ -82,6 +84,54 @@ export interface QuerySpec {
   withLabels?: boolean;
 }
 
+/** One phase of a query, in milliseconds. */
+export interface TimingPhase {
+  label: string;
+  ms: number;
+}
+
+/**
+ * Where a query's time went (D-066), assembled from the server's `QueryStats`
+ * frame plus two measurements only the client can make.
+ *
+ * The three groups are **not** interchangeable and a UI must not mix them:
+ *
+ * - `phases` are sequential wall-clock spans of the server's timeline. They sum
+ *   to `serverMs` exactly, because `other` is included as an explicit term
+ *   rather than the remainder being smeared across the named phases.
+ * - `transportMs` / `decodeMs` are the client's own halves — network plus Arrow
+ *   decode — which the daemon cannot see.
+ * - `datafusion` and the sidecar fetch totals are summed across partitions and
+ *   concurrent fetches. They can legitimately exceed the phase that contains
+ *   them, so they are reported apart and never drawn as timeline slices.
+ */
+export interface QueryTiming {
+  /** Server-side total, including time queued before the request was read. */
+  serverMs: number;
+  /** Sequential server phases, `other` last. Only non-zero phases are listed. */
+  phases: TimingPhase[];
+  /** `elapsedMs − serverMs − decodeMs`: the network round trip. */
+  transportMs: number;
+  /** Time this client spent in `tableFromIPC`. */
+  decodeMs: number;
+  /** Whether the server answered from its result cache. */
+  cacheHit: boolean;
+  /** Response attempts, >1 when a block vanished mid-scan and forced a replan. */
+  attempts: number;
+  blocksScanned: number;
+  blocksConsidered: number;
+  bytesScanned: bigint;
+  /** Object-store waits, summed over concurrent fetches — not timeline slices. */
+  postingsFetchMs: number;
+  bloomFetchMs: number;
+  /** Summed across partitions — can exceed `execute`. Never a timeline slice. */
+  datafusion: { openingMs: number; scanningMs: number; computeMs: number };
+  /** Which daemon produced this. Empty if it didn't identify itself. */
+  nodeId: string;
+  /** Per-ingester fan-out for a `live` query; empty for an ordinary one. */
+  liveNodes: { addr: string; ms: number; rows: bigint; ok: boolean }[];
+}
+
 export interface QueryResult {
   /** The decoded Arrow table (schema + rows). */
   table: Table;
@@ -91,6 +141,86 @@ export interface QueryResult {
   totalRows: bigint;
   /** Wall-clock round-trip, milliseconds. */
   elapsedMs: number;
+  /**
+   * Phase breakdown, when the server sent a `QueryStats` frame. `undefined`
+   * against a daemon older than D-066 — the query still succeeds, so callers
+   * must treat this as optional rather than assuming it.
+   */
+  timing?: QueryTiming;
+}
+
+/** Microseconds (server wire units) → milliseconds, at 3 decimal places. */
+function usToMs(us: bigint | number): number {
+  return Number(us) / 1000;
+}
+
+/**
+ * Turn a raw `QueryStats` frame plus the client's own two measurements into a
+ * `QueryTiming`.
+ *
+ * Exported for tests: the arithmetic here — specifically that the phases,
+ * `other` included, sum back to `serverMs` — is the property that makes the
+ * waterfall honest, and it deserves a test that does not need a live daemon.
+ */
+export function buildQueryTiming(
+  s: QueryStatsOutput,
+  elapsedMs: number,
+  decodeMs: number,
+): QueryTiming {
+  const named: [string, bigint | number][] = [
+    ["admission", s.admission_wait_us],
+    ["catalog", s.catalog_us],
+    ["cache-lookup", s.cache_lookup_us],
+    ["live-fetch", s.live_fetch_us],
+    ["register", s.register_us],
+    ["plan", s.plan_us],
+    ["execute", s.execute_us],
+    ["serialize", s.serialize_us],
+    ["write", s.write_us],
+  ];
+  const serverMs = usToMs(s.server_total_us);
+  const namedMs = named.reduce((acc, [, us]) => acc + usToMs(us), 0);
+  // The residual is a first-class phase, not a rounding error to hide. The
+  // server measures its total independently of the parts, so anything the named
+  // phases don't cover is real time that went somewhere unnamed — most often
+  // reading the request off the socket, which happens before the phase timers
+  // start. Clamped at 0 because the two measurements are independent and a
+  // scheduling hiccup could in principle invert them by microseconds.
+  const otherMs = Math.max(0, serverMs - namedMs);
+
+  const phases: TimingPhase[] = named
+    .filter(([, us]) => Number(us) > 0)
+    .map(([label, us]) => ({ label, ms: usToMs(us) }));
+  phases.push({ label: "other", ms: otherMs });
+
+  return {
+    serverMs,
+    phases,
+    // What is left after the server's own time and our Arrow decode is the
+    // network. This is the half of "why did that take 9 seconds?" that the
+    // daemon's logs cannot answer.
+    transportMs: Math.max(0, elapsedMs - serverMs - decodeMs),
+    decodeMs,
+    cacheHit: Number(s.cache_hit) === 1,
+    attempts: Number(s.attempts),
+    blocksScanned: Number(s.blocks_scanned),
+    blocksConsidered: Number(s.blocks_considered),
+    bytesScanned: BigInt(s.bytes_scanned),
+    postingsFetchMs: usToMs(s.postings_fetch_us),
+    bloomFetchMs: usToMs(s.bloom_fetch_us),
+    datafusion: {
+      openingMs: usToMs(s.df_opening_us),
+      scanningMs: usToMs(s.df_scanning_us),
+      computeMs: usToMs(s.df_compute_us),
+    },
+    nodeId: s.node_id,
+    liveNodes: (s.live_nodes ?? []).map((n) => ({
+      addr: n.addr,
+      ms: usToMs(n.elapsed_us),
+      rows: BigInt(n.rows),
+      ok: Number(n.ok) === 1,
+    })),
+  };
 }
 
 /** A protocol-level `StreamError` frame, surfaced as an exception. */
@@ -165,6 +295,7 @@ export async function runQuery(
   let sawTerminator = false;
   let activeAttempt = 0;
   let awaitingSchema = true;
+  let stats: QueryStatsOutput | undefined;
   const maxSupersededAttempts = 2;
 
   for (const body of deframe(responseBytes)) {
@@ -197,6 +328,13 @@ export async function runQuery(
         ipcChunks = [];
         activeAttempt = msg.value.next_attempt;
         awaitingSchema = true;
+        // A superseded attempt's timings describe work that was thrown away.
+        stats = undefined;
+        break;
+      case "QueryStats":
+        // Sent immediately before the terminator. Optional by design: an older
+        // daemon simply never sends one and the query still succeeds.
+        stats = msg.value;
         break;
       case "EndOfStream":
         if (awaitingSchema) throw new Error("EndOfStream received before schema");
@@ -219,17 +357,23 @@ export async function runQuery(
     throw new Error("server sent no schema frame");
   }
 
+  // Timed on its own: Arrow decode is client-side CPU, and folding it into the
+  // round trip would make a big result look like a slow network.
+  const decodeStarted = performance.now();
   const table = tableFromIPC(concatChunks(ipcChunks));
+  const decodeMs = performance.now() - decodeStarted;
   if (BigInt(table.numRows) !== totalRows) {
     throw new Error(
       `query row-count mismatch: decoded ${table.numRows}, server reported ${totalRows}`,
     );
   }
+  const elapsedMs = performance.now() - started;
   return {
     table,
     rowCount: table.numRows,
     totalRows,
-    elapsedMs: performance.now() - started,
+    elapsedMs,
+    timing: stats ? buildQueryTiming(stats, elapsedMs, decodeMs) : undefined,
   };
 }
 

@@ -106,6 +106,14 @@ pub struct BloomCacheStats {
     pub evictions: u64,
     /// Fetches that failed and left the slot empty for a future retry.
     pub fetch_errors: u64,
+    /// Total nanoseconds callers spent blocked on bloom resolution: the
+    /// object-store fetch + parse for whoever wins the single-flight, and the
+    /// wait for everyone who joins it. A cache hit contributes ~0.
+    ///
+    /// **A sum across concurrent callers, not a wall-clock duration** — blooms
+    /// for a candidate set resolve concurrently, so a per-query delta can
+    /// exceed the phase containing it. Same caveat as the other deltas here.
+    pub fetch_nanos: u64,
     pub bytes_in: usize,
     pub entries: usize,
     pub budget_bytes: usize,
@@ -118,6 +126,7 @@ impl BloomCacheStats {
             misses: self.misses.saturating_sub(prior.misses),
             evictions: self.evictions.saturating_sub(prior.evictions),
             fetch_errors: self.fetch_errors.saturating_sub(prior.fetch_errors),
+            fetch_nanos: self.fetch_nanos.saturating_sub(prior.fetch_nanos),
             bytes_in: self.bytes_in,
             entries: self.entries,
             budget_bytes: self.budget_bytes,
@@ -162,6 +171,7 @@ pub struct BloomCache {
     misses: AtomicU64,
     evictions: AtomicU64,
     fetch_errors: AtomicU64,
+    fetch_nanos: AtomicU64,
     fill_permits: Arc<Semaphore>,
 }
 
@@ -187,6 +197,7 @@ impl BloomCache {
             misses: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
             fetch_errors: AtomicU64::new(0),
+            fetch_nanos: AtomicU64::new(0),
             fill_permits: Arc::new(Semaphore::new(cfg.max_concurrent_fills.max(1))),
         }
     }
@@ -207,6 +218,7 @@ impl BloomCache {
             misses: self.misses.load(Ordering::Relaxed),
             evictions: self.evictions.load(Ordering::Relaxed),
             fetch_errors: self.fetch_errors.load(Ordering::Relaxed),
+            fetch_nanos: self.fetch_nanos.load(Ordering::Relaxed),
             bytes_in: state.bytes_in,
             entries: state.map.len(),
             budget_bytes: self.budget_bytes,
@@ -282,6 +294,11 @@ impl BloomCache {
         let store_for_fetch = store.clone();
         let meta_for_fetch = meta.clone();
         let permits = self.fill_permits.clone();
+        // Timed around `get_or_try_init`, not the fetch: this measures what the
+        // caller waited for (own fill, joined fill, or permit wait). A resolved
+        // cell returns immediately and contributes ~0. Recorded on both arms —
+        // a failed fetch still burned wall time.
+        let fetch_start = std::time::Instant::now();
         let init_result = cell
             .get_or_try_init(|| async move {
                 let _permit = permits
@@ -293,6 +310,8 @@ impl BloomCache {
                     .map(Arc::new)
             })
             .await;
+        self.fetch_nanos
+            .fetch_add(fetch_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
         let value = match init_result {
             Ok(v) => v.clone(),

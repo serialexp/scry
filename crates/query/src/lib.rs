@@ -78,7 +78,7 @@ pub use postings_cache::{
     DEFAULT_BUDGET_BYTES as DEFAULT_POSTINGS_CACHE_BYTES,
 };
 pub use result_cache::{
-    hash128, QueryResultCache, QueryResultCacheStats, DEFAULT_QUERY_CACHE_BYTES,
+    hash128, CachedResponse, QueryResultCache, QueryResultCacheStats, DEFAULT_QUERY_CACHE_BYTES,
     DEFAULT_QUERY_CACHE_ENTRY_BYTES,
 };
 pub use table::{time_overlaps, BlockEntry, MetricsTable};
