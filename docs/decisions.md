@@ -3622,3 +3622,83 @@ history, Prometheus exporter, or recursive self-ingestion is introduced.
 
 Sealed by focused `scry-status`/gateway/frontend tests and the gateway leg in
 `scripts/smoke-status.sh`. Full design contract: `docs/design/gateway-status.md`.
+
+## D-068: The catalog reports a trend, not just a level
+
+**Status:** accepted.
+
+After D-066 cut a compaction partition from ~13 min to ~57 s on gothab, the
+obvious follow-up question had no answer anywhere in the process: *is the
+350,000-block backlog actually shrinking?* Compaction cadence says how often
+merges fire, not whether they are outpacing ingest.
+
+`QueryMetrics` reported `catalog_blocks` — a level with no slope. Getting a
+trend meant reading it twice by hand, hours apart. `ServerMetrics` did not
+report it at all, even though `scry ingest --mode full` is the instance holding
+the catalog and running compaction. And retention reaps were recorded
+**nowhere** (`record_compaction_pass` existed; there was no retention twin), so
+half of block removal was invisible.
+
+**Both halves are reported, because neither alone answers it.**
+
+*The level and its slope.* `CatalogGauge` (`crates/server/src/catalog_gauge.rs`)
+samples the catalog every 60 s, keeps a 60-entry ring (a one-hour window) and
+reports the endpoint-to-endpoint rate alongside the window length. It measures
+the shared catalog, so it already includes peers' work.
+
+*The flows.* `created = uploads + compaction blocks_out`;
+`reclaimed = compaction reaps + retention reaps`. **Compaction sits on both
+sides** — a merge writes a block as well as consuming some. Treating it as pure
+removal, the intuitive reading, would report the backlog draining faster than
+it is; `blocks_in` deliberately never enters the sum, since those inputs are
+counted when *reaped*, not when read. These are per-instance and will not
+reconcile exactly with the slope on a multi-instance deployment. That gap is
+information, not an inconsistency.
+
+**Three design points that are forced by the measurement, not stylistic:**
+
+1. **The sampler never touches the shared catalog mutex.** It opens its own
+   read-only connection (`Catalog::open_read_only`, the flags `save_snapshot`
+   already uses to `VACUUM INTO` a live catalog). A full aggregate over a large
+   `blocks` table is slow enough that running it under the mutex ingest writes
+   and queries contend for would stall real work for the least urgent reader in
+   the process. This also fixes a **pre-existing** problem: `query_data()` ran
+   `block_count()` + `live_row_count()` + `lineage_row_count()` on *every*
+   status heartbeat — three full scans every 2 s, on the query path's own lock.
+   The status path is now a struct read.
+2. **A slope it cannot justify is absent, not zero.** Under two samples, or a
+   window under 120 s, `blocks_per_hour` is `null`. Zero means "measured, and
+   steady". An operator staring at a backlog needs those distinguished: "not
+   moving" and "not measured" call for opposite reactions.
+3. **Every reading carries its own age**, computed at snapshot time on the
+   sampling instance's clock (a viewer subtracting its own `Date.now()` would
+   be comparing two machines' clocks). Without it the count is unfalsifiable —
+   a freshly booted daemon samples before the first block lands, and a real
+   catalog reads as empty for a full minute. This was found by running it, not
+   by reasoning about it.
+
+`Catalog::live_block_stats` replaces the two separate scans with one
+`GROUP BY level`, which also yields the per-level histogram — the diagnostic a
+single total hides, since L0 climbing while upper levels drain is exactly the
+state where ingest is outrunning merging, and the total can sit still through
+all of it. Its predicate is `deleted_at IS NULL AND superseded = 0`, character
+for character what `list_blocks` uses, so status cannot count a different set
+than queries read; a test pins that.
+
+Interval is a constant, not a flag: nothing downstream reacts faster than a
+human refreshing a status page. ingestd samples only with an online catalog and
+`--stats-listen` (the existing opt-in rule); queryd always, where 60 s replaces
+the old 2 s cadence.
+
+The Fleet card shows both groups on the ingest and query roles, with the trend
+signed explicitly (`−441/h` / `+1.2k/h` / `steady` / `—`) since the sign is the
+entire question. Counts fall back to the flat `catalog_*` keys a pre-gauge
+instance publishes — not for API compatibility but for rolling deploys, when
+old and new instances share the fleet and this page is what you are watching
+the rollout with.
+
+Sealed by unit tests (slope arithmetic, ring bounds, reading age, the
+both-sides block balance, predicate equivalence), `fleetFields` render tests,
+and new assertions in `scripts/smoke-status.sh` covering a sampled queryd
+gauge, a storage-less ingester reporting no gauge at all, and a single reading
+yielding no trend.

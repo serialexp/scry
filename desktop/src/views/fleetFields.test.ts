@@ -107,3 +107,121 @@ describe("fleetFields", () => {
     expect(fleetVersion(instance("query", {}))).toBe("—");
   });
 });
+
+describe("catalog trend", () => {
+  const catalog = (over: Record<string, unknown>) => ({
+    catalog: {
+      sampled: true,
+      blocks: 348_112,
+      rows: 9_000_000,
+      lineage_rows: 12,
+      by_level: [
+        { level: 0, blocks: 12_345, rows: 1_000 },
+        { level: 1, blocks: 900, rows: 2_000 },
+      ],
+      trend_window_secs: 3600,
+      ...over,
+    },
+  });
+
+  it("shows a shrinking catalog with an explicit minus sign", () => {
+    const fields = new Map(fleetFields(instance("query", catalog({ blocks_per_hour: -441 }))));
+    expect(fields.get("block trend")).toBe("−441/h");
+    expect(fields.get("catalog blocks")).toBe("348,112");
+    expect(fields.get("trend window")).toBe("1.0h");
+  });
+
+  it("shows a growing catalog with an explicit plus sign, scaled", () => {
+    const fields = new Map(fleetFields(instance("query", catalog({ blocks_per_hour: 1234 }))));
+    expect(fields.get("block trend")).toBe("+1.2k/h");
+  });
+
+  it("distinguishes measured-and-steady from not-measured", () => {
+    const steady = new Map(fleetFields(instance("query", catalog({ blocks_per_hour: 0 }))));
+    expect(steady.get("block trend")).toBe("steady");
+
+    // blocks_per_hour absent: the gauge has not accumulated enough samples.
+    const unmeasured = new Map(fleetFields(instance("query", catalog({}))));
+    expect(unmeasured.get("block trend")).toBe("—");
+  });
+
+  it("renders an unsampled gauge as absent rather than an empty catalog", () => {
+    const fields = new Map(fleetFields(instance("query", { catalog: { sampled: false } })));
+    expect(fields.get("catalog blocks")).toBe("—");
+    expect(fields.get("block trend")).toBe("—");
+    expect(fields.get("level split")).toBe("—");
+  });
+
+  it("breaks blocks down by compaction level", () => {
+    const fields = new Map(fleetFields(instance("ingest", catalog({ blocks_per_hour: -10 }))));
+    expect(fields.get("level split")).toBe("L0 12,345 · L1 900");
+  });
+});
+
+describe("ingest block balance", () => {
+  it("keeps merge outputs on the created side and both reapers on the removed side", () => {
+    const fields = new Map(fleetFields(instance("ingest", {
+      blocks: {
+        created: 5,
+        uploaded: 3,
+        merge_outputs: 2,
+        reclaimed: 13,
+        compaction_reaped: 8,
+        retention_reaped: 5,
+        net: -8,
+      },
+    })));
+
+    expect(fields.get("blocks created")).toBe("5");
+    expect(fields.get("  ↳ merge outputs")).toBe("2");
+    expect(fields.get("blocks reclaimed")).toBe("13");
+    expect(fields.get("  ↳ by retention")).toBe("5");
+    expect(fields.get("net blocks (this instance)")).toBe("-8");
+  });
+
+  it("separates staged retention work from actually-reaped work", () => {
+    const fields = new Map(fleetFields(instance("ingest", {
+      retention: {
+        passes: 4,
+        reaped: 5,
+        staged: 3,
+        bytes_reaped: 1_048_576,
+        reap_failed: 0,
+        last_dry_run: false,
+      },
+    })));
+
+    expect(fields.get("retention reaped")).toBe("5");
+    expect(fields.get("retention staged")).toBe("3");
+    expect(fields.get("retention freed")).toBe("1.0 MiB");
+    expect(fields.get("retention mode")).toBe("applying");
+    expect(fields.get("retention passes")).toBe("4");
+  });
+
+  it("says when retention is only dry-running, so a zero reap is not read as nothing to do", () => {
+    const fields = new Map(fleetFields(instance("ingest", {
+      retention: { passes: 9, reaped: 0, candidates: 120, last_dry_run: true },
+    })));
+    expect(fields.get("retention mode")).toBe("dry run");
+    expect(fields.get("retention reaped")).toBe("0");
+  });
+});
+
+describe("mixed-version fleet during a rollout", () => {
+  it("still shows counts from a pre-gauge instance's flat keys", () => {
+    const fields = new Map(fleetFields(instance("query", {
+      catalog_blocks: 350_095,
+      catalog_rows: 42,
+      catalog_lineage_rows: 7,
+    })));
+
+    expect(fields.get("catalog blocks")).toBe("350,095");
+    expect(fields.get("catalog rows")).toBe("42");
+    expect(fields.get("lineage claims")).toBe("7");
+    expect(fields.get("block trend")).toBe(
+      "—",
+      // An instance that never sampled has no trend to fall back to, and
+      // inventing one would be worse than showing none.
+    );
+  });
+});

@@ -28,15 +28,21 @@ use scry_duration::parse_duration;
 use scry_objstore::{open as open_objstore, ObjStoreConfig};
 use scry_retention::RetentionConfig;
 use scry_server::{
-    decode, serve_status, BlockBuilderConfig, CompactionPassStats, DummyShards, FleetSource,
-    LiveRing, LocalStatus, LogsShards, MetricsShards, ProfilesShards, Server, ServerConfig,
-    ServerMetrics, ShardedPipeline, TracesShards, INGEST_SHARDS,
+    decode, serve_status, BlockBuilderConfig, CatalogGauge, CompactionPassStats, DummyShards,
+    FleetSource, LiveRing, LocalStatus, LogsShards, MetricsShards, ProfilesShards,
+    RetentionPassStats, Server, ServerConfig, ServerMetrics, ShardedPipeline, TracesShards,
+    CATALOG_GAUGE_INTERVAL, INGEST_SHARDS,
 };
 use scry_valkey::{
     parse_envelope, subscribe_blocks, StatusRegistration, TailRegistration, ValkeyClient,
     ValkeyLeaseProvider, ValkeySink, STATUS_TTL, VALKEY_URL_ENV,
 };
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -337,12 +343,27 @@ pub async fn run(args: Args) -> Result<()> {
     // dashboard or Valkey fleet publication is enabled. Like queryd, an ingestd
     // connected to Valkey must report to the fleet even without --stats-listen.
     let valkey_configured = args.valkey_url.is_some() || std::env::var(VALKEY_URL_ENV).is_ok();
+
+    // Catalog size + trend. Only meaningful where there is an online catalog to
+    // observe, so it is gated on exactly the condition under which `--catalog`
+    // is honoured at all — `--storage`. Without that gate the gauge would sit
+    // on a path that is never created and log failures forever.
+    //
+    // Built here so it can be attached to the metrics; the sampling task is
+    // spawned later, once the pipelines have actually created the catalog file
+    // (starting it now would warn on a file that is milliseconds from
+    // existing).
+    let catalog_gauge: Option<Arc<CatalogGauge>> = (args.storage && args.catalog.is_some())
+        .then(|| CatalogGauge::new(args.catalog.clone().expect("guarded by is_some")));
+
     let stats_metrics: Option<Arc<ServerMetrics>> =
         (args.stats_listen.is_some() || valkey_configured).then(|| {
-            Arc::new(
-                ServerMetrics::new(upload_concurrency)
-                    .with_identity(writer_uuid.to_string(), args.listen.clone()),
-            )
+            let mut metrics = ServerMetrics::new(upload_concurrency)
+                .with_identity(writer_uuid.to_string(), args.listen.clone());
+            if let Some(gauge) = catalog_gauge.clone() {
+                metrics = metrics.with_catalog_gauge(gauge);
+            }
+            Arc::new(metrics)
         });
 
     // ---- Multi-instance coordination (v0.9) -------------------------------
@@ -739,6 +760,18 @@ pub async fn run(args: Args) -> Result<()> {
             }));
         }
 
+        // 0b. catalog gauge: sample block count + per-level split on a timer so
+        // the status page can report which way the catalog is *moving*, not
+        // just how big it is. Reads through its own read-only connection, so
+        // this never queues behind ingest on the shared catalog mutex.
+        if let Some(gauge) = catalog_gauge.clone() {
+            info!(
+                interval_secs = CATALOG_GAUGE_INTERVAL.as_secs(),
+                "catalog gauge enabled"
+            );
+            bg_tasks.push(gauge.spawn(CATALOG_GAUGE_INTERVAL));
+        }
+
         // 1. pub/sub convergence consumer (low-latency hint; only with Valkey).
         if let Some(url) = valkey_url.clone() {
             let cat = catalog.clone();
@@ -1039,6 +1072,29 @@ fn record_compaction_metrics(
     );
 }
 
+fn record_retention_metrics(
+    metrics: Option<&ServerMetrics>,
+    report: &scry_retention::RetentionReport,
+    duration: Duration,
+) {
+    let Some(metrics) = metrics else {
+        return;
+    };
+    metrics.record_retention_pass(
+        RetentionPassStats {
+            scanned: report.scanned as u64,
+            candidates: report.candidates as u64,
+            staged: report.staged as u64,
+            reaped: report.reaped as u64,
+            bytes_reaped: report.bytes_reaped,
+            reap_failed: report.reap_failed as u64,
+            aborted: u64::from(report.aborted),
+            dry_run: report.dry_run,
+        },
+        duration,
+    );
+}
+
 /// The lease-guarded maintenance loop: fire a compaction pass on
 /// `compact_interval` and (if any TTL is configured) a retention pass on
 /// `retention_interval`. Generic over the lease provider so the Valkey
@@ -1124,6 +1180,7 @@ async fn run_maintenance_loop<L: LeaseProvider>(
             }
             _ = retention_tick.tick(), if retention_active => {
                 let now = now_unix_nano();
+                let started = Instant::now();
                 match run_retention_pass(
                     &provider, store.clone(), catalog.as_ref(),
                     &retention_cfg, now, sink_ref, lease_ttl,
@@ -1133,17 +1190,26 @@ async fn run_maintenance_loop<L: LeaseProvider>(
                     // out its durable grace. Reporting the plan as if it
                     // were deletions (the old behaviour) claimed removals
                     // that had not happened — especially on an aborted pass.
-                    Ok(r) if r.reaped > 0 || r.staged > 0 || r.reap_failed > 0 => info!(
-                        candidates = r.candidates,
-                        staged = r.staged,
-                        reaped = r.reaped,
-                        bytes = r.bytes_reaped,
-                        reap_failed = r.reap_failed,
-                        aborted = r.aborted,
-                        dry_run = r.dry_run,
-                        "retention pass"
-                    ),
-                    Ok(_) => {}
+                    Ok(r) => {
+                        if r.reaped > 0 || r.staged > 0 || r.reap_failed > 0 {
+                            info!(
+                                candidates = r.candidates,
+                                staged = r.staged,
+                                reaped = r.reaped,
+                                bytes = r.bytes_reaped,
+                                reap_failed = r.reap_failed,
+                                aborted = r.aborted,
+                                dry_run = r.dry_run,
+                                "retention pass"
+                            );
+                        }
+                        // Recorded on *every* pass, including the quiet ones the
+                        // log deliberately skips: "retention ran and found
+                        // nothing" and "retention has not run" are different
+                        // states, and the block balance needs the second term
+                        // regardless of whether it was interesting enough to log.
+                        record_retention_metrics(metrics.as_deref(), &r, started.elapsed());
+                    }
                     Err(e) => warn!(error = %e, "retention pass failed"),
                 }
             }

@@ -53,8 +53,8 @@ use scry_query::{
     BloomCache, BloomCacheConfig, PostingsCache, PostingsCacheConfig, QueryResultCache,
 };
 use scry_server::{
-    serve_status, CgroupMemoryGuard, FleetSource, LiveDiscovery, LiveFetchLimits, LocalStatus,
-    QueryMemoryGuard, QueryMetrics, QueryService,
+    serve_status, CatalogGauge, CgroupMemoryGuard, FleetSource, LiveDiscovery, LiveFetchLimits,
+    LocalStatus, QueryMemoryGuard, QueryMetrics, QueryService, CATALOG_GAUGE_INTERVAL,
 };
 use scry_valkey::{
     discover_status_blobs, discover_tail_endpoints, parse_envelope, subscribe_blocks,
@@ -617,16 +617,23 @@ pub async fn run(args: Args) -> Result<()> {
         .clone()
         .map(|vk| Arc::new(ValkeyFleetSource { valkey: vk }) as Arc<dyn FleetSource>);
 
+    // Catalog size + trend, sampled on the gauge's own read-only connection
+    // rather than read under the shared catalog mutex. Before this, every
+    // status heartbeat (~2s) ran three full scans of `blocks` on the same lock
+    // queries take; now the scan happens once a minute, off to the side, and
+    // the status path is a struct read. The trend it accumulates is the point:
+    // a block count alone cannot say whether compaction is winning.
+    let catalog_gauge = CatalogGauge::new(args.catalog.clone());
+    catalog_gauge.clone().spawn(CATALOG_GAUGE_INTERVAL);
+
     // Query metrics: **always built now** (D-059) — the lightweight query
     // counters (`queries_total`/`queries_in_flight`/`blocks_scanned_total`, a
     // few `Relaxed` atomics) back the periodic activity log, which is on by
     // default so runaway queries are visible in `kubectl logs`. This narrows
     // D-057's opt-in to just the `--stats-listen` HTTP page + Valkey fleet
     // heartbeat below; the counters themselves are free. Shares the caches /
-    // memory pool / catalog the service already holds, so a snapshot is a
-    // handful of live reads with no hot-path cost. `catalog` is moved into the
-    // service below, so hand `QueryMetrics` the `conv_catalog` clone (same
-    // underlying connection).
+    // memory pool the service already holds, so a snapshot is a handful of
+    // live reads with no hot-path cost.
     let query_metrics: Arc<QueryMetrics> = Arc::new(QueryMetrics::new(
         instance_uuid.to_string(),
         args.listen.to_string(),
@@ -634,7 +641,7 @@ pub async fn run(args: Args) -> Result<()> {
         bloom_cache.clone(),
         result_cache.clone(),
         memory_pool.clone(),
-        conv_catalog.clone(),
+        catalog_gauge,
         valkey.as_ref().map(|c| c.health()),
     ));
 

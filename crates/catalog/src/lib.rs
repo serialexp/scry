@@ -39,6 +39,27 @@ pub use snapshot::{
     SNAPSHOT_KEY,
 };
 
+/// Live blocks and rows at one compaction level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LevelStats {
+    pub level: u32,
+    pub blocks: u64,
+    pub rows: u64,
+}
+
+/// The result of [`Catalog::live_block_stats`]: totals plus the per-level
+/// split, from one scan.
+///
+/// `by_level` is a `Vec` ordered by level rather than a map: levels are a
+/// small dense range starting at 0, callers iterate it in order to render or
+/// serialise, and nobody looks up a level by key.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LiveBlockStats {
+    pub blocks: u64,
+    pub rows: u64,
+    pub by_level: Vec<LevelStats>,
+}
+
 /// A catalog row, joining the block sidecar with the per-instance
 /// bookkeeping fields (`bucket`, `date`, `level`). Returned by
 /// [`Catalog::list_blocks`] and [`Catalog::get_block`].
@@ -115,6 +136,33 @@ impl Catalog {
         };
         cat.init_schema()?;
         Ok(cat)
+    }
+
+    /// Open an existing catalog **read-only**, on this connection alone.
+    ///
+    /// For observers that want to aggregate over the catalog without joining
+    /// the queue for the shared `Arc<Mutex<Catalog>>` that ingest writes and
+    /// queries contend for. A full scan of a large `blocks` table takes long
+    /// enough that doing it under that mutex would stall real work, and the
+    /// scan is the *least* urgent thing in the process.
+    ///
+    /// Same connection flags [`save_snapshot`] already uses to `VACUUM INTO`
+    /// a live catalog. Deliberately does not run `init_schema`: read-only means
+    /// read-only, and a missing table should surface as an error from the
+    /// caller's query rather than an attempted write on a read-only handle.
+    ///
+    /// The file must already exist — this cannot bootstrap one.
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )
+        .with_context(|| format!("opening sqlite read-only at {}", path.display()))?;
+        Ok(Self {
+            conn,
+            // Only meaningful for inserts, which a read-only handle cannot do.
+            bucket: String::new(),
+        })
     }
 
     /// Bucket associated with this catalog instance. New inserts are
@@ -616,6 +664,54 @@ impl Catalog {
             |r| r.get(0),
         )?;
         Ok(n as u64)
+    }
+
+    /// Blocks and rows that are logically live, broken down by compaction
+    /// level, in a **single** table scan.
+    ///
+    /// This exists because status reporting wanted three numbers that are all
+    /// the same aggregation over the same rows, and was paying for two separate
+    /// full scans ([`block_count`](Self::block_count) and
+    /// [`live_row_count`](Self::live_row_count)) to get two of them.
+    ///
+    /// The per-level split is the part that carries diagnostic weight: a total
+    /// block count that holds steady can hide L0 growing while compaction
+    /// drains the upper levels, which is precisely the state in which ingest is
+    /// outrunning merging. One number cannot show that; this one can.
+    ///
+    /// The predicate is `deleted_at IS NULL AND superseded = 0`, character for
+    /// character what [`list_blocks`](Self::list_blocks) uses. That is a
+    /// requirement, not a coincidence: if status counted a different set than
+    /// queries read, the reported catalog size would not describe the catalog
+    /// anyone is querying.
+    pub fn live_block_stats(&self) -> Result<LiveBlockStats> {
+        let mut stmt = self.conn.prepare(
+            "SELECT level, COUNT(*), COALESCE(SUM(row_count), 0) FROM blocks \
+             WHERE deleted_at IS NULL AND superseded = 0 \
+             GROUP BY level ORDER BY level",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?;
+
+        let mut stats = LiveBlockStats::default();
+        for row in rows {
+            let (level, blocks, block_rows) = row?;
+            let blocks = blocks as u64;
+            let block_rows = block_rows as u64;
+            stats.blocks += blocks;
+            stats.rows += block_rows;
+            stats.by_level.push(LevelStats {
+                level: level.max(0) as u32,
+                blocks,
+                rows: block_rows,
+            });
+        }
+        Ok(stats)
     }
 
     /// Number of durable ancestry claims retained in the rebuildable lineage

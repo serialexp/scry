@@ -799,3 +799,69 @@ fn lineage_recovered_from_the_bucket_needs_explicit_reap_staging() {
     );
     assert_eq!(cat.list_pending_reaps(ts).unwrap().len(), 2);
 }
+
+/// `live_block_stats` must agree with the two scans it replaces, and must
+/// count the same rows `list_blocks` returns.
+///
+/// The trap this pins: status counting a *different* set than queries read. If
+/// the predicate here ever drifts from `list_blocks`, the reported catalog size
+/// stops describing the catalog anyone is actually querying — and it would
+/// drift silently, because both numbers still look plausible on their own.
+#[test]
+fn live_block_stats_matches_the_scans_it_replaces() {
+    let tmp = TempDir::new().unwrap();
+    let cat = Catalog::open(&tmp.path().join("cat.sqlite"), "scry-dev").unwrap();
+    let writer = Uuid::now_v7();
+    let ts = 1_700_000_000_000_000_000;
+
+    // Three L0 blocks of 10 rows, two L1 of 100, one L2 of 1000.
+    let at_level = |level: u32, rows: u64| {
+        let mut m = meta(Uuid::now_v7(), writer, ts, rows);
+        m.level = level;
+        cat.insert_block(&m).unwrap();
+        m.uuid
+    };
+    let l0: Vec<Uuid> = (0..3).map(|_| at_level(0, 10)).collect();
+    let l1: Vec<Uuid> = (0..2).map(|_| at_level(1, 100)).collect();
+    at_level(2, 1000);
+
+    let stats = cat.live_block_stats().unwrap();
+    assert_eq!(stats.blocks, 6);
+    assert_eq!(stats.rows, 3 * 10 + 2 * 100 + 1000);
+    assert_eq!(
+        stats
+            .by_level
+            .iter()
+            .map(|l| (l.level, l.blocks, l.rows))
+            .collect::<Vec<_>>(),
+        vec![(0, 3, 30), (1, 2, 200), (2, 1, 1000)],
+        "levels ascending, each carrying its own blocks and rows"
+    );
+    assert_eq!(stats.blocks as usize, cat.block_count().unwrap());
+    assert_eq!(stats.rows, cat.live_row_count().unwrap());
+
+    // A superseded block leaves the live set the moment it is superseded,
+    // before any object is reaped.
+    let merged = Uuid::now_v7();
+    cat.mark_superseded(&l0, merged).unwrap();
+    let stats = cat.live_block_stats().unwrap();
+    assert_eq!(stats.blocks, 3, "the three superseded L0 blocks are gone");
+    assert_eq!(stats.rows, 2 * 100 + 1000);
+    assert!(
+        !stats.by_level.iter().any(|l| l.level == 0),
+        "a level with no live blocks is absent, not a zero row"
+    );
+
+    // So does a soft-deleted one, while its grace window runs.
+    cat.mark_deleted(&l1[..1], ts, ts + 600_000_000_000)
+        .unwrap();
+    let stats = cat.live_block_stats().unwrap();
+    assert_eq!(stats.blocks, 2);
+    assert_eq!(stats.blocks as usize, cat.block_count().unwrap());
+    assert_eq!(stats.rows, cat.live_row_count().unwrap());
+    assert_eq!(
+        stats.blocks as usize,
+        cat.list_blocks().unwrap().len(),
+        "status counts exactly what a query would read"
+    );
+}

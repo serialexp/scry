@@ -242,17 +242,64 @@ the two runaway walks were saturating Garage, a 13-min gap = ~3,900 sidecars
 per metrics date partition — and ~3,900 × ~90 daily partitions ≈ 350k, which is
 the observed bucket size. Metrics dominates the bucket.
 
-**D-066 probably helps this a lot without having aimed at it.** A4 put
-`buffer_unordered(16)` inside `fetch_and_apply`, and `reconcile_partition` goes
-through the same function, so it inherits 16× concurrency; and with the walks
-no longer saturating Garage the per-GET rate should recover too. Both effects
-are unverified until v0.18.0 actually runs — **that is the measurement to take
-after deploying**, not another local one.
+**D-066 helped this a lot without having aimed at it — now confirmed in prod.**
+A4 put `buffer_unordered(16)` inside `fetch_and_apply`, and
+`reconcile_partition` goes through the same function, so it inherited 16×
+concurrency. Measured on gothab after the v0.19.0 rollout (2026-08-31):
+merge-to-merge cadence went from **~13 min to ~57 s**, i.e. **~14×** — almost
+exactly the concurrency factor. (A window at 04:13–04:15 showed ~15 s gaps, but
+those were atypically tiny logs partitions at `row_count=160`; ~57 s is the
+steady state across mixed partition sizes. Do not quote the 15 s number.)
 
 **Structural issue that remains regardless:** the cost is O(blocks in the
 partition) per merge, on the partition compaction exists to shrink. It
 self-heals as levels build, but slowly. No change made — Bart asked for
 investigation only.
+
+## Part C — catalog trend in ingestd stats + the Fleet UI (D-068): DONE
+
+Asked for after the compaction re-measure could not answer "is the 350k backlog
+shrinking?". Cadence says how often merges fire, not whether they beat ingest.
+
+**What existed:** queryd reported `catalog_blocks` — a level with no slope.
+ingestd reported no block count at all, despite being the instance that holds
+the catalog and runs compaction. Retention reaps were recorded **nowhere**.
+
+**Shipped:**
+- `Catalog::live_block_stats` — one `GROUP BY level` replacing the two separate
+  `block_count`/`live_row_count` scans, and yielding the per-level histogram.
+  Predicate pinned to `list_blocks`' by a test.
+- `Catalog::open_read_only` + `crates/server/src/catalog_gauge.rs` — samples
+  every 60s on its **own read-only connection**, 60-sample ring, endpoint slope
+  with a 120s floor. Absent (not zero) when unjustifiable. Every reading carries
+  its own age, on the sampler's clock.
+- `RetentionPassStats` / `record_retention_pass`, recorded on *every* pass
+  including the quiet ones the log skips. `staged` kept distinct from `reaped`.
+- Block balance: `created = uploads + compaction blocks_out`,
+  `reclaimed = compaction + retention reaps`. Compaction is on **both** sides;
+  `blocks_in` deliberately never enters the sum.
+- Fleet card (`fleetFields.ts`) on both ingest and query roles, trend signed
+  explicitly, counts falling back to the flat `catalog_*` keys so a mid-rollout
+  fleet still renders.
+
+**Pre-existing bug fixed on the way:** queryd ran three full scans of `blocks`
+under the shared catalog mutex on *every* status heartbeat (~2s) — on the query
+path's own lock. `QueryMetrics` now takes an `Arc<CatalogGauge>` instead of the
+catalog handle, so it cannot come back.
+
+**Verified:** 75 test binaries green; 116 frontend tests; clippy clean on new
+code; `SIGNAL=both` + `MULTI=1` + `smoke-status.sh` (new gauge assertions) +
+`smoke-webui.sh` all PASS. End-to-end: a live ingester's gauge reported
+**+220 blocks/h over a 180s window** with blocks/rows matching the catalog
+exactly.
+
+**Two apparent discrepancies chased down, both correct behaviour:** gauge 11 vs
+uploaded 9 was the boot seed walk converging leftovers (gauge = shared catalog,
+balance = this instance); gauge 3 vs uploaded 4 was a 28s-old reading. The
+second is exactly why `reading age` is displayed — without it that looks like a
+bug.
+
+**Not deployed.** gothab still runs v0.19.0.
 
 ## Also found, not addressed
 - **The v0.18.0 deploy never took, and the reason is a config override.**

@@ -26,12 +26,13 @@
 //!    only as "this instance".
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
-use scry_catalog::Catalog;
 use scry_proto::constants::Signal;
+
+use crate::catalog_gauge::CatalogGauge;
 use scry_query::{BloomCache, PostingsCache, QueryResultCache};
 #[cfg(test)]
 use scry_query::{BloomCacheConfig, PostingsCacheConfig};
@@ -110,6 +111,13 @@ impl UploadStats {
         self.upload_failures.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Blocks this signal has successfully uploaded. One of the two terms on
+    /// the *created* side of the catalog's block balance.
+    #[inline]
+    pub fn blocks_uploaded(&self) -> u64 {
+        self.blocks_uploaded.load(Ordering::Relaxed)
+    }
+
     fn snapshot(&self) -> serde_json::Value {
         let inflight = self.uploads_inflight.load(Ordering::Relaxed);
         let waiters = self.upload_waiters.load(Ordering::Relaxed);
@@ -150,6 +158,29 @@ pub struct CompactionPassStats {
     /// closure would exceed the sidecar cap. A non-zero value that never
     /// returns to zero means those partitions will never compact again.
     pub oversized: u64,
+}
+
+/// One completed retention pass, recorded into [`ServerMetrics`].
+///
+/// Retention is the other half of block removal, and until now it was recorded
+/// nowhere — compaction had [`CompactionPassStats`] and retention had only a
+/// log line. That made "are blocks being reclaimed?" unanswerable from the
+/// status page, because half the removals were invisible.
+///
+/// `staged` and `reaped` are kept apart on purpose. A staged block is
+/// soft-deleted and waiting out its durable grace window: it has left the live
+/// set but its objects are still in the bucket. Folding the two together would
+/// claim storage had been freed that has not been.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RetentionPassStats {
+    pub scanned: u64,
+    pub candidates: u64,
+    pub staged: u64,
+    pub reaped: u64,
+    pub bytes_reaped: u64,
+    pub reap_failed: u64,
+    pub aborted: u64,
+    pub dry_run: bool,
 }
 
 /// Process-global ingest metrics. Record counters are bumped once per *batch*
@@ -198,6 +229,23 @@ pub struct ServerMetrics {
     compaction_oversized: AtomicU64,
     compaction_last_pass_unix_ms: AtomicU64,
     compaction_last_pass_duration_ms: AtomicU64,
+    retention_passes: AtomicU64,
+    retention_scanned: AtomicU64,
+    retention_candidates: AtomicU64,
+    retention_staged: AtomicU64,
+    retention_reaped: AtomicU64,
+    retention_bytes_reaped: AtomicU64,
+    retention_reap_failed: AtomicU64,
+    retention_aborted: AtomicU64,
+    /// Gauge: whether the most recent pass was a dry run. Retention is dry-run
+    /// by default, and a dry-run pass reaping nothing is indistinguishable from
+    /// a live pass finding nothing unless this is reported.
+    retention_last_dry_run: AtomicU64,
+    retention_last_pass_unix_ms: AtomicU64,
+    retention_last_pass_duration_ms: AtomicU64,
+    /// Sampled catalog size and trend. `None` when this daemon has no online
+    /// catalog to observe.
+    catalog_gauge: Option<Arc<CatalogGauge>>,
 }
 
 impl ServerMetrics {
@@ -242,6 +290,18 @@ impl ServerMetrics {
             compaction_oversized: AtomicU64::new(0),
             compaction_last_pass_unix_ms: AtomicU64::new(0),
             compaction_last_pass_duration_ms: AtomicU64::new(0),
+            retention_passes: AtomicU64::new(0),
+            retention_scanned: AtomicU64::new(0),
+            retention_candidates: AtomicU64::new(0),
+            retention_staged: AtomicU64::new(0),
+            retention_reaped: AtomicU64::new(0),
+            retention_bytes_reaped: AtomicU64::new(0),
+            retention_reap_failed: AtomicU64::new(0),
+            retention_aborted: AtomicU64::new(0),
+            retention_last_dry_run: AtomicU64::new(0),
+            retention_last_pass_unix_ms: AtomicU64::new(0),
+            retention_last_pass_duration_ms: AtomicU64::new(0),
+            catalog_gauge: None,
         }
     }
 
@@ -308,6 +368,42 @@ impl ServerMetrics {
         );
         self.compaction_last_pass_unix_ms
             .store(unix_ms_now(), Ordering::Release);
+    }
+
+    /// Accumulate one completed retention pass and retain its latest timing.
+    pub fn record_retention_pass(&self, pass: RetentionPassStats, duration: Duration) {
+        self.retention_passes.fetch_add(1, Ordering::Relaxed);
+        self.retention_scanned
+            .fetch_add(pass.scanned, Ordering::Relaxed);
+        self.retention_candidates
+            .fetch_add(pass.candidates, Ordering::Relaxed);
+        self.retention_staged
+            .fetch_add(pass.staged, Ordering::Relaxed);
+        self.retention_reaped
+            .fetch_add(pass.reaped, Ordering::Relaxed);
+        self.retention_bytes_reaped
+            .fetch_add(pass.bytes_reaped, Ordering::Relaxed);
+        self.retention_reap_failed
+            .fetch_add(pass.reap_failed, Ordering::Relaxed);
+        self.retention_aborted
+            .fetch_add(pass.aborted, Ordering::Relaxed);
+        // Replaced, not accumulated — this describes the latest pass's mode.
+        self.retention_last_dry_run
+            .store(u64::from(pass.dry_run), Ordering::Relaxed);
+        self.retention_last_pass_duration_ms.store(
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.retention_last_pass_unix_ms
+            .store(unix_ms_now(), Ordering::Release);
+    }
+
+    /// Attach the sampled catalog gauge. Builder-style, like
+    /// [`with_identity`](Self::with_identity), because the gauge needs the
+    /// catalog path and only some deployments have an online catalog at all.
+    pub fn with_catalog_gauge(mut self, gauge: Arc<CatalogGauge>) -> Self {
+        self.catalog_gauge = Some(gauge);
+        self
     }
 
     /// Record a pass-level failure that produced no [`CompactionPassStats`].
@@ -409,6 +505,51 @@ impl ServerMetrics {
         }
     }
 
+    /// The block balance: how many blocks this instance has added to the
+    /// catalog, how many it has taken away, and the net.
+    ///
+    /// **Compaction sits on both sides.** A merge consumes `blocks_in` and
+    /// writes `blocks_out`, then reaps the inputs. Counting a merge as pure
+    /// removal — the obvious mistake — would report a backlog draining faster
+    /// than it is, by exactly the number of merged blocks written.
+    ///
+    /// So: created = uploads + merge outputs; reclaimed = compaction reaps +
+    /// retention reaps. `blocks_in` deliberately does not appear: those inputs
+    /// are counted as removed when they are *reaped*, not when they are read,
+    /// and using both would double-count them.
+    ///
+    /// This is per-instance and cumulative since start. On a multi-instance
+    /// deployment it will not match the catalog gauge's slope, which measures
+    /// the shared catalog including peers' work. That gap is information, not
+    /// an inconsistency.
+    fn block_balance(&self) -> serde_json::Value {
+        let uploaded: u64 = [
+            &self.metrics_upload,
+            &self.logs_upload,
+            &self.traces_upload,
+            &self.profiles_upload,
+            &self.dummy_upload,
+        ]
+        .iter()
+        .map(|u| u.blocks_uploaded())
+        .sum();
+        let merged_out = self.compaction_blocks_out.load(Ordering::Relaxed);
+        let created = uploaded + merged_out;
+        let reclaimed = self.compaction_reaped.load(Ordering::Relaxed)
+            + self.retention_reaped.load(Ordering::Relaxed);
+        serde_json::json!({
+            "created": created,
+            "uploaded": uploaded,
+            "merge_outputs": merged_out,
+            "reclaimed": reclaimed,
+            "compaction_reaped": self.compaction_reaped.load(Ordering::Relaxed),
+            "retention_reaped": self.retention_reaped.load(Ordering::Relaxed),
+            // Signed: negative means this instance has removed more blocks than
+            // it has created, which is the whole question being asked.
+            "net": created as i64 - reclaimed as i64,
+        })
+    }
+
     /// The ingest-specific payload embedded in the status snapshot's `data`.
     fn ingest_data(&self) -> serde_json::Value {
         let (status, severity, message) = self.bottleneck();
@@ -451,6 +592,25 @@ impl ServerMetrics {
                 "last_pass_unix_ms": self.compaction_last_pass_unix_ms.load(Ordering::Acquire),
                 "last_pass_duration_ms": self.compaction_last_pass_duration_ms.load(Ordering::Relaxed),
             },
+            "retention": {
+                "passes": self.retention_passes.load(Ordering::Relaxed),
+                "scanned": self.retention_scanned.load(Ordering::Relaxed),
+                "candidates": self.retention_candidates.load(Ordering::Relaxed),
+                "staged": self.retention_staged.load(Ordering::Relaxed),
+                "reaped": self.retention_reaped.load(Ordering::Relaxed),
+                "bytes_reaped": self.retention_bytes_reaped.load(Ordering::Relaxed),
+                "reap_failed": self.retention_reap_failed.load(Ordering::Relaxed),
+                "aborted": self.retention_aborted.load(Ordering::Relaxed),
+                "last_dry_run": self.retention_last_dry_run.load(Ordering::Relaxed) != 0,
+                "last_pass_unix_ms": self.retention_last_pass_unix_ms.load(Ordering::Acquire),
+                "last_pass_duration_ms": self.retention_last_pass_duration_ms.load(Ordering::Relaxed),
+            },
+            "catalog": self
+                .catalog_gauge
+                .as_ref()
+                .map(|g| g.snapshot_json())
+                .unwrap_or(serde_json::Value::Null),
+            "blocks": self.block_balance(),
             "bottleneck": {
                 "status": status,
                 "severity": severity,
@@ -560,7 +720,14 @@ pub struct QueryMetrics {
     bloom_cache: Arc<BloomCache>,
     result_cache: Arc<QueryResultCache>,
     memory_pool: Arc<GreedyMemoryPool>,
-    catalog: Arc<Mutex<Catalog>>,
+    /// Sampled catalog size and trend.
+    ///
+    /// Deliberately *not* an `Arc<Mutex<Catalog>>`. This used to hold the
+    /// shared catalog handle and run `COUNT`/`SUM` scans on every status
+    /// heartbeat — three full scans of the `blocks` table every two seconds,
+    /// under the same mutex queries take. Holding the handle here would invite
+    /// that back; the gauge samples on its own read-only connection instead.
+    catalog_gauge: Arc<CatalogGauge>,
     /// Connection health of this daemon's Valkey link, if any. `None` ⇒ no
     /// Valkey configured; `Some(false)` ⇒ configured but currently down.
     valkey_health: Option<watch::Receiver<bool>>,
@@ -575,7 +742,7 @@ impl QueryMetrics {
         bloom_cache: Arc<BloomCache>,
         result_cache: Arc<QueryResultCache>,
         memory_pool: Arc<GreedyMemoryPool>,
-        catalog: Arc<Mutex<Catalog>>,
+        catalog_gauge: Arc<CatalogGauge>,
         valkey_health: Option<watch::Receiver<bool>>,
     ) -> Self {
         Self {
@@ -613,7 +780,7 @@ impl QueryMetrics {
             bloom_cache,
             result_cache,
             memory_pool,
-            catalog,
+            catalog_gauge,
             valkey_health,
         }
     }
@@ -746,17 +913,13 @@ impl QueryMetrics {
         let p = self.postings_cache.stats();
         let b = self.bloom_cache.stats();
         let r = self.result_cache.stats();
-        // Catalog: one indexed COUNT/SUM under the brief mutex. On a poisoned
-        // lock (a panicked query holder) fall back to zeros rather than panic
-        // the status server.
-        let (catalog_blocks, catalog_rows, catalog_lineage_rows) = match self.catalog.lock() {
-            Ok(cat) => (
-                cat.block_count().unwrap_or(0) as u64,
-                cat.live_row_count().unwrap_or(0),
-                cat.lineage_row_count().unwrap_or(0),
-            ),
-            Err(_) => (0, 0, 0),
-        };
+        // Catalog: read the sampled gauge. This used to be three full scans of
+        // the `blocks` table taken under the shared catalog mutex on *every*
+        // heartbeat — at a 2s heartbeat and a large catalog, a repeated
+        // full-table scan competing with the query path for the same lock.
+        // Now it is a struct read, and the scanning happens once a minute on
+        // the gauge's own read-only connection.
+        let catalog = self.catalog_gauge.snapshot_json();
         let valkey_connected = self.valkey_health.as_ref().map(|rx| *rx.borrow());
         let latency_buckets: Vec<u64> = self
             .query_latency_buckets
@@ -825,9 +988,13 @@ impl QueryMetrics {
                 "repair_failures_total": self.repair_failures_total.load(Ordering::Relaxed),
                 "repair_stability_retries_total": self.repair_stability_retries_total.load(Ordering::Relaxed),
             },
-            "catalog_blocks": catalog_blocks,
-            "catalog_rows": catalog_rows,
-            "catalog_lineage_rows": catalog_lineage_rows,
+            // Flat mirrors of the gauge's headline numbers, kept because
+            // existing consumers read them by these names. `catalog` below is
+            // the full envelope, including the trend and the per-level split.
+            "catalog_blocks": catalog.get("blocks").and_then(|v| v.as_u64()).unwrap_or(0),
+            "catalog_rows": catalog.get("rows").and_then(|v| v.as_u64()).unwrap_or(0),
+            "catalog_lineage_rows": catalog.get("lineage_rows").and_then(|v| v.as_u64()).unwrap_or(0),
+            "catalog": catalog,
             "valkey_connected": valkey_connected,
         })
     }
@@ -942,6 +1109,78 @@ mod tests {
         assert_eq!(d["compaction"]["passes"], serde_json::json!(0));
     }
 
+    /// The block balance has to put a merge on **both** sides, and the trap is
+    /// that treating compaction as pure removal is the intuitive reading.
+    ///
+    /// A pass here merges 16 inputs into 2 outputs and reaps 8. If merge
+    /// outputs were left off the created side the net would look 2 blocks
+    /// better than it is; if `blocks_in` were counted as removals instead of
+    /// the reaps, it would look 8 better still — and either way an operator
+    /// would read a backlog as draining when it was not.
+    #[test]
+    fn the_block_balance_counts_a_merge_on_both_sides() {
+        let m = ServerMetrics::new(1);
+        // Three uploaded blocks: metrics ×2, logs ×1.
+        m.metrics_upload().record_success(100, 1);
+        m.metrics_upload().record_success(100, 1);
+        m.logs_upload().record_success(100, 1);
+        m.record_compaction_pass(
+            CompactionPassStats {
+                merges: 2,
+                blocks_in: 16,
+                blocks_out: 2,
+                reaped: 8,
+                ..Default::default()
+            },
+            Duration::from_millis(10),
+        );
+        m.record_retention_pass(
+            RetentionPassStats {
+                reaped: 5,
+                staged: 3,
+                ..Default::default()
+            },
+            Duration::from_millis(10),
+        );
+
+        let snap = m.snapshot();
+        let b = &snap.data["blocks"];
+        assert_eq!(b["uploaded"], serde_json::json!(3));
+        assert_eq!(b["merge_outputs"], serde_json::json!(2));
+        assert_eq!(
+            b["created"],
+            serde_json::json!(5),
+            "a merge writes blocks; they are created, not free"
+        );
+        assert_eq!(b["compaction_reaped"], serde_json::json!(8));
+        assert_eq!(b["retention_reaped"], serde_json::json!(5));
+        assert_eq!(
+            b["reclaimed"],
+            serde_json::json!(13),
+            "both reapers count, and retention used to count nowhere at all"
+        );
+        assert_eq!(
+            b["net"],
+            serde_json::json!(-8),
+            "5 created - 13 reclaimed; blocks_in must not enter this sum"
+        );
+
+        // Staged is not reaped: those objects are still in the bucket.
+        let r = &snap.data["retention"];
+        assert_eq!(r["staged"], serde_json::json!(3));
+        assert_eq!(r["reaped"], serde_json::json!(5));
+        assert_eq!(r["passes"], serde_json::json!(1));
+    }
+
+    /// A daemon with no online catalog reports the gauge as absent rather than
+    /// as a catalog containing zero blocks.
+    #[test]
+    fn a_gaugeless_ingester_reports_null_not_an_empty_catalog() {
+        let snap = ServerMetrics::new(1).snapshot();
+        assert!(snap.data["catalog"].is_null());
+        assert_eq!(snap.data["blocks"]["net"], serde_json::json!(0));
+    }
+
     #[test]
     fn ingest_snapshot_accumulates_compaction_activity() {
         let m = ServerMetrics::new(1);
@@ -1011,9 +1250,9 @@ mod tests {
     #[test]
     fn query_snapshot_reports_ranges_latency_memory_admission_and_recovery() {
         let temp = tempfile::tempdir().unwrap();
-        let catalog = Arc::new(Mutex::new(
-            Catalog::open(&temp.path().join("catalog.sqlite"), "test-bucket").unwrap(),
-        ));
+        // Never sampled: the gauge reports absent, and the flat mirrors fall
+        // back to 0 rather than inventing a catalog size.
+        let gauge = CatalogGauge::new(temp.path().join("catalog.sqlite"));
         let memory_pool = Arc::new(GreedyMemoryPool::new(1024 * 1024));
         let metrics = Arc::new(QueryMetrics::new(
             "query-id".into(),
@@ -1028,7 +1267,7 @@ mod tests {
             })),
             Arc::new(QueryResultCache::with_budget_bytes(1024)),
             memory_pool,
-            catalog,
+            gauge,
             None,
         ));
 

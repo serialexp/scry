@@ -32,6 +32,7 @@
 //! server.serve_with_shutdown(tokio::signal::ctrl_c()).await?;
 //! ```
 
+pub mod catalog_gauge;
 pub mod decode;
 pub mod live_merge;
 pub mod live_ring;
@@ -43,6 +44,7 @@ pub mod shutdown;
 pub mod stats;
 pub mod tail;
 
+pub use catalog_gauge::{CatalogGauge, CATALOG_GAUGE_INTERVAL};
 pub use live_merge::{fetch_live_from_ingester, LiveDiscovery};
 pub use live_ring::{LiveLogRecord, LiveRing, RetainingLogsAppender};
 pub use memory_guard::{CgroupMemoryGuard, QueryMemoryGuard, QUERY_TOO_LARGE_MESSAGE};
@@ -55,7 +57,7 @@ pub use server::{
     TracesPipeline, TracesShards,
 };
 pub use stats::{
-    serve_status, CompactionPassStats, FleetSource, LocalStatus, QueryMetrics, ServerMetrics,
-    StatusSnapshot, UploadStats,
+    serve_status, CompactionPassStats, FleetSource, LocalStatus, QueryMetrics, RetentionPassStats,
+    ServerMetrics, StatusSnapshot, UploadStats,
 };
 pub use tail::{SubId, SubscriptionRegistry, TailItem, TappingLogsAppender};

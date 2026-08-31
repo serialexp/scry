@@ -44,6 +44,73 @@ function bytes(value: number | null): string {
   return mib < 1024 ? `${mib.toFixed(1)} MiB` : `${(mib / 1024).toFixed(2)} GiB`;
 }
 
+/** A signed rate of change per hour.
+ *
+ *  The sign is the entire reason this field exists — "is the catalog growing or
+ *  shrinking" — so it is always explicit and never left for the reader to infer
+ *  from a bare number.
+ *
+ *  Three distinct outcomes, deliberately not collapsed: `—` (no measurement
+ *  yet), `steady` (measured, and not moving), and a signed rate. A daemon that
+ *  has just started and one whose catalog is perfectly balanced call for very
+ *  different reactions. */
+function perHour(value: number | null): string {
+  if (value === null) return "—";
+  const rounded = Math.round(value);
+  if (rounded === 0) return "steady";
+  const sign = rounded > 0 ? "+" : "−";
+  const magnitude = Math.abs(rounded);
+  const scaled = magnitude >= 1000
+    ? `${(magnitude / 1000).toFixed(1)}k`
+    : `${magnitude}`;
+  return `${sign}${scaled}/h`;
+}
+
+/** Blocks per compaction level, ascending: `L0 12,345 · L1 900 · L2 40`.
+ *
+ *  Worth its own row because a flat total hides the state that matters: L0
+ *  climbing while the upper levels drain means ingest is outrunning merging,
+ *  and the total can sit still through all of it. */
+function levelSplit(catalog: Data): string {
+  const raw = catalog.by_level;
+  if (!Array.isArray(raw) || raw.length === 0) return "—";
+  return raw
+    .map((entry) => {
+      const level = object(entry);
+      const n = number(level, "level");
+      return `L${n === null ? "?" : n} ${count(number(level, "blocks"))}`;
+    })
+    .join(" · ");
+}
+
+/** The sampled catalog gauge, shown identically on every role that has one.
+ *
+ *  The block/row/lineage counts fall back to the flat `catalog_*` keys a
+ *  pre-gauge daemon publishes. Not for API compatibility — for rolling
+ *  deploys, where old and new instances sit in the fleet together and this page
+ *  is the thing you are watching the rollout with. The trend genuinely has no
+ *  fallback: an old instance never measured one. */
+function catalogFields(data: Data): FleetField[] {
+  const catalog = object(data.catalog);
+  return [
+    ["catalog blocks", count(number(catalog, "blocks") ?? number(data, "catalog_blocks"))],
+    // The count is sampled, not live. Showing its age keeps a minute-old
+    // reading from being read as current — which matters most just after a
+    // restart, when the first sample can predate the first block.
+    ["reading age", duration(number(catalog, "sampled_age_secs"))],
+    ["block trend", perHour(number(catalog, "blocks_per_hour"))],
+    // Qualifies the trend: a rate over four minutes and a rate over an hour
+    // deserve different amounts of trust.
+    ["trend window", duration(number(catalog, "trend_window_secs"))],
+    ["level split", levelSplit(catalog)],
+    ["catalog rows", count(number(catalog, "rows") ?? number(data, "catalog_rows"))],
+    [
+      "lineage claims",
+      count(number(catalog, "lineage_rows") ?? number(data, "catalog_lineage_rows")),
+    ],
+  ];
+}
+
 function hitRate(data: Data): string {
   const hits = number(data, "hits") ?? 0;
   const misses = number(data, "misses") ?? 0;
@@ -70,13 +137,27 @@ function sumOrMissing(...values: Array<number | null>): number | null {
 function ingestFields(data: Data): FleetField[] {
   const hasCompaction = data.compaction !== null && typeof data.compaction === "object";
   const compaction = object(data.compaction);
+  const retention = object(data.retention);
+  const balance = object(data.blocks);
   const lastPass = number(compaction, "last_pass_unix_ms");
+  const lastRetention = number(retention, "last_pass_unix_ms");
   const enabled = boolean(compaction, "enabled");
   return [
     ["active connections", count(number(data, "active_connections"))],
     ["metric samples", count(number(data, "metric_samples"))],
     ["log entries", count(number(data, "log_entries"))],
     ["rejected", count(number(data, "rejected"))],
+    ...catalogFields(data),
+    // The balance is this instance's own cumulative flows, which is why it sits
+    // beside the trend rather than being expected to equal it: the trend
+    // measures the shared catalog, peers included.
+    ["blocks created", count(number(balance, "created"))],
+    ["  ↳ uploaded", count(number(balance, "uploaded"))],
+    ["  ↳ merge outputs", count(number(balance, "merge_outputs"))],
+    ["blocks reclaimed", count(number(balance, "reclaimed"))],
+    ["  ↳ by compaction", count(number(balance, "compaction_reaped"))],
+    ["  ↳ by retention", count(number(balance, "retention_reaped"))],
+    ["net blocks (this instance)", count(number(balance, "net"))],
     ["compaction", !hasCompaction || enabled === null ? "—" : (enabled ? "enabled" : "disabled")],
     ["compaction grace", duration(number(compaction, "grace_secs"))],
     ["compaction passes", count(number(compaction, "passes"))],
@@ -90,6 +171,20 @@ function ingestFields(data: Data): FleetField[] {
     ["compaction failures", count(sumOrMissing(number(compaction, "pass_failed"), number(compaction, "partition_failed")))],
     ["reap failures", count(number(compaction, "reap_failed"))],
     ["last compaction", lastPass === null ? "—" : new Date(lastPass).toLocaleString()],
+    ["retention passes", count(number(retention, "passes"))],
+    // Retention is dry-run by default, so a pass that reaped nothing is
+    // ambiguous unless the mode is shown next to it.
+    ["retention mode", boolean(retention, "last_dry_run") === null
+      ? "—"
+      : (boolean(retention, "last_dry_run") ? "dry run" : "applying")],
+    ["retention reaped", count(number(retention, "reaped"))],
+    // Staged means soft-deleted and serving out its grace window: gone from the
+    // live set, still occupying the bucket. Kept apart from reaped so freed
+    // storage is never over-claimed.
+    ["retention staged", count(number(retention, "staged"))],
+    ["retention freed", bytes(number(retention, "bytes_reaped"))],
+    ["retention reap failures", count(number(retention, "reap_failed"))],
+    ["last retention", lastRetention === null ? "—" : new Date(lastRetention).toLocaleString()],
   ];
 }
 
@@ -164,8 +259,7 @@ function queryFields(data: Data): FleetField[] {
     ["repair failures", count(number(recovery, "repair_failures_total"))],
     ["postings hit rate", hitRate(object(data.postings_cache))],
     ["result hit rate", hitRate(object(data.result_cache))],
-    ["catalog blocks", count(number(data, "catalog_blocks"))],
-    ["lineage claims", count(number(data, "catalog_lineage_rows"))],
+    ...catalogFields(data),
   ];
 }
 

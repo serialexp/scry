@@ -188,6 +188,33 @@ check(gw["data"]["inbound"]["otlp_http"]["rejected"] >= 1, "gateway reports reje
 check(list(ing_map).count(ing_self) == 1, "ingest self_id resolves to exactly one entry")
 check(list(qry_map).count(qry_self) == 1, "query self_id resolves to exactly one entry")
 
+# ---- catalog gauge ---------------------------------------------------------
+# queryd has an online catalog, so it samples one. It has only just started, so
+# it has exactly one reading and therefore must NOT report a trend: a rate
+# extrapolated from a single sample would be fiction, and the gauge is required
+# to say "unknown" rather than guess.
+qd = next(i for i in query["instances"] if i["instance_id"] == qry_self)["data"]
+cat = qd.get("catalog")
+check(isinstance(cat, dict), "query instance carries a catalog gauge")
+if isinstance(cat, dict):
+    check(cat.get("sampled") is True, f"query gauge has sampled the catalog (got {cat.get('sampled')})")
+    check(cat.get("blocks") == 0, f"empty catalog reports 0 blocks (got {cat.get('blocks')})")
+    check(cat.get("blocks_per_hour") is None, "a single reading yields no trend")
+    check(cat.get("sample_failures") == 0, "the read-only sampling connection works")
+    # The flat mirrors must agree with the envelope; they are what a
+    # mid-rollout UI falls back to.
+    check(qd.get("catalog_blocks") == cat.get("blocks"), "flat catalog_blocks mirrors the gauge")
+
+# This ingester is storage-less, so there is no catalog for it to observe. It
+# must report that as absent, not as a catalog that happens to contain nothing.
+ind = next(i for i in ingest["instances"] if i["instance_id"] == ing_self)["data"]
+check(ind.get("catalog") is None, "a storage-less ingester reports no catalog gauge")
+check(isinstance(ind.get("retention"), dict), "ingester reports a retention section")
+check(ind.get("retention", {}).get("passes") == 0, "no retention passes have run")
+bal = ind.get("blocks", {})
+check(bal.get("created") == 0 and bal.get("reclaimed") == 0 and bal.get("net") == 0,
+      f"idle ingester's block balance is flat (got {bal})")
+
 sys.exit(0 if ok else 1)
 PY
 ok "fleet aggregation works from both sides (each page lists both instances)"
