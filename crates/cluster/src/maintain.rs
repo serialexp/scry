@@ -30,6 +30,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use futures::StreamExt;
 use object_store::ObjectStore;
 use scry_block::{BlockBuilderConfig, BlockEvent, BlockEventSink};
 use scry_catalog::CatalogHandle;
@@ -138,121 +139,141 @@ where
         .context("list pending compaction reaps")?;
     reap_pending(store.clone(), catalog, &pending, sink, &mut report).await;
 
-    for plan in plans {
-        let key = compaction_lease_key(&plan.signal, &plan.date, plan.input_level);
-        let guard = match provider.try_acquire(&key, lease_ttl).await {
-            Ok(Some(g)) => g,
-            Ok(None) => {
-                report.lease_held += 1;
-                tracing::debug!(%key, "compaction partition held by a peer; skipping");
-                continue;
-            }
-            Err(e) => {
-                // Backend unreachable — pause destructive work for this pass.
-                report.lease_unavailable += 1;
-                tracing::warn!(%key, error = %e, "lease backend unreachable; skipping compaction");
-                continue;
-            }
-        };
+    let parallelism = cfg.parallelism.max(1);
+    let results: Vec<PartitionResult> = futures::stream::iter(plans.into_iter().map(|plan| {
+        let store = store.clone();
+        let bucket = bucket.to_string();
+        let cfg = cfg.clone();
+        let block_cfg = block_cfg.clone();
+        async move {
+            let key = compaction_lease_key(&plan.signal, &plan.date, plan.input_level);
+            let guard = match provider.try_acquire(&key, lease_ttl).await {
+                Ok(Some(g)) => g,
+                Ok(None) => {
+                    tracing::debug!(%key, "compaction partition held by a peer; skipping");
+                    return PartitionResult::LeaseHeld;
+                }
+                Err(e) => {
+                    tracing::warn!(%key, error = %e, "lease backend unreachable; skipping compaction");
+                    return PartitionResult::LeaseUnavailable;
+                }
+            };
 
-        let fence = guard.fence();
-        if let Err(error) = reconcile_partition(
-            store.as_ref(),
-            catalog,
-            bucket,
-            &plan.signal,
-            &plan.date,
-            cfg.grace,
-        )
-        .await
-        {
-            guard.release().await;
-            report.partition_failed += 1;
-            tracing::warn!(
-                signal = %plan.signal,
-                date = %plan.date,
-                input_level = plan.input_level,
-                error = %format!("{error:#}"),
-                "compaction partition reconcile failed; continuing pass"
-            );
-            continue;
-        }
-
-        // Revalidate the exact inputs after authoritative reconciliation. A
-        // previous lease holder may have committed an output and crashed before
-        // publishing its catalog/event update; its ancestry now hides these rows.
-        let still_live = catalog
-            .with(|c| c.list_blocks())
-            .context("re-list live blocks after partition reconcile")?;
-        let live_ids: std::collections::HashSet<_> =
-            still_live.iter().map(|entry| entry.meta.uuid).collect();
-        if plan
-            .inputs
-            .iter()
-            .any(|input| !live_ids.contains(&input.meta.uuid))
-        {
-            tracing::info!(
-                signal = %plan.signal,
-                date = %plan.date,
-                input_level = plan.input_level,
-                "compaction plan became stale after authoritative reconcile; skipping"
-            );
-            guard.release().await;
-            continue;
-        }
-
-        // Keep compaction outputs under a writer prefix already known to cursor
-        // polling. The output UUID is still fresh/content-unique; only the path
-        // prefix is stable, so a dropped Created event is incrementally
-        // discoverable instead of waiting for the full walk.
-        let writer_id = plan
-            .inputs
-            .iter()
-            .map(|input| input.meta.writer_id)
-            .min()
-            .unwrap_or_else(Uuid::now_v7);
-        let outcome = compact_partition(
-            &plan,
-            store.clone(),
-            catalog,
-            bucket,
-            writer_id,
-            cfg,
-            block_cfg,
-            fence.as_ref(),
-            sink,
-        )
-        .await;
-        // Release promptly regardless of outcome. A damaged/unavailable
-        // partition must not starve unrelated backlog work in this pass.
-        guard.release().await;
-        let outcome = match outcome {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                report.partition_failed += 1;
+            let fence = guard.fence();
+            if let Err(error) = reconcile_partition(
+                store.as_ref(),
+                catalog,
+                &bucket,
+                &plan.signal,
+                &plan.date,
+                cfg.grace,
+            )
+            .await
+            {
+                guard.release().await;
                 tracing::warn!(
                     signal = %plan.signal,
                     date = %plan.date,
                     input_level = plan.input_level,
                     error = %format!("{error:#}"),
-                    "compaction partition failed; continuing pass"
+                    "compaction partition reconcile failed; continuing pass"
                 );
-                continue;
+                return PartitionResult::Failed;
             }
-        };
 
-        match outcome {
-            PartitionOutcome::Merged { bytes_out } => {
-                report.merges += 1;
-                report.blocks_in += plan.inputs.len();
-                report.blocks_out += 1;
-                report.bytes_out += bytes_out;
+            // Revalidate the exact inputs after authoritative reconciliation.
+            let still_live = match catalog.with(|c| c.list_blocks()) {
+                Ok(l) => l,
+                Err(e) => {
+                    guard.release().await;
+                    tracing::warn!(error = %e, "re-list after partition reconcile failed");
+                    return PartitionResult::Failed;
+                }
+            };
+            let live_ids: std::collections::HashSet<_> =
+                still_live.iter().map(|entry| entry.meta.uuid).collect();
+            if plan
+                .inputs
+                .iter()
+                .any(|input| !live_ids.contains(&input.meta.uuid))
+            {
+                tracing::info!(
+                    signal = %plan.signal,
+                    date = %plan.date,
+                    input_level = plan.input_level,
+                    "compaction plan became stale after authoritative reconcile; skipping"
+                );
+                guard.release().await;
+                return PartitionResult::Stale;
             }
-            PartitionOutcome::Aborted => report.aborted += 1,
+
+            let writer_id = plan
+                .inputs
+                .iter()
+                .map(|input| input.meta.writer_id)
+                .min()
+                .unwrap_or_else(Uuid::now_v7);
+            let outcome = compact_partition(
+                &plan,
+                store.clone(),
+                catalog,
+                &bucket,
+                writer_id,
+                &cfg,
+                &block_cfg,
+                fence.as_ref(),
+                sink,
+            )
+            .await;
+            guard.release().await;
+            match outcome {
+                Ok(o) => PartitionResult::Done {
+                    outcome: o,
+                    inputs: plan.inputs.len(),
+                },
+                Err(error) => {
+                    tracing::warn!(
+                        signal = %plan.signal,
+                        date = %plan.date,
+                        input_level = plan.input_level,
+                        error = %format!("{error:#}"),
+                        "compaction partition failed; continuing pass"
+                    );
+                    PartitionResult::Failed
+                }
+            }
+        }
+    }))
+    .buffer_unordered(parallelism)
+    .collect()
+    .await;
+
+    for result in results {
+        match result {
+            PartitionResult::Done { outcome, inputs } => {
+                report.absorb(&outcome, inputs);
+            }
+            PartitionResult::LeaseHeld => report.lease_held += 1,
+            PartitionResult::LeaseUnavailable => report.lease_unavailable += 1,
+            PartitionResult::Failed => report.partition_failed += 1,
+            PartitionResult::Stale => {}
         }
     }
 
     Ok(report)
+}
+
+/// Per-partition result, accumulated into [`CompactReport`] after the
+/// concurrent partition stream completes.
+enum PartitionResult {
+    Done {
+        outcome: PartitionOutcome,
+        inputs: usize,
+    },
+    LeaseHeld,
+    LeaseUnavailable,
+    Failed,
+    Stale,
 }
 
 /// Run one lease-guarded retention pass. In dry-run (`cfg.apply == false`) it

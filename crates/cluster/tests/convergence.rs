@@ -23,8 +23,8 @@ use scry_block::{
 };
 use scry_catalog::{date_dir, Catalog};
 use scry_cluster::{
-    apply_event, full_walk, poll_once, run_compaction_pass, run_retention_pass, LeaseGuard,
-    LeaseProvider, LocalLeaseProvider, RETENTION_LEASE_KEY,
+    apply_event, full_walk, poll_once, reconcile_partition, run_compaction_pass,
+    run_retention_pass, LeaseGuard, LeaseProvider, LocalLeaseProvider, RETENTION_LEASE_KEY,
 };
 use scry_compact::CompactConfig;
 use scry_proto::streaming::LogsAppender;
@@ -1100,5 +1100,62 @@ async fn a_transient_sidecar_failure_neither_aborts_the_pass_nor_skips_the_block
         catalog.get_cursor("logs", writer, &date).unwrap(),
         Some(b3.uuid),
         "with the gap filled the cursor advances to the prefix head"
+    );
+}
+
+/// `reconcile_partition` must use the same `known_block_uuids` filter that
+/// D-066 taught the full walk. Without it, every compaction partition reconcile
+/// re-fetches ~3,900 sidecars the catalog already has (~50 s), making the
+/// per-partition cost 10× larger than the merge itself.
+///
+/// The authoritative property is maintained: the LIST still discovers every
+/// committed `meta.json` in the prefix. The filter only skips the GET for
+/// UUIDs already in the catalog — which is correct because
+/// `known_block_uuids` has no liveness filter, so superseded and soft-deleted
+/// blocks count as known, matching the full walk's guarantee.
+#[tokio::test]
+async fn converged_partition_reconcile_fetches_no_sidecars() {
+    let probe = Arc::new(ProbeStore::new());
+    let store: Arc<dyn ObjectStore> = probe.clone();
+    let writer = Uuid::now_v7();
+    build_logs_block(&store, writer, 0xD001, NOW, 10).await;
+    build_logs_block(&store, writer, 0xD002, NOW + 50, 10).await;
+    build_logs_block(&store, writer, 0xD003, NOW + 100, 10).await;
+
+    let (catalog, _tmp) = open_catalog();
+
+    // Cold: all three are unknown, so we GET all three.
+    probe.reset();
+    let cold = reconcile_partition(
+        store.as_ref(),
+        &catalog,
+        BUCKET,
+        "logs",
+        &date_dir(NOW),
+        Duration::from_secs(0),
+    )
+    .await
+    .unwrap();
+    assert_eq!(cold.inserted, 3, "cold partition discovers all three");
+    assert_eq!(probe.meta_gets(), 3, "cold pays one GET per block");
+
+    // Warm: all three are now known, so zero GETs.
+    probe.reset();
+    let warm = reconcile_partition(
+        store.as_ref(),
+        &catalog,
+        BUCKET,
+        "logs",
+        &date_dir(NOW),
+        Duration::from_secs(0),
+    )
+    .await
+    .unwrap();
+    assert_eq!(warm.inserted, 0);
+    assert_eq!(warm.skipped, 3, "every listed block was already known");
+    assert_eq!(
+        probe.meta_gets(),
+        0,
+        "a converged partition reconcile must not fetch a single sidecar"
     );
 }

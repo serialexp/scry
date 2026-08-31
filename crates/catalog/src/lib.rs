@@ -1378,6 +1378,13 @@ impl CatalogHandle for std::sync::Mutex<Catalog> {
     }
 }
 
+impl CatalogHandle for std::sync::Arc<std::sync::Mutex<Catalog>> {
+    #[inline]
+    fn with<R>(&self, f: impl FnOnce(&Catalog) -> R) -> R {
+        f(&self.lock().expect("catalog mutex poisoned"))
+    }
+}
+
 /// The `yyyy-mm-dd` UTC partition date a block with this `ts_min_unix_nano`
 /// belongs to — the `date` column value and the date component of both the
 /// object-storage path and a poll cursor's key. Exposed so the cluster's

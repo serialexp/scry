@@ -183,12 +183,21 @@ where
     let prefix = ObjPath::from(format!("{signal}/{}/", date.replace('-', "/")));
     let locations = collect_meta_locations(store, Some(&prefix)).await?;
     let mut report = PollReport::default();
-    // Deliberately unfiltered. This runs under a partition lease to establish
-    // authoritative truth before a merge commits, and it is scoped to one
-    // `(signal, date)` prefix rather than the whole bucket — so it is not the
-    // pathology D-066 addresses, and it is not the place to take a risk with
-    // compaction's correctness.
-    fetch_and_apply(store, catalog, bucket, locations, None, &mut report).await?;
+    // Filtered by what the catalog already holds, exactly as D-066 taught the
+    // full walk. The LIST is still authoritative — it discovers every committed
+    // `meta.json` in the prefix, including one a crashed peer wrote — but the
+    // GETs skip sidecars the catalog already has. On a converged catalog this
+    // turns ~3,900 GETs into approximately zero, dropping the per-partition
+    // cost from ~50 s to the LIST time (~2 s).
+    //
+    // This was previously `None` ("deliberately unfiltered") out of caution.
+    // The filter is safe because `known_block_uuids()` returns every row in
+    // `blocks` (no liveness filter), so a superseded or soft-deleted block is
+    // still "known" and never re-fetched — matching the full walk's guarantee.
+    let known = catalog
+        .with(|c| c.known_block_uuids())
+        .context("load known block uuids for partition reconcile")?;
+    fetch_and_apply(store, catalog, bucket, locations, Some(&known), &mut report).await?;
     let eligible = (SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

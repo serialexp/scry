@@ -37,6 +37,12 @@ pub struct CompactConfig {
     pub grace: Duration,
     /// If set, only compact this signal; otherwise every signal.
     pub signal_filter: Option<String>,
+    /// Maximum partitions to merge concurrently. Each partition's merge is
+    /// independent (different blocks, different lease key), so there is no
+    /// data-level reason for serial execution — the serial loop was just the
+    /// first thing that worked. Default 1 preserves the old behaviour for
+    /// anyone who does not opt in.
+    pub parallelism: usize,
 }
 
 impl Default for CompactConfig {
@@ -46,6 +52,7 @@ impl Default for CompactConfig {
             max_level: 3,
             grace: Duration::ZERO,
             signal_filter: None,
+            parallelism: 1,
         }
     }
 }

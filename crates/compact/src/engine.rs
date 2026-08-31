@@ -34,6 +34,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use futures::StreamExt;
 use object_store::ObjectStore;
 use scry_block::{
     delete_block_objects, AlwaysValid, BlockBuilderConfig, BlockEvent, BlockEventSink, Fence,
@@ -100,17 +101,23 @@ pub struct CompactReport {
 /// This is the **single-instance** entry point: it plans every eligible
 /// partition and runs each through [`compact_partition`] with an
 /// [`AlwaysValid`] fence (there is no lease to lose with one actor) and a
-/// [`NoopSink`] (no peers to notify). Signature and behaviour are unchanged
-/// from v0.8.
+/// [`NoopSink`] (no peers to notify).
+///
+/// Takes `Arc<Mutex<Catalog>>` rather than `&Catalog` so that when
+/// `parallelism > 1` the merge I/O for multiple partitions can overlap while
+/// the catalog ops (milliseconds) are serialized. The caller wraps its catalog
+/// once and passes it in.
 pub async fn compact_once(
     store: Arc<dyn ObjectStore>,
-    catalog: &Catalog,
+    catalog: &Arc<std::sync::Mutex<Catalog>>,
     bucket: &str,
     cfg: &CompactConfig,
     block_cfg: &BlockBuilderConfig,
 ) -> Result<CompactReport> {
     cfg.validate().context("invalid compaction policy")?;
-    let live = catalog.list_blocks().context("list live blocks")?;
+    let live = catalog
+        .with(|c| c.list_blocks())
+        .context("list live blocks")?;
     let plan = plan_merges(&live, cfg);
     let plans = plan.merges;
     let mut report = CompactReport {
@@ -120,31 +127,47 @@ pub async fn compact_once(
     warn_oversized(&plan.oversized);
     let now = now_unix_nano();
     let pending = catalog
-        .list_pending_reaps(now)
+        .with(|c| c.list_pending_reaps(now))
         .context("list pending compaction reaps")?;
     reap_pending(store.clone(), catalog, &pending, &NoopSink, &mut report).await;
 
     // One compactor identity for this pass — block paths are
     // content-addressed under it (`<signal>/.../<writer_id>/<uuid>`).
     let writer_id = Uuid::now_v7();
-    let fence = AlwaysValid;
-    let sink = NoopSink;
 
-    for plan in plans {
-        let outcome = compact_partition(
-            &plan,
-            store.clone(),
-            catalog,
-            bucket,
-            writer_id,
-            cfg,
-            block_cfg,
-            &fence,
-            &sink,
-        )
-        .await
-        .with_context(|| format!("compacting {} {} partition", plan.signal, plan.date))?;
-        report.absorb(&outcome, plan.inputs.len());
+    let parallelism = cfg.parallelism.max(1);
+    let results: Vec<_> = futures::stream::iter(plans.into_iter().map(|plan| {
+        let store = store.clone();
+        let catalog = catalog.clone();
+        let bucket = bucket.to_string();
+        let cfg = cfg.clone();
+        let block_cfg = block_cfg.clone();
+        async move {
+            let inputs = plan.inputs.len();
+            let label = format!("{} {}", plan.signal, plan.date);
+            let outcome = compact_partition(
+                &plan,
+                store,
+                &catalog,
+                &bucket,
+                writer_id,
+                &cfg,
+                &block_cfg,
+                &AlwaysValid,
+                &NoopSink,
+            )
+            .await
+            .with_context(|| format!("compacting {label} partition"))?;
+            Ok::<_, anyhow::Error>((outcome, inputs))
+        }
+    }))
+    .buffer_unordered(parallelism)
+    .collect()
+    .await;
+
+    for result in results {
+        let (outcome, inputs) = result?;
+        report.absorb(&outcome, inputs);
     }
 
     Ok(report)
@@ -162,7 +185,7 @@ pub enum PartitionOutcome {
 }
 
 impl CompactReport {
-    fn absorb(&mut self, outcome: &PartitionOutcome, inputs: usize) {
+    pub fn absorb(&mut self, outcome: &PartitionOutcome, inputs: usize) {
         match outcome {
             PartitionOutcome::Merged { bytes_out } => {
                 self.merges += 1;

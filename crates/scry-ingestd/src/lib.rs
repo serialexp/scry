@@ -210,6 +210,12 @@ pub struct Args {
     #[arg(long)]
     compact_grace: Option<u64>,
 
+    /// Maximum partitions to merge concurrently. Each partition merges
+    /// independent blocks and (with Valkey) takes its own lease, so
+    /// parallelism multiplies throughput with no data-level conflict.
+    #[arg(long, default_value_t = 1)]
+    compact_parallelism: usize,
+
     /// Blanket retention TTL applied to every signal (opt-in: omit to leave
     /// all signals un-reaped). Accepts `s`/`m`/`h`/`d` suffixes.
     #[arg(long, value_parser = parse_duration)]
@@ -879,6 +885,7 @@ pub async fn run(args: Args) -> Result<()> {
                 // Compaction interprets this as a deferred reap eligibility
                 // timestamp; it never sleeps the merge pass.
                 grace: Duration::from_secs(args.compact_grace.unwrap_or(compact_grace_default)),
+                parallelism: args.compact_parallelism,
                 ..Default::default()
             };
             compact_cfg

@@ -39,6 +39,7 @@ pub use policy::{
 };
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -89,6 +90,12 @@ pub struct Args {
     /// Seconds between passes in `--watch` mode.
     #[arg(long, default_value_t = 60)]
     pub interval: u64,
+
+    /// Maximum partitions to merge concurrently. Each partition merges
+    /// independent blocks and (with Valkey) takes its own lease, so
+    /// parallelism multiplies throughput with no data-level conflict.
+    #[arg(long, default_value_t = 1)]
+    pub parallelism: usize,
 }
 
 /// Run the standalone (single-instance) compaction tool: one pass, or a
@@ -107,6 +114,7 @@ pub async fn run(args: Args) -> Result<()> {
         max_level: args.max_level,
         grace: Duration::from_secs(args.grace),
         signal_filter: args.signal.clone(),
+        parallelism: args.parallelism,
     };
     compact_cfg
         .validate()
@@ -139,10 +147,14 @@ pub async fn run(args: Args) -> Result<()> {
     // infer it from a partition that quietly stops shrinking.
     report_stuck_partitions(&catalog, &compact_cfg)?;
 
+    // Wrapped for shared access across concurrent partitions.
+    let catalog = Arc::new(std::sync::Mutex::new(catalog));
+
     if args.watch {
         tracing::info!(
             interval_secs = args.interval,
             fanout = args.fanout,
+            parallelism = args.parallelism,
             "starting compaction watch loop (Ctrl-C to stop)"
         );
         loop {
@@ -226,7 +238,7 @@ async fn reconcile(
 
 async fn run_pass(
     store: &std::sync::Arc<dyn object_store::ObjectStore>,
-    catalog: &Catalog,
+    catalog: &Arc<std::sync::Mutex<Catalog>>,
     bucket: &str,
     compact_cfg: &CompactConfig,
     block_cfg: &BlockBuilderConfig,
