@@ -3436,7 +3436,7 @@ dependencies = [
 
 [[package]]
 name = "noise-spewer"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "binschema-runtime",
@@ -4432,7 +4432,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "scry"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -4455,7 +4455,7 @@ dependencies = [
 
 [[package]]
 name = "scry-agent"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4480,7 +4480,7 @@ dependencies = [
 
 [[package]]
 name = "scry-block"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -4502,7 +4502,7 @@ dependencies = [
 
 [[package]]
 name = "scry-catalog"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4520,7 +4520,7 @@ dependencies = [
 
 [[package]]
 name = "scry-client"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "scry-proto",
@@ -4530,7 +4530,7 @@ dependencies = [
 
 [[package]]
 name = "scry-cluster"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4554,7 +4554,7 @@ dependencies = [
 
 [[package]]
 name = "scry-compact"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -4579,7 +4579,7 @@ dependencies = [
 
 [[package]]
 name = "scry-compactd"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4601,11 +4601,11 @@ dependencies = [
 
 [[package]]
 name = "scry-duration"
-version = "0.19.0"
+version = "0.20.0"
 
 [[package]]
 name = "scry-gateway"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4635,7 +4635,7 @@ dependencies = [
 
 [[package]]
 name = "scry-httpsig"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -4648,7 +4648,7 @@ dependencies = [
 
 [[package]]
 name = "scry-ingestd"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4672,7 +4672,7 @@ dependencies = [
 
 [[package]]
 name = "scry-list"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -4684,7 +4684,7 @@ dependencies = [
 
 [[package]]
 name = "scry-match"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "regex",
@@ -4693,7 +4693,7 @@ dependencies = [
 
 [[package]]
 name = "scry-objstore"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4707,7 +4707,7 @@ dependencies = [
 
 [[package]]
 name = "scry-proto"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "binschema-runtime",
  "thiserror 1.0.69",
@@ -4718,7 +4718,7 @@ dependencies = [
 
 [[package]]
 name = "scry-query"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -4748,7 +4748,7 @@ dependencies = [
 
 [[package]]
 name = "scry-queryd"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4771,7 +4771,7 @@ dependencies = [
 
 [[package]]
 name = "scry-replay-opensearch"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4791,7 +4791,7 @@ dependencies = [
 
 [[package]]
 name = "scry-retention"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -4812,7 +4812,7 @@ dependencies = [
 
 [[package]]
 name = "scry-server"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -4843,7 +4843,7 @@ dependencies = [
 
 [[package]]
 name = "scry-status"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4855,7 +4855,7 @@ dependencies = [
 
 [[package]]
 name = "scry-tail"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4868,7 +4868,7 @@ dependencies = [
 
 [[package]]
 name = "scry-valkey"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "fred",
@@ -4885,7 +4885,7 @@ dependencies = [
 
 [[package]]
 name = "scry-wal"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "crc32fast",
@@ -4896,7 +4896,7 @@ dependencies = [
 
 [[package]]
 name = "scry-webui"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "async-stream",
