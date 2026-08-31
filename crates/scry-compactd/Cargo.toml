@@ -1,0 +1,31 @@
+[package]
+name        = "scry-compactd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Compaction daemon role: single-instance or leased fleet member with Valkey convergence."
+
+[lib]
+name = "scry_compactd"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow             = { workspace = true }
+async-trait         = { workspace = true }
+clap               = { workspace = true }
+futures            = { workspace = true }
+object_store       = { workspace = true }
+scry-block         = { workspace = true }
+scry-catalog       = { workspace = true }
+scry-cluster       = { workspace = true }
+scry-compact       = { workspace = true }
+scry-objstore      = { workspace = true }
+scry-server        = { workspace = true }
+scry-valkey        = { workspace = true }
+serde_json         = { workspace = true }
+tokio              = { workspace = true }
+tracing            = { workspace = true }
+uuid               = { workspace = true }
+
+[lints]
+workspace = true

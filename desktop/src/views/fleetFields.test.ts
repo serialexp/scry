@@ -207,6 +207,77 @@ describe("ingest block balance", () => {
   });
 });
 
+describe("compact role card", () => {
+  it("renders compaction-focused metrics and the catalog gauge", () => {
+    const fields = new Map(fleetFields(instance("compact", {
+      catalog: {
+        sampled: true,
+        blocks: 347_715,
+        rows: 8_000_000,
+        lineage_rows: 10,
+        by_level: [
+          { level: 0, blocks: 340_000, rows: 7_500_000 },
+          { level: 1, blocks: 7_000, rows: 450_000 },
+          { level: 2, blocks: 715, rows: 50_000 },
+        ],
+        blocks_per_hour: -2200,
+        trend_window_secs: 1800,
+        sampled_age_secs: 5,
+      },
+      blocks: {
+        created: 100,
+        uploaded: 0,
+        merge_outputs: 100,
+        reclaimed: 800,
+        compaction_reaped: 800,
+        retention_reaped: 0,
+        net: -700,
+      },
+      compaction: {
+        enabled: true,
+        grace_secs: 600,
+        passes: 12,
+        merges: 100,
+        blocks_in: 800,
+        blocks_out: 100,
+        bytes_out: 52_428_800,
+        reaped: 700,
+        reap_failed: 3,
+        aborted: 1,
+        pass_failed: 0,
+        partition_failed: 2,
+        lease_held: 5,
+        lease_unavailable: 0,
+        oversized: 4,
+        last_pass_unix_ms: 1725100000000,
+        last_pass_duration_ms: 4500,
+      },
+    })));
+
+    // Catalog gauge
+    expect(fields.get("catalog blocks")).toBe("347,715");
+    expect(fields.get("block trend")).toBe("−2.2k/h");
+    expect(fields.get("level split")).toBe("L0 340,000 · L1 7,000 · L2 715");
+
+    // Block balance (a compactor creates only merge outputs, reclaims only via compaction)
+    expect(fields.get("blocks created")).toBe("100");
+    expect(fields.get("  ↳ merge outputs")).toBe("100");
+    expect(fields.get("blocks reclaimed")).toBe("800");
+    expect(fields.get("  ↳ by compaction")).toBe("800");
+    expect(fields.get("net blocks (this instance)")).toBe("-700");
+
+    // Compaction stats
+    expect(fields.get("compaction")).toBe("enabled");
+    expect(fields.get("compaction merges")).toBe("100");
+    expect(fields.get("blocks compacted")).toBe("800");
+    expect(fields.get("compaction output")).toBe("50.0 MiB");
+    expect(fields.get("lease held")).toBe("5");
+    expect(fields.get("oversized partitions")).toBe("4");
+    expect(fields.get("last pass duration")).toBe("4,500 ms");
+    expect(fields.get("compaction failures")).toBe("2");
+  });
+});
+
 describe("mixed-version fleet during a rollout", () => {
   it("still shows counts from a pre-gauge instance's flat keys", () => {
     const fields = new Map(fleetFields(instance("query", {

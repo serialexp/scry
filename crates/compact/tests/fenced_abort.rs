@@ -142,6 +142,7 @@ fn one_logs_plan(catalog: &Catalog) -> scry_compact::PlannedMerge {
         max_level: 3,
         grace: std::time::Duration::ZERO,
         signal_filter: Some("logs".into()),
+        parallelism: 1,
     };
     let live = catalog.list_blocks().unwrap();
     let mut plans = plan_merges(&live, &cfg).merges;
@@ -169,6 +170,7 @@ fn cfg() -> CompactConfig {
         max_level: 3,
         grace: std::time::Duration::ZERO,
         signal_filter: Some("logs".into()),
+        parallelism: 1,
     }
 }
 

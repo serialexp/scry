@@ -263,9 +263,43 @@ function queryFields(data: Data): FleetField[] {
   ];
 }
 
+function compactFields(data: Data): FleetField[] {
+  const compaction = object(data.compaction);
+  const balance = object(data.blocks);
+  const lastPass = number(compaction, "last_pass_unix_ms");
+  const enabled = boolean(compaction, "enabled");
+  return [
+    ...catalogFields(data),
+    // Balance: same shape as ingest, but a pure compactor creates only via
+    // merges and reclaims only via compaction reaps — uploaded and retention
+    // columns are always 0.
+    ["blocks created", count(number(balance, "created"))],
+    ["  ↳ merge outputs", count(number(balance, "merge_outputs"))],
+    ["blocks reclaimed", count(number(balance, "reclaimed"))],
+    ["  ↳ by compaction", count(number(balance, "compaction_reaped"))],
+    ["net blocks (this instance)", count(number(balance, "net"))],
+    ["compaction", enabled === null ? "—" : (enabled ? "enabled" : "disabled")],
+    ["compaction grace", duration(number(compaction, "grace_secs"))],
+    ["compaction passes", count(number(compaction, "passes"))],
+    ["compaction merges", count(number(compaction, "merges"))],
+    ["blocks compacted", count(number(compaction, "blocks_in"))],
+    ["compaction output", bytes(number(compaction, "bytes_out"))],
+    ["inputs reaped", count(number(compaction, "reaped"))],
+    ["fenced aborts", count(number(compaction, "aborted"))],
+    ["lease held", count(number(compaction, "lease_held"))],
+    ["lease unavailable", count(number(compaction, "lease_unavailable"))],
+    ["oversized partitions", count(number(compaction, "oversized"))],
+    ["compaction failures", count(sumOrMissing(number(compaction, "pass_failed"), number(compaction, "partition_failed")))],
+    ["reap failures", count(number(compaction, "reap_failed"))],
+    ["last compaction", lastPass === null ? "—" : new Date(lastPass).toLocaleString()],
+    ["last pass duration", milliseconds(number(compaction, "last_pass_duration_ms"))],
+  ];
+}
+
 export function fleetFields(instance: FleetInstance): FleetField[] {
   if (instance.role === "ingest") return ingestFields(instance.data);
   if (instance.role === "query") return queryFields(instance.data);
   if (instance.role === "gateway") return gatewayFields(instance.data);
+  if (instance.role === "compact") return compactFields(instance.data);
   return genericFields(instance.data);
 }

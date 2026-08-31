@@ -247,7 +247,9 @@ async fn logs_compaction_is_lossless_and_reaps_inputs() {
         max_level: 3,
         grace: std::time::Duration::ZERO,
         signal_filter: Some("logs".into()),
+        parallelism: 1,
     };
+    let catalog = std::sync::Arc::new(std::sync::Mutex::new(catalog));
     let report = compact_once(store.clone(), &catalog, BUCKET, &cfg, &test_cfg())
         .await
         .unwrap();
@@ -256,6 +258,10 @@ async fn logs_compaction_is_lossless_and_reaps_inputs() {
     assert_eq!(report.blocks_out, 1);
 
     // ── Catalog transitioned: one merged L1 block, inputs gone. ──────
+    let catalog = match std::sync::Arc::try_unwrap(catalog) {
+        Ok(mutex) => mutex.into_inner().unwrap_or_else(|e| e.into_inner()),
+        Err(_) => panic!("other references to the catalog Arc still exist"),
+    };
     let live = catalog.list_blocks().unwrap();
     assert_eq!(live.len(), 1, "only the merged block remains live");
     let merged = &live[0];
@@ -396,13 +402,19 @@ async fn metrics_compaction_is_lossless() {
         max_level: 3,
         grace: std::time::Duration::ZERO,
         signal_filter: Some("metrics".into()),
+        parallelism: 1,
     };
+    let catalog = std::sync::Arc::new(std::sync::Mutex::new(catalog));
     let report = compact_once(store.clone(), &catalog, BUCKET, &cfg, &test_cfg())
         .await
         .unwrap();
     assert_eq!(report.merges, 1);
     assert_eq!(report.blocks_in, 3);
 
+    let catalog = match std::sync::Arc::try_unwrap(catalog) {
+        Ok(mutex) => mutex.into_inner().unwrap_or_else(|e| e.into_inner()),
+        Err(_) => panic!("other references to the catalog Arc still exist"),
+    };
     let live = catalog.list_blocks().unwrap();
     assert_eq!(live.len(), 1);
     let merged = &live[0];

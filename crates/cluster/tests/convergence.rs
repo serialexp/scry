@@ -314,6 +314,7 @@ async fn lease_holder_reconciles_prior_committed_output_before_remerging_inputs(
             max_level: 3,
             grace: Duration::ZERO,
             signal_filter: Some("logs".into()),
+            parallelism: 1,
         },
     )
     .merges
@@ -348,6 +349,7 @@ async fn lease_holder_reconciles_prior_committed_output_before_remerging_inputs(
             max_level: 3,
             grace: Duration::ZERO,
             signal_filter: Some("logs".into()),
+            parallelism: 1,
         },
         &test_cfg(),
         &NoopSink,
@@ -406,6 +408,7 @@ async fn concurrent_compaction_has_a_single_winner() {
         max_level: 3,
         grace: Duration::ZERO,
         signal_filter: Some("logs".into()),
+        parallelism: 1,
     };
 
     // Two instances run a compaction pass concurrently over the same

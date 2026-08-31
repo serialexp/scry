@@ -194,6 +194,10 @@ pub struct ServerMetrics {
     /// [`with_identity`](Self::with_identity) is called (e.g. in tests).
     instance_id: String,
     addr: String,
+    /// The role this daemon publishes in its status snapshot. Defaults to
+    /// `"ingest"`; override with [`with_role`](Self::with_role) for other
+    /// daemon types (e.g. `"compact"`).
+    role: String,
     active_connections: AtomicU64,
     total_connections: AtomicU64,
     batches: AtomicU64,
@@ -256,6 +260,7 @@ impl ServerMetrics {
             started: Instant::now(),
             instance_id: String::new(),
             addr: String::new(),
+            role: "ingest".to_string(),
             active_connections: AtomicU64::new(0),
             total_connections: AtomicU64::new(0),
             batches: AtomicU64::new(0),
@@ -309,6 +314,13 @@ impl ServerMetrics {
     pub fn with_identity(mut self, instance_id: String, addr: String) -> Self {
         self.instance_id = instance_id;
         self.addr = addr;
+        self
+    }
+
+    /// Override the role name published in the status snapshot (default
+    /// `"ingest"`). Use `"compact"` for the dedicated compaction daemon.
+    pub fn with_role(mut self, role: impl Into<String>) -> Self {
+        self.role = role.into();
         self
     }
 
@@ -623,7 +635,7 @@ impl ServerMetrics {
 impl LocalStatus for ServerMetrics {
     fn snapshot(&self) -> StatusSnapshot {
         StatusSnapshot {
-            role: "ingest".to_string(),
+            role: self.role.clone(),
             instance_id: self.instance_id.clone(),
             addr: self.addr.clone(),
             version: env!("CARGO_PKG_VERSION").to_string(),

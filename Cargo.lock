@@ -4439,6 +4439,7 @@ dependencies = [
  "mimalloc",
  "scry-agent",
  "scry-compact",
+ "scry-compactd",
  "scry-gateway",
  "scry-ingestd",
  "scry-list",
@@ -4573,6 +4574,28 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "uuid",
+]
+
+[[package]]
+name = "scry-compactd"
+version = "0.19.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "clap",
+ "futures",
+ "object_store",
+ "scry-block",
+ "scry-catalog",
+ "scry-cluster",
+ "scry-compact",
+ "scry-objstore",
+ "scry-server",
+ "scry-valkey",
+ "serde_json",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 

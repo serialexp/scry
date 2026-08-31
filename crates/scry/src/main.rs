@@ -62,8 +62,8 @@ enum Cmd {
     Gateway(scry_gateway::cli::Args),
     /// Browser query UI + byte-pipe relay to `scry query`.
     Web(scry_webui::Args),
-    /// Size-tiered block compaction (one-shot / watch).
-    Compact(scry_compact::Args),
+    /// Size-tiered block compaction (one-shot / watch / leased fleet member).
+    Compact(scry_compactd::Args),
     /// Per-signal TTL retention (dry-run by default).
     Retention(scry_retention::Args),
     /// Live log tailing (best-effort, straight off the ingest hot path).
@@ -91,7 +91,7 @@ async fn main() -> Result<()> {
         Cmd::Agent(a) => scry_agent::run(a).await,
         Cmd::Gateway(a) => scry_gateway::cli::run(a).await,
         Cmd::Web(a) => scry_webui::run(a).await,
-        Cmd::Compact(a) => scry_compact::run(a).await,
+        Cmd::Compact(a) => scry_compactd::run(a).await,
         Cmd::Retention(a) => scry_retention::run(a).await,
         Cmd::Tail(a) => scry_tail::run(a).await,
         Cmd::ReplayOpensearch(a) => scry_replay_opensearch::run(a).await,

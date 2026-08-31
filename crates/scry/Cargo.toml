@@ -26,6 +26,7 @@ scry-agent         = { workspace = true }
 scry-gateway       = { workspace = true }
 scry-webui         = { workspace = true }
 scry-compact       = { workspace = true }
+scry-compactd      = { workspace = true }
 scry-retention     = { workspace = true }
 scry-tail          = { workspace = true }
 scry-replay-opensearch = { workspace = true }
