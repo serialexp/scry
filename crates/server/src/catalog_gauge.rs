@@ -30,7 +30,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use scry_catalog::{Catalog, LevelStats};
+use scry_catalog::{Catalog, LevelStats, SignalStats};
 use tracing::{debug, warn};
 
 /// How often to scan the catalog.
@@ -64,6 +64,7 @@ struct Reading {
     rows: u64,
     lineage_rows: u64,
     by_level: Vec<LevelStats>,
+    by_signal: Vec<SignalStats>,
     at_unix_ms: u64,
 }
 
@@ -129,6 +130,7 @@ impl CatalogGauge {
             rows: stats.rows,
             lineage_rows,
             by_level: stats.by_level,
+            by_signal: stats.by_signal,
             at_unix_ms,
         });
         state.ring.push_back(Sample {
@@ -222,6 +224,16 @@ impl CatalogGauge {
                     "bytes": l.bytes,
                 }))
                 .collect::<Vec<_>>(),
+            "by_signal": current
+                .by_signal
+                .iter()
+                .map(|s| serde_json::json!({
+                    "signal": s.signal,
+                    "blocks": s.blocks,
+                    "rows": s.rows,
+                    "bytes": s.bytes,
+                }))
+                .collect::<Vec<_>>(),
             // Absent rather than 0.0 when unjustifiable — see the module docs.
             "blocks_per_hour": Self::blocks_per_hour(&state),
             "trend_window_secs": window_secs,
@@ -266,6 +278,7 @@ mod tests {
             rows: blocks * 10,
             lineage_rows: 0,
             by_level: Vec::new(),
+            by_signal: Vec::new(),
             at_unix_ms,
         });
         state.ring.push_back(Sample { at_unix_ms, blocks });

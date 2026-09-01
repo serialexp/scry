@@ -48,8 +48,17 @@ pub struct LevelStats {
     pub bytes: u64,
 }
 
+/// Per-signal totals (blocks, rows, bytes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignalStats {
+    pub signal: String,
+    pub blocks: u64,
+    pub rows: u64,
+    pub bytes: u64,
+}
+
 /// The result of [`Catalog::live_block_stats`]: totals plus the per-level
-/// split, from one scan.
+/// and per-signal splits, from one scan.
 ///
 /// `by_level` is a `Vec` ordered by level rather than a map: levels are a
 /// small dense range starting at 0, callers iterate it in order to render or
@@ -60,6 +69,7 @@ pub struct LiveBlockStats {
     pub rows: u64,
     pub bytes: u64,
     pub by_level: Vec<LevelStats>,
+    pub by_signal: Vec<SignalStats>,
 }
 
 /// A catalog row, joining the block sidecar with the per-instance
@@ -719,6 +729,33 @@ impl Catalog {
                 bytes: block_bytes,
             });
         }
+
+        // Per-signal split (same predicate as above).
+        let mut sig_stmt = self.conn.prepare(
+            "SELECT signal, COUNT(*), COALESCE(SUM(row_count), 0), \
+                    COALESCE(SUM(byte_size), 0) \
+             FROM blocks \
+             WHERE deleted_at IS NULL AND superseded = 0 \
+             GROUP BY signal ORDER BY signal",
+        )?;
+        let sig_rows = sig_stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        })?;
+        for row in sig_rows {
+            let (signal, blocks, rows, sig_bytes) = row?;
+            stats.by_signal.push(SignalStats {
+                signal,
+                blocks: blocks as u64,
+                rows: rows as u64,
+                bytes: sig_bytes as u64,
+            });
+        }
+
         Ok(stats)
     }
 

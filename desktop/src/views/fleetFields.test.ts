@@ -152,9 +152,30 @@ describe("catalog trend", () => {
     expect(fields.get("level split")).toBe("—");
   });
 
-  it("breaks blocks down by compaction level without bytes", () => {
+  it("breaks blocks down by compaction level, one row per level", () => {
     const fields = new Map(fleetFields(instance("ingest", catalog({ blocks_per_hour: -10 }))));
-    expect(fields.get("level split")).toBe("L0 12,345 · L1 900");
+    expect(fields.get("L0")).toBe("12,345 blocks");
+    expect(fields.get("L1")).toBe("900 blocks");
+  });
+
+  it("shows per-signal breakdown when by_signal is present", () => {
+    const fields = new Map(fleetFields(instance("query", {
+      catalog: {
+        sampled: true,
+        blocks: 341_000,
+        rows: 17_000_000_000,
+        lineage_rows: 5,
+        by_level: [],
+        by_signal: [
+          { signal: "logs", blocks: 338_000, rows: 16_900_000_000, bytes: 483_183_820_800 },
+          { signal: "metrics", blocks: 2_800, rows: 100_000_000, bytes: 1_288_490_188 },
+          { signal: "traces", blocks: 200, rows: 500_000, bytes: 83_886_080 },
+        ],
+      },
+    })));
+    expect(fields.get("logs")).toBe("338,000 blocks · 450.00 GiB");
+    expect(fields.get("metrics")).toBe("2,800 blocks · 1.20 GiB");
+    expect(fields.get("traces")).toBe("200 blocks · 80.0 MiB");
   });
 
   it("shows average block size per level when bytes are present", () => {
@@ -173,7 +194,8 @@ describe("catalog trend", () => {
     })));
     // L0: 1,048,576,000 / 1000 = 1,048,576 = 1.0 MiB avg
     // L1: 1,048,576,000 / 100 = 10,485,760 = 10.0 MiB avg
-    expect(fields.get("level split")).toBe("L0 1,000 ~1.0 MiB · L1 100 ~10.0 MiB");
+    expect(fields.get("L0")).toBe("1,000 blocks · 1.0 MiB avg");
+    expect(fields.get("L1")).toBe("100 blocks · 10.0 MiB avg");
   });
 });
 
@@ -278,7 +300,9 @@ describe("compact role card", () => {
     // Catalog gauge
     expect(fields.get("catalog blocks")).toBe("347,715");
     expect(fields.get("block trend")).toBe("−2.2k/h");
-    expect(fields.get("level split")).toBe("L0 340,000 · L1 7,000 · L2 715");
+    expect(fields.get("L0")).toBe("340,000 blocks");
+    expect(fields.get("L1")).toBe("7,000 blocks");
+    expect(fields.get("L2")).toBe("715 blocks");
 
     // Block balance (a compactor creates only merge outputs, reclaims only via compaction)
     expect(fields.get("blocks created")).toBe("100");

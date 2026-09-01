@@ -66,30 +66,39 @@ function perHour(value: number | null): string {
   return `${sign}${scaled}/h`;
 }
 
-/** Average block size, or "—" when the data is absent. */
-function avgBlockSize(blocks: number | null, totalBytes: number | null): string {
-  if (blocks === null || totalBytes === null || blocks === 0) return "";
-  return ` ~${bytes(totalBytes / blocks)}`;
-}
-
-/** Blocks per compaction level, ascending: `L0 12,345 ~1.2 MiB · L1 900 ~9.6 MiB`.
+/** One row per compaction level: label "L0", value "339,426 · ~1.2 MiB avg".
  *
- *  Worth its own row because a flat total hides the state that matters: L0
+ *  Worth breaking out because a flat total hides the state that matters: L0
  *  climbing while the upper levels drain means ingest is outrunning merging,
  *  and the total can sit still through all of it. The average size shows
  *  whether compaction is actually producing larger blocks. */
-function levelSplit(catalog: Data): string {
+function levelRows(catalog: Data): FleetField[] {
   const raw = catalog.by_level;
-  if (!Array.isArray(raw) || raw.length === 0) return "—";
-  return raw
-    .map((entry) => {
-      const level = object(entry);
-      const n = number(level, "level");
-      const b = number(level, "blocks");
-      const sz = avgBlockSize(b, number(level, "bytes"));
-      return `L${n === null ? "?" : n} ${count(b)}${sz}`;
-    })
-    .join(" · ");
+  if (!Array.isArray(raw) || raw.length === 0) return [["level split", "—"]];
+  return raw.map((entry): FleetField => {
+    const level = object(entry);
+    const n = number(level, "level");
+    const b = number(level, "blocks");
+    const totalBytes = number(level, "bytes");
+    const avg = b !== null && totalBytes !== null && b > 0
+      ? ` · ${bytes(totalBytes / b)} avg`
+      : "";
+    return [`L${n === null ? "?" : n}`, `${count(b)} blocks${avg}`];
+  });
+}
+
+/** One row per signal: label "logs", value "338,000 blocks · 450.2 GiB". */
+function signalRows(catalog: Data): FleetField[] {
+  const raw = catalog.by_signal;
+  if (!Array.isArray(raw) || raw.length === 0) return [];
+  return raw.map((entry): FleetField => {
+    const sig = object(entry);
+    const name = typeof sig.signal === "string" ? sig.signal : "?";
+    const b = number(sig, "blocks");
+    const totalBytes = number(sig, "bytes");
+    const sz = totalBytes !== null ? ` · ${bytes(totalBytes)}` : "";
+    return [name, `${count(b)} blocks${sz}`];
+  });
 }
 
 /** The sampled catalog gauge, shown identically on every role that has one.
@@ -111,7 +120,8 @@ function catalogFields(data: Data): FleetField[] {
     // Qualifies the trend: a rate over four minutes and a rate over an hour
     // deserve different amounts of trust.
     ["trend window", duration(number(catalog, "trend_window_secs"))],
-    ["level split", levelSplit(catalog)],
+    ...levelRows(catalog),
+    ...signalRows(catalog),
     ["catalog rows", count(number(catalog, "rows") ?? number(data, "catalog_rows"))],
     [
       "lineage claims",
