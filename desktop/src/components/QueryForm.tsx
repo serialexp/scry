@@ -14,6 +14,8 @@ import {
   setMatcher,
   runCurrentQuery,
   runFramesOverview,
+  rootSpansOnly,
+  toggleRootSpans,
   targets,
   labelNames,
   labelValues,
@@ -297,6 +299,10 @@ const QueryForm: Component = () => {
           >
             Frames overview
           </button>
+          <label class="root-toggle" title="Show only root spans (entry points) in the frames overview">
+            <input type="checkbox" checked={rootSpansOnly()} onInput={() => toggleRootSpans()} />
+            root spans only
+          </label>
         </Show>
       </div>
     </form>

@@ -660,6 +660,26 @@ textarea {
   margin: 0;
 }
 
+.root-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  user-select: none;
+  font-size: 12px;
+  color: var(--muted);
+}
+.root-toggle input { margin: 0; }
+
+.trace-drill {
+  all: unset;
+  cursor: pointer;
+  color: var(--teal);
+  font-family: var(--mono);
+  font-size: inherit;
+}
+.trace-drill:hover { text-decoration: underline; }
+
 .log-list {
   flex: 1;
   overflow: auto;
@@ -1434,6 +1454,14 @@ textarea {
   gap: 10px;
 }
 
+.qbar-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
 /* Segmented pill groups (signal tabs, time ranges). */
 .seg {
   display: inline-flex;
@@ -1554,6 +1582,14 @@ textarea {
   outline: none;
   border: none;
 }
+
+.token-spinner {
+  flex: 0 0 auto;
+  display: inline-flex;
+  color: var(--muted);
+  animation: spin .8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
 
 .token-count {
   margin-left: auto;
@@ -1795,6 +1831,7 @@ textarea {
 
 .refresh-select {
   flex: 0 0 auto;
+  max-width: 80px;
   background: var(--panel-2);
   border: 1px solid var(--border-2);
   color: var(--muted);
@@ -1837,6 +1874,14 @@ textarea {
   padding: 8px 18px;
   border-radius: 8px;
   font-size: 13px;
+}
+
+/* On narrow viewports shrink the tab pills and hide the colour dots to
+   save horizontal space. The structural two-row split (.qbar-row +
+   .qbar-actions) already keeps the bar from overflowing. */
+@media (max-width: 720px) {
+  .seg.tabs .seg-pill { padding: 5px 8px; font-size: 11px; }
+  .seg.tabs .tab-dot { display: none; }
 }
 
 /* ── Advanced popover ─────────────────────────────────────────────── */

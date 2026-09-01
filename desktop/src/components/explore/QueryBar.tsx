@@ -25,6 +25,7 @@ import {
   runCurrentQuery,
   runFramesOverview,
   labelNames,
+  labelStatus,
   refreshLabels,
   QUICK_RANGES,
   applyQuickRange,
@@ -41,8 +42,11 @@ import {
   refreshMs,
   setRefreshInterval,
   resultTiming,
+  rootSpansOnly,
+  toggleRootSpans,
 } from "../../store";
 import { TimingPopover } from "./TimingPopover";
+import { PhSpinnerGapIcon } from "solidjs-phosphor";
 
 /** Signal tabs, in the mock's order. Dot colour distinguishes them at a
  *  glance; Profiles is appended (the app supports it; the mock showed three). */
@@ -131,8 +135,8 @@ const QueryBar: Component = () => {
 
   return (
     <div class="qbar">
+      {/* Row 1: signal tabs + token (matcher) bar */}
       <div class="qbar-row">
-        {/* Signal tabs */}
         <div class="seg tabs">
           <For each={TABS}>
             {(t) => (
@@ -149,7 +153,6 @@ const QueryBar: Component = () => {
           </For>
         </div>
 
-        {/* Token matcher bar */}
         <div class="token-bar">
           <For each={tokens()}>
             {(tok) => (
@@ -186,7 +189,6 @@ const QueryBar: Component = () => {
                 draft() === "" &&
                 tokens().length > 0
               ) {
-                // Backspace on an empty draft pops the last token.
                 deleteMatcher(tokens()[tokens().length - 1]!.i);
               }
             }}
@@ -194,6 +196,11 @@ const QueryBar: Component = () => {
           <datalist id="qbar-label-names">
             <For each={labelNames()}>{(n) => <option value={`${n}=`} />}</For>
           </datalist>
+          <Show when={labelStatus() === "loading"}>
+            <span class="token-spinner" title="Loading field names…">
+              <PhSpinnerGapIcon size={14} />
+            </span>
+          </Show>
           <span class="token-count">
             <Show when={state.status === "done"}>
               <TimingPopover
@@ -204,8 +211,10 @@ const QueryBar: Component = () => {
             </Show>
           </span>
         </div>
+      </div>
 
-        {/* Time-range pills */}
+      {/* Row 2: time-range pills + live/refresh + ⋯ + Run */}
+      <div class="qbar-actions">
         <div class="seg ranges">
           <For each={QUICK_RANGES}>
             {(r) => (
@@ -221,12 +230,6 @@ const QueryBar: Component = () => {
           </For>
         </div>
 
-        {/* Live tail (logs + metrics) / auto-refresh (traces, profiles). Only
-            ever one of the two is offered, because only one of them is real:
-            the server taps the logs and metrics ingest paths and nothing else
-            (D-050, D-065). Within a tailable signal the pill can still be
-            disabled — see `liveUnavailableReason` — with the reason as its
-            tooltip. */}
         <Show
           when={state.signal === "Logs" || state.signal === "Metrics"}
           fallback={
@@ -259,7 +262,6 @@ const QueryBar: Component = () => {
           </button>
         </Show>
 
-        {/* Advanced toggle + Run */}
         <button
           type="button"
           class="adv-toggle"
@@ -365,6 +367,10 @@ const QueryBar: Component = () => {
               >
                 Frames overview
               </button>
+              <label class="root-toggle" title="Show only root spans (entry points) in the frames overview">
+                <input type="checkbox" checked={rootSpansOnly()} onInput={() => toggleRootSpans()} />
+                root spans only
+              </label>
             </Show>
           </div>
         </div>

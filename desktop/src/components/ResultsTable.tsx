@@ -27,6 +27,7 @@ import {
   setSelected,
   liveRows,
   liveActive,
+  drillIntoFrame,
 } from "../store";
 import { severity } from "../severity";
 import TracesView, { type TraceData } from "./TracesView";
@@ -281,9 +282,19 @@ const ResultsTable: Component = () => {
                             {svc}
                           </span>
                           <span class="lg-msg">{r.body}</span>
-                          <span class="lg-trace" title={trace}>
-                            {trace ? trace.slice(0, 12) : ""}
-                          </span>
+                          <Show when={trace} fallback={<span class="lg-trace" />}>
+                            <button
+                              type="button"
+                              class="lg-trace trace-drill"
+                              title={`Open trace ${trace}`}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                void drillIntoFrame(trace);
+                              }}
+                            >
+                              {trace.slice(0, 12)}
+                            </button>
+                          </Show>
                         </button>
                       );
                     }}
@@ -340,11 +351,28 @@ const ResultsTable: Component = () => {
                   </thead>
                   <tbody>
                     <For each={v().rows}>
-                      {(row) => (
-                        <tr>
-                          <For each={row}>{(cell) => <td title={cell}>{cell}</td>}</For>
-                        </tr>
-                      )}
+                      {(row) => {
+                        const traceColIdx = v().fields.findIndex((f) => f.name === "trace_id");
+                        return (
+                          <tr>
+                            <For each={row}>
+                              {(cell, i) => (
+                                <td title={cell}>
+                                  <Show when={i() === traceColIdx && cell} fallback={cell}>
+                                    <button
+                                      type="button"
+                                      class="trace-drill"
+                                      onClick={() => void drillIntoFrame(cell)}
+                                    >
+                                      {cell}
+                                    </button>
+                                  </Show>
+                                </td>
+                              )}
+                            </For>
+                          </tr>
+                        );
+                      }}
                     </For>
                   </tbody>
                 </table>

@@ -131,7 +131,16 @@ const [resultKind, setResultKind] = createSignal<"default" | "frames">("default"
  *  carries run-outcome *scalars*, not structures. */
 const [resultTiming, setResultTiming] = createSignal<QueryTiming | null>(null);
 
-export { state, resultTable, resultKind, resultTiming };
+/** Whether the frames overview should filter to root spans only (parent_span_id
+ *  IS NULL). Default true — root spans are the entry points, which is what you
+ *  typically want when browsing traces. */
+const [rootSpansOnly, setRootSpansOnly] = createSignal(true);
+
+export function toggleRootSpans(): void {
+  setRootSpansOnly((v) => !v);
+}
+
+export { state, resultTable, resultKind, resultTiming, rootSpansOnly };
 
 // ── Inspector selection ──────────────────────────────────────────────
 //
@@ -1473,13 +1482,14 @@ export async function runFramesOverview(): Promise<void> {
     return;
   }
 
+  const where = rootSpansOnly() ? "WHERE parent_span_id IS NULL " : "";
   const sql =
     "SELECT trace_id, " +
     "MIN(start_unix_nano) AS t0, " +
     "MAX(end_unix_nano) AS t1, " +
     "MAX(end_unix_nano) - MIN(start_unix_nano) AS dur_ns, " +
     "COUNT(*) AS spans " +
-    "FROM traces GROUP BY trace_id " +
+    `FROM traces ${where}GROUP BY trace_id ` +
     `ORDER BY dur_ns DESC LIMIT ${FRAMES_LIMIT}`;
 
   await runSpec(
