@@ -362,10 +362,12 @@ pub async fn run(args: Args) -> Result<()> {
     let catalog_gauge: Option<Arc<CatalogGauge>> = (args.storage && args.catalog.is_some())
         .then(|| CatalogGauge::new(args.catalog.clone().expect("guarded by is_some")));
 
+    let compaction_progress = Arc::new(scry_block::CompactionProgress::new());
     let stats_metrics: Option<Arc<ServerMetrics>> =
         (args.stats_listen.is_some() || valkey_configured).then(|| {
             let mut metrics = ServerMetrics::new(upload_concurrency)
-                .with_identity(writer_uuid.to_string(), args.listen.clone());
+                .with_identity(writer_uuid.to_string(), args.listen.clone())
+                .with_compaction_progress(compaction_progress.clone());
             if let Some(gauge) = catalog_gauge.clone() {
                 metrics = metrics.with_catalog_gauge(gauge);
             }
@@ -1122,6 +1124,9 @@ async fn run_maintenance_loop<L: LeaseProvider>(
     lease_ttl: Duration,
 ) {
     let noop = NoopSink;
+    let compaction_progress = metrics
+        .as_ref()
+        .and_then(|m| m.compaction_progress().cloned());
     let retention_active = retention_cfg.any_ttl_configured();
     let mut compact_tick = tokio::time::interval(compact_interval);
     compact_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1163,6 +1168,7 @@ async fn run_maintenance_loop<L: LeaseProvider>(
                 match run_compaction_pass(
                     &provider, store.clone(), catalog.as_ref(), &bucket,
                     &compact_cfg, &block_cfg, sink_ref, lease_ttl,
+                    compaction_progress.as_deref(),
                 ).await {
                     Ok(r) if r.merges > 0 || r.partition_failed > 0 || r.reap_failed > 0 || r.oversized > 0 => {
                         record_compaction_metrics(metrics.as_deref(), &r, started.elapsed());

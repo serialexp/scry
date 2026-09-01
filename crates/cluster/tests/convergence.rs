@@ -354,6 +354,7 @@ async fn lease_holder_reconciles_prior_committed_output_before_remerging_inputs(
         &test_cfg(),
         &NoopSink,
         Duration::from_secs(30),
+        None,
     )
     .await
     .unwrap();
@@ -430,6 +431,7 @@ async fn concurrent_compaction_has_a_single_winner() {
                 &test_cfg(),
                 &NoopSink,
                 Duration::from_secs(30),
+                None,
             )
             .await
             .unwrap()
@@ -452,6 +454,7 @@ async fn concurrent_compaction_has_a_single_winner() {
                 &test_cfg(),
                 &NoopSink,
                 Duration::from_secs(30),
+                None,
             )
             .await
             .unwrap()

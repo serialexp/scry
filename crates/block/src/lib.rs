@@ -28,7 +28,7 @@ pub mod traces;
 pub use bloom::{BodyBloom, BodyBloomBuilder};
 pub use dummy::DummyBlockBuilder;
 pub use events::{BlockEvent, BlockEventSink, Envelope, NoopSink};
-pub use fence::{AlwaysValid, Fence};
+pub use fence::{AlwaysValid, CompactionProgress, Fence};
 pub use logs::LogsBlockBuilder;
 pub use meta::{
     compacted_ancestor_closure, BlockMeta, MAX_COMPACTED_ANCESTORS, MAX_COMPACTED_ANCESTRY_BYTES,

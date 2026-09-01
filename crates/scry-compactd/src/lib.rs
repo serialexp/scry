@@ -373,11 +373,13 @@ async fn run_leased(
     let gauge = CatalogGauge::new(args.catalog.clone());
     bg_tasks.push(gauge.clone().spawn(CATALOG_GAUGE_INTERVAL));
 
+    let compaction_progress = Arc::new(scry_block::CompactionProgress::new());
     let metrics = Arc::new(
         ServerMetrics::new(0)
             .with_identity(instance_id.to_string(), String::new())
             .with_role("compact")
-            .with_catalog_gauge(gauge),
+            .with_catalog_gauge(gauge)
+            .with_compaction_progress(compaction_progress.clone()),
     );
     metrics.configure_compaction(true, compact_cfg.grace);
 
@@ -500,6 +502,7 @@ async fn run_leased(
             &block_cfg,
             &*sink,
             lease_ttl,
+            Some(&compaction_progress),
         )
         .await
         {

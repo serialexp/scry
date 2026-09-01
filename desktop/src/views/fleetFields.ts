@@ -111,6 +111,15 @@ function catalogFields(data: Data): FleetField[] {
   ];
 }
 
+/** Render live compaction progress: "compacting 45 / 211", or "idle" when
+ *  `current_pass_planned` is 0. */
+function compactionStatus(compaction: Data): string {
+  const planned = number(compaction, "current_pass_planned");
+  const completed = number(compaction, "current_pass_completed");
+  if (planned === null || planned === 0) return "idle";
+  return `compacting ${count(completed ?? 0)} / ${count(planned)}`;
+}
+
 function hitRate(data: Data): string {
   const hits = number(data, "hits") ?? 0;
   const misses = number(data, "misses") ?? 0;
@@ -159,6 +168,7 @@ function ingestFields(data: Data): FleetField[] {
     ["  ↳ by retention", count(number(balance, "retention_reaped"))],
     ["net blocks (this instance)", count(number(balance, "net"))],
     ["compaction", !hasCompaction || enabled === null ? "—" : (enabled ? "enabled" : "disabled")],
+    ["current pass", compactionStatus(compaction)],
     ["compaction grace", duration(number(compaction, "grace_secs"))],
     ["compaction passes", count(number(compaction, "passes"))],
     ["compaction merges", count(number(compaction, "merges"))],
@@ -279,6 +289,7 @@ function compactFields(data: Data): FleetField[] {
     ["  ↳ by compaction", count(number(balance, "compaction_reaped"))],
     ["net blocks (this instance)", count(number(balance, "net"))],
     ["compaction", enabled === null ? "—" : (enabled ? "enabled" : "disabled")],
+    ["current pass", compactionStatus(compaction)],
     ["compaction grace", duration(number(compaction, "grace_secs"))],
     ["compaction passes", count(number(compaction, "passes"))],
     ["compaction merges", count(number(compaction, "merges"))],

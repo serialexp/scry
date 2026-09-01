@@ -32,7 +32,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use object_store::ObjectStore;
-use scry_block::{BlockBuilderConfig, BlockEvent, BlockEventSink};
+use scry_block::{BlockBuilderConfig, BlockEvent, BlockEventSink, CompactionProgress};
 use scry_catalog::CatalogHandle;
 use scry_compact::{
     compact_partition, plan_merges, reap_pending, CompactConfig, CompactReport, PartitionOutcome,
@@ -110,6 +110,7 @@ pub async fn run_compaction_pass<L, C>(
     block_cfg: &BlockBuilderConfig,
     sink: &dyn BlockEventSink,
     lease_ttl: Duration,
+    progress: Option<&CompactionProgress>,
 ) -> Result<CompactReport>
 where
     L: LeaseProvider,
@@ -138,6 +139,10 @@ where
         .with(|c| c.list_pending_reaps(now))
         .context("list pending compaction reaps")?;
     reap_pending(store.clone(), catalog, &pending, sink, &mut report).await;
+
+    if let Some(p) = progress {
+        p.start(plans.len());
+    }
 
     let parallelism = cfg.parallelism.max(1);
     let results: Vec<PartitionResult> = futures::stream::iter(plans.into_iter().map(|plan| {
@@ -249,6 +254,9 @@ where
     .await;
 
     for result in results {
+        if let Some(p) = progress {
+            p.tick();
+        }
         match result {
             PartitionResult::Done { outcome, inputs } => {
                 report.absorb(&outcome, inputs);
@@ -258,6 +266,10 @@ where
             PartitionResult::Failed => report.partition_failed += 1,
             PartitionResult::Stale => {}
         }
+    }
+
+    if let Some(p) = progress {
+        p.clear();
     }
 
     Ok(report)

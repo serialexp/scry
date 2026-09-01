@@ -250,6 +250,8 @@ pub struct ServerMetrics {
     /// Sampled catalog size and trend. `None` when this daemon has no online
     /// catalog to observe.
     catalog_gauge: Option<Arc<CatalogGauge>>,
+    /// Live compaction progress. `None` when this daemon does not compact.
+    compaction_progress: Option<Arc<scry_block::CompactionProgress>>,
 }
 
 impl ServerMetrics {
@@ -307,6 +309,7 @@ impl ServerMetrics {
             retention_last_pass_unix_ms: AtomicU64::new(0),
             retention_last_pass_duration_ms: AtomicU64::new(0),
             catalog_gauge: None,
+            compaction_progress: None,
         }
     }
 
@@ -338,6 +341,19 @@ impl ServerMetrics {
     }
     pub fn dummy_upload(&self) -> Arc<UploadStats> {
         self.dummy_upload.clone()
+    }
+
+    /// Attach a live compaction progress tracker. The same `Arc` is passed to
+    /// [`run_compaction_pass`] so the status page can show "compacting 45/211"
+    /// mid-pass.
+    pub fn with_compaction_progress(mut self, p: Arc<scry_block::CompactionProgress>) -> Self {
+        self.compaction_progress = Some(p);
+        self
+    }
+
+    /// Return the shared progress tracker (for passing to `run_compaction_pass`).
+    pub fn compaction_progress(&self) -> Option<&Arc<scry_block::CompactionProgress>> {
+        self.compaction_progress.as_ref()
     }
 
     /// Describe this daemon's compaction policy in fleet snapshots.
@@ -603,6 +619,8 @@ impl ServerMetrics {
                 "oversized": self.compaction_oversized.load(Ordering::Relaxed),
                 "last_pass_unix_ms": self.compaction_last_pass_unix_ms.load(Ordering::Acquire),
                 "last_pass_duration_ms": self.compaction_last_pass_duration_ms.load(Ordering::Relaxed),
+                "current_pass_planned": self.compaction_progress.as_ref().map(|p| p.snapshot().0).unwrap_or(0),
+                "current_pass_completed": self.compaction_progress.as_ref().map(|p| p.snapshot().1).unwrap_or(0),
             },
             "retention": {
                 "passes": self.retention_passes.load(Ordering::Relaxed),

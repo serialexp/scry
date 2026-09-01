@@ -251,6 +251,8 @@ describe("compact role card", () => {
         oversized: 4,
         last_pass_unix_ms: 1725100000000,
         last_pass_duration_ms: 4500,
+        current_pass_planned: 211,
+        current_pass_completed: 45,
       },
     })));
 
@@ -266,6 +268,9 @@ describe("compact role card", () => {
     expect(fields.get("  ↳ by compaction")).toBe("800");
     expect(fields.get("net blocks (this instance)")).toBe("-700");
 
+    // Live progress
+    expect(fields.get("current pass")).toBe("compacting 45 / 211");
+
     // Compaction stats
     expect(fields.get("compaction")).toBe("enabled");
     expect(fields.get("compaction merges")).toBe("100");
@@ -275,6 +280,17 @@ describe("compact role card", () => {
     expect(fields.get("oversized partitions")).toBe("4");
     expect(fields.get("last pass duration")).toBe("4,500 ms");
     expect(fields.get("compaction failures")).toBe("2");
+  });
+
+  it("shows idle when no pass is running", () => {
+    const fields = new Map(fleetFields(instance("compact", {
+      compaction: {
+        enabled: true,
+        current_pass_planned: 0,
+        current_pass_completed: 0,
+      },
+    })));
+    expect(fields.get("current pass")).toBe("idle");
   });
 });
 
