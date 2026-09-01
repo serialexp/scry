@@ -66,11 +66,18 @@ function perHour(value: number | null): string {
   return `${sign}${scaled}/h`;
 }
 
-/** Blocks per compaction level, ascending: `L0 12,345 · L1 900 · L2 40`.
+/** Average block size, or "—" when the data is absent. */
+function avgBlockSize(blocks: number | null, totalBytes: number | null): string {
+  if (blocks === null || totalBytes === null || blocks === 0) return "";
+  return ` ~${bytes(totalBytes / blocks)}`;
+}
+
+/** Blocks per compaction level, ascending: `L0 12,345 ~1.2 MiB · L1 900 ~9.6 MiB`.
  *
  *  Worth its own row because a flat total hides the state that matters: L0
  *  climbing while the upper levels drain means ingest is outrunning merging,
- *  and the total can sit still through all of it. */
+ *  and the total can sit still through all of it. The average size shows
+ *  whether compaction is actually producing larger blocks. */
 function levelSplit(catalog: Data): string {
   const raw = catalog.by_level;
   if (!Array.isArray(raw) || raw.length === 0) return "—";
@@ -78,7 +85,9 @@ function levelSplit(catalog: Data): string {
     .map((entry) => {
       const level = object(entry);
       const n = number(level, "level");
-      return `L${n === null ? "?" : n} ${count(number(level, "blocks"))}`;
+      const b = number(level, "blocks");
+      const sz = avgBlockSize(b, number(level, "bytes"));
+      return `L${n === null ? "?" : n} ${count(b)}${sz}`;
     })
     .join(" · ");
 }

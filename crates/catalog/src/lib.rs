@@ -45,6 +45,7 @@ pub struct LevelStats {
     pub level: u32,
     pub blocks: u64,
     pub rows: u64,
+    pub bytes: u64,
 }
 
 /// The result of [`Catalog::live_block_stats`]: totals plus the per-level
@@ -57,6 +58,7 @@ pub struct LevelStats {
 pub struct LiveBlockStats {
     pub blocks: u64,
     pub rows: u64,
+    pub bytes: u64,
     pub by_level: Vec<LevelStats>,
 }
 
@@ -686,7 +688,9 @@ impl Catalog {
     /// anyone is querying.
     pub fn live_block_stats(&self) -> Result<LiveBlockStats> {
         let mut stmt = self.conn.prepare(
-            "SELECT level, COUNT(*), COALESCE(SUM(row_count), 0) FROM blocks \
+            "SELECT level, COUNT(*), COALESCE(SUM(row_count), 0), \
+                    COALESCE(SUM(byte_size), 0) \
+             FROM blocks \
              WHERE deleted_at IS NULL AND superseded = 0 \
              GROUP BY level ORDER BY level",
         )?;
@@ -695,20 +699,24 @@ impl Catalog {
                 r.get::<_, i64>(0)?,
                 r.get::<_, i64>(1)?,
                 r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
             ))
         })?;
 
         let mut stats = LiveBlockStats::default();
         for row in rows {
-            let (level, blocks, block_rows) = row?;
+            let (level, blocks, block_rows, block_bytes) = row?;
             let blocks = blocks as u64;
             let block_rows = block_rows as u64;
+            let block_bytes = block_bytes as u64;
             stats.blocks += blocks;
             stats.rows += block_rows;
+            stats.bytes += block_bytes;
             stats.by_level.push(LevelStats {
                 level: level.max(0) as u32,
                 blocks,
                 rows: block_rows,
+                bytes: block_bytes,
             });
         }
         Ok(stats)

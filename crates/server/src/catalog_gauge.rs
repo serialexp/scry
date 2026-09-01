@@ -219,6 +219,7 @@ impl CatalogGauge {
                     "level": l.level,
                     "blocks": l.blocks,
                     "rows": l.rows,
+                    "bytes": l.bytes,
                 }))
                 .collect::<Vec<_>>(),
             // Absent rather than 0.0 when unjustifiable — see the module docs.

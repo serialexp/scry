@@ -832,10 +832,14 @@ fn live_block_stats_matches_the_scans_it_replaces() {
         stats
             .by_level
             .iter()
-            .map(|l| (l.level, l.blocks, l.rows))
+            .map(|l| (l.level, l.blocks, l.rows, l.bytes))
             .collect::<Vec<_>>(),
-        vec![(0, 3, 30), (1, 2, 200), (2, 1, 1000)],
-        "levels ascending, each carrying its own blocks and rows"
+        vec![
+            (0, 3, 30, 3 * 10 * 64),
+            (1, 2, 200, 2 * 100 * 64),
+            (2, 1, 1000, 1 * 1000 * 64),
+        ],
+        "levels ascending, each carrying its own blocks, rows, and bytes"
     );
     assert_eq!(stats.blocks as usize, cat.block_count().unwrap());
     assert_eq!(stats.rows, cat.live_row_count().unwrap());

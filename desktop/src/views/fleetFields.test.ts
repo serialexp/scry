@@ -152,9 +152,28 @@ describe("catalog trend", () => {
     expect(fields.get("level split")).toBe("—");
   });
 
-  it("breaks blocks down by compaction level", () => {
+  it("breaks blocks down by compaction level without bytes", () => {
     const fields = new Map(fleetFields(instance("ingest", catalog({ blocks_per_hour: -10 }))));
     expect(fields.get("level split")).toBe("L0 12,345 · L1 900");
+  });
+
+  it("shows average block size per level when bytes are present", () => {
+    const fields = new Map(fleetFields(instance("ingest", {
+      catalog: {
+        sampled: true,
+        blocks: 1_100,
+        rows: 50_000,
+        lineage_rows: 2,
+        by_level: [
+          { level: 0, blocks: 1_000, rows: 10_000, bytes: 1_048_576_000 },
+          { level: 1, blocks: 100, rows: 40_000, bytes: 1_048_576_000 },
+        ],
+        blocks_per_hour: -5,
+      },
+    })));
+    // L0: 1,048,576,000 / 1000 = 1,048,576 = 1.0 MiB avg
+    // L1: 1,048,576,000 / 100 = 10,485,760 = 10.0 MiB avg
+    expect(fields.get("level split")).toBe("L0 1,000 ~1.0 MiB · L1 100 ~10.0 MiB");
   });
 });
 
