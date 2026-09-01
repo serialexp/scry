@@ -40,7 +40,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -50,7 +50,8 @@ use scry_catalog::Catalog;
 use scry_cluster::{apply_event, full_walk, poll_once};
 use scry_objstore::{open_with_pool_config, BufPoolConfig, ObjStoreConfig};
 use scry_query::{
-    BloomCache, BloomCacheConfig, PostingsCache, PostingsCacheConfig, QueryResultCache,
+    BloomCache, BloomCacheConfig, LabelMetadataConfig, PostingsCache, PostingsCacheConfig,
+    QueryResultCache,
 };
 use scry_server::{
     serve_status, CatalogGauge, CgroupMemoryGuard, FleetSource, LiveDiscovery, LiveFetchLimits,
@@ -175,6 +176,29 @@ pub struct Args {
     /// Maximum distinct postings sidecars fetched/decoded concurrently.
     #[arg(long)]
     postings_cache_max_fills: Option<usize>,
+
+    /// Recent seconds of metrics/logs label metadata to warm before accepting
+    /// queries and keep warm in the background. `0` disables proactive warming.
+    #[arg(long, default_value_t = 3600)]
+    label_warm_window_secs: u64,
+
+    /// Seconds between recent label-metadata warm passes. Scheduled from pass
+    /// completion; `0` disables periodic warming while retaining request-driven
+    /// cache expansion.
+    #[arg(long, default_value_t = 30)]
+    label_warm_interval_secs: u64,
+
+    /// Maximum projected postings sidecars read concurrently for labels.
+    #[arg(long, default_value_t = 16)]
+    label_warm_concurrency: usize,
+
+    /// Values retained per ordinary label in the process-wide suggestion view.
+    #[arg(long, default_value_t = 1_000)]
+    label_values_limit: usize,
+
+    /// Metric names retained for `__name__` in the suggestion view.
+    #[arg(long, default_value_t = 10_000)]
+    label_metric_names_limit: usize,
 
     /// Body-bloom sidecar cache byte budget for the logs full-text
     /// path. Overrides `SCRY_BLOOM_CACHE_BYTES` if both are set. Blooms
@@ -634,10 +658,18 @@ pub async fn run(args: Args) -> Result<()> {
     // heartbeat below; the counters themselves are free. Shares the caches /
     // memory pool the service already holds, so a snapshot is a handful of
     // live reads with no hot-path cost.
+    let label_metadata = Arc::new(scry_query::LabelMetadataCoordinator::new(
+        LabelMetadataConfig {
+            read_parallelism: args.label_warm_concurrency.max(1),
+            values_per_label: args.label_values_limit,
+            metric_names: args.label_metric_names_limit,
+        },
+    ));
     let query_metrics: Arc<QueryMetrics> = Arc::new(QueryMetrics::new(
         instance_uuid.to_string(),
         args.listen.to_string(),
         postings_cache.clone(),
+        label_metadata.clone(),
         bloom_cache.clone(),
         result_cache.clone(),
         memory_pool.clone(),
@@ -657,6 +689,7 @@ pub async fn run(args: Args) -> Result<()> {
             result_cache.clone(),
             args.query_cache_entry_bytes,
         )
+        .with_label_metadata_coordinator(label_metadata)
         .with_live_discovery(live_discovery)
         .with_fleet_source(fleet_source.clone())
         // Same id this instance publishes to the Valkey status registry, so a
@@ -685,6 +718,26 @@ pub async fn run(args: Args) -> Result<()> {
         .with_memory_guard(memory_guard),
     );
 
+    // D-069: shift the normal recent-window cost to readiness so the first
+    // autocomplete client never pays object-store round trips. A bounded failed
+    // attempt is degraded-but-ready; the periodic loop retries it.
+    if args.label_warm_window_secs > 0 {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        let since = now.saturating_sub(args.label_warm_window_secs.saturating_mul(1_000_000_000));
+        match service.bootstrap_label_metadata(since) {
+            Ok(pairs) if pairs > 0 => info!(pairs, "restored label suggestions from catalog"),
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "restoring label suggestions from catalog failed"),
+        }
+        match service.warm_recent_label_metadata(since, 1_024).await {
+            Ok(blocks) => info!(blocks, "initial label metadata warm complete"),
+            Err((code, message)) => warn!(code, %message, "initial label metadata warm degraded"),
+        }
+    }
+
     info!(
         listen = %args.listen,
         catalog = %args.catalog.display(),
@@ -707,6 +760,11 @@ pub async fn run(args: Args) -> Result<()> {
         query_max_active            = args.query_max_active.max(1),
         query_max_waiting           = args.query_max_waiting,
         query_queue_timeout_secs    = args.query_queue_timeout,
+        label_warm_window_secs      = args.label_warm_window_secs,
+        label_warm_interval_secs    = args.label_warm_interval_secs,
+        label_warm_concurrency      = args.label_warm_concurrency.max(1),
+        label_values_limit          = args.label_values_limit,
+        label_metric_names_limit    = args.label_metric_names_limit,
         "query daemon ready"
     );
 
@@ -803,6 +861,33 @@ pub async fn run(args: Args) -> Result<()> {
                 )
                 .await;
                 tokio::time::sleep(interval).await;
+            }
+        }));
+    }
+
+    // D-069 recent label-metadata warmer. Sleep after completion so an
+    // overrunning object store does not turn this into a continuous loop.
+    if args.label_warm_window_secs > 0 && args.label_warm_interval_secs > 0 {
+        let service = service.clone();
+        let window_secs = args.label_warm_window_secs;
+        let interval = Duration::from_secs(args.label_warm_interval_secs);
+        bg_tasks.push(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64;
+                let since = now.saturating_sub(window_secs.saturating_mul(1_000_000_000));
+                match service.warm_recent_label_metadata(since, 1_024).await {
+                    Ok(blocks) if blocks > 0 => {
+                        info!(blocks, "label metadata warm applied new blocks")
+                    }
+                    Ok(_) => {}
+                    Err((code, message)) => {
+                        warn!(code, %message, "label metadata warm failed")
+                    }
+                }
             }
         }));
     }

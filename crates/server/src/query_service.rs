@@ -77,8 +77,9 @@ use scry_query::{
     },
     register_metrics_table_from_candidates,
     traces::{list_traces_candidates, register_traces_table_from_candidates, TRACES_TABLE_NAME},
-    BloomCache, BloomCacheStats, EvictOnNotFound, PostingsCache, PostingsCacheStats, Query,
-    QueryRequest, QueryResultCache, QueryResultCacheStats, METRICS_TABLE_NAME,
+    BloomCache, BloomCacheStats, EvictOnNotFound, LabelMetadataConfig, LabelMetadataCoordinator,
+    LabelMetadataStats, PostingsCache, PostingsCacheStats, Query, QueryRequest, QueryResultCache,
+    QueryResultCacheStats, METRICS_TABLE_NAME,
 };
 
 use crate::live_merge::{fetch_live_from_ingester, LiveDiscovery};
@@ -259,6 +260,10 @@ pub struct QueryService {
     /// Single-flight built in: concurrent misses on the same block
     /// only do one parquet fetch.
     postings_cache: Arc<PostingsCache>,
+    /// Process-wide label/value suggestion view. Unlike `postings_cache`, this
+    /// projects only the two scalar postings columns and deliberately omits the
+    /// high-cardinality fingerprint lists.
+    label_metadata: Arc<LabelMetadataCoordinator>,
     /// Per-block body-bloom cache for the logs full-text path. Same
     /// immutable-block rationale as `postings_cache`, but a separate
     /// budget (blooms are ~2% of body size) so cheap blooms aren't
@@ -352,6 +357,7 @@ impl QueryService {
             store,
             pool,
             postings_cache,
+            label_metadata: Arc::new(LabelMetadataCoordinator::default()),
             bloom_cache,
             runtime_env,
             memory_pool,
@@ -374,6 +380,68 @@ impl QueryService {
             targeted_repair_slots: Arc::new(Mutex::new(HashMap::new())),
             node_id: String::new(),
         }
+    }
+
+    /// Configure the process-wide label suggestion cache (D-069).
+    pub fn with_label_metadata(mut self, config: LabelMetadataConfig) -> Self {
+        self.label_metadata = Arc::new(LabelMetadataCoordinator::new(config));
+        self
+    }
+
+    pub fn with_label_metadata_coordinator(
+        mut self,
+        coordinator: Arc<LabelMetadataCoordinator>,
+    ) -> Self {
+        self.label_metadata = coordinator;
+        self
+    }
+
+    pub fn label_metadata(&self) -> Arc<LabelMetadataCoordinator> {
+        self.label_metadata.clone()
+    }
+
+    pub fn label_metadata_stats(&self) -> LabelMetadataStats {
+        self.label_metadata.stats()
+    }
+
+    /// Merge already-materialized recent labels from the catalog into memory.
+    /// Exposed separately from object-store warming so startup can restore a
+    /// large snapshot in bounded chunks without repeating projected reads.
+    pub fn bootstrap_label_metadata_from_candidates(
+        &self,
+        signal: Signal,
+        candidates: &[CatalogEntry],
+    ) -> Result<usize> {
+        let catalog = self
+            .catalog
+            .lock()
+            .map_err(|e| anyhow::anyhow!("catalog mutex poisoned: {e}"))?;
+        let uuids: Vec<_> = candidates.iter().map(|entry| entry.meta.uuid).collect();
+        let mut merged = 0usize;
+        for chunk in uuids.chunks(256) {
+            let pairs = catalog
+                .load_block_label_pairs(signal_name(signal), chunk)
+                .with_context(|| format!("loading persisted {} labels", signal_name(signal)))?;
+            merged += pairs.len();
+            let mut by_block: HashMap<Uuid, Vec<(String, String)>> = HashMap::new();
+            for pair in pairs {
+                by_block
+                    .entry(pair.block_uuid)
+                    .or_default()
+                    .push((pair.name, pair.value));
+            }
+            let warmed = catalog
+                .warmed_blocks(chunk)
+                .with_context(|| format!("loading warmed {} label blocks", signal_name(signal)))?;
+            for uuid in warmed {
+                self.label_metadata.merge_persisted_block(
+                    signal,
+                    uuid,
+                    by_block.remove(&uuid).unwrap_or_default(),
+                );
+            }
+        }
+        Ok(merged)
     }
 
     /// Attach the status-page query metrics (D-057). Builder-style — call
@@ -1750,16 +1818,25 @@ impl QueryService {
                 })
                 .collect();
             let evict = Arc::new(EvictOnNotFound::new(self.store.clone()));
-            match collect_label_names(
-                &self.catalog,
-                evict.clone(),
-                self.postings_cache.as_ref(),
-                self.runtime_env.clone(),
-                signal,
-                q,
-            )
-            .await
-            {
+            let collected = match signal {
+                Signal::Metrics | Signal::Logs => {
+                    self.label_metadata
+                        .warm_candidates(&self.catalog, evict.clone(), signal, &candidates)
+                        .await
+                }
+                _ => {
+                    collect_label_names(
+                        &self.catalog,
+                        evict.clone(),
+                        self.postings_cache.as_ref(),
+                        self.runtime_env.clone(),
+                        signal,
+                        q,
+                    )
+                    .await
+                }
+            };
+            match collected {
                 Ok(names) => return Ok(names),
                 Err(error) => {
                     let missing = evict.take_evicted();
@@ -1788,6 +1865,71 @@ impl QueryService {
 
     /// Distinct, sorted values for one label name over a signal + time window.
     /// Thin wrapper over the shared [`scry_query::collect_label_values`].
+    /// Rehydrate the in-memory view from D-050's persisted catalog materialization
+    /// before looking for cold blocks. This is required after snapshot restore:
+    /// every recent block may already be marked warm while process memory is empty.
+    pub fn bootstrap_label_metadata(&self, ts_min: u64) -> Result<usize> {
+        let mut merged = 0usize;
+        for signal in [Signal::Metrics, Signal::Logs] {
+            let q = meta_query(Some(ts_min), None);
+            let candidates = self.list_candidates(signal, &q).map_err(|(_, message)| {
+                anyhow::anyhow!(
+                    "listing {} label candidates: {message}",
+                    signal_name(signal)
+                )
+            })?;
+            merged += self.bootstrap_label_metadata_from_candidates(signal, &candidates)?;
+        }
+        Ok(merged)
+    }
+
+    /// Warm the recent metrics/logs suggestion window. A pass is best-effort per
+    /// signal; callers decide whether a startup failure should delay readiness.
+    pub async fn warm_recent_label_metadata(
+        &self,
+        ts_min: u64,
+        max_blocks_per_signal: usize,
+    ) -> std::result::Result<usize, (u16, String)> {
+        if max_blocks_per_signal == 0 {
+            return Ok(0);
+        }
+        let mut warmed = 0usize;
+        for signal in [Signal::Metrics, Signal::Logs] {
+            loop {
+                let candidates = {
+                    let catalog = self.catalog.lock().map_err(|e| {
+                        (QUERY_ERR_INTERNAL, format!("catalog mutex poisoned: {e}"))
+                    })?;
+                    catalog
+                        .list_unwarmed_postings_blocks(
+                            signal_name(signal),
+                            Some(ts_min),
+                            None,
+                            max_blocks_per_signal,
+                        )
+                        .map_err(|e| {
+                            (
+                                QUERY_ERR_INTERNAL,
+                                format!("list unwarmed {} labels: {e:#}", signal_name(signal)),
+                            )
+                        })?
+                };
+                let count = candidates.len();
+                if count == 0 {
+                    break;
+                }
+                self.label_metadata
+                    .warm_candidates(&self.catalog, self.store.clone(), signal, &candidates)
+                    .await?;
+                warmed += count;
+                if count < max_blocks_per_signal {
+                    break;
+                }
+            }
+        }
+        Ok(warmed)
+    }
+
     async fn collect_label_values(
         &self,
         signal: Signal,
@@ -1807,17 +1949,26 @@ impl QueryService {
                 })
                 .collect();
             let evict = Arc::new(EvictOnNotFound::new(self.store.clone()));
-            match collect_label_values(
-                &self.catalog,
-                evict.clone(),
-                self.postings_cache.as_ref(),
-                self.runtime_env.clone(),
-                signal,
-                name,
-                q,
-            )
-            .await
-            {
+            let collected = match signal {
+                Signal::Metrics | Signal::Logs => self
+                    .label_metadata
+                    .warm_candidates(&self.catalog, evict.clone(), signal, &candidates)
+                    .await
+                    .map(|_| self.label_metadata.label_values(signal, name)),
+                _ => {
+                    collect_label_values(
+                        &self.catalog,
+                        evict.clone(),
+                        self.postings_cache.as_ref(),
+                        self.runtime_env.clone(),
+                        signal,
+                        name,
+                        q,
+                    )
+                    .await
+                }
+            };
+            match collected {
                 Ok(values) => return Ok(values),
                 Err(error) => {
                     let missing = evict.take_evicted();

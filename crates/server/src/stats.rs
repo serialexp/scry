@@ -33,7 +33,7 @@ use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
 use scry_proto::constants::Signal;
 
 use crate::catalog_gauge::CatalogGauge;
-use scry_query::{BloomCache, PostingsCache, QueryResultCache};
+use scry_query::{BloomCache, LabelMetadataCoordinator, PostingsCache, QueryResultCache};
 #[cfg(test)]
 use scry_query::{BloomCacheConfig, PostingsCacheConfig};
 use tokio::sync::watch;
@@ -747,6 +747,7 @@ pub struct QueryMetrics {
     repair_stability_retries_total: AtomicU64,
     // Live-read handles into the query service's shared state.
     postings_cache: Arc<PostingsCache>,
+    label_metadata: Arc<LabelMetadataCoordinator>,
     bloom_cache: Arc<BloomCache>,
     result_cache: Arc<QueryResultCache>,
     memory_pool: Arc<GreedyMemoryPool>,
@@ -769,6 +770,7 @@ impl QueryMetrics {
         instance_id: String,
         addr: String,
         postings_cache: Arc<PostingsCache>,
+        label_metadata: Arc<LabelMetadataCoordinator>,
         bloom_cache: Arc<BloomCache>,
         result_cache: Arc<QueryResultCache>,
         memory_pool: Arc<GreedyMemoryPool>,
@@ -807,6 +809,7 @@ impl QueryMetrics {
             repair_failures_total: AtomicU64::new(0),
             repair_stability_retries_total: AtomicU64::new(0),
             postings_cache,
+            label_metadata,
             bloom_cache,
             result_cache,
             memory_pool,
@@ -941,6 +944,8 @@ impl QueryMetrics {
             0.0
         };
         let p = self.postings_cache.stats();
+        let labels = self.label_metadata.stats();
+        let label_config = self.label_metadata.config();
         let b = self.bloom_cache.stats();
         let r = self.result_cache.stats();
         // Catalog: read the sampled gauge. This used to be three full scans of
@@ -992,6 +997,20 @@ impl QueryMetrics {
             "postings_cache": {
                 "hits": p.hits, "misses": p.misses, "evictions": p.evictions,
                 "entries": p.entries, "bytes_in": p.bytes_in, "budget_bytes": p.budget_bytes,
+            },
+            "label_suggestions": {
+                "resident_bytes_estimate": labels.resident_bytes_estimate,
+                "names": labels.names,
+                "values": labels.values,
+                "saturated_labels": labels.saturated_labels,
+                "blocks_warmed": labels.blocks_warmed,
+                "projected_reads": labels.projected_reads,
+                "cache_hits": labels.cache_hits,
+                "fills_in_flight": labels.fills_in_flight,
+                "fill_failures": labels.fill_failures,
+                "read_parallelism": label_config.read_parallelism.max(1),
+                "values_per_label": label_config.values_per_label,
+                "metric_names": label_config.metric_names,
             },
             "bloom_cache": {
                 "hits": b.hits, "misses": b.misses, "evictions": b.evictions,
@@ -1291,6 +1310,7 @@ mod tests {
                 budget_bytes: 1024,
                 max_concurrent_fills: 1,
             })),
+            Arc::new(LabelMetadataCoordinator::default()),
             Arc::new(BloomCache::new(BloomCacheConfig {
                 budget_bytes: 1024,
                 max_concurrent_fills: 1,
@@ -1369,6 +1389,18 @@ mod tests {
             serde_json::json!(1)
         );
         assert_eq!(data["query_latency"]["buckets"][0], serde_json::json!(1));
+        assert_eq!(
+            data["label_suggestions"]["resident_bytes_estimate"],
+            serde_json::json!(0)
+        );
+        assert_eq!(
+            data["label_suggestions"]["read_parallelism"],
+            serde_json::json!(16)
+        );
+        assert_eq!(
+            data["label_suggestions"]["values_per_label"],
+            serde_json::json!(1_000)
+        );
     }
 
     #[test]

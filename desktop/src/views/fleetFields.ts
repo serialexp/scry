@@ -267,6 +267,7 @@ function queryFields(data: Data): FleetField[] {
   const ranges = object(data.query_ranges);
   const admission = object(data.admission);
   const recovery = object(data.recovery);
+  const labels = object(data.label_suggestions);
   return [
     ["queries", count(number(data, "queries_total"))],
     ["in flight", count(number(data, "queries_in_flight"))],
@@ -280,6 +281,11 @@ function queryFields(data: Data): FleetField[] {
     ["unbounded starts", count(number(ranges, "unbounded_start_total"))],
     ["memory reserved", bytes(number(data, "memory_reserved_bytes"))],
     ["observed memory high-water", bytes(number(data, "memory_observed_peak_reserved_bytes"))],
+    ["label suggestions memory", bytes(number(labels, "resident_bytes_estimate"))],
+    ["label suggestion names", count(number(labels, "names"))],
+    ["label suggestion values", count(number(labels, "values"))],
+    ["saturated labels", count(number(labels, "saturated_labels"))],
+    ["label warm failures", count(number(labels, "fill_failures"))],
     ["admission waiting", count(number(admission, "waiting"))],
     ["admission max wait", milliseconds(number(admission, "max_wait_ms"))],
     ["admission rejected", count(sumOrMissing(number(admission, "timeouts_total"), number(admission, "rejected_total")))],

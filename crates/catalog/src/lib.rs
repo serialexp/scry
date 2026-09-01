@@ -121,6 +121,18 @@ pub struct PendingReap {
     pub eligible_at_unix_nano: u64,
 }
 
+/// One persisted label-cache row associated with its source block.
+///
+/// Returned by [`Catalog::load_block_label_pairs`] so queryd can bootstrap its
+/// process-wide suggestion view without re-reading postings that this catalog
+/// has already warmed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockLabelPair {
+    pub block_uuid: Uuid,
+    pub name: String,
+    pub value: String,
+}
+
 pub struct Catalog {
     conn: Connection,
     bucket: String,
@@ -259,6 +271,13 @@ impl Catalog {
             CREATE INDEX IF NOT EXISTS idx_blocks_query
               ON blocks(signal, date, ts_min, ts_max)
               WHERE deleted_at IS NULL AND superseded = 0;
+
+            -- Queryd's periodic label prewarmer walks recent postings-bearing
+            -- blocks newest-first and anti-joins the warmed marker. Keep that
+            -- discovery out of the full live-block scan.
+            CREATE INDEX IF NOT EXISTS idx_blocks_label_prewarm
+              ON blocks(signal, ts_max DESC, ts_min, uuid)
+              WHERE deleted_at IS NULL AND superseded = 0 AND has_postings = 1;
 
             CREATE INDEX IF NOT EXISTS idx_blocks_compact
               ON blocks(bucket, signal, date, level)
@@ -1036,6 +1055,93 @@ impl Catalog {
             if stmt.exists(params![uuid.to_string()])? {
                 out.insert(*uuid);
             }
+        }
+        Ok(out)
+    }
+
+    /// Select live, postings-bearing blocks whose label cache is not yet warm.
+    ///
+    /// Blocks must overlap the optional inclusive time window: `ts_max >=
+    /// ts_min` and `ts_min <= ts_max`. Results are newest-first and capped by
+    /// `limit`, making this suitable for queryd's bounded startup and periodic
+    /// label-prewarm passes. The partial `idx_blocks_label_prewarm` index keeps
+    /// discovery proportional to eligible live postings blocks rather than the
+    /// entire catalog.
+    pub fn list_unwarmed_postings_blocks(
+        &self,
+        signal: &str,
+        ts_min_unix_nano: Option<u64>,
+        ts_max_unix_nano: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<CatalogEntry>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let lower = ts_min_unix_nano.map(|v| v.min(i64::MAX as u64) as i64);
+        let upper = ts_max_unix_nano.map(|v| v.min(i64::MAX as u64) as i64);
+        let mut stmt = self.conn.prepare_cached(
+            r#"
+            SELECT b.uuid, b.bucket, b.signal, b.date, b.writer_id, b.level,
+                   b.ts_min, b.ts_max, b.row_count, b.byte_size,
+                   b.schema_version, b.fingerprint,
+                   b.has_postings, b.postings_size_bytes,
+                   b.has_body_bloom, b.body_bloom_size_bytes,
+                   b.wal_seg_max, b.wal_shard
+            FROM blocks b
+            WHERE b.signal = ?1
+              AND b.deleted_at IS NULL AND b.superseded = 0
+              AND b.has_postings = 1
+              AND (?2 IS NULL OR b.ts_max >= ?2)
+              AND (?3 IS NULL OR b.ts_min <= ?3)
+              AND NOT EXISTS (
+                SELECT 1 FROM block_labels_warmed w WHERE w.block_uuid = b.uuid
+              )
+            ORDER BY b.ts_max DESC, b.ts_min DESC, b.uuid DESC
+            LIMIT ?4
+            "#,
+        )?;
+        let rows = stmt.query_map(
+            params![signal, lower, upper, limit.min(i64::MAX as usize) as i64],
+            row_to_entry,
+        )?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("list_unwarmed_postings_blocks")
+    }
+
+    /// Load persisted `(name, value)` pairs for the specified live blocks of
+    /// `signal`, associated with their source UUID.
+    ///
+    /// Unknown, deleted, superseded, wrong-signal, and not-yet-warmed blocks
+    /// contribute no rows. Blocks are looked up one at a time through their
+    /// primary keys, deliberately avoiding SQLite's bound-variable limit for a
+    /// large but caller-bounded bootstrap batch. Output follows block input
+    /// order, with each block's pairs sorted by `(name, value)`.
+    pub fn load_block_label_pairs(
+        &self,
+        signal: &str,
+        blocks: &[Uuid],
+    ) -> Result<Vec<BlockLabelPair>> {
+        let mut stmt = self.conn.prepare_cached(
+            r#"
+            SELECT l.label_name, l.label_value
+            FROM blocks b
+            JOIN block_labels_warmed w ON w.block_uuid = b.uuid
+            JOIN block_labels l ON l.block_uuid = b.uuid
+            WHERE b.uuid = ?1 AND b.signal = ?2
+              AND b.deleted_at IS NULL AND b.superseded = 0
+            ORDER BY l.label_name, l.label_value
+            "#,
+        )?;
+        let mut out = Vec::new();
+        for uuid in blocks {
+            let rows = stmt.query_map(params![uuid.to_string(), signal], |row| {
+                Ok(BlockLabelPair {
+                    block_uuid: *uuid,
+                    name: row.get(0)?,
+                    value: row.get(1)?,
+                })
+            })?;
+            out.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
         }
         Ok(out)
     }

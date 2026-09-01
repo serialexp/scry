@@ -71,7 +71,10 @@ pub use bloom_cache::{
 };
 pub use evict::EvictOnNotFound;
 pub use label_enrich::{FpLabels, LabelEnrichExec, LabelPairs};
-pub use metadata::{collect_label_names, collect_label_values, meta_query, MetaError};
+pub use metadata::{
+    collect_label_names, collect_label_values, meta_query, LabelMetadataConfig,
+    LabelMetadataCoordinator, LabelMetadataStats, MetaError,
+};
 pub use postings::resolve_fingerprints;
 pub use postings_cache::{
     PostingsCache, PostingsCacheConfig, PostingsCacheStats, PostingsIndex,

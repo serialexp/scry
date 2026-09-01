@@ -719,6 +719,16 @@ async fn query_round_trip() {
     // likewise. Metadata projects only (name,value), so it must not populate
     // or perturb the full fingerprint postings cache.
     let metadata_cache_before = postings_cache.stats();
+    // Simulate queryd's startup bootstrap: the first socket should answer from
+    // the process-wide view without changing the full postings cache.
+    service
+        .bootstrap_label_metadata(0)
+        .expect("bootstrap label suggestions");
+    service
+        .warm_recent_label_metadata(0, 1_024)
+        .await
+        .expect("prewarm label suggestions");
+    let reads_before = service.label_metadata_stats().projected_reads;
     let names = fetch_label_names(listen_addr, Signal::Metrics).await;
     assert_eq!(
         names,
@@ -741,6 +751,11 @@ async fn query_round_trip() {
     let missing = fetch_label_values(listen_addr, Signal::Metrics, "nope").await;
     assert!(missing.is_empty(), "unknown label yields no values");
     let metadata_cache_after = postings_cache.stats();
+    assert_eq!(
+        service.label_metadata_stats().projected_reads,
+        reads_before,
+        "first metadata clients after startup bootstrap must not reread postings"
+    );
     assert_eq!(metadata_cache_after.hits, metadata_cache_before.hits);
     assert_eq!(metadata_cache_after.misses, metadata_cache_before.misses);
     assert_eq!(

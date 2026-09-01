@@ -657,6 +657,94 @@ fn label_cache_warms_a_label_less_block() {
 }
 
 #[test]
+fn label_prewarm_selects_only_live_overlapping_unwarmed_postings_blocks() {
+    let tmp = TempDir::new().unwrap();
+    let cat = Catalog::open(&tmp.path().join("cat.sqlite"), "scry-dev").unwrap();
+    let writer = Uuid::now_v7();
+
+    let make = |signal: &str, start: u64, postings: bool| {
+        let mut m = meta(Uuid::now_v7(), writer, start, 1);
+        m.signal = signal.to_string();
+        m.has_postings = postings;
+        m.postings_size_bytes = postings.then_some(123);
+        m
+    };
+    let old = make("metrics", 100, true); // ts_max=10_000_000_100
+    let recent = make("metrics", 20_000_000_000, true);
+    let newest = make("metrics", 30_000_000_000, true);
+    let logs = make("logs", 25_000_000_000, true);
+    let no_postings = make("metrics", 25_000_000_000, false);
+    let retired = make("metrics", 27_000_000_000, true);
+    for m in [&old, &recent, &newest, &logs, &no_postings, &retired] {
+        cat.insert_block(m).unwrap();
+    }
+    cat.upsert_block_labels(recent.uuid, &pairs(&[("env", "prod")]))
+        .unwrap();
+    cat.mark_superseded(&[retired.uuid], newest.uuid).unwrap();
+
+    // Inclusive overlap, signal, postings, liveness and warmed-state filters all
+    // apply; newest blocks are returned first and the caller can bound work.
+    let got = cat
+        .list_unwarmed_postings_blocks("metrics", Some(20_000_000_000), Some(40_000_000_000), 10)
+        .unwrap();
+    assert_eq!(
+        got.iter().map(|e| e.meta.uuid).collect::<Vec<_>>(),
+        vec![newest.uuid]
+    );
+    assert!(cat
+        .list_unwarmed_postings_blocks("metrics", None, None, 0)
+        .unwrap()
+        .is_empty());
+    let bounded = cat
+        .list_unwarmed_postings_blocks("metrics", None, None, 1)
+        .unwrap();
+    assert_eq!(bounded[0].meta.uuid, newest.uuid);
+}
+
+#[test]
+fn persisted_label_pairs_are_scoped_to_signal_and_live_blocks() {
+    let tmp = TempDir::new().unwrap();
+    let cat = Catalog::open(&tmp.path().join("cat.sqlite"), "scry-dev").unwrap();
+    let writer = Uuid::now_v7();
+    let mut metrics = meta(Uuid::now_v7(), writer, 100, 1);
+    metrics.signal = "metrics".into();
+    metrics.has_postings = true;
+    let mut logs = meta(Uuid::now_v7(), writer, 200, 1);
+    logs.signal = "logs".into();
+    logs.has_postings = true;
+    let mut retired = meta(Uuid::now_v7(), writer, 300, 1);
+    retired.signal = "metrics".into();
+    retired.has_postings = true;
+    for m in [&metrics, &logs, &retired] {
+        cat.insert_block(m).unwrap();
+    }
+    cat.upsert_block_labels(metrics.uuid, &pairs(&[("service", "api"), ("env", "prod")]))
+        .unwrap();
+    cat.upsert_block_labels(logs.uuid, &pairs(&[("service", "worker")]))
+        .unwrap();
+    cat.upsert_block_labels(retired.uuid, &pairs(&[("gone", "yes")]))
+        .unwrap();
+    cat.mark_superseded(&[retired.uuid], metrics.uuid).unwrap();
+
+    let loaded = cat
+        .load_block_label_pairs("metrics", &[metrics.uuid, logs.uuid, retired.uuid])
+        .unwrap();
+    assert_eq!(loaded.len(), 2);
+    assert!(loaded.iter().all(|p| p.block_uuid == metrics.uuid));
+    assert_eq!(
+        loaded
+            .iter()
+            .map(|p| (p.name.as_str(), p.value.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("env", "prod"), ("service", "api")]
+    );
+    assert!(cat
+        .load_block_label_pairs("metrics", &[])
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
 fn poll_cursor_absent_then_advances_monotonically() {
     let tmp = TempDir::new().unwrap();
     let cat = Catalog::open(&tmp.path().join("cat.sqlite"), "scry-dev").unwrap();

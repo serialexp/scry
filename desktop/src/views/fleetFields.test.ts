@@ -53,12 +53,24 @@ describe("fleetFields", () => {
       recovery: { response_resets_total: 4, repair_attempts_total: 5, repair_failures_total: 1 },
       postings_cache: { hits: 9, misses: 1 },
       result_cache: { hits: 1, misses: 1 },
+      label_suggestions: {
+        resident_bytes_estimate: 65_536,
+        names: 12,
+        values: 345,
+        saturated_labels: 2,
+        fill_failures: 1,
+      },
     })));
 
     expect(fields.get("latency p95 ≤")).toBe("500 ms");
     expect(fields.get("average range")).toBe("2.0h");
     expect(fields.get("maximum range")).toBe("1.0d");
     expect(fields.get("observed memory high-water")).toBe("2.0 MiB");
+    expect(fields.get("label suggestions memory")).toBe("64.0 KiB");
+    expect(fields.get("label suggestion names")).toBe("12");
+    expect(fields.get("label suggestion values")).toBe("345");
+    expect(fields.get("saturated labels")).toBe("2");
+    expect(fields.get("label warm failures")).toBe("1");
     expect(fields.get("admission rejected")).toBe("5");
     expect(fields.get("response resets")).toBe("4");
     expect(fields.get("postings hit rate")).toBe("90%");

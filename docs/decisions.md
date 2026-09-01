@@ -3702,3 +3702,37 @@ both-sides block balance, predicate equivalence), `fleetFields` render tests,
 and new assertions in `scripts/smoke-status.sh` covering a sampled queryd
 gauge, a storage-less ingester reporting no gauge at all, and a single reading
 yielding no trend.
+
+## D-069: Queryd owns a bounded, proactively warmed autocomplete view
+
+**Status:** accepted.
+
+The D-050 label cache removed data scans from metadata discovery, but it left
+latency on the first client: a cold queryd fetched every candidate block's
+postings sidecar serially before it could answer autocomplete. Exact
+range-scoped metadata also discarded useful knowledge. A label learned from a
+previous range is still a valid suggestion even when it ultimately matches no
+rows in the current range.
+
+Each queryd therefore owns one process-wide suggestion view for metrics and
+logs. Before opening its query listener it makes a bounded attempt to warm the
+latest hour, then refreshes every 30 seconds. A request extending outside that
+window warms its cold candidate blocks and merges what it learns into the same
+view, so later clients benefit. Suggestions are deliberately inexact and may
+include names or values learned from another range; query execution remains the
+source of truth.
+
+Warming projects only `label_name` and `label_value` from immutable postings
+sidecars. Reads run with bounded parallelism and per-block single-flight, so
+latency is no longer `blocks × object-store RTT` and concurrent clients do not
+fetch the same block twice. The SQLite `block_labels` materialization remains
+the persistent rebuildable cache; the in-memory view is an accelerator shared
+by connections, not a new authority.
+
+Names are retained globally. Values are bounded to 1,000 per ordinary label and
+10,000 for metrics' `__name__`, preventing identifiers and instance-like labels
+from turning autocomplete into an unbounded heap. Queryd status reports retained
+name/value counts, saturation, warm progress, and an explicitly estimated
+resident-byte figure. It remains distinct from process RSS, DataFusion reserved
+memory, and SQLite disk size. Full design contract:
+`docs/design/query-label-suggestions.md`.

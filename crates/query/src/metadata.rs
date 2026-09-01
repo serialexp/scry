@@ -32,13 +32,18 @@
 //!   `(label_name,label_value)` from its postings sidecar without the lock and
 //!   briefly re-locks to persist that block before moving to the next.
 
-use std::sync::{Arc, Mutex};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::mem::size_of;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+
+use tokio::sync::Semaphore;
 
 use arrow::array::StringArray;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::prelude::SessionConfig;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use object_store::{path::Path as ObjPath, ObjectStore, ObjectStoreExt};
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 use parquet::arrow::ProjectionMask;
@@ -58,6 +63,372 @@ use crate::{
 /// A metadata failure: a `QUERY_ERR_*` code plus human context. The daemon maps
 /// this into a `StreamError` frame; the CLI prints it and exits non-zero.
 pub type MetaError = (u16, String);
+
+/// Bounds for the reusable, process-local label metadata view.
+#[derive(Clone, Debug)]
+pub struct LabelMetadataConfig {
+    /// Maximum number of projected postings sidecars read concurrently.
+    pub read_parallelism: usize,
+    /// Values retained for an ordinary label.
+    pub values_per_label: usize,
+    /// Values retained for the metric-name label (`__name__`).
+    pub metric_names: usize,
+}
+
+impl Default for LabelMetadataConfig {
+    fn default() -> Self {
+        Self {
+            read_parallelism: 16,
+            values_per_label: 1_000,
+            metric_names: 10_000,
+        }
+    }
+}
+
+/// Cheap, eventually-consistent coordinator counters.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LabelMetadataStats {
+    /// Estimated retained heap for the suggestion indexes. This is neither RSS
+    /// nor SQLite size; it counts string capacity plus conservative container
+    /// node overhead.
+    pub resident_bytes_estimate: usize,
+    pub names: usize,
+    pub values: usize,
+    pub saturated_labels: usize,
+    pub blocks_warmed: u64,
+    pub projected_reads: u64,
+    pub cache_hits: u64,
+    pub fills_in_flight: usize,
+    pub fill_failures: u64,
+}
+
+#[derive(Default)]
+struct MetadataView {
+    names: HashMap<u8, BTreeSet<String>>,
+    values: HashMap<(u8, String), BTreeSet<String>>,
+    saturated: HashSet<(u8, String)>,
+    blocks: HashSet<Uuid>,
+    names_count: usize,
+    values_count: usize,
+}
+
+/// Reusable label metadata materialized view. Clones share the same view.
+///
+/// Suggestions are global (the union of everything merged or warmed), sorted,
+/// and value lists are bounded by [`LabelMetadataConfig`]. The per-UUID flight
+/// lock is process-wide, including across independently-created coordinators.
+pub struct LabelMetadataCoordinator {
+    config: LabelMetadataConfig,
+    view: Mutex<MetadataView>,
+    fill_permits: Arc<Semaphore>,
+    resident_bytes_estimate: AtomicUsize,
+    blocks_warmed: AtomicU64,
+    projected_reads: AtomicU64,
+    cache_hits: AtomicU64,
+    fills_in_flight: AtomicUsize,
+    fill_failures: AtomicU64,
+}
+
+impl LabelMetadataCoordinator {
+    pub fn new(config: LabelMetadataConfig) -> Self {
+        let read_parallelism = config.read_parallelism.max(1);
+        Self {
+            config,
+            view: Mutex::new(MetadataView::default()),
+            fill_permits: Arc::new(Semaphore::new(read_parallelism)),
+            resident_bytes_estimate: AtomicUsize::new(0),
+            blocks_warmed: AtomicU64::new(0),
+            projected_reads: AtomicU64::new(0),
+            cache_hits: AtomicU64::new(0),
+            fills_in_flight: AtomicUsize::new(0),
+            fill_failures: AtomicU64::new(0),
+        }
+    }
+
+    pub fn config(&self) -> &LabelMetadataConfig {
+        &self.config
+    }
+
+    /// Merge one already-warmed block loaded from persistent storage. Recording
+    /// the UUID as well as its pairs is important: otherwise the first client
+    /// after startup would revisit every persisted recent block just to learn
+    /// that it was already warm. Empty pairs still mark a label-less block.
+    pub fn merge_persisted_block<I, N, V>(&self, signal: Signal, uuid: Uuid, pairs: I)
+    where
+        I: IntoIterator<Item = (N, V)>,
+        N: Into<String>,
+        V: Into<String>,
+    {
+        self.merge_persisted_pairs(signal, pairs);
+        let inserted = self
+            .view
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .blocks
+            .insert(uuid);
+        if inserted {
+            self.blocks_warmed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Merge pairs loaded by a caller from persistent storage (also useful for
+    /// tests and incremental contributions whose block identity is unavailable).
+    pub fn merge_persisted_pairs<I, N, V>(&self, signal: Signal, pairs: I)
+    where
+        I: IntoIterator<Item = (N, V)>,
+        N: Into<String>,
+        V: Into<String>,
+    {
+        let mut view = self.view.lock().unwrap_or_else(|e| e.into_inner());
+        for (name, value) in pairs {
+            let name = name.into();
+            let value = value.into();
+            let signal_byte = signal.as_u8();
+            if view
+                .names
+                .entry(signal_byte)
+                .or_default()
+                .insert(name.clone())
+            {
+                view.names_count += 1;
+                self.resident_bytes_estimate.fetch_add(
+                    name.capacity() + estimated_tree_node_overhead(),
+                    Ordering::Relaxed,
+                );
+            }
+            let limit = if signal == Signal::Metrics && name == "__name__" {
+                self.config.metric_names
+            } else {
+                self.config.values_per_label
+            };
+            let key = (signal_byte, name);
+            if !view.values.contains_key(&key) {
+                self.resident_bytes_estimate.fetch_add(
+                    key.1.capacity() + 2 * size_of::<usize>() + size_of::<BTreeSet<String>>(),
+                    Ordering::Relaxed,
+                );
+            }
+            let mut added = false;
+            let saturated = {
+                let values = view.values.entry(key.clone()).or_default();
+                if values.contains(&value) {
+                    continue;
+                }
+                // Keep the lexicographically smallest bounded set, making results
+                // deterministic regardless of completion order.
+                if values.len() < limit {
+                    self.resident_bytes_estimate.fetch_add(
+                        value.capacity() + estimated_tree_node_overhead(),
+                        Ordering::Relaxed,
+                    );
+                    values.insert(value);
+                    added = true;
+                    false
+                } else {
+                    if limit > 0 && values.last().is_some_and(|last| value < *last) {
+                        let removed = values.pop_last().expect("non-empty bounded set");
+                        self.resident_bytes_estimate
+                            .fetch_sub(removed.capacity(), Ordering::Relaxed);
+                        self.resident_bytes_estimate
+                            .fetch_add(value.capacity(), Ordering::Relaxed);
+                        values.insert(value);
+                    }
+                    true
+                }
+            };
+            if added {
+                view.values_count += 1;
+            }
+            if saturated {
+                view.saturated.insert(key);
+            }
+        }
+    }
+
+    pub fn label_names(&self, signal: Signal) -> Vec<String> {
+        self.view
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .names
+            .get(&signal.as_u8())
+            .map(|v| v.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn label_values(&self, signal: Signal, name: &str) -> Vec<String> {
+        self.view
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values
+            .get(&(signal.as_u8(), name.to_owned()))
+            .map(|v| v.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn estimated_resident_bytes(&self) -> usize {
+        self.resident_bytes_estimate.load(Ordering::Relaxed)
+    }
+
+    pub fn stats(&self) -> LabelMetadataStats {
+        let view = self.view.lock().unwrap_or_else(|e| e.into_inner());
+        LabelMetadataStats {
+            resident_bytes_estimate: self.estimated_resident_bytes(),
+            names: view.names_count,
+            values: view.values_count,
+            saturated_labels: view.saturated.len(),
+            blocks_warmed: self.blocks_warmed.load(Ordering::Relaxed),
+            projected_reads: self.projected_reads.load(Ordering::Relaxed),
+            cache_hits: self.cache_hits.load(Ordering::Relaxed),
+            fills_in_flight: self.fills_in_flight.load(Ordering::Relaxed),
+            fill_failures: self.fill_failures.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Warm supplied catalog candidates with bounded parallel projected reads,
+    /// then return the coordinator's global sorted label-name suggestions.
+    pub async fn warm_candidates(
+        &self,
+        catalog: &Mutex<Catalog>,
+        store: Arc<dyn ObjectStore>,
+        signal: Signal,
+        candidates: &[CatalogEntry],
+    ) -> Result<Vec<String>, MetaError> {
+        let parallelism = self.config.read_parallelism.max(1);
+        futures::stream::iter(candidates.iter().cloned().map(|entry| {
+            let store = store.clone();
+            async move { self.warm_one(catalog, store, signal, entry).await }
+        }))
+        .buffer_unordered(parallelism)
+        .try_collect::<Vec<_>>()
+        .await?;
+        Ok(self.label_names(signal))
+    }
+
+    async fn warm_one(
+        &self,
+        catalog: &Mutex<Catalog>,
+        store: Arc<dyn ObjectStore>,
+        signal: Signal,
+        entry: CatalogEntry,
+    ) -> Result<(), MetaError> {
+        let uuid = entry.meta.uuid;
+        if self
+            .view
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .blocks
+            .contains(&uuid)
+        {
+            self.cache_hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        let flight = uuid_flight(uuid);
+        let _guard = flight.lock().await;
+        if self
+            .view
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .blocks
+            .contains(&uuid)
+        {
+            self.cache_hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+
+        let persisted = lock(catalog)?
+            .warmed_blocks(&[uuid])
+            .map_err(|e| (QUERY_ERR_INTERNAL, format!("warmed_blocks: {e:#}")))?
+            .contains(&uuid);
+        let pairs = if persisted {
+            persisted_pairs(catalog, uuid)?
+        } else if entry.meta.has_postings {
+            let _permit = self
+                .fill_permits
+                .acquire()
+                .await
+                .expect("label metadata fill semaphore is never closed");
+            self.projected_reads.fetch_add(1, Ordering::Relaxed);
+            self.fills_in_flight.fetch_add(1, Ordering::Relaxed);
+            let result = fetch_label_pairs(store, &entry.meta).await;
+            self.fills_in_flight.fetch_sub(1, Ordering::Relaxed);
+            result.map_err(|e| {
+                self.fill_failures.fetch_add(1, Ordering::Relaxed);
+                (
+                    QUERY_ERR_INTERNAL,
+                    format!("metadata postings {uuid}: {e:#}"),
+                )
+            })?
+        } else {
+            Vec::new()
+        };
+
+        // Persist before publishing anything in memory: callers never observe
+        // partial success, and a failed/cancelled flight remains retryable.
+        if !persisted {
+            lock(catalog)?
+                .upsert_block_labels(uuid, &pairs)
+                .map_err(|e| {
+                    (
+                        QUERY_ERR_INTERNAL,
+                        format!("upsert_block_labels {uuid}: {e:#}"),
+                    )
+                })?;
+        }
+        self.merge_persisted_pairs(signal, pairs);
+        self.view
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .blocks
+            .insert(uuid);
+        self.blocks_warmed.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+impl Default for LabelMetadataCoordinator {
+    fn default() -> Self {
+        Self::new(LabelMetadataConfig::default())
+    }
+}
+
+fn estimated_tree_node_overhead() -> usize {
+    // BTreeSet stores each String alongside links/occupancy metadata. Rust does
+    // not expose the allocator's exact node layout, so use a stable conservative
+    // estimate and label the resulting status gauge explicitly as an estimate.
+    size_of::<String>() + 3 * size_of::<usize>()
+}
+
+fn uuid_flight(uuid: Uuid) -> Arc<tokio::sync::Mutex<()>> {
+    static FLIGHTS: OnceLock<Mutex<HashMap<Uuid, Weak<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    let mut flights = FLIGHTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(lock) = flights.get(&uuid).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    flights.insert(uuid, Arc::downgrade(&lock));
+    lock
+}
+
+fn persisted_pairs(
+    catalog: &Mutex<Catalog>,
+    uuid: Uuid,
+) -> Result<Vec<(String, String)>, MetaError> {
+    let guard = lock(catalog)?;
+    let names = guard
+        .distinct_label_names(&[uuid])
+        .map_err(|e| (QUERY_ERR_INTERNAL, format!("distinct_label_names: {e:#}")))?;
+    let mut pairs = Vec::new();
+    for name in names {
+        let values = guard
+            .distinct_label_values(&name, &[uuid])
+            .map_err(|e| (QUERY_ERR_INTERNAL, format!("distinct_label_values: {e:#}")))?;
+        pairs.extend(values.into_iter().map(|value| (name.clone(), value)));
+    }
+    Ok(pairs)
+}
 
 /// Distinct, sorted label names for a signal over an optional `[ts_min, ts_max]`
 /// window. See the module docs for per-signal fidelity.
@@ -155,34 +526,17 @@ async fn warm_label_cache(
 
     let all_uuids: Vec<Uuid> = candidates.iter().map(|c| c.meta.uuid).collect();
 
-    // Phase 2 — fetch + enumerate cold blocks, then persist one block before
-    // fetching the next. The catalog lock is never held over an await, and peak
-    // memory is bounded to one projected (name,value) sidecar rather than the
-    // union of every cold block in the requested range.
-    for entry in &candidates {
-        if warm.contains(&entry.meta.uuid) {
-            continue;
-        }
-        let pairs = if entry.meta.has_postings {
-            fetch_label_pairs(store.clone(), &entry.meta)
-                .await
-                .map_err(|e| {
-                    (
-                        QUERY_ERR_INTERNAL,
-                        format!("metadata postings {}: {e:#}", entry.meta.uuid),
-                    )
-                })?
-        } else {
-            // No postings ⇒ nothing enumerable; still mark warmed (empty) so
-            // it isn't refetched every request.
-            Vec::new()
-        };
-        let guard = lock(catalog)?;
-        if let Err(e) = guard.upsert_block_labels(entry.meta.uuid, &pairs) {
-            tracing::warn!(uuid = %entry.meta.uuid, error = %e,
-                "metadata: upsert_block_labels failed");
-        }
-    }
+    // Preserve the exact one-shot API while using an ephemeral coordinator for
+    // bounded parallel reads and the process-wide UUID single-flight registry.
+    // Already-persisted candidates need no object-store read.
+    let cold: Vec<CatalogEntry> = candidates
+        .iter()
+        .filter(|entry| !warm.contains(&entry.meta.uuid))
+        .cloned()
+        .collect();
+    LabelMetadataCoordinator::default()
+        .warm_candidates(catalog, store, signal, &cold)
+        .await?;
 
     Ok(all_uuids)
 }
@@ -312,4 +666,62 @@ fn lock(catalog: &Mutex<Catalog>) -> Result<std::sync::MutexGuard<'_, Catalog>, 
     catalog
         .lock()
         .map_err(|e| (QUERY_ERR_INTERNAL, format!("catalog mutex poisoned: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn suggestion_values_are_bounded_sorted_and_report_saturation() {
+        let cache = LabelMetadataCoordinator::new(LabelMetadataConfig {
+            read_parallelism: 2,
+            values_per_label: 2,
+            metric_names: 3,
+        });
+        cache.merge_persisted_pairs(
+            Signal::Metrics,
+            [
+                ("env", "z"),
+                ("env", "a"),
+                ("env", "m"),
+                ("__name__", "z_metric"),
+                ("__name__", "a_metric"),
+                ("__name__", "m_metric"),
+                ("__name__", "b_metric"),
+            ],
+        );
+
+        assert_eq!(cache.label_names(Signal::Metrics), vec!["__name__", "env"]);
+        assert_eq!(cache.label_values(Signal::Metrics, "env"), vec!["a", "m"]);
+        assert_eq!(
+            cache.label_values(Signal::Metrics, "__name__"),
+            vec!["a_metric", "b_metric", "m_metric"]
+        );
+        let stats = cache.stats();
+        assert_eq!(stats.names, 2);
+        assert_eq!(stats.values, 5);
+        assert_eq!(stats.saturated_labels, 2);
+        assert!(stats.resident_bytes_estimate > 0);
+    }
+
+    #[test]
+    fn metric_name_limit_does_not_apply_to_logs() {
+        let cache = LabelMetadataCoordinator::new(LabelMetadataConfig {
+            read_parallelism: 1,
+            values_per_label: 1,
+            metric_names: 10,
+        });
+        cache.merge_persisted_pairs(Signal::Logs, [("__name__", "z"), ("__name__", "a")]);
+        assert_eq!(cache.label_values(Signal::Logs, "__name__"), vec!["a"]);
+        assert_eq!(cache.stats().saturated_labels, 1);
+    }
+
+    #[test]
+    fn defaults_match_queryd_autocomplete_budget() {
+        let config = LabelMetadataConfig::default();
+        assert_eq!(config.read_parallelism, 16);
+        assert_eq!(config.values_per_label, 1_000);
+        assert_eq!(config.metric_names, 10_000);
+    }
 }
