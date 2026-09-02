@@ -320,6 +320,8 @@ async fn lease_holder_reconciles_prior_committed_output_before_remerging_inputs(
     .merges
     .pop()
     .unwrap();
+    let resources =
+        scry_compact::CompactResources::new(scry_compact::ResourceConfig::default()).unwrap();
     let committed = scry_compact::merge_blocks(
         store.clone(),
         BUCKET,
@@ -329,6 +331,7 @@ async fn lease_holder_reconciles_prior_committed_output_before_remerging_inputs(
         Uuid::now_v7(),
         &test_cfg(),
         &scry_block::AlwaysValid,
+        &resources,
     )
     .await
     .unwrap()
@@ -355,6 +358,7 @@ async fn lease_holder_reconciles_prior_committed_output_before_remerging_inputs(
         &NoopSink,
         Duration::from_secs(30),
         None,
+        scry_compact::CompactResources::new(scry_compact::ResourceConfig::default()).unwrap(),
     )
     .await
     .unwrap();
@@ -432,6 +436,8 @@ async fn concurrent_compaction_has_a_single_winner() {
                 &NoopSink,
                 Duration::from_secs(30),
                 None,
+                scry_compact::CompactResources::new(scry_compact::ResourceConfig::default())
+                    .unwrap(),
             )
             .await
             .unwrap()
@@ -455,6 +461,8 @@ async fn concurrent_compaction_has_a_single_winner() {
                 &NoopSink,
                 Duration::from_secs(30),
                 None,
+                scry_compact::CompactResources::new(scry_compact::ResourceConfig::default())
+                    .unwrap(),
             )
             .await
             .unwrap()

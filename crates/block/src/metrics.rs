@@ -300,7 +300,7 @@ impl MetricsBlockBuilder {
         self.fingerprints = Vec::new();
         self.ts = Vec::new();
         self.values = Vec::new();
-        rows.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        rows.sort_unstable_by_key(|row| (row.0, row.1));
 
         let main_schema = Self::main_schema();
         let fp_arr: ArrayRef = Arc::new(UInt64Array::from_iter_values(rows.iter().map(|r| r.0)));

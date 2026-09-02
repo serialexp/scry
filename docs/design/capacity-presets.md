@@ -73,7 +73,18 @@ Do not publish an ingest capacity promise until the ingest memory-envelope work 
 
 ### Compaction controls
 
-Do not qualify compaction until it has a DataFusion memory budget and spill path. Profiles should eventually set compaction memory, spill capacity, fanout, concurrency, and pressure backoff.
+Compaction is qualified against a **shared, process-wide bounded DataFusion pool** and a bounded spill path, not against an independent budget per partition. The pool is reserved separately from query and ingest headroom. Each candidate merge makes a weighted reservation based on its input/partition shape; the scheduler waits or rejects according to queue policy when the reservation is unavailable. A partition-count concurrency limit is only a secondary guard and must not replace byte-weighted admission.
+
+The merge is staged and streamed: bounded RecordBatches are written to a temporary/staged output as they arrive, while postings, bloom, and other sidecars are built incrementally. The complete output is published at the commit point (metadata last); a failed stage is cleaned up and its inputs remain live. Thus a full DataFusion pool or spill area is an ordinary per-partition resource failure, not permission to exceed the envelope and not data loss. The maintenance loop records the failure, releases the reservation, and retries with bounded backoff or defers that partition without crashing or declaring success.
+
+Profiles should set and display:
+
+- shared compaction DataFusion pool limit and reserved safety headroom;
+- spill directory/filesystem and byte capacity;
+- weighted admission limit, queue policy/timeout, fanout, and secondary concurrency;
+- pressure-backoff settings and staged-output cleanup policy.
+
+The conservative default derives from the process cgroup memory limit (`memory.max` on cgroup v2, cgroup v1 fallback), minus explicit query/ingest reservations and safety headroom. Missing, unlimited, or invalid cgroup limits use a conservative fixed default rather than host RAM. Explicit overrides are allowed, and startup telemetry must identify the source and resolved envelope. Runtime telemetry should include pool limit/reserved/in-use bytes, weighted queued/running work, admission wait time, spill usage/capacity and cleanup failures, and per-partition duration, bytes/rows, and outcome.
 
 ## Synthetic qualification
 

@@ -29,9 +29,12 @@ use bytes::Bytes;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::prelude::{col, ParquetReadOptions, SessionConfig, SessionContext};
 use futures::StreamExt;
+use object_store::buffered::BufWriter as ObjectStoreWriter;
 use object_store::{path::Path as ObjPath, ObjectStore, ObjectStoreExt};
-use parquet::arrow::ArrowWriter;
-use scry_block::postings::{decode_postings, encode_postings, merge_postings};
+use parquet::arrow::AsyncArrowWriter;
+use scry_block::postings::{
+    decode_postings, encode_postings, finish_postings_merge, merge_postings_into,
+};
 use scry_block::{
     block_path, compacted_ancestor_closure, BlockBuilderConfig, BlockMeta, BodyBloomBuilder, Fence,
 };
@@ -117,6 +120,7 @@ pub async fn merge_blocks(
     writer_id: Uuid,
     block_cfg: &BlockBuilderConfig,
     fence: &dyn Fence,
+    resources: &Arc<crate::resource::CompactResources>,
 ) -> Result<Option<BlockMeta>> {
     anyhow::ensure!(!inputs.is_empty(), "merge_blocks called with no inputs");
     let spec = spec_for(signal)?;
@@ -178,7 +182,7 @@ pub async fn merge_blocks(
         .execution
         .parquet
         .schema_force_view_types = false;
-    let ctx = SessionContext::new_with_config(session_cfg);
+    let ctx = SessionContext::new_with_config_rt(session_cfg, resources.runtime_env());
     let url = ObjectStoreUrl::parse(format!("s3://{bucket}"))
         .map_err(|e| anyhow::anyhow!("parse object store url: {e}"))?;
     ctx.runtime_env()
@@ -226,9 +230,13 @@ pub async fn merge_blocks(
     let mut bloom_builder = body_idx.map(|_| BodyBloomBuilder::new(block_cfg.bloom_ngram));
 
     let main_props = block_cfg.main_writer_props()?;
-    let mut main_buf: Vec<u8> = Vec::new();
-    let mut writer = ArrowWriter::try_new(&mut main_buf, out_schema.clone(), Some(main_props))
-        .context("ArrowWriter::try_new (merged main)")?;
+    let main_path = ObjPath::from(block_path(signal, ts_min, writer_id, block_uuid, "parquet"));
+    let output_buffer = resources.config().output_buffer_bytes;
+    let main_sink =
+        ObjectStoreWriter::with_capacity(store.clone(), main_path.clone(), output_buffer)
+            .with_max_concurrency(1);
+    let mut writer = AsyncArrowWriter::try_new(main_sink, out_schema.clone(), Some(main_props))
+        .context("AsyncArrowWriter::try_new (merged main)")?;
     let mut row_count: u64 = 0;
 
     while let Some(batch) = stream.next().await {
@@ -257,21 +265,24 @@ pub async fn merge_blocks(
                 }
             }
         }
-        writer.write(&batch).context("write merged batch")?;
+        writer.write(&batch).await.context("write merged batch")?;
+        if writer.in_progress_size() >= resources.config().parquet_writer_memory_bytes {
+            writer
+                .flush()
+                .await
+                .context("flush merged parquet row group")?;
+        }
     }
-    writer.close().context("close merged main parquet")?;
-    let main_bytes = Bytes::from(main_buf);
-    let byte_size = main_bytes.len() as u64;
-
-    let mut puts: Vec<(ObjPath, Bytes)> = Vec::new();
-    puts.push((
-        ObjPath::from(block_path(signal, ts_min, writer_id, block_uuid, "parquet")),
-        main_bytes,
-    ));
+    writer.close().await.context("close merged main parquet")?;
+    let byte_size = store
+        .head(&main_path)
+        .await
+        .context("head merged main parquet")?
+        .size;
 
     // ── Postings (metrics/logs): union the inputs' postings. ─────────
     let (has_postings, postings_size_bytes) = if spec.fp_col.is_some() {
-        let mut sets = Vec::with_capacity(inputs.len());
+        let mut postings = HashMap::new();
         for e in inputs {
             if !e.meta.has_postings {
                 continue;
@@ -290,22 +301,24 @@ pub async fn merge_blocks(
                 .bytes()
                 .await
                 .context("read input postings body")?;
-            sets.push(decode_postings(bytes).context("decode input postings")?);
+            let decoded = decode_postings(bytes).context("decode input postings")?;
+            merge_postings_into(&mut postings, decoded);
         }
-        let merged = merge_postings(sets);
+        let merged = finish_postings_merge(postings);
         let props = block_cfg.postings_writer_props()?;
         let bytes = encode_postings(&merged, &props).context("encode merged postings")?;
         let size = bytes.len() as u64;
-        puts.push((
-            ObjPath::from(block_path(
-                signal,
-                ts_min,
-                writer_id,
-                block_uuid,
-                "postings.parquet",
-            )),
-            bytes,
+        let path = ObjPath::from(block_path(
+            signal,
+            ts_min,
+            writer_id,
+            block_uuid,
+            "postings.parquet",
         ));
+        store
+            .put(&path, bytes.into())
+            .await
+            .with_context(|| format!("upload merged object {path}"))?;
         (true, Some(size))
     } else {
         (false, None)
@@ -316,16 +329,17 @@ pub async fn merge_blocks(
         let bloom = bb.finish(block_cfg.bloom_target_fpr);
         let bytes = Bytes::from(bloom.to_bytes());
         let size = bytes.len() as u64;
-        puts.push((
-            ObjPath::from(block_path(
-                signal,
-                ts_min,
-                writer_id,
-                block_uuid,
-                "body.bloom",
-            )),
-            bytes,
+        let path = ObjPath::from(block_path(
+            signal,
+            ts_min,
+            writer_id,
+            block_uuid,
+            "body.bloom",
         ));
+        store
+            .put(&path, bytes.into())
+            .await
+            .with_context(|| format!("upload merged object {path}"))?;
         (true, Some(size))
     } else {
         (false, None)
@@ -385,15 +399,9 @@ pub async fn merge_blocks(
     let meta_bytes =
         Bytes::from(serde_json::to_vec_pretty(&meta).context("serialise merged meta")?);
 
-    // Upload the data objects first (main → [postings] → [bloom]). These
-    // carry no "block exists" signal on their own — reconcile keys on
-    // meta.json — so they are safe to write before the commit point.
-    for (path, bytes) in puts {
-        store
-            .put(&path, bytes.into())
-            .await
-            .with_context(|| format!("upload merged object {path}"))?;
-    }
+    // Main and sidecars have now been uploaded in durability order. None carry
+    // the "block exists" signal on their own — reconcile keys on meta.json — so
+    // they are safe to write before the commit point.
 
     // Commit-point fence: the merge may have taken minutes. If the lease was
     // lost in the meantime, abort *before* writing meta.json. Without the

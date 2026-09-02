@@ -250,9 +250,18 @@ async fn logs_compaction_is_lossless_and_reaps_inputs() {
         parallelism: 1,
     };
     let catalog = std::sync::Arc::new(std::sync::Mutex::new(catalog));
-    let report = compact_once(store.clone(), &catalog, BUCKET, &cfg, &test_cfg())
-        .await
-        .unwrap();
+    let resources =
+        scry_compact::CompactResources::new(scry_compact::ResourceConfig::default()).unwrap();
+    let report = compact_once(
+        store.clone(),
+        &catalog,
+        BUCKET,
+        &cfg,
+        &test_cfg(),
+        resources,
+    )
+    .await
+    .unwrap();
     assert_eq!(report.merges, 1);
     assert_eq!(report.blocks_in, 3);
     assert_eq!(report.blocks_out, 1);
@@ -405,9 +414,18 @@ async fn metrics_compaction_is_lossless() {
         parallelism: 1,
     };
     let catalog = std::sync::Arc::new(std::sync::Mutex::new(catalog));
-    let report = compact_once(store.clone(), &catalog, BUCKET, &cfg, &test_cfg())
-        .await
-        .unwrap();
+    let resources =
+        scry_compact::CompactResources::new(scry_compact::ResourceConfig::default()).unwrap();
+    let report = compact_once(
+        store.clone(),
+        &catalog,
+        BUCKET,
+        &cfg,
+        &test_cfg(),
+        resources,
+    )
+    .await
+    .unwrap();
     assert_eq!(report.merges, 1);
     assert_eq!(report.blocks_in, 3);
 

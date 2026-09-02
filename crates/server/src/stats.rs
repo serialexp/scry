@@ -141,6 +141,79 @@ impl UploadStats {
     }
 }
 
+/// Cheap cached view of the compactor's process-wide memory envelope.
+///
+/// The compaction crate writes this from its existing loop; status heartbeats
+/// only read atomics and never enumerate spill files or admission queues.
+#[derive(Debug, Default)]
+pub struct CompactionResourceStats {
+    memory_budget_bytes: AtomicU64,
+    datafusion_limit_bytes: AtomicU64,
+    datafusion_reserved_bytes: AtomicU64,
+    non_datafusion_limit_bytes: AtomicU64,
+    weighted_running_bytes: AtomicU64,
+    weighted_waiters: AtomicU64,
+    spill_limit_bytes: AtomicU64,
+    spill_used_bytes: AtomicU64,
+    spill_active_files: AtomicU64,
+    admissions: AtomicU64,
+    rejected: AtomicU64,
+    cumulative_wait_micros: AtomicU64,
+}
+
+impl CompactionResourceStats {
+    #[allow(clippy::too_many_arguments)]
+    pub fn update(
+        &self,
+        memory_budget_bytes: u64,
+        datafusion_limit_bytes: u64,
+        datafusion_reserved_bytes: u64,
+        non_datafusion_limit_bytes: u64,
+        weighted_running_bytes: u64,
+        weighted_waiters: u64,
+        spill_limit_bytes: u64,
+        spill_used_bytes: u64,
+        spill_active_files: u64,
+        admissions: u64,
+        rejected: u64,
+        cumulative_wait_micros: u64,
+    ) {
+        for (field, value) in [
+            (&self.memory_budget_bytes, memory_budget_bytes),
+            (&self.datafusion_limit_bytes, datafusion_limit_bytes),
+            (&self.datafusion_reserved_bytes, datafusion_reserved_bytes),
+            (&self.non_datafusion_limit_bytes, non_datafusion_limit_bytes),
+            (&self.weighted_running_bytes, weighted_running_bytes),
+            (&self.weighted_waiters, weighted_waiters),
+            (&self.spill_limit_bytes, spill_limit_bytes),
+            (&self.spill_used_bytes, spill_used_bytes),
+            (&self.spill_active_files, spill_active_files),
+            (&self.admissions, admissions),
+            (&self.rejected, rejected),
+            (&self.cumulative_wait_micros, cumulative_wait_micros),
+        ] {
+            field.store(value, Ordering::Relaxed);
+        }
+    }
+
+    fn snapshot(&self) -> serde_json::Value {
+        serde_json::json!({
+            "memory_budget_bytes": self.memory_budget_bytes.load(Ordering::Relaxed),
+            "datafusion_limit_bytes": self.datafusion_limit_bytes.load(Ordering::Relaxed),
+            "datafusion_reserved_bytes": self.datafusion_reserved_bytes.load(Ordering::Relaxed),
+            "non_datafusion_limit_bytes": self.non_datafusion_limit_bytes.load(Ordering::Relaxed),
+            "weighted_running_bytes": self.weighted_running_bytes.load(Ordering::Relaxed),
+            "weighted_waiters": self.weighted_waiters.load(Ordering::Relaxed),
+            "spill_limit_bytes": self.spill_limit_bytes.load(Ordering::Relaxed),
+            "spill_used_bytes": self.spill_used_bytes.load(Ordering::Relaxed),
+            "spill_active_files": self.spill_active_files.load(Ordering::Relaxed),
+            "admissions": self.admissions.load(Ordering::Relaxed),
+            "rejected": self.rejected.load(Ordering::Relaxed),
+            "cumulative_wait_micros": self.cumulative_wait_micros.load(Ordering::Relaxed),
+        })
+    }
+}
+
 /// One completed compaction pass, recorded into [`ServerMetrics`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CompactionPassStats {
@@ -152,6 +225,9 @@ pub struct CompactionPassStats {
     pub reaped: u64,
     pub reap_failed: u64,
     pub partition_failed: u64,
+    /// Partitions skipped because their merge could not acquire the configured
+    /// compaction resource envelope. Inputs remain live and can be retried.
+    pub resource_failed: u64,
     pub lease_held: u64,
     pub lease_unavailable: u64,
     /// Partitions the planner declined because the merged output's ancestor
@@ -227,6 +303,7 @@ pub struct ServerMetrics {
     compaction_reaped: AtomicU64,
     compaction_reap_failed: AtomicU64,
     compaction_partition_failed: AtomicU64,
+    compaction_resource_failed: AtomicU64,
     compaction_lease_held: AtomicU64,
     compaction_lease_unavailable: AtomicU64,
     /// Gauge, not a counter: stuck partitions as of the most recent pass.
@@ -252,6 +329,8 @@ pub struct ServerMetrics {
     catalog_gauge: Option<Arc<CatalogGauge>>,
     /// Live compaction progress. `None` when this daemon does not compact.
     compaction_progress: Option<Arc<scry_block::CompactionProgress>>,
+    /// Cheap mirrored resource counters for compaction-only status.
+    compaction_resource_stats: Option<Arc<CompactionResourceStats>>,
 }
 
 impl ServerMetrics {
@@ -292,6 +371,7 @@ impl ServerMetrics {
             compaction_reaped: AtomicU64::new(0),
             compaction_reap_failed: AtomicU64::new(0),
             compaction_partition_failed: AtomicU64::new(0),
+            compaction_resource_failed: AtomicU64::new(0),
             compaction_lease_held: AtomicU64::new(0),
             compaction_lease_unavailable: AtomicU64::new(0),
             compaction_oversized: AtomicU64::new(0),
@@ -310,6 +390,7 @@ impl ServerMetrics {
             retention_last_pass_duration_ms: AtomicU64::new(0),
             catalog_gauge: None,
             compaction_progress: None,
+            compaction_resource_stats: None,
         }
     }
 
@@ -356,6 +437,11 @@ impl ServerMetrics {
         self.compaction_progress.as_ref()
     }
 
+    pub fn with_compaction_resource_stats(mut self, stats: Arc<CompactionResourceStats>) -> Self {
+        self.compaction_resource_stats = Some(stats);
+        self
+    }
+
     /// Describe this daemon's compaction policy in fleet snapshots.
     pub fn configure_compaction(&self, enabled: bool, grace: Duration) {
         self.compaction_enabled
@@ -383,6 +469,8 @@ impl ServerMetrics {
             .fetch_add(pass.reap_failed, Ordering::Relaxed);
         self.compaction_partition_failed
             .fetch_add(pass.partition_failed, Ordering::Relaxed);
+        self.compaction_resource_failed
+            .fetch_add(pass.resource_failed, Ordering::Relaxed);
         self.compaction_lease_held
             .fetch_add(pass.lease_held, Ordering::Relaxed);
         self.compaction_lease_unavailable
@@ -614,6 +702,7 @@ impl ServerMetrics {
                 "reaped": self.compaction_reaped.load(Ordering::Relaxed),
                 "reap_failed": self.compaction_reap_failed.load(Ordering::Relaxed),
                 "partition_failed": self.compaction_partition_failed.load(Ordering::Relaxed),
+                "resource_failed": self.compaction_resource_failed.load(Ordering::Relaxed),
                 "lease_held": self.compaction_lease_held.load(Ordering::Relaxed),
                 "lease_unavailable": self.compaction_lease_unavailable.load(Ordering::Relaxed),
                 "oversized": self.compaction_oversized.load(Ordering::Relaxed),
@@ -621,6 +710,7 @@ impl ServerMetrics {
                 "last_pass_duration_ms": self.compaction_last_pass_duration_ms.load(Ordering::Relaxed),
                 "current_pass_planned": self.compaction_progress.as_ref().map(|p| p.snapshot().0).unwrap_or(0),
                 "current_pass_completed": self.compaction_progress.as_ref().map(|p| p.snapshot().1).unwrap_or(0),
+                "resources": self.compaction_resource_stats.as_ref().map(|r| r.snapshot()).unwrap_or(serde_json::Value::Null),
             },
             "retention": {
                 "passes": self.retention_passes.load(Ordering::Relaxed),
@@ -1244,6 +1334,7 @@ mod tests {
                 reaped: 8,
                 reap_failed: 2,
                 partition_failed: 3,
+                resource_failed: 2,
                 lease_held: 4,
                 lease_unavailable: 5,
                 oversized: 6,
@@ -1277,6 +1368,7 @@ mod tests {
         assert_eq!(c["reaped"], serde_json::json!(12));
         assert_eq!(c["reap_failed"], serde_json::json!(2));
         assert_eq!(c["partition_failed"], serde_json::json!(3));
+        assert_eq!(c["resource_failed"], serde_json::json!(2));
         assert_eq!(c["lease_held"], serde_json::json!(4));
         assert_eq!(c["lease_unavailable"], serde_json::json!(5));
         // A gauge: the second pass reported none stuck, which replaces the 6

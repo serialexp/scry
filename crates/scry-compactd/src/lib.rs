@@ -27,10 +27,13 @@ use scry_block::BlockBuilderConfig;
 use scry_catalog::Catalog;
 use scry_compact::{
     compact_once, validate_against_catalog, warn_oversized, CompactConfig, CompactReport,
+    CompactResources, ResourceConfig,
 };
 use scry_objstore::{open as open_objstore, ObjStoreConfig};
 use tracing::{info, warn};
 use uuid::Uuid;
+
+pub mod memory;
 
 /// CLI arguments for the `scry compact` subcommand.
 #[derive(Parser, Debug)]
@@ -81,6 +84,23 @@ pub struct Args {
     /// parallelism multiplies throughput with no data-level conflict.
     #[arg(long, default_value_t = 1)]
     pub parallelism: usize,
+
+    /// Shared compaction memory budget in MiB. If omitted, derive a
+    /// conservative budget from the Linux cgroup limit or use a fixed fallback.
+    #[arg(long)]
+    pub memory_budget_mib: Option<u64>,
+
+    /// Directory for bounded DataFusion spill files.
+    #[arg(long)]
+    pub spill_dir: Option<PathBuf>,
+
+    /// Maximum spill-disk usage in MiB.
+    #[arg(long, default_value_t = 4096)]
+    pub spill_max_mib: u64,
+
+    /// Bounded staged-output buffer size in MiB.
+    #[arg(long, default_value_t = 8)]
+    pub output_buffer_mib: u64,
 
     // ── Multi-instance (D-069) ──────────────────────────────────
     /// Valkey URL for per-partition lease coordination, pub/sub catalog
@@ -162,11 +182,41 @@ pub async fn run(mut args: Args) -> Result<()> {
         .validate()
         .context("invalid compaction policy")?;
     let block_cfg = BlockBuilderConfig::default();
+    let detected = memory::detect_cgroup_memory_limit();
+    let budget = memory::resolve_memory_budget(args.memory_budget_mib, detected)?;
+    let mut resource_cfg = ResourceConfig::from_envelope(budget.bytes);
+    resource_cfg.spill_dir = args.spill_dir.clone();
+    resource_cfg.spill_bytes = args
+        .spill_max_mib
+        .checked_mul(1024 * 1024)
+        .context("--spill-max-mib is too large")?;
+    resource_cfg.output_buffer_bytes = args
+        .output_buffer_mib
+        .checked_mul(1024 * 1024)
+        .and_then(|v| usize::try_from(v).ok())
+        .context("--output-buffer-mib is too large")?;
+    let resources = CompactResources::new(resource_cfg)
+        .context("constructing process-wide compaction resources")?;
+    info!(
+        source = %budget.source,
+        cgroup_limit_bytes = ?budget.cgroup_limit_bytes,
+        memory_budget_bytes = budget.bytes,
+        "resolved compaction memory budget"
+    );
 
     if args.valkey_url.is_some() {
-        run_leased(args, store, bucket, instance_id, compact_cfg, block_cfg).await
+        run_leased(
+            args,
+            store,
+            bucket,
+            instance_id,
+            compact_cfg,
+            block_cfg,
+            resources,
+        )
+        .await
     } else {
-        run_standalone(args, store, bucket, compact_cfg, block_cfg).await
+        run_standalone(args, store, bucket, compact_cfg, block_cfg, resources).await
     }
 }
 
@@ -177,6 +227,7 @@ async fn run_standalone(
     bucket: String,
     compact_cfg: CompactConfig,
     block_cfg: BlockBuilderConfig,
+    resources: Arc<CompactResources>,
 ) -> Result<()> {
     let catalog = Catalog::open(&args.catalog, &bucket)
         .with_context(|| format!("opening catalog at {}", args.catalog.display()))?;
@@ -197,7 +248,15 @@ async fn run_standalone(
             "starting compaction watch loop (single-instance, Ctrl-C to stop)"
         );
         loop {
-            run_unfenced_pass(&store, &catalog, &bucket, &compact_cfg, &block_cfg).await?;
+            run_unfenced_pass(
+                &store,
+                &catalog,
+                &bucket,
+                &compact_cfg,
+                &block_cfg,
+                resources.clone(),
+            )
+            .await?;
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(args.interval)) => {}
                 _ = tokio::signal::ctrl_c() => {
@@ -207,7 +266,15 @@ async fn run_standalone(
             }
         }
     } else {
-        run_unfenced_pass(&store, &catalog, &bucket, &compact_cfg, &block_cfg).await?;
+        run_unfenced_pass(
+            &store,
+            &catalog,
+            &bucket,
+            &compact_cfg,
+            &block_cfg,
+            resources.clone(),
+        )
+        .await?;
     }
     Ok(())
 }
@@ -220,10 +287,12 @@ async fn run_leased(
     instance_id: Uuid,
     compact_cfg: CompactConfig,
     block_cfg: BlockBuilderConfig,
+    resources: Arc<CompactResources>,
 ) -> Result<()> {
     use scry_cluster::{apply_event, full_walk, poll_once, run_compaction_pass};
     use scry_server::{
-        serve_status, CatalogGauge, FleetSource, LocalStatus, ServerMetrics, CATALOG_GAUGE_INTERVAL,
+        serve_status, CatalogGauge, CompactionResourceStats, FleetSource, LocalStatus,
+        ServerMetrics, CATALOG_GAUGE_INTERVAL,
     };
     use scry_valkey::{
         discover_status_blobs, parse_envelope, subscribe_blocks, Keyspace, StatusRegistration,
@@ -374,12 +443,15 @@ async fn run_leased(
     bg_tasks.push(gauge.clone().spawn(CATALOG_GAUGE_INTERVAL));
 
     let compaction_progress = Arc::new(scry_block::CompactionProgress::new());
+    let resource_stats = Arc::new(CompactionResourceStats::default());
+    update_resource_stats(&resource_stats, &resources);
     let metrics = Arc::new(
         ServerMetrics::new(0)
             .with_identity(instance_id.to_string(), String::new())
             .with_role("compact")
             .with_catalog_gauge(gauge)
-            .with_compaction_progress(compaction_progress.clone()),
+            .with_compaction_progress(compaction_progress.clone())
+            .with_compaction_resource_stats(resource_stats.clone()),
     );
     metrics.configure_compaction(true, compact_cfg.grace);
 
@@ -493,6 +565,7 @@ async fn run_leased(
 
     loop {
         let started = std::time::Instant::now();
+        update_resource_stats(&resource_stats, &resources);
         match run_compaction_pass(
             &provider,
             store.clone(),
@@ -503,10 +576,16 @@ async fn run_leased(
             &*sink,
             lease_ttl,
             Some(&compaction_progress),
+            resources.clone(),
         )
         .await
         {
-            Ok(r) if r.merges > 0 || r.partition_failed > 0 || r.oversized > 0 => {
+            Ok(r)
+                if r.merges > 0
+                    || r.partition_failed > 0
+                    || r.resource_failed > 0
+                    || r.oversized > 0 =>
+            {
                 let duration = started.elapsed();
                 info!(
                     merges = r.merges,
@@ -531,6 +610,7 @@ async fn run_leased(
                 warn!(error = %e, "compaction pass failed");
             }
         }
+        update_resource_stats(&resource_stats, &resources);
 
         tokio::select! {
             _ = tokio::time::sleep(interval) => {}
@@ -542,6 +622,28 @@ async fn run_leased(
     }
 
     Ok(())
+}
+
+fn update_resource_stats(
+    stats: &scry_server::CompactionResourceStats,
+    resources: &CompactResources,
+) {
+    let cfg = resources.config();
+    let t = resources.telemetry();
+    stats.update(
+        cfg.envelope_bytes,
+        cfg.datafusion_memory_bytes,
+        t.datafusion_reserved_bytes as u64,
+        cfg.non_datafusion_memory_bytes,
+        t.weighted_running_bytes,
+        t.weighted_waiters as u64,
+        cfg.spill_bytes,
+        t.spill_used_bytes,
+        t.spill_active_files as u64,
+        t.admissions,
+        t.rejected,
+        t.cumulative_wait_micros,
+    );
 }
 
 fn record_compaction_metrics(
@@ -560,6 +662,7 @@ fn record_compaction_metrics(
             reaped: report.reaped as u64,
             reap_failed: report.reap_failed as u64,
             partition_failed: report.partition_failed as u64,
+            resource_failed: report.resource_failed as u64,
             lease_held: report.lease_held as u64,
             lease_unavailable: report.lease_unavailable as u64,
             oversized: report.oversized as u64,
@@ -625,8 +728,17 @@ async fn run_unfenced_pass(
     bucket: &str,
     compact_cfg: &CompactConfig,
     block_cfg: &BlockBuilderConfig,
+    resources: Arc<CompactResources>,
 ) -> Result<()> {
-    let report = compact_once(store.clone(), catalog, bucket, compact_cfg, block_cfg).await?;
+    let report = compact_once(
+        store.clone(),
+        catalog,
+        bucket,
+        compact_cfg,
+        block_cfg,
+        resources,
+    )
+    .await?;
     if report.merges == 0 {
         info!(oversized = report.oversized, "nothing to compact this pass");
     } else {

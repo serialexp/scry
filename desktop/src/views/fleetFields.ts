@@ -198,6 +198,7 @@ function ingestFields(data: Data): FleetField[] {
     ["lease held", count(number(compaction, "lease_held"))],
     ["lease unavailable", count(number(compaction, "lease_unavailable"))],
     ["compaction failures", count(sumOrMissing(number(compaction, "pass_failed"), number(compaction, "partition_failed")))],
+    ["resource deferrals", count(number(compaction, "resource_failed"))],
     ["reap failures", count(number(compaction, "reap_failed"))],
     ["last compaction", lastPass === null ? "—" : new Date(lastPass).toLocaleString()],
     ["retention passes", count(number(retention, "passes"))],
@@ -301,6 +302,7 @@ function queryFields(data: Data): FleetField[] {
 function compactFields(data: Data): FleetField[] {
   const compaction = object(data.compaction);
   const balance = object(data.blocks);
+  const resources = object(compaction.resources);
   const lastPass = number(compaction, "last_pass_unix_ms");
   const enabled = boolean(compaction, "enabled");
   return [
@@ -326,6 +328,14 @@ function compactFields(data: Data): FleetField[] {
     ["lease unavailable", count(number(compaction, "lease_unavailable"))],
     ["oversized partitions", count(number(compaction, "oversized"))],
     ["compaction failures", count(sumOrMissing(number(compaction, "pass_failed"), number(compaction, "partition_failed")))],
+    ["resource deferrals", count(number(compaction, "resource_failed"))],
+    ["memory budget", bytes(number(resources, "memory_budget_bytes"))],
+    ["DataFusion reserved", bytes(number(resources, "datafusion_reserved_bytes"))],
+    ["merge memory running", bytes(number(resources, "weighted_running_bytes"))],
+    ["merge memory waiters", count(number(resources, "weighted_waiters"))],
+    ["spill usage", `${bytes(number(resources, "spill_used_bytes"))} / ${bytes(number(resources, "spill_limit_bytes"))}`],
+    ["resource admissions", count(number(resources, "admissions"))],
+    ["resource rejected", count(number(resources, "rejected"))],
     ["reap failures", count(number(compaction, "reap_failed"))],
     ["last compaction", lastPass === null ? "—" : new Date(lastPass).toLocaleString()],
     ["last pass duration", milliseconds(number(compaction, "last_pass_duration_ms"))],

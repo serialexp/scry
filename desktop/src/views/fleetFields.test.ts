@@ -40,6 +40,31 @@ describe("fleetFields", () => {
     expect(fields.get("compaction failures")).toBe("5");
   });
 
+  it("renders compact resource telemetry", () => {
+    const fields = new Map(fleetFields(instance("compact", {
+      compaction: {
+        enabled: true,
+        resource_failed: 3,
+        resources: {
+          memory_budget_bytes: 1_073_741_824,
+          datafusion_reserved_bytes: 134_217_728,
+          weighted_running_bytes: 268_435_456,
+          weighted_waiters: 2,
+          spill_used_bytes: 536_870_912,
+          spill_limit_bytes: 4_294_967_296,
+          admissions: 12,
+          rejected: 3,
+        },
+      },
+    })));
+    expect(fields.get("resource deferrals")).toBe("3");
+    expect(fields.get("memory budget")).toBe("1.00 GiB");
+    expect(fields.get("DataFusion reserved")).toBe("128.0 MiB");
+    expect(fields.get("merge memory waiters")).toBe("2");
+    expect(fields.get("spill usage")).toBe("512.0 MiB / 4.00 GiB");
+    expect(fields.get("resource rejected")).toBe("3");
+  });
+
   it("renders nested query telemetry and cache rates", () => {
     const fields = new Map(fleetFields(instance("query", {
       queries_total: 10,

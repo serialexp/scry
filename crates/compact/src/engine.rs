@@ -45,6 +45,7 @@ use uuid::Uuid;
 
 use crate::merge::merge_blocks;
 use crate::policy::{plan_merges, CompactConfig, OversizedPartition, PlannedMerge};
+use crate::resource::CompactResources;
 
 /// Surface partitions the planner declined. These are operator-actionable
 /// (raise `--compact-max-level`, restore the previous `--compact-fanout`, or
@@ -83,6 +84,9 @@ pub struct CompactReport {
     pub reap_failed: usize,
     /// Partitions whose merge/reconciliation failed while the pass continued.
     pub partition_failed: usize,
+    /// Partitions deferred because the bounded memory/spill envelope could not
+    /// admit or execute them. Inputs remain live and later passes retry.
+    pub resource_failed: usize,
     /// Eligible partitions currently leased by another maintenance instance.
     pub lease_held: usize,
     /// Eligible partitions skipped because the lease backend was unavailable.
@@ -113,6 +117,7 @@ pub async fn compact_once(
     bucket: &str,
     cfg: &CompactConfig,
     block_cfg: &BlockBuilderConfig,
+    resources: Arc<CompactResources>,
 ) -> Result<CompactReport> {
     cfg.validate().context("invalid compaction policy")?;
     let live = catalog
@@ -131,8 +136,8 @@ pub async fn compact_once(
         .context("list pending compaction reaps")?;
     reap_pending(store.clone(), catalog, &pending, &NoopSink, &mut report).await;
 
-    // One compactor identity for this pass — block paths are
-    // content-addressed under it (`<signal>/.../<writer_id>/<uuid>`).
+    // One compactor identity for this pass. The caller-owned resource envelope
+    // is process-wide and survives across passes.
     let writer_id = Uuid::now_v7();
 
     let parallelism = cfg.parallelism.max(1);
@@ -141,7 +146,8 @@ pub async fn compact_once(
         let catalog = catalog.clone();
         let bucket = bucket.to_string();
         let cfg = cfg.clone();
-        let block_cfg = block_cfg.clone();
+        let block_cfg = *block_cfg;
+        let resources = resources.clone();
         async move {
             let inputs = plan.inputs.len();
             let label = format!("{} {}", plan.signal, plan.date);
@@ -155,6 +161,7 @@ pub async fn compact_once(
                 &block_cfg,
                 &AlwaysValid,
                 &NoopSink,
+                &resources,
             )
             .await
             .with_context(|| format!("compacting {label} partition"))?;
@@ -224,6 +231,7 @@ pub async fn compact_partition<C: CatalogHandle>(
     block_cfg: &BlockBuilderConfig,
     fence: &dyn Fence,
     sink: &dyn BlockEventSink,
+    resources: &Arc<CompactResources>,
 ) -> Result<PartitionOutcome> {
     let input_uuids: Vec<Uuid> = plan.inputs.iter().map(|e| e.meta.uuid).collect();
     tracing::info!(
@@ -242,6 +250,28 @@ pub async fn compact_partition<C: CatalogHandle>(
         return Ok(PartitionOutcome::Aborted);
     }
 
+    // DataFusion does not account for parquet decode, ArrowWriter row groups,
+    // postings, fingerprints, or body-bloom construction. Conservatively
+    // expand the catalog's compressed object sizes to cover decoded state and
+    // transient sidecar copies. This is intentionally pessimistic: deferring a
+    // pathological merge is preferable to crossing the process envelope.
+    let compressed = plan.inputs.iter().try_fold(0u64, |sum, entry| {
+        sum.checked_add(entry.meta.byte_size)
+            .and_then(|v| v.checked_add(entry.meta.postings_size_bytes.unwrap_or(0)))
+            .and_then(|v| v.checked_add(entry.meta.body_bloom_size_bytes.unwrap_or(0)))
+    });
+    let estimated = compressed
+        .and_then(|bytes| bytes.checked_mul(8))
+        .ok_or_else(|| crate::resource::ResourceError::RequestTooLarge {
+            requested_bytes: u64::MAX,
+            budget_bytes: resources.config().non_datafusion_memory_bytes,
+        })?
+        .max(16 * 1024 * 1024);
+    let _resource_permit = resources
+        .admit(estimated)
+        .await
+        .context("compaction resource admission")?;
+
     // 1. Merge → upload data objects → fenced meta.json commit. `None` means
     //    the fence tripped before the commit; the inputs are untouched.
     let merged = match merge_blocks(
@@ -253,6 +283,7 @@ pub async fn compact_partition<C: CatalogHandle>(
         writer_id,
         block_cfg,
         fence,
+        resources,
     )
     .await
     .with_context(|| format!("merging {} {} blocks", plan.inputs.len(), plan.signal))?

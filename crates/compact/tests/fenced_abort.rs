@@ -174,6 +174,10 @@ fn cfg() -> CompactConfig {
     }
 }
 
+fn resources() -> Arc<scry_compact::CompactResources> {
+    scry_compact::CompactResources::new(scry_compact::ResourceConfig::default()).unwrap()
+}
+
 #[tokio::test]
 async fn fence_lost_before_meta_commit_aborts_with_inputs_intact() {
     let (store, catalog, _tmp, metas) = three_logs_blocks().await;
@@ -196,6 +200,7 @@ async fn fence_lost_before_meta_commit_aborts_with_inputs_intact() {
         &test_cfg(),
         &fence,
         &sink,
+        &resources(),
     )
     .await
     .unwrap();
@@ -243,6 +248,7 @@ async fn fence_lost_after_commit_still_publishes_output_and_defers_reap() {
         &test_cfg(),
         &fence,
         &sink,
+        &resources(),
     )
     .await
     .unwrap();
@@ -290,6 +296,7 @@ async fn valid_fence_merges_reaps_inputs_and_emits_events() {
         &test_cfg(),
         &fence,
         &sink,
+        &resources(),
     )
     .await
     .unwrap();

@@ -35,7 +35,8 @@ use object_store::ObjectStore;
 use scry_block::{BlockBuilderConfig, BlockEvent, BlockEventSink, CompactionProgress};
 use scry_catalog::CatalogHandle;
 use scry_compact::{
-    compact_partition, plan_merges, reap_pending, CompactConfig, CompactReport, PartitionOutcome,
+    compact_partition, plan_merges, reap_pending, CompactConfig, CompactReport, CompactResources,
+    PartitionOutcome,
 };
 use scry_retention::{
     plan_reaping, reap_pending_deletions, retain_planned, RetentionConfig, RetentionReport,
@@ -111,6 +112,7 @@ pub async fn run_compaction_pass<L, C>(
     sink: &dyn BlockEventSink,
     lease_ttl: Duration,
     progress: Option<&CompactionProgress>,
+    resources: Arc<CompactResources>,
 ) -> Result<CompactReport>
 where
     L: LeaseProvider,
@@ -149,7 +151,8 @@ where
         let store = store.clone();
         let bucket = bucket.to_string();
         let cfg = cfg.clone();
-        let block_cfg = block_cfg.clone();
+        let block_cfg = *block_cfg;
+        let resources = resources.clone();
         async move {
             let key = compaction_lease_key(&plan.signal, &plan.date, plan.input_level);
             let guard = match provider.try_acquire(&key, lease_ttl).await {
@@ -228,6 +231,7 @@ where
                 &block_cfg,
                 fence.as_ref(),
                 sink,
+                &resources,
             )
             .await;
             guard.release().await;
@@ -237,14 +241,22 @@ where
                     inputs: plan.inputs.len(),
                 },
                 Err(error) => {
+                    let resource_failure = error
+                        .chain()
+                        .any(|cause| cause.downcast_ref::<scry_compact::ResourceError>().is_some());
                     tracing::warn!(
                         signal = %plan.signal,
                         date = %plan.date,
                         input_level = plan.input_level,
                         error = %format!("{error:#}"),
+                        resource_failure,
                         "compaction partition failed; continuing pass"
                     );
-                    PartitionResult::Failed
+                    if resource_failure {
+                        PartitionResult::ResourceFailed
+                    } else {
+                        PartitionResult::Failed
+                    }
                 }
             }
         }
@@ -264,6 +276,7 @@ where
             PartitionResult::LeaseHeld => report.lease_held += 1,
             PartitionResult::LeaseUnavailable => report.lease_unavailable += 1,
             PartitionResult::Failed => report.partition_failed += 1,
+            PartitionResult::ResourceFailed => report.resource_failed += 1,
             PartitionResult::Stale => {}
         }
     }
@@ -285,6 +298,7 @@ enum PartitionResult {
     LeaseHeld,
     LeaseUnavailable,
     Failed,
+    ResourceFailed,
     Stale,
 }
 

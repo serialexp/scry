@@ -16,6 +16,8 @@
 //! [`decode_postings`] reads parquet bytes back to the same shape (used
 //! by the compactor to union the postings of the blocks it merges).
 
+use std::collections::HashMap;
+use std::io::Write;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -56,16 +58,30 @@ pub fn postings_schema() -> SchemaRef {
 /// parquet so the sidecar object is always present when
 /// `has_postings = true`; the query path detects empty by row count.
 pub fn encode_postings(entries: &[PostingsEntry], props: &WriterProperties) -> Result<Bytes> {
+    let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+    encode_postings_to_writer(entries, props, &mut buf)?;
+    Ok(Bytes::from(buf))
+}
+
+/// Serialise postings directly to a synchronous writer.
+///
+/// This is the bounded-output counterpart to [`encode_postings`]: compactors
+/// can target a staged file instead of first materialising the complete
+/// parquet object in memory.
+pub fn encode_postings_to_writer<W: Write + Send>(
+    entries: &[PostingsEntry],
+    props: &WriterProperties,
+    writer: W,
+) -> Result<()> {
     let schema = postings_schema();
     if entries.is_empty() {
         let empty = RecordBatch::new_empty(schema.clone());
-        let mut buf: Vec<u8> = Vec::new();
-        let mut w = ArrowWriter::try_new(&mut buf, schema, Some(props.clone()))
+        let mut w = ArrowWriter::try_new(writer, schema, Some(props.clone()))
             .context("ArrowWriter::try_new (empty postings)")?;
         w.write(&empty)
             .context("ArrowWriter::write (empty postings)")?;
         w.close().context("ArrowWriter::close (empty postings)")?;
-        return Ok(Bytes::from(buf));
+        return Ok(());
     }
 
     let names: StringArray = entries.iter().map(|((k, _), _)| Some(k.as_str())).collect();
@@ -104,12 +120,11 @@ pub fn encode_postings(entries: &[PostingsEntry], props: &WriterProperties) -> R
     )
     .context("constructing postings RecordBatch")?;
 
-    let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
-    let mut w = ArrowWriter::try_new(&mut buf, schema, Some(props.clone()))
+    let mut w = ArrowWriter::try_new(writer, schema, Some(props.clone()))
         .context("ArrowWriter::try_new (postings)")?;
     w.write(&batch).context("ArrowWriter::write (postings)")?;
     w.close().context("ArrowWriter::close (postings)")?;
-    Ok(Bytes::from(buf))
+    Ok(())
 }
 
 /// Read postings parquet bytes back into `Vec<PostingsEntry>`. Used by
@@ -163,13 +178,29 @@ pub fn decode_postings(bytes: Bytes) -> Result<Vec<PostingsEntry>> {
 /// with sorted+deduped fingerprints. This is exactly the shape
 /// [`encode_postings`] expects.
 pub fn merge_postings(sets: Vec<Vec<PostingsEntry>>) -> Vec<PostingsEntry> {
-    use std::collections::HashMap;
-    let mut inv: HashMap<(String, String), Vec<u64>> = HashMap::new();
+    let mut inv = HashMap::new();
     for set in sets {
-        for (key, fps) in set {
-            inv.entry(key).or_default().extend(fps);
-        }
+        merge_postings_into(&mut inv, set);
     }
+    finish_postings_merge(inv)
+}
+
+/// Fold one decoded postings sidecar into an existing accumulator.
+///
+/// Unlike [`merge_postings`], this lets a compactor decode and immediately
+/// consume each input, so at most one decoded input set is resident alongside
+/// the final union.
+pub fn merge_postings_into(
+    inv: &mut HashMap<(String, String), Vec<u64>>,
+    entries: Vec<PostingsEntry>,
+) {
+    for (key, fps) in entries {
+        inv.entry(key).or_default().extend(fps);
+    }
+}
+
+/// Finalise an incremental postings merge in canonical output order.
+pub fn finish_postings_merge(inv: HashMap<(String, String), Vec<u64>>) -> Vec<PostingsEntry> {
     let mut entries: Vec<PostingsEntry> = inv.into_iter().collect();
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     for (_, fps) in entries.iter_mut() {

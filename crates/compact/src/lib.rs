@@ -28,6 +28,7 @@
 pub mod engine;
 pub mod merge;
 pub mod policy;
+pub mod resource;
 
 pub use engine::{
     compact_once, compact_partition, reap_pending, warn_oversized, CompactReport, PartitionOutcome,
@@ -36,6 +37,9 @@ pub use merge::merge_blocks;
 pub use policy::{
     plan_merges, projected_ancestry_len, validate_against_catalog, CompactConfig, CompactionPlan,
     OversizedPartition, PlannedMerge,
+};
+pub use resource::{
+    CompactResources, ResourceConfig, ResourceError, ResourcePermit, ResourceTelemetry,
 };
 
 use std::path::PathBuf;
@@ -120,6 +124,8 @@ pub async fn run(args: Args) -> Result<()> {
         .validate()
         .context("invalid compaction policy")?;
     let block_cfg = BlockBuilderConfig::default();
+    let resources = CompactResources::new(ResourceConfig::default())
+        .context("constructing compaction resource envelope")?;
 
     // Bring the catalog in line with the bucket once before compacting,
     // so the tool works against a shared bucket with no online catalog.
@@ -158,7 +164,15 @@ pub async fn run(args: Args) -> Result<()> {
             "starting compaction watch loop (Ctrl-C to stop)"
         );
         loop {
-            run_pass(&store, &catalog, &bucket, &compact_cfg, &block_cfg).await?;
+            run_pass(
+                &store,
+                &catalog,
+                &bucket,
+                &compact_cfg,
+                &block_cfg,
+                resources.clone(),
+            )
+            .await?;
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(args.interval)) => {}
                 _ = tokio::signal::ctrl_c() => {
@@ -168,7 +182,15 @@ pub async fn run(args: Args) -> Result<()> {
             }
         }
     } else {
-        run_pass(&store, &catalog, &bucket, &compact_cfg, &block_cfg).await?;
+        run_pass(
+            &store,
+            &catalog,
+            &bucket,
+            &compact_cfg,
+            &block_cfg,
+            resources,
+        )
+        .await?;
     }
 
     Ok(())
@@ -242,8 +264,17 @@ async fn run_pass(
     bucket: &str,
     compact_cfg: &CompactConfig,
     block_cfg: &BlockBuilderConfig,
+    resources: Arc<CompactResources>,
 ) -> Result<()> {
-    let report = compact_once(store.clone(), catalog, bucket, compact_cfg, block_cfg).await?;
+    let report = compact_once(
+        store.clone(),
+        catalog,
+        bucket,
+        compact_cfg,
+        block_cfg,
+        resources,
+    )
+    .await?;
     if report.merges == 0 {
         tracing::info!(oversized = report.oversized, "nothing to compact this pass");
     } else {

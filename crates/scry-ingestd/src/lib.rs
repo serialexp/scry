@@ -23,7 +23,7 @@ use scry_catalog::Catalog;
 use scry_cluster::{
     poll_once, run_compaction_pass, run_retention_pass, LeaseProvider, LocalLeaseProvider,
 };
-use scry_compact::CompactConfig;
+use scry_compact::{CompactConfig, CompactResources, ResourceConfig};
 use scry_duration::parse_duration;
 use scry_objstore::{open as open_objstore, ObjStoreConfig};
 use scry_retention::RetentionConfig;
@@ -215,6 +215,23 @@ pub struct Args {
     /// parallelism multiplies throughput with no data-level conflict.
     #[arg(long, default_value_t = 1)]
     compact_parallelism: usize,
+
+    /// Process-wide compaction memory envelope in MiB. Embedded maintenance
+    /// defaults conservatively because ingest has its own unpooled memory.
+    #[arg(long, default_value_t = 512)]
+    compact_memory_budget_mib: u64,
+
+    /// Directory for bounded compaction spill files.
+    #[arg(long)]
+    compact_spill_dir: Option<PathBuf>,
+
+    /// Maximum compaction spill usage in MiB.
+    #[arg(long, default_value_t = 2048)]
+    compact_spill_max_mib: u64,
+
+    /// Multipart output buffer per active merge in MiB.
+    #[arg(long, default_value_t = 8)]
+    compact_output_buffer_mib: u64,
 
     /// Blanket retention TTL applied to every signal (opt-in: omit to leave
     /// all signals un-reaped). Accepts `s`/`m`/`h`/`d` suffixes.
@@ -893,6 +910,23 @@ pub async fn run(args: Args) -> Result<()> {
             compact_cfg
                 .validate()
                 .context("invalid compaction policy")?;
+            let memory_bytes = args
+                .compact_memory_budget_mib
+                .checked_mul(1024 * 1024)
+                .context("--compact-memory-budget-mib is too large")?;
+            let mut compact_resource_cfg = ResourceConfig::from_envelope(memory_bytes);
+            compact_resource_cfg.spill_dir = args.compact_spill_dir.clone();
+            compact_resource_cfg.spill_bytes = args
+                .compact_spill_max_mib
+                .checked_mul(1024 * 1024)
+                .context("--compact-spill-max-mib is too large")?;
+            compact_resource_cfg.output_buffer_bytes = args
+                .compact_output_buffer_mib
+                .checked_mul(1024 * 1024)
+                .and_then(|v| usize::try_from(v).ok())
+                .context("--compact-output-buffer-mib is too large")?;
+            let compact_resources = CompactResources::new(compact_resource_cfg)
+                .context("constructing process-wide compaction resources")?;
             let mut overrides = BTreeMap::new();
             if let Some(d) = args.ttl_metrics {
                 overrides.insert("metrics".to_string(), d);
@@ -929,6 +963,7 @@ pub async fn run(args: Args) -> Result<()> {
                         catalog,
                         compact_cfg,
                         block_cfg,
+                        compact_resources.clone(),
                         retention_cfg,
                         event_sink.clone(),
                         stats_metrics.clone(),
@@ -950,6 +985,7 @@ pub async fn run(args: Args) -> Result<()> {
                         catalog,
                         compact_cfg,
                         block_cfg,
+                        compact_resources.clone(),
                         retention_cfg,
                         event_sink.clone(),
                         stats_metrics.clone(),
@@ -1073,6 +1109,7 @@ fn record_compaction_metrics(
             reaped: report.reaped as u64,
             reap_failed: report.reap_failed as u64,
             partition_failed: report.partition_failed as u64,
+            resource_failed: report.resource_failed as u64,
             lease_held: report.lease_held as u64,
             lease_unavailable: report.lease_unavailable as u64,
             oversized: report.oversized as u64,
@@ -1116,6 +1153,7 @@ async fn run_maintenance_loop<L: LeaseProvider>(
     catalog: Arc<std::sync::Mutex<Catalog>>,
     compact_cfg: CompactConfig,
     block_cfg: BlockBuilderConfig,
+    compact_resources: Arc<CompactResources>,
     retention_cfg: RetentionConfig,
     sink: Option<Arc<dyn BlockEventSink>>,
     metrics: Option<Arc<ServerMetrics>>,
@@ -1169,6 +1207,7 @@ async fn run_maintenance_loop<L: LeaseProvider>(
                     &provider, store.clone(), catalog.as_ref(), &bucket,
                     &compact_cfg, &block_cfg, sink_ref, lease_ttl,
                     compaction_progress.as_deref(),
+                    compact_resources.clone(),
                 ).await {
                     Ok(r) if r.merges > 0 || r.partition_failed > 0 || r.reap_failed > 0 || r.oversized > 0 => {
                         record_compaction_metrics(metrics.as_deref(), &r, started.elapsed());

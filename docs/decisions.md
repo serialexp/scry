@@ -3736,3 +3736,59 @@ name/value counts, saturation, warm progress, and an explicitly estimated
 resident-byte figure. It remains distinct from process RSS, DataFusion reserved
 memory, and SQLite disk size. Full design contract:
 `docs/design/query-label-suggestions.md`.
+
+## D-070: Compaction is bounded, staged, and admission-controlled
+
+**Date:** 2026-09-02
+**Status:** accepted.
+
+Compaction must not turn the number or size of partitions into an implicit
+memory limit. A large merge can otherwise compete with queries, several
+partitions can multiply their DataFusion allocations, and collecting the
+merged output before writing makes the peak depend on the entire partition.
+The compaction contract is therefore a resource policy, not just a merge
+algorithm.
+
+All compaction work uses one process-wide, bounded DataFusion memory pool and
+one configured spill area. The pool is shared by concurrently eligible
+partitions (and its accounting is the authority for admission); a partition
+may not create a private, unbounded DataFusion budget. Spill is part of that
+same envelope: its byte capacity, filesystem, and cleanup policy are explicit,
+and a full or unavailable spill area is a resource failure rather than a
+reason to exceed the memory cap. Query and ingest budgets remain separately
+visible and protected; compaction cannot consume their reserved headroom.
+
+A merge is staged and streamed. It reads bounded RecordBatches, writes the
+sorted result to a temporary/staged object or file as batches arrive, and
+builds sidecars incrementally. It never materializes a whole partition or
+whole output in memory. The output is published only after the main parquet
+and sidecars are complete, with the commit metadata written last; failed or
+cancelled stages are cleaned up and input blocks remain live. Supersede and
+reap happen only after that commit point (and the configured grace/fence), so
+an output resource failure cannot lose accepted data.
+
+Admission is weighted, not a count of partitions. Before a merge starts it
+estimates a weight from the input/partition shape and reserves that weight
+from the shared pool. Work waits, or is rejected according to the configured
+queue policy, when the reservation cannot be made; bounded concurrency is a
+secondary guard, not a substitute for bytes. Reservations are released on
+all success, cancellation, and failure paths, and pressure backs off
+scheduling rather than allowing an unbounded queue.
+
+The default pool is derived conservatively from the process cgroup limit
+(`memory.max` on cgroup v2, with the v1 limit as a fallback), subtracting
+explicit query/ingest reservations and safety headroom. An unavailable,
+unlimited, or nonsensical cgroup value selects a conservative fixed default
+rather than treating host RAM as available compaction memory. Operators may
+set the pool, spill, reserve, and admission values explicitly; startup logs
+must show both the source and the resolved envelope.
+
+Telemetry is part of the contract: expose the pool limit, reserved and in-use
+bytes, weighted queued/running work, wait time, spill bytes/capacity and
+cleanup failures, plus per-partition duration, rows/bytes, and outcome.
+Resource exhaustion for one partition is an ordinary per-partition resource
+failure: record it, release its reservation, clean the stage, leave inputs
+untouched, and retry with bounded backoff or defer it. It must not crash the
+maintenance loop, mark the partition successful, or be reported as data or
+protocol corruption. See `docs/design/capacity-presets.md` for profile
+qualification and operator-facing controls.
