@@ -19,6 +19,7 @@ members = [
     "crates/scry-queryd",
     "crates/compact",
     "crates/scry-compactd",
+    "crates/resources",
     "crates/retention",
     "crates/cluster",
     "crates/valkey",
@@ -75,6 +76,7 @@ scry-client       = { path = "crates/client" }
 scry-query        = { path = "crates/query" }
 scry-compact      = { path = "crates/compact" }
 scry-compactd     = { path = "crates/scry-compactd" }
+scry-resources    = { path = "crates/resources" }
 scry-retention    = { path = "crates/retention" }
 scry-cluster      = { path = "crates/cluster" }
 scry-valkey       = { path = "crates/valkey" }

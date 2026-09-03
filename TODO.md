@@ -8,15 +8,14 @@ charged twice at admission; waiters are cancellation-safe; standalone passes
 survive partition failures; the dedicated daemon resolves finite/nested cgroups
 and `memory.high`; postings use a sorted k-way stream; sidecar growth is
 permit-relative and fails controllably; pre-commit objects have cleanup guards;
-DataFusion resource exhaustion is classified; and live/peak telemetry is sampled.
-Remaining release work is tracked below.
+DataFusion resource exhaustion is classified; live telemetry is sampled; and
+DataFusion/weighted peaks are captured at allocation events. Remaining release
+work is tracked below.
 
-- [ ] Finish admission policy: the original `(main + postings + bloom) × 8`
-      estimate is charged against only one quarter of the envelope, so a default
-      512 MiB budget permanently rejects merges with more than ~16 MiB of
-      compressed inputs. Charge only genuinely non-DataFusion state, distinguish
-      permanent oversize from transient queue pressure, and prove realistic
-      L0→L1/L1→L2 merges remain admissible.
+- [x] Finish admission policy: charge sidecars and fixed writer state rather
+      than compressed main parquet already governed by DataFusion; distinguish
+      permanent oversize from queue pressure and cover real default-envelope
+      merges plus transient deferral/recovery.
 - [x] Make standalone `scry compact --watch` absorb per-partition resource
       failures like the leased path. One rejected partition currently aborts the
       complete pass and exits the daemon instead of leaving inputs live and
@@ -25,53 +24,47 @@ Remaining release work is tracked below.
       increments before awaiting and only decrements on normal completion, so a
       dropped future leaks a waiter and can eventually make every merge report
       `QueueFull`; use an RAII waiter guard and test cancellation.
-- [ ] Consolidate cgroup detection across compactd, embedded ingest compaction,
-      query, and the legacy standalone compact entry point. The dedicated daemon
-      now resolves nested paths and `memory.high` and refuses unsafe small limits;
-      ingest still uses an independent explicit default.
-- [ ] Never resolve a finite cgroup to an envelope larger than the cgroup. A
-      small finite limit currently falls back to 512 MiB; refuse compaction when
-      the detected limit cannot support the 128 MiB minimum plus required
-      headroom. The dedicated daemon now resolves nested paths through
-      `/proc/self/cgroup`, walks ancestors, and considers `memory.high`; finish
-      mount-root mapping and apply the shared detector to embedded maintenance.
-- [ ] Fully account sidecar/cardinality peaks. Runtime limits are now relative to
-      each merge's acquired permit, but input metadata, pathological postings
-      rows/batches, and bloom finalisation still need pre-allocation reservations
-      or hard input-size caps.
-- [ ] Bound sidecar/cardinality state during a merge, not only with an up-front
-      compressed-byte estimate: postings union/encoding, distinct fingerprints,
-      logs body n-grams, `series_types`, `all_fingerprints`, and meta JSON can
-      still grow beyond the permit. Use incremental reservations and controlled
-      resource failure; move large inline metadata to versioned sidecars where
-      needed.
+- [x] Consolidate cgroup detection across compactd, embedded ingest compaction,
+      query, and the legacy standalone compact entry point in `scry-resources`.
+      Detection maps cgroup namespace mount roots, walks ancestors, handles v1/v2
+      and `memory.high`, and supplies the query pressure guard's usage path.
+- [x] Never resolve a finite cgroup to an envelope larger than its safe budget.
+      Finite small limits and unsafe explicit overrides now fail rather than
+      selecting the 512 MiB fallback; embedded maintenance uses the same policy.
+- [x] Account sidecar/cardinality peaks within each acquired permit: cap input
+      metadata before collection, preflight postings row groups and validate rows
+      before cloning, bound bloom finalisation/serialization, and retain the
+      existing incremental limits for fingerprints, postings, series types, and
+      output metadata. Parquet 58 exposes row-group rather than exact repeated-row
+      allocation bounds, so the preflight is deliberately conservative.
 - [x] Finish streaming postings output. `encode_postings_to_writer` exists, but
       compaction still materializes the merged postings Arrow arrays and complete
       encoded sidecar in memory. Implement a sorted k-way/external merge with
       bounded batches and spill-backed or multipart output.
-- [ ] Complete abort/cleanup coverage for staged multipart and completed
-      pre-commit objects. Error, fence, and future-cancellation paths now clean
-      staged data, while ambiguous `meta.json` commit responses deliberately keep
-      data for reconciliation. Still add injected failures at each upload stage
-      and bucket lifecycle guidance for process crashes.
+- [x] Cover staged cleanup with injected pre-commit upload failure, cancellation
+      after completed objects, permit release/recovery, fence abort, and ambiguous
+      `meta.json` failure. Bucket guidance requires aborting incomplete multipart
+      uploads while avoiding lifecycle expiry of complete block objects.
 - [x] Classify DataFusion pool exhaustion and spill-area exhaustion as
       `resource_failed`, not generic `partition_failed`.
 - [x] Make resource telemetry live during active passes. It is currently copied
       only immediately before and after awaiting a pass, so reserved/running/spill
       gauges usually appear as zero. Use direct dependency-neutral atomics or a
       periodic sampler, and retain sampled peak counters.
-- [ ] Expose status/resource telemetry in standalone compact mode and make peak
-      tracking event-driven rather than sampler-relative.
-- [ ] Warn or refuse when the spill directory is tmpfs, and account for
-      cgroup-charged page cache in deployment headroom. Sub-budget and writer
-      buffer validation is implemented.
+- [x] Expose status/resource telemetry in standalone compact mode. Weighted and
+      DataFusion peaks are event-driven; spill peak remains explicitly sampled
+      because DataFusion's `DiskManager` has no public lifecycle observer.
+- [x] Refuse tmpfs/ramfs spill unless an explicit unsafe override is supplied,
+      and reserve a bounded dirty-page/writeback share inside the advertised
+      memory envelope.
 - [x] Validate that DataFusion + non-DataFusion sub-budgets and writer buffers
       fit the advertised envelope.
-- [ ] Add the remaining constrained-memory coverage: concurrent forced sort
-      spill, high-cardinality postings/fingerprints, high-entropy logs bloom,
-      spill-cap exhaustion, cancellation, cleanup, permit release, daemon
-      survival, and measured peak RSS under a cgroup. Existing E2E data is too
-      small to establish the production envelope.
+- [ ] Complete production resource qualification. Deterministic tests now cover
+      metadata/postings/bloom cardinality rejection, admission pressure,
+      cancellation, staged cleanup, permit release, and next-pass survival.
+      Still run and retain artifacts from concurrent forced sort spill and
+      spill-cap exhaustion under a real cgroup using
+      `scripts/profile-compact-memory.sh`; unit/E2E fixtures cannot establish RSS.
 
 ### Ingest, WAL, and block building
 - [ ] Rotate/upload or spill block-sized chunks during WAL recovery. Replay

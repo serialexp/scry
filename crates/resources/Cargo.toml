@@ -1,0 +1,12 @@
+[package]
+name = "scry-resources"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Dependency-light process resource discovery and budget policy."
+
+[dependencies]
+anyhow = { workspace = true }
+
+[lints]
+workspace = true

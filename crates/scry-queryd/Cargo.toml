@@ -28,6 +28,7 @@ scry-match         = { workspace = true }
 scry-objstore      = { workspace = true }
 scry-proto         = { workspace = true }
 scry-query         = { workspace = true }
+scry-resources     = { workspace = true }
 scry-server        = { workspace = true }
 scry-tail          = { workspace = true }
 scry-valkey        = { workspace = true }

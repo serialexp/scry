@@ -21,6 +21,7 @@ scry-catalog      = { workspace = true }
 scry-cluster      = { workspace = true }
 scry-compact      = { workspace = true }
 scry-objstore     = { workspace = true }
+scry-resources    = { workspace = true }
 scry-retention    = { workspace = true }
 scry-server       = { workspace = true }
 scry-valkey       = { workspace = true }

@@ -125,21 +125,24 @@ pub async fn run(args: Args) -> Result<()> {
         .validate()
         .context("invalid compaction policy")?;
     let block_cfg = BlockBuilderConfig::default();
-    // The dedicated daemon has the full mount-aware cgroup resolver. This
-    // library entry point retains a conservative auto-detected default and an
-    // environment override for callers that need an explicit envelope.
-    let mut resource_cfg = ResourceConfig::default();
-    if let Ok(raw) = std::env::var("SCRY_COMPACT_MEMORY_BUDGET_MIB") {
-        let mib: u64 = raw
-            .parse()
-            .context("SCRY_COMPACT_MEMORY_BUDGET_MIB must be an integer")?;
-        resource_cfg = ResourceConfig::from_envelope(
-            mib.checked_mul(1024 * 1024)
-                .context("SCRY_COMPACT_MEMORY_BUDGET_MIB is too large")?,
-        );
-    }
-    let resources =
-        CompactResources::new(resource_cfg).context("constructing compaction resource envelope")?;
+    let explicit_mib = std::env::var("SCRY_COMPACT_MEMORY_BUDGET_MIB")
+        .ok()
+        .map(|raw| {
+            raw.parse::<u64>()
+                .context("SCRY_COMPACT_MEMORY_BUDGET_MIB must be an integer")
+        })
+        .transpose()?;
+    let detected = scry_resources::detect_cgroup_memory_limit();
+    let budget = scry_resources::resolve_memory_budget(explicit_mib, detected)
+        .context("resolving compaction memory budget")?;
+    let resources = CompactResources::new(ResourceConfig::from_envelope(budget.bytes))
+        .context("constructing compaction resource envelope")?;
+    tracing::info!(
+        source = %budget.source,
+        cgroup_limit_bytes = ?budget.cgroup_limit_bytes,
+        memory_budget_bytes = budget.bytes,
+        "resolved standalone compaction memory budget"
+    );
 
     // Bring the catalog in line with the bucket once before compacting,
     // so the tool works against a shared bucket with no online catalog.

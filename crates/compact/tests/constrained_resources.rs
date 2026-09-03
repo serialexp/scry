@@ -2,9 +2,11 @@
 
 use std::{sync::Arc, time::Duration};
 
+use bytes::Bytes;
 use futures::StreamExt;
-use object_store::{memory::InMemory, ObjectStore};
-use scry_block::{BlockBuilder, BlockBuilderConfig, LogsBlockBuilder};
+use object_store::{memory::InMemory, path::Path as ObjPath, ObjectStore, ObjectStoreExt};
+use scry_block::postings::encode_postings;
+use scry_block::{block_path, BlockBuilder, BlockBuilderConfig, LogsBlockBuilder};
 use scry_catalog::Catalog;
 use scry_compact::{compact_once, CompactConfig, CompactResources, ResourceConfig};
 use scry_proto::streaming::LogsAppender;
@@ -39,7 +41,9 @@ fn constrained(timeout: Duration) -> Arc<CompactResources> {
         datafusion_memory_bytes: 64 * MIB,
         non_datafusion_memory_bytes: 16 * MIB,
         spill_bytes: 64 * MIB,
+        spill_page_cache_headroom_bytes: 8 * MIB,
         spill_dir: None,
+        allow_memory_backed_spill: true,
         output_buffer_bytes: 5 * MIB as usize,
         parquet_writer_memory_bytes: MIB as usize,
         max_waiters: 2,
@@ -89,6 +93,87 @@ async fn meta_count(store: &Arc<dyn ObjectStore>) -> usize {
         }
     }
     count
+}
+
+fn sidecar_path(meta: &scry_block::BlockMeta, suffix: &str) -> ObjPath {
+    ObjPath::from(block_path(
+        &meta.signal,
+        meta.ts_min_unix_nano,
+        meta.writer_id,
+        meta.uuid,
+        suffix,
+    ))
+}
+
+#[tokio::test]
+async fn cumulative_input_meta_budget_is_a_controlled_failure() {
+    let (store, catalog, _tmp) = fixture(["first", "second"]).await;
+    let input = catalog.lock().unwrap().list_blocks().unwrap()[0].clone();
+    let path = sidecar_path(&input.meta, "meta.json");
+    let mut json = store
+        .get(&path)
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap()
+        .to_vec();
+    // JSON permits trailing whitespace. Keep the sidecar semantically valid while
+    // making the cumulative bytes exceed the permit-relative metadata share.
+    json.resize(json.len() + MIB as usize, b' ');
+    store.put(&path, Bytes::from(json).into()).await.unwrap();
+
+    let resources = constrained(Duration::from_secs(1));
+    let report = compact_once(
+        store.clone(),
+        &catalog,
+        BUCKET,
+        &compact_cfg(),
+        &block_cfg(),
+        resources.clone(),
+    )
+    .await
+    .expect("oversized input metadata is a report outcome");
+    assert_eq!(report.merges, 0);
+    assert_eq!(report.resource_failed, 1);
+    assert_eq!(meta_count(&store).await, 2, "no output committed");
+    assert_eq!(catalog.lock().unwrap().list_blocks().unwrap().len(), 2);
+    assert_eq!(resources.telemetry().weighted_running_bytes, 0);
+}
+
+#[tokio::test]
+async fn oversized_uncompressed_postings_row_group_fails_preflight() {
+    let (store, catalog, _tmp) = fixture(["first", "second"]).await;
+    let input = catalog.lock().unwrap().list_blocks().unwrap()[0].clone();
+    // The catalog retains the original small compressed-sidecar estimate, so
+    // admission succeeds; parquet metadata then exposes this pathological row
+    // group's much larger uncompressed size before any rows are decoded.
+    let entries = vec![(
+        ("service".to_owned(), "api".to_owned()),
+        (0..300_000).collect(),
+    )];
+    let bytes = encode_postings(&entries, &block_cfg().postings_writer_props().unwrap()).unwrap();
+    store
+        .put(&sidecar_path(&input.meta, "postings.parquet"), bytes.into())
+        .await
+        .unwrap();
+
+    let resources = constrained(Duration::from_secs(1));
+    let report = compact_once(
+        store.clone(),
+        &catalog,
+        BUCKET,
+        &compact_cfg(),
+        &block_cfg(),
+        resources.clone(),
+    )
+    .await
+    .expect("postings row-group preflight is a report outcome");
+    assert_eq!(report.merges, 0);
+    assert_eq!(report.resource_failed, 1);
+    assert_eq!(meta_count(&store).await, 2, "no output committed");
+    assert_eq!(catalog.lock().unwrap().list_blocks().unwrap().len(), 2);
+    assert_eq!(resources.telemetry().weighted_running_bytes, 0);
 }
 
 #[tokio::test]

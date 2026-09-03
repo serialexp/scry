@@ -4558,6 +4558,7 @@ version = "0.21.0"
 dependencies = [
  "anyhow",
  "arrow",
+ "async-trait",
  "bytes",
  "clap",
  "datafusion",
@@ -4569,6 +4570,7 @@ dependencies = [
  "scry-objstore",
  "scry-proto",
  "scry-query",
+ "scry-resources",
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
@@ -4592,6 +4594,7 @@ dependencies = [
  "scry-cluster",
  "scry-compact",
  "scry-objstore",
+ "scry-resources",
  "scry-server",
  "scry-valkey",
  "serde_json",
@@ -4662,6 +4665,7 @@ dependencies = [
  "scry-compact",
  "scry-duration",
  "scry-objstore",
+ "scry-resources",
  "scry-retention",
  "scry-server",
  "scry-valkey",
@@ -4761,6 +4765,7 @@ dependencies = [
  "scry-objstore",
  "scry-proto",
  "scry-query",
+ "scry-resources",
  "scry-server",
  "scry-tail",
  "scry-valkey",
@@ -4788,6 +4793,13 @@ dependencies = [
  "tracing",
  "uuid",
  "zstd",
+]
+
+[[package]]
+name = "scry-resources"
+version = "0.21.0"
+dependencies = [
+ "anyhow",
 ]
 
 [[package]]
@@ -4831,6 +4843,7 @@ dependencies = [
  "scry-objstore",
  "scry-proto",
  "scry-query",
+ "scry-resources",
  "scry-status",
  "scry-wal",
  "serde",

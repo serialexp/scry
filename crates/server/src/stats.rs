@@ -171,11 +171,14 @@ impl CompactionResourceStats {
         memory_budget_bytes: u64,
         datafusion_limit_bytes: u64,
         datafusion_reserved_bytes: u64,
+        datafusion_peak_bytes: u64,
         non_datafusion_limit_bytes: u64,
         weighted_running_bytes: u64,
+        weighted_peak_bytes: u64,
         weighted_waiters: u64,
         spill_limit_bytes: u64,
         spill_used_bytes: u64,
+        sampled_spill_peak_bytes: u64,
         spill_active_files: u64,
         admissions: u64,
         rejected: u64,
@@ -185,11 +188,14 @@ impl CompactionResourceStats {
             (&self.memory_budget_bytes, memory_budget_bytes),
             (&self.datafusion_limit_bytes, datafusion_limit_bytes),
             (&self.datafusion_reserved_bytes, datafusion_reserved_bytes),
+            (&self.datafusion_peak_bytes, datafusion_peak_bytes),
             (&self.non_datafusion_limit_bytes, non_datafusion_limit_bytes),
             (&self.weighted_running_bytes, weighted_running_bytes),
+            (&self.weighted_peak_bytes, weighted_peak_bytes),
             (&self.weighted_waiters, weighted_waiters),
             (&self.spill_limit_bytes, spill_limit_bytes),
             (&self.spill_used_bytes, spill_used_bytes),
+            (&self.spill_peak_bytes, sampled_spill_peak_bytes),
             (&self.spill_active_files, spill_active_files),
             (&self.admissions, admissions),
             (&self.rejected, rejected),
@@ -197,12 +203,6 @@ impl CompactionResourceStats {
         ] {
             field.store(value, Ordering::Relaxed);
         }
-        self.datafusion_peak_bytes
-            .fetch_max(datafusion_reserved_bytes, Ordering::Relaxed);
-        self.weighted_peak_bytes
-            .fetch_max(weighted_running_bytes, Ordering::Relaxed);
-        self.spill_peak_bytes
-            .fetch_max(spill_used_bytes, Ordering::Relaxed);
     }
 
     fn snapshot(&self) -> serde_json::Value {

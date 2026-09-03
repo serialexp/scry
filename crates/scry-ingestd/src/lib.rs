@@ -216,10 +216,10 @@ pub struct Args {
     #[arg(long, default_value_t = 1)]
     compact_parallelism: usize,
 
-    /// Process-wide compaction memory envelope in MiB. Embedded maintenance
-    /// defaults conservatively because ingest has its own unpooled memory.
-    #[arg(long, default_value_t = 512)]
-    compact_memory_budget_mib: u64,
+    /// Process-wide compaction memory envelope in MiB. When omitted, derive a
+    /// conservative envelope from the process cgroup.
+    #[arg(long)]
+    compact_memory_budget_mib: Option<u64>,
 
     /// Directory for bounded compaction spill files.
     #[arg(long)]
@@ -228,6 +228,10 @@ pub struct Args {
     /// Maximum compaction spill usage in MiB.
     #[arg(long, default_value_t = 2048)]
     compact_spill_max_mib: u64,
+
+    /// Permit compaction spill on tmpfs/ramfs. Unsafe under memory cgroups.
+    #[arg(long)]
+    compact_allow_memory_backed_spill: bool,
 
     /// Multipart output buffer per active merge in MiB.
     #[arg(long, default_value_t = 8)]
@@ -912,12 +916,13 @@ pub async fn run(args: Args) -> Result<()> {
             compact_cfg
                 .validate()
                 .context("invalid compaction policy")?;
-            let memory_bytes = args
-                .compact_memory_budget_mib
-                .checked_mul(1024 * 1024)
-                .context("--compact-memory-budget-mib is too large")?;
-            let mut compact_resource_cfg = ResourceConfig::from_envelope(memory_bytes);
+            let detected = scry_resources::detect_cgroup_memory_limit();
+            let budget =
+                scry_resources::resolve_memory_budget(args.compact_memory_budget_mib, detected)
+                    .context("resolving embedded compaction memory budget")?;
+            let mut compact_resource_cfg = ResourceConfig::from_envelope(budget.bytes);
             compact_resource_cfg.spill_dir = args.compact_spill_dir.clone();
+            compact_resource_cfg.allow_memory_backed_spill = args.compact_allow_memory_backed_spill;
             compact_resource_cfg.spill_bytes = args
                 .compact_spill_max_mib
                 .checked_mul(1024 * 1024)
@@ -929,6 +934,12 @@ pub async fn run(args: Args) -> Result<()> {
                 .context("--compact-output-buffer-mib is too large")?;
             let compact_resources = CompactResources::new(compact_resource_cfg)
                 .context("constructing process-wide compaction resources")?;
+            tracing::info!(
+                source = %budget.source,
+                cgroup_limit_bytes = ?budget.cgroup_limit_bytes,
+                memory_budget_bytes = budget.bytes,
+                "resolved embedded compaction memory budget"
+            );
             update_compaction_resource_stats(&compaction_resource_stats, &compact_resources);
             {
                 let stats = compaction_resource_stats.clone();
@@ -1168,11 +1179,14 @@ fn update_compaction_resource_stats(stats: &CompactionResourceStats, resources: 
         cfg.envelope_bytes,
         cfg.datafusion_memory_bytes,
         telemetry.datafusion_reserved_bytes as u64,
+        telemetry.datafusion_peak_bytes as u64,
         cfg.non_datafusion_memory_bytes,
         telemetry.weighted_running_bytes,
+        telemetry.weighted_peak_bytes,
         telemetry.weighted_waiters as u64,
         cfg.spill_bytes,
         telemetry.spill_used_bytes,
+        telemetry.sampled_spill_peak_bytes,
         telemetry.spill_active_files as u64,
         telemetry.admissions,
         telemetry.rejected,

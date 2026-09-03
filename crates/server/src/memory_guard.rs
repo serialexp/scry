@@ -7,7 +7,9 @@
 //! small injectable trait: production uses [`CgroupMemoryGuard`], while tests
 //! can force exhaustion without allocating real memory.
 
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -45,13 +47,29 @@ pub struct CgroupMemoryGuard {
 
 impl CgroupMemoryGuard {
     pub fn detect(reserve_bytes: u64) -> Result<Option<Self>> {
-        Self::from_files(
-            Path::new("/sys/fs/cgroup/memory.current"),
-            Path::new("/sys/fs/cgroup/memory.max"),
+        let Some(limit) = scry_resources::detect_cgroup_memory_limit() else {
+            return Ok(None);
+        };
+        let Some(current_path) = scry_resources::detect_cgroup_memory_usage_path() else {
+            return Ok(None);
+        };
+        Ok(Some(Self::from_limit(
+            current_path,
+            limit.bytes,
             reserve_bytes,
-        )
+        )))
     }
 
+    fn from_limit(current_path: PathBuf, limit: u64, reserve_bytes: u64) -> Self {
+        let reject_at = limit.saturating_sub(reserve_bytes.min(limit));
+        Self {
+            current_path,
+            reject_at,
+            limit,
+        }
+    }
+
+    #[cfg(test)]
     fn from_files(
         current_path: &Path,
         max_path: &Path,

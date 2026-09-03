@@ -98,6 +98,11 @@ pub struct Args {
     #[arg(long, default_value_t = 4096)]
     pub spill_max_mib: u64,
 
+    /// Permit spill on tmpfs/ramfs. Unsafe under memory cgroups; intended only
+    /// for explicitly accepted development environments.
+    #[arg(long)]
+    pub allow_memory_backed_spill: bool,
+
     /// Bounded staged-output buffer size in MiB.
     #[arg(long, default_value_t = 8)]
     pub output_buffer_mib: u64,
@@ -186,6 +191,7 @@ pub async fn run(mut args: Args) -> Result<()> {
     let budget = memory::resolve_memory_budget(args.memory_budget_mib, detected)?;
     let mut resource_cfg = ResourceConfig::from_envelope(budget.bytes);
     resource_cfg.spill_dir = args.spill_dir.clone();
+    resource_cfg.allow_memory_backed_spill = args.allow_memory_backed_spill;
     resource_cfg.spill_bytes = args
         .spill_max_mib
         .checked_mul(1024 * 1024)
@@ -216,7 +222,16 @@ pub async fn run(mut args: Args) -> Result<()> {
         )
         .await
     } else {
-        run_standalone(args, store, bucket, compact_cfg, block_cfg, resources).await
+        run_standalone(
+            args,
+            store,
+            bucket,
+            instance_id,
+            compact_cfg,
+            block_cfg,
+            resources,
+        )
+        .await
     }
 }
 
@@ -225,6 +240,7 @@ async fn run_standalone(
     args: Args,
     store: Arc<dyn ObjectStore>,
     bucket: String,
+    instance_id: Uuid,
     compact_cfg: CompactConfig,
     block_cfg: BlockBuilderConfig,
     resources: Arc<CompactResources>,
@@ -239,6 +255,41 @@ async fn run_standalone(
     report_stuck_partitions(&catalog, &compact_cfg)?;
 
     let catalog = Arc::new(Mutex::new(catalog));
+    let resource_stats = Arc::new(scry_server::CompactionResourceStats::default());
+    update_resource_stats(&resource_stats, &resources);
+    let gauge = scry_server::CatalogGauge::new(args.catalog.clone());
+    let metrics = Arc::new(
+        scry_server::ServerMetrics::new(0)
+            .with_identity(instance_id.to_string(), String::new())
+            .with_role("compact")
+            .with_catalog_gauge(gauge.clone())
+            .with_compaction_resource_stats(resource_stats.clone()),
+    );
+    metrics.configure_compaction(true, compact_cfg.grace);
+    let mut bg_tasks = vec![gauge.spawn(scry_server::CATALOG_GAUGE_INTERVAL)];
+    {
+        let stats = resource_stats.clone();
+        let resources = resources.clone();
+        bg_tasks.push(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(250));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                update_resource_stats(&stats, &resources);
+            }
+        }));
+    }
+    if let Some(addr) = args.stats_listen.clone() {
+        let local: Arc<dyn scry_server::LocalStatus> = metrics.clone();
+        let self_id = instance_id.to_string();
+        bg_tasks.push(tokio::spawn(async move {
+            if let Err(error) =
+                scry_server::serve_status(addr, local, None, self_id, std::future::pending()).await
+            {
+                warn!(%error, "standalone status endpoint failed");
+            }
+        }));
+    }
 
     if args.watch {
         info!(
@@ -248,7 +299,8 @@ async fn run_standalone(
             "starting compaction watch loop (single-instance, Ctrl-C to stop)"
         );
         loop {
-            run_unfenced_pass(
+            let started = std::time::Instant::now();
+            match run_unfenced_pass(
                 &store,
                 &catalog,
                 &bucket,
@@ -256,7 +308,15 @@ async fn run_standalone(
                 &block_cfg,
                 resources.clone(),
             )
-            .await?;
+            .await
+            {
+                Ok(report) => record_compaction_metrics(&metrics, &report, started.elapsed()),
+                Err(error) => {
+                    metrics.record_compaction_failure(started.elapsed());
+                    warn!(%error, "standalone compaction pass failed; continuing watch loop");
+                }
+            }
+            update_resource_stats(&resource_stats, &resources);
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(args.interval)) => {}
                 _ = tokio::signal::ctrl_c() => {
@@ -266,7 +326,8 @@ async fn run_standalone(
             }
         }
     } else {
-        run_unfenced_pass(
+        let started = std::time::Instant::now();
+        match run_unfenced_pass(
             &store,
             &catalog,
             &bucket,
@@ -274,7 +335,19 @@ async fn run_standalone(
             &block_cfg,
             resources.clone(),
         )
-        .await?;
+        .await
+        {
+            Ok(report) => record_compaction_metrics(&metrics, &report, started.elapsed()),
+            Err(error) => {
+                metrics.record_compaction_failure(started.elapsed());
+                return Err(error);
+            }
+        }
+        update_resource_stats(&resource_stats, &resources);
+    }
+    for task in bg_tasks {
+        task.abort();
+        let _ = task.await;
     }
     Ok(())
 }
@@ -650,11 +723,14 @@ fn update_resource_stats(
         cfg.envelope_bytes,
         cfg.datafusion_memory_bytes,
         t.datafusion_reserved_bytes as u64,
+        t.datafusion_peak_bytes as u64,
         cfg.non_datafusion_memory_bytes,
         t.weighted_running_bytes,
+        t.weighted_peak_bytes,
         t.weighted_waiters as u64,
         cfg.spill_bytes,
         t.spill_used_bytes,
+        t.sampled_spill_peak_bytes,
         t.spill_active_files as u64,
         t.admissions,
         t.rejected,
@@ -745,7 +821,7 @@ async fn run_unfenced_pass(
     compact_cfg: &CompactConfig,
     block_cfg: &BlockBuilderConfig,
     resources: Arc<CompactResources>,
-) -> Result<()> {
+) -> Result<CompactReport> {
     let report = compact_once(
         store.clone(),
         catalog,
@@ -755,17 +831,17 @@ async fn run_unfenced_pass(
         resources,
     )
     .await?;
-    if report.merges == 0 {
-        info!(oversized = report.oversized, "nothing to compact this pass");
-    } else {
-        info!(
-            merges = report.merges,
-            blocks_in = report.blocks_in,
-            blocks_out = report.blocks_out,
-            bytes_out = report.bytes_out,
-            oversized = report.oversized,
-            "compaction pass complete"
-        );
-    }
-    Ok(())
+    info!(
+        merges = report.merges,
+        blocks_in = report.blocks_in,
+        blocks_out = report.blocks_out,
+        bytes_out = report.bytes_out,
+        reaped = report.reaped,
+        reap_failed = report.reap_failed,
+        partition_failed = report.partition_failed,
+        resource_failed = report.resource_failed,
+        oversized = report.oversized,
+        "standalone compaction pass complete"
+    );
+    Ok(report)
 }

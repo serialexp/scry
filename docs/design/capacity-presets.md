@@ -86,6 +86,15 @@ Profiles should set and display:
 
 The conservative default derives from the process cgroup memory limit (`memory.max` on cgroup v2, cgroup v1 fallback), minus explicit query/ingest reservations and safety headroom. Missing, unlimited, or invalid cgroup limits use a conservative fixed default rather than host RAM. Explicit overrides are allowed, and startup telemetry must identify the source and resolved envelope. Runtime telemetry should include pool limit/reserved/in-use bytes, weighted queued/running work, admission wait time, spill usage/capacity and cleanup failures, and per-partition duration, bytes/rows, and outcome.
 
+Spill must use persistent storage by default; tmpfs/ramfs competes directly with the
+memory pool and requires an explicit unsafe override. The envelope reserves a
+bounded dirty-page/writeback allowance, but the kernel controls persistent-disk
+page-cache residency and writeback. Therefore the configured envelope is an
+allocator/admission bound, not by itself a proof of maximum RSS. Production
+qualification must run under the real cgroup and storage class, inspect
+`memory.current`, `memory.peak`, and `memory.events`, and leave the documented
+outer cgroup headroom intact.
+
 ## Synthetic qualification
 
 Provide a repeatable command such as:

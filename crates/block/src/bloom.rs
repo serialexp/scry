@@ -44,6 +44,7 @@ const FORMAT_VERSION: u8 = 1;
 const SEED1: u64 = 0;
 const SEED2: u64 = 0x9E37_79B9_7F4A_7C15;
 const HEADER_LEN: usize = 4 + 1 + 1 + 4 + 8;
+const BYTES_PER_DISTINCT_GRAM: usize = 40;
 
 /// A built body bloom: bit array plus the parameters needed to probe it.
 #[derive(Debug, Clone)]
@@ -101,7 +102,6 @@ impl BodyBloomBuilder {
     /// control/storage in `seen`, and allocator slack. Forty bytes per gram is
     /// deliberately conservative; exact allocator accounting is unavailable.
     pub fn add_body_bounded(&mut self, body: &str, max_bytes: usize) -> bool {
-        const BYTES_PER_DISTINCT_GRAM: usize = 40;
         let bytes = body.as_bytes();
         if bytes.len() < self.ngram {
             return true;
@@ -125,21 +125,38 @@ impl BodyBloomBuilder {
         true
     }
 
+    /// Conservative bytes retained by the distinct-gram accumulator.
+    pub fn estimated_bytes(&self) -> usize {
+        self.grams.len().saturating_mul(BYTES_PER_DISTINCT_GRAM)
+    }
+
     /// Size `(m, k)` for the exact distinct-gram count at `target_fpr`
     /// and fill the bit array. Consumes the builder.
     pub fn finish(self, target_fpr: f64) -> BodyBloom {
+        self.finish_bounded(target_fpr, usize::MAX)
+            .expect("unbounded bloom finalization")
+    }
+
+    /// Finalise only when the accumulator and materialised bitset fit together
+    /// within `max_bytes`. The two coexist while hashes are applied, so this
+    /// check happens before allocating the bitset.
+    pub fn finish_bounded(self, target_fpr: f64, max_bytes: usize) -> Option<BodyBloom> {
         let n = self.grams.len() as u64;
         let (m_bits, k) = optimal_params(n, target_fpr);
+        let bit_bytes = usize::try_from(m_bits.div_ceil(8)).ok()?;
+        if self.estimated_bytes().saturating_add(bit_bytes) > max_bytes {
+            return None;
+        }
         let mut bloom = BodyBloom {
             ngram: self.ngram as u8,
             k,
             m_bits,
-            bits: vec![0u8; m_bits.div_ceil(8) as usize],
+            bits: vec![0u8; bit_bytes],
         };
         for (h1, h2) in self.grams {
             bloom.set_gram(h1, h2);
         }
-        bloom
+        Some(bloom)
     }
 }
 
@@ -200,14 +217,25 @@ impl BodyBloom {
 
     /// Serialise to the `<uuid>.body.bloom` sidecar bytes.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.byte_len());
+        self.to_bytes_bounded(usize::MAX)
+            .expect("unbounded bloom serialization")
+    }
+
+    /// Serialise only if the resulting allocation does not exceed `max_bytes`.
+    /// The format is identical to [`to_bytes`](Self::to_bytes).
+    pub fn to_bytes_bounded(&self, max_bytes: usize) -> Option<Vec<u8>> {
+        let byte_len = self.byte_len();
+        if byte_len > max_bytes {
+            return None;
+        }
+        let mut out = Vec::with_capacity(byte_len);
         out.extend_from_slice(&MAGIC);
         out.push(FORMAT_VERSION);
         out.push(self.ngram);
         out.extend_from_slice(&self.k.to_be_bytes());
         out.extend_from_slice(&self.m_bits.to_be_bytes());
         out.extend_from_slice(&self.bits);
-        out
+        Some(out)
     }
 
     /// Parse a `<uuid>.body.bloom` sidecar. Returns `None` on a bad
@@ -374,6 +402,21 @@ mod tests {
             one_shot.to_bytes(),
             streamed.to_bytes(),
             "streaming builder must produce a bit-identical filter"
+        );
+    }
+
+    #[test]
+    fn bounded_finish_and_serialization_reject_before_allocation() {
+        let mut builder = BodyBloomBuilder::new(3);
+        assert!(builder.add_body_bounded("abcdefghijklmnopqrstuvwxyz", 1_000_000));
+        let retained = builder.estimated_bytes();
+        assert!(builder.clone().finish_bounded(0.01, retained).is_none());
+
+        let bloom = builder.finish_bounded(0.01, 1_000_000).expect("fits");
+        assert!(bloom.to_bytes_bounded(bloom.byte_len() - 1).is_none());
+        assert_eq!(
+            bloom.to_bytes_bounded(bloom.byte_len()),
+            Some(bloom.to_bytes())
         );
     }
 

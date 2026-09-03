@@ -89,6 +89,41 @@ impl Drop for OutputCleanupGuard {
     }
 }
 
+#[derive(Clone, Copy)]
+struct SidecarBudgets {
+    input_meta: u64,
+    fingerprints: u64,
+    bloom: u64,
+    postings: u64,
+    series_types: u64,
+    output_meta: u64,
+}
+
+impl SidecarBudgets {
+    fn for_permit(admitted_non_df_bytes: u64, fixed_bytes: u64) -> Self {
+        // These states can overlap near the end of a logs/metrics merge. Divide
+        // only the permit remainder after fixed writer/upload state, and make
+        // the weighted shares sum to one complete sidecar allowance.
+        let unit = admitted_non_df_bytes.saturating_sub(fixed_bytes) / 8;
+        Self {
+            input_meta: unit,
+            fingerprints: unit,
+            bloom: unit.saturating_mul(2),
+            postings: unit.saturating_mul(2),
+            series_types: unit,
+            output_meta: unit,
+        }
+    }
+}
+
+fn sidecar_limit(component: &'static str, budget_bytes: u64) -> anyhow::Error {
+    crate::resource::ResourceError::SidecarLimit {
+        component,
+        budget_bytes,
+    }
+    .into()
+}
+
 struct SignalSpec {
     /// Columns the merged main parquet is ordered by, ascending — must
     /// match the block builder's sort for this signal.
@@ -111,6 +146,7 @@ struct PostingsCursor {
     batch: Option<RecordBatch>,
     row: usize,
     current: Option<PostingsEntry>,
+    row_budget: u64,
 }
 
 impl PostingsCursor {
@@ -138,6 +174,15 @@ impl PostingsCursor {
                         .as_any()
                         .downcast_ref::<UInt64Array>()
                         .context("postings fingerprint list not UInt64")?;
+                    let requested = names
+                        .value(self.row)
+                        .len()
+                        .saturating_add(values.value(self.row).len())
+                        .saturating_add(fps.len().saturating_mul(std::mem::size_of::<u64>()))
+                        .saturating_add(16) as u64;
+                    if requested > self.row_budget {
+                        return Err(sidecar_limit("postings row", self.row_budget));
+                    }
                     self.current = Some((
                         (
                             names.value(self.row).to_owned(),
@@ -288,14 +333,25 @@ async fn merge_blocks_inner(
     cleanup: &OutputCleanupGuard,
 ) -> Result<Option<BlockMeta>> {
     let spec = spec_for(signal)?;
+    let fixed_bytes = (resources.config().output_buffer_bytes as u64)
+        .saturating_add(resources.config().parquet_writer_memory_bytes as u64)
+        .saturating_add(8 * 1024 * 1024);
+    let budgets = SidecarBudgets::for_permit(admitted_non_df_bytes, fixed_bytes);
 
     // Catalog entries intentionally omit sidecar-only fields. Fetch every
     // durable input meta exactly once for all signals, validate that it is the
     // sidecar requested by the catalog entry, and reuse it for every metadata
     // concern below (series types and ancestry).
     let mut input_metas = Vec::with_capacity(inputs.len());
+    let mut input_meta_bytes = 0u64;
     for entry in inputs {
-        let fetched = fetch_meta(&store, &entry.meta).await?;
+        let fetched = fetch_meta(
+            &store,
+            &entry.meta,
+            &mut input_meta_bytes,
+            budgets.input_meta,
+        )
+        .await?;
         anyhow::ensure!(
             fetched.uuid == entry.meta.uuid,
             "input meta UUID mismatch: requested {}, fetched {}",
@@ -423,7 +479,7 @@ async fn merge_blocks_inner(
                     .as_any()
                     .downcast_ref::<UInt64Array>()
                     .context("fingerprint column is not UInt64")?;
-                let fingerprint_budget = admitted_non_df_bytes / 6;
+                let fingerprint_budget = budgets.fingerprints;
                 for v in arr.iter().flatten() {
                     if !set.contains(&v)
                         && (set.len() as u64).saturating_add(1).saturating_mul(32)
@@ -446,7 +502,7 @@ async fn merge_blocks_inner(
                     .context("body column is not Utf8")?;
                 // Leave room in the admitted non-DF allocation for the parquet
                 // writer, upload chunk, fingerprints, and final bloom bitset.
-                let bloom_budget = admitted_non_df_bytes / 3;
+                let bloom_budget = budgets.bloom;
                 for i in 0..arr.len() {
                     if arr.is_valid(i) && !bb.add_body_bounded(arr.value(i), bloom_budget as usize)
                     {
@@ -498,7 +554,7 @@ async fn merge_blocks_inner(
             path,
             block_cfg,
             resources,
-            admitted_non_df_bytes / 3,
+            budgets.postings,
         )
         .await?;
         (true, Some(size))
@@ -508,8 +564,15 @@ async fn merge_blocks_inner(
 
     // ── Body bloom (logs): finalise the streamed accumulator. ────────
     let (has_body_bloom, body_bloom_size_bytes) = if let Some(bb) = bloom_builder {
-        let bloom = bb.finish(block_cfg.bloom_target_fpr);
-        let bytes = Bytes::from(bloom.to_bytes());
+        let bloom = bb
+            .finish_bounded(block_cfg.bloom_target_fpr, budgets.bloom as usize)
+            .ok_or_else(|| sidecar_limit("body bloom finalization", budgets.bloom))?;
+        let serialization_budget = (budgets.bloom as usize).saturating_sub(bloom.byte_len());
+        let bytes = Bytes::from(
+            bloom
+                .to_bytes_bounded(serialization_budget)
+                .ok_or_else(|| sidecar_limit("body bloom serialization", budgets.bloom))?,
+        );
         let size = bytes.len() as u64;
         let path = ObjPath::from(block_path(
             signal,
@@ -530,7 +593,7 @@ async fn merge_blocks_inner(
     // ── series_types (metrics): union from input sidecars. ───────────
     let series_types = if spec.has_series_types {
         let mut map: HashMap<u64, u8> = HashMap::new();
-        let series_types_budget = admitted_non_df_bytes / 6;
+        let series_types_budget = budgets.series_types;
         for meta in &input_metas {
             if let Some(types) = &meta.series_types {
                 for &(fp, t) in types {
@@ -590,7 +653,7 @@ async fn merge_blocks_inner(
         wal_shard: None,
     };
     let meta_bytes = Bytes::from(serde_json::to_vec(&meta).context("serialise merged meta")?);
-    let meta_budget = admitted_non_df_bytes / 6;
+    let meta_budget = budgets.output_meta;
     if meta_bytes.len() as u64 > meta_budget {
         return Err(crate::resource::ResourceError::SidecarLimit {
             component: "meta.json",
@@ -660,6 +723,18 @@ async fn merge_postings_streaming(
     resources: &Arc<crate::resource::CompactResources>,
     postings_budget: u64,
 ) -> Result<u64> {
+    // Cursor batches/current rows, the active merged list, the pending output
+    // batch, and ArrowWriter state can overlap. Give each class one quarter of
+    // the postings share; divide the cursor quarter across all fanout inputs.
+    let working_budget = (postings_budget / 4).max(1);
+    let postings_inputs = inputs
+        .iter()
+        .filter(|entry| entry.meta.has_postings)
+        .count();
+    let per_cursor_budget = working_budget
+        .checked_div(postings_inputs.max(1) as u64)
+        .unwrap_or(0)
+        .max(1);
     let mut cursors = Vec::new();
     for entry in inputs.iter().filter(|entry| entry.meta.has_postings) {
         let path = ObjPath::from(block_path(
@@ -675,10 +750,21 @@ async fn merge_postings_streaming(
             .with_context(|| format!("HEAD input postings {path}"))?;
         let reader =
             ParquetObjectReader::new(store.clone(), path.clone()).with_file_size(meta.size);
-        let stream = ParquetRecordBatchStreamBuilder::new(reader)
+        let builder = ParquetRecordBatchStreamBuilder::new(reader)
             .await
-            .with_context(|| format!("open input postings {path}"))?
-            .with_batch_size(1024)
+            .with_context(|| format!("open input postings {path}"))?;
+        let largest_row_group = builder
+            .metadata()
+            .row_groups()
+            .iter()
+            .map(|group| group.total_byte_size().max(0) as u64)
+            .max()
+            .unwrap_or(0);
+        if largest_row_group > per_cursor_budget {
+            return Err(sidecar_limit("postings row group", per_cursor_budget));
+        }
+        let stream = builder
+            .with_batch_size(1)
             .build()
             .with_context(|| format!("build input postings stream {path}"))?;
         let mut cursor = PostingsCursor {
@@ -686,6 +772,7 @@ async fn merge_postings_streaming(
             batch: None,
             row: 0,
             current: None,
+            row_budget: per_cursor_budget,
         };
         cursor.advance().await?;
         cursors.push(cursor);
@@ -700,11 +787,11 @@ async fn merge_postings_streaming(
     .with_max_concurrency(1);
     let mut writer = AsyncArrowWriter::try_new(sink, postings_schema(), Some(props))
         .context("create merged postings writer")?;
-    let limit = postings_budget.max(1);
+    let limit = working_budget;
     let batch_limit = resources
         .config()
         .parquet_writer_memory_bytes
-        .min(limit as usize)
+        .min(working_budget as usize)
         .max(1);
     let result: Result<()> = async {
         let mut heap = BinaryHeap::new();
@@ -784,7 +871,12 @@ async fn cleanup_paths(store: &Arc<dyn ObjectStore>, paths: &[ObjPath]) {
 }
 
 /// Fetch and parse a block's `meta.json` sidecar from the bucket.
-async fn fetch_meta(store: &Arc<dyn ObjectStore>, meta: &BlockMeta) -> Result<BlockMeta> {
+async fn fetch_meta(
+    store: &Arc<dyn ObjectStore>,
+    meta: &BlockMeta,
+    cumulative_bytes: &mut u64,
+    budget_bytes: u64,
+) -> Result<BlockMeta> {
     let p = block_path(
         &meta.signal,
         meta.ts_min_unix_nano,
@@ -792,12 +884,15 @@ async fn fetch_meta(store: &Arc<dyn ObjectStore>, meta: &BlockMeta) -> Result<Bl
         meta.uuid,
         "meta.json",
     );
-    let bytes = store
+    let result = store
         .get(&ObjPath::from(p))
         .await
-        .context("get input meta.json")?
-        .bytes()
-        .await
-        .context("read input meta.json body")?;
+        .context("get input meta.json")?;
+    let next = cumulative_bytes.saturating_add(result.meta.size);
+    if next > budget_bytes {
+        return Err(sidecar_limit("input meta.json", budget_bytes));
+    }
+    *cumulative_bytes = next;
+    let bytes = result.bytes().await.context("read input meta.json body")?;
     serde_json::from_slice(&bytes).context("parse input meta.json")
 }

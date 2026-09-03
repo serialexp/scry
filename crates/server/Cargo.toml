@@ -22,6 +22,7 @@ scry-match        = { workspace = true }
 scry-objstore     = { workspace = true }
 scry-proto        = { workspace = true }
 scry-query        = { workspace = true }
+scry-resources    = { workspace = true }
 scry-status       = { workspace = true }
 scry-wal          = { workspace = true }
 serde             = { workspace = true, features = ["derive"] }

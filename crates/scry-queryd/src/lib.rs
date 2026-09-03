@@ -602,6 +602,15 @@ pub async fn run(args: Args) -> Result<()> {
         .query_memory_budget_mib
         .checked_mul(1024 * 1024)
         .context("--query-memory-budget-mib overflows usize when converted to bytes")?;
+    let detected_cgroup = scry_resources::detect_cgroup_memory_limit();
+    if let Some(limit) = detected_cgroup {
+        let reserve_bytes = args.query_memory_reserve_mib.saturating_mul(1024 * 1024);
+        let safe_pool_bytes = limit.bytes.saturating_sub(reserve_bytes.min(limit.bytes));
+        anyhow::ensure!(
+            memory_budget_bytes as u64 <= safe_pool_bytes,
+            "--query-memory-budget-mib exceeds the safe budget under the detected finite cgroup ceiling"
+        );
+    }
     let memory_pool = Arc::new(GreedyMemoryPool::new(memory_budget_bytes));
     let runtime_env = Arc::new(
         RuntimeEnvBuilder::new()
