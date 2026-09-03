@@ -164,6 +164,16 @@ async fn count_meta_json(store: &Arc<dyn ObjectStore>) -> usize {
     n
 }
 
+async fn count_objects(store: &Arc<dyn ObjectStore>) -> usize {
+    let mut list = store.list(None);
+    let mut n = 0;
+    while let Some(item) = list.next().await {
+        item.unwrap();
+        n += 1;
+    }
+    n
+}
+
 fn cfg() -> CompactConfig {
     CompactConfig {
         fanout: 3,
@@ -189,6 +199,7 @@ async fn fence_lost_before_meta_commit_aborts_with_inputs_intact() {
     let fence = CountingFence::new(1);
     let sink = CapturingSink::default();
     let writer_id = Uuid::now_v7();
+    let objects_before = count_objects(&store).await;
 
     let outcome = compact_partition(
         &plan,
@@ -212,6 +223,11 @@ async fn fence_lost_before_meta_commit_aborts_with_inputs_intact() {
         count_meta_json(&store).await,
         3,
         "merge must not commit meta.json after losing the lease"
+    );
+    assert_eq!(
+        count_objects(&store).await,
+        objects_before,
+        "all staged output objects must be cleaned after a fence abort"
     );
 
     // Inputs are untouched: all three live, none superseded.

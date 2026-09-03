@@ -241,9 +241,7 @@ where
                     inputs: plan.inputs.len(),
                 },
                 Err(error) => {
-                    let resource_failure = error
-                        .chain()
-                        .any(|cause| cause.downcast_ref::<scry_compact::ResourceError>().is_some());
+                    let resource_failure = scry_compact::is_resource_failure(&error);
                     tracing::warn!(
                         signal = %plan.signal,
                         date = %plan.date,

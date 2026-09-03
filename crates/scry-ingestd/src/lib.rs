@@ -28,10 +28,10 @@ use scry_duration::parse_duration;
 use scry_objstore::{open as open_objstore, ObjStoreConfig};
 use scry_retention::RetentionConfig;
 use scry_server::{
-    decode, serve_status, BlockBuilderConfig, CatalogGauge, CompactionPassStats, DummyShards,
-    FleetSource, LiveRing, LocalStatus, LogsShards, MetricsShards, ProfilesShards,
-    RetentionPassStats, Server, ServerConfig, ServerMetrics, ShardedPipeline, TracesShards,
-    CATALOG_GAUGE_INTERVAL, INGEST_SHARDS,
+    decode, serve_status, BlockBuilderConfig, CatalogGauge, CompactionPassStats,
+    CompactionResourceStats, DummyShards, FleetSource, LiveRing, LocalStatus, LogsShards,
+    MetricsShards, ProfilesShards, RetentionPassStats, Server, ServerConfig, ServerMetrics,
+    ShardedPipeline, TracesShards, CATALOG_GAUGE_INTERVAL, INGEST_SHARDS,
 };
 use scry_valkey::{
     parse_envelope, subscribe_blocks, StatusRegistration, TailRegistration, ValkeyClient,
@@ -380,11 +380,13 @@ pub async fn run(args: Args) -> Result<()> {
         .then(|| CatalogGauge::new(args.catalog.clone().expect("guarded by is_some")));
 
     let compaction_progress = Arc::new(scry_block::CompactionProgress::new());
+    let compaction_resource_stats = Arc::new(CompactionResourceStats::default());
     let stats_metrics: Option<Arc<ServerMetrics>> =
         (args.stats_listen.is_some() || valkey_configured).then(|| {
             let mut metrics = ServerMetrics::new(upload_concurrency)
                 .with_identity(writer_uuid.to_string(), args.listen.clone())
-                .with_compaction_progress(compaction_progress.clone());
+                .with_compaction_progress(compaction_progress.clone())
+                .with_compaction_resource_stats(compaction_resource_stats.clone());
             if let Some(gauge) = catalog_gauge.clone() {
                 metrics = metrics.with_catalog_gauge(gauge);
             }
@@ -927,6 +929,19 @@ pub async fn run(args: Args) -> Result<()> {
                 .context("--compact-output-buffer-mib is too large")?;
             let compact_resources = CompactResources::new(compact_resource_cfg)
                 .context("constructing process-wide compaction resources")?;
+            update_compaction_resource_stats(&compaction_resource_stats, &compact_resources);
+            {
+                let stats = compaction_resource_stats.clone();
+                let resources = compact_resources.clone();
+                bg_tasks.push(tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(Duration::from_millis(250));
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        tick.tick().await;
+                        update_compaction_resource_stats(&stats, &resources);
+                    }
+                }));
+            }
             let mut overrides = BTreeMap::new();
             if let Some(d) = args.ttl_metrics {
                 overrides.insert("metrics".to_string(), d);
@@ -1146,6 +1161,25 @@ fn record_retention_metrics(
 /// `retention_interval`. Generic over the lease provider so the Valkey
 /// provider and the single-process `LocalLeaseProvider` share one body.
 #[allow(clippy::too_many_arguments)]
+fn update_compaction_resource_stats(stats: &CompactionResourceStats, resources: &CompactResources) {
+    let cfg = resources.config();
+    let telemetry = resources.telemetry();
+    stats.update(
+        cfg.envelope_bytes,
+        cfg.datafusion_memory_bytes,
+        telemetry.datafusion_reserved_bytes as u64,
+        cfg.non_datafusion_memory_bytes,
+        telemetry.weighted_running_bytes,
+        telemetry.weighted_waiters as u64,
+        cfg.spill_bytes,
+        telemetry.spill_used_bytes,
+        telemetry.spill_active_files as u64,
+        telemetry.admissions,
+        telemetry.rejected,
+        telemetry.cumulative_wait_micros,
+    );
+}
+
 async fn run_maintenance_loop<L: LeaseProvider>(
     provider: L,
     store: Arc<dyn ObjectStore>,

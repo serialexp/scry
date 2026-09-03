@@ -89,16 +89,40 @@ impl BodyBloomBuilder {
     /// n-gram width contribute no grams (the bloom can't index them; the
     /// query scans for short patterns regardless).
     pub fn add_body(&mut self, body: &str) {
+        // Unbounded construction remains available to block builders, whose
+        // input size is independently capped by block sealing.
+        let _ = self.add_body_bounded(body, usize::MAX);
+    }
+
+    /// Feed a body while enforcing a conservative bound for the accumulator.
+    /// Returns `false` before adding a gram that would cross `max_bytes`.
+    ///
+    /// Each distinct gram occupies two u64s in `grams`, one u64 plus hash-table
+    /// control/storage in `seen`, and allocator slack. Forty bytes per gram is
+    /// deliberately conservative; exact allocator accounting is unavailable.
+    pub fn add_body_bounded(&mut self, body: &str, max_bytes: usize) -> bool {
+        const BYTES_PER_DISTINCT_GRAM: usize = 40;
         let bytes = body.as_bytes();
         if bytes.len() < self.ngram {
-            return;
+            return true;
         }
         for window in bytes.windows(self.ngram) {
             let (h1, h2) = hash_pair(window);
-            if self.seen.insert(h1) {
-                self.grams.push((h1, h2));
+            if self.seen.contains(&h1) {
+                continue;
             }
+            let next_bytes = self
+                .grams
+                .len()
+                .saturating_add(1)
+                .saturating_mul(BYTES_PER_DISTINCT_GRAM);
+            if next_bytes > max_bytes {
+                return false;
+            }
+            self.seen.insert(h1);
+            self.grams.push((h1, h2));
         }
+        true
     }
 
     /// Size `(m, k)` for the exact distinct-gram count at `target_fpr`

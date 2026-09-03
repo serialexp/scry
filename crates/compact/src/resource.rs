@@ -55,9 +55,11 @@ impl ResourceConfig {
     /// Resolve a conservative envelope from cgroup-v2. Unlimited, malformed, or
     /// unavailable limits deliberately fall back to a small fixed envelope.
     pub fn detect() -> Self {
-        let envelope = read_cgroup_limit(Path::new("/sys/fs/cgroup/memory.max"))
-            .and_then(|limit| limit.checked_sub(SYSTEM_HEADROOM + QUERY_INGEST_RESERVE))
-            .filter(|available| *available >= 128 * MIB)
+        let envelope = detect_cgroup_v2_limit()
+            // A finite cgroup is authoritative even when too small: retaining
+            // the resulting sub-minimum envelope makes validation refuse
+            // startup instead of silently selecting a larger fallback.
+            .map(|limit| limit.saturating_sub(SYSTEM_HEADROOM + QUERY_INGEST_RESERVE))
             .unwrap_or(FALLBACK_ENVELOPE);
         Self::from_envelope(envelope)
     }
@@ -94,6 +96,20 @@ impl ResourceConfig {
                 "non-DataFusion memory must be at least 1 MiB",
             ));
         }
+        if bytes_to_capacity_units(self.non_datafusion_memory_bytes) > u32::MAX as u64 {
+            return Err(ResourceError::InvalidConfig(
+                "non-DataFusion memory exceeds weighted admission capacity",
+            ));
+        }
+        if self
+            .datafusion_memory_bytes
+            .checked_add(self.non_datafusion_memory_bytes)
+            .is_none_or(|committed| committed > self.envelope_bytes)
+        {
+            return Err(ResourceError::InvalidConfig(
+                "DataFusion and non-DataFusion budgets exceed the compaction envelope",
+            ));
+        }
         if self.spill_bytes == 0 {
             return Err(ResourceError::InvalidConfig("spill limit must be non-zero"));
         }
@@ -105,6 +121,18 @@ impl ResourceConfig {
         if self.parquet_writer_memory_bytes == 0 {
             return Err(ResourceError::InvalidConfig(
                 "parquet writer memory must be non-zero",
+            ));
+        }
+        let writer_buffers = u64::try_from(self.output_buffer_bytes)
+            .ok()
+            .and_then(|output| {
+                u64::try_from(self.parquet_writer_memory_bytes)
+                    .ok()
+                    .and_then(|parquet| output.checked_add(parquet))
+            });
+        if writer_buffers.is_none_or(|bytes| bytes > self.non_datafusion_memory_bytes) {
+            return Err(ResourceError::InvalidConfig(
+                "output and parquet writer buffers exceed the non-DataFusion budget",
             ));
         }
         if self.max_waiters == 0 {
@@ -120,18 +148,48 @@ fn read_cgroup_limit(path: &Path) -> Option<u64> {
     (raw != "max").then(|| raw.parse().ok()).flatten()
 }
 
-/// Ordinary, retryable resource failures. Inputs remain live on every variant.
+fn detect_cgroup_v2_limit() -> Option<u64> {
+    let cgroups = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let relative = cgroups
+        .lines()
+        .find_map(|line| {
+            let mut fields = line.splitn(3, ':');
+            let _ = fields.next()?;
+            fields.next()?.is_empty().then(|| fields.next()).flatten()
+        })?
+        .trim_start_matches('/');
+    let dir = Path::new("/sys/fs/cgroup").join(relative);
+    let max = read_cgroup_limit(&dir.join("memory.max"));
+    let high = read_cgroup_limit(&dir.join("memory.high"));
+    match (max, high) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(limit), None) | (None, Some(limit)) => Some(limit),
+        (None, None) => None,
+    }
+}
+
+/// Resource admission failures. Inputs remain live on every variant.
+///
+/// [`ResourceError::RequestTooLarge`] is permanent for the current envelope;
+/// queue saturation and timeouts are transient and may be retried.
 #[derive(Debug, thiserror::Error)]
 pub enum ResourceError {
     #[error("invalid compaction resource config: {0}")]
     InvalidConfig(&'static str),
     #[error("constructing compaction runtime: {0}")]
     Runtime(#[source] datafusion::error::DataFusionError),
+    #[error("compaction exhausted its DataFusion memory or spill budget: {0}")]
+    DataFusionExhausted(#[source] datafusion::error::DataFusionError),
     #[error(
         "compaction request needs {requested_bytes} non-DataFusion bytes, budget is {budget_bytes}"
     )]
     RequestTooLarge {
         requested_bytes: u64,
+        budget_bytes: u64,
+    },
+    #[error("compaction sidecar {component} exceeded its {budget_bytes}-byte memory budget")]
+    SidecarLimit {
+        component: &'static str,
         budget_bytes: u64,
     },
     #[error("compaction resource queue is full ({max_waiters} waiters)")]
@@ -197,8 +255,9 @@ impl CompactResources {
                 .build()
                 .map_err(ResourceError::Runtime)?,
         );
-        let units =
-            bytes_to_units(config.non_datafusion_memory_bytes).min(u32::MAX as u64) as usize;
+        // Requests round up to MiB, so capacity must round down. Rounding both
+        // sides up would allow reservations beyond the advertised byte budget.
+        let units = bytes_to_capacity_units(config.non_datafusion_memory_bytes) as usize;
         tracing::info!(
             datafusion_memory_bytes = config.datafusion_memory_bytes,
             non_datafusion_memory_bytes = config.non_datafusion_memory_bytes,
@@ -229,12 +288,23 @@ impl CompactResources {
         &self.config
     }
 
+    /// Convert DataFusion memory/spill exhaustion into a retryable compaction
+    /// resource error while preserving all other execution errors unchanged.
+    pub fn classify_datafusion(error: datafusion::error::DataFusionError) -> anyhow::Error {
+        use datafusion::error::DataFusionError;
+        if matches!(error.find_root(), DataFusionError::ResourcesExhausted(_)) {
+            ResourceError::DataFusionExhausted(error).into()
+        } else {
+            error.into()
+        }
+    }
+
     pub async fn admit(
         self: &Arc<Self>,
         estimated_bytes: u64,
     ) -> Result<ResourcePermit, ResourceError> {
         let units = bytes_to_units(estimated_bytes).max(1);
-        let capacity = bytes_to_units(self.config.non_datafusion_memory_bytes);
+        let capacity = bytes_to_capacity_units(self.config.non_datafusion_memory_bytes);
         if units > capacity || units > u32::MAX as u64 {
             self.rejected.fetch_add(1, Ordering::Relaxed);
             return Err(ResourceError::RequestTooLarge {
@@ -243,8 +313,8 @@ impl CompactResources {
             });
         }
         let previous = self.waiters.fetch_add(1, Ordering::AcqRel);
+        let waiter = WaiterGuard::new(&self.waiters);
         if previous >= self.config.max_waiters {
-            self.waiters.fetch_sub(1, Ordering::AcqRel);
             self.rejected.fetch_add(1, Ordering::Relaxed);
             return Err(ResourceError::QueueFull {
                 max_waiters: self.config.max_waiters,
@@ -256,7 +326,7 @@ impl CompactResources {
             self.admission.clone().acquire_many_owned(units as u32),
         )
         .await;
-        self.waiters.fetch_sub(1, Ordering::AcqRel);
+        drop(waiter);
         let waited = started.elapsed();
         self.wait_micros.fetch_add(
             waited.as_micros().min(u64::MAX as u128) as u64,
@@ -301,11 +371,40 @@ fn bytes_to_units(bytes: u64) -> u64 {
     bytes.saturating_add(MIB - 1) / MIB
 }
 
+fn bytes_to_capacity_units(bytes: u64) -> u64 {
+    bytes / MIB
+}
+
+struct WaiterGuard<'a> {
+    waiters: &'a AtomicUsize,
+}
+
+impl<'a> WaiterGuard<'a> {
+    fn new(waiters: &'a AtomicUsize) -> Self {
+        Self { waiters }
+    }
+}
+
+impl Drop for WaiterGuard<'_> {
+    fn drop(&mut self) {
+        self.waiters.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 pub struct ResourcePermit {
     #[allow(dead_code)]
     permit: OwnedSemaphorePermit,
     units: u64,
     running_units: Arc<AtomicU64>,
+}
+
+impl ResourcePermit {
+    /// Bytes reserved from the process-wide non-DataFusion envelope. Allocation
+    /// limits inside a merge must be derived from this value, not from the
+    /// process-global capacity, so concurrent merges cannot each spend it.
+    pub fn reserved_bytes(&self) -> u64 {
+        self.units.saturating_mul(MIB)
+    }
 }
 
 impl Drop for ResourcePermit {
@@ -322,7 +421,7 @@ mod tests {
         ResourceConfig {
             envelope_bytes: 128 * MIB,
             datafusion_memory_bytes: 64 * MIB,
-            non_datafusion_memory_bytes: 2 * MIB,
+            non_datafusion_memory_bytes: 8 * MIB,
             spill_bytes: 16 * MIB,
             spill_dir: None,
             output_buffer_bytes: 5 * MIB as usize,
@@ -346,7 +445,7 @@ mod tests {
     async fn oversized_request_is_retryable_error() {
         let resources = CompactResources::new(config()).unwrap();
         assert!(matches!(
-            resources.admit(3 * MIB).await,
+            resources.admit(9 * MIB).await,
             Err(ResourceError::RequestTooLarge { .. })
         ));
         assert_eq!(resources.telemetry().rejected, 1);
@@ -355,12 +454,45 @@ mod tests {
     #[tokio::test]
     async fn admission_times_out_without_leaking_waiter() {
         let resources = CompactResources::new(config()).unwrap();
-        let _all = resources.admit(2 * MIB).await.unwrap();
+        let _all = resources.admit(8 * MIB).await.unwrap();
         assert!(matches!(
             resources.admit(MIB).await,
             Err(ResourceError::AdmissionTimeout { .. })
         ));
         assert_eq!(resources.telemetry().weighted_waiters, 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_admission_does_not_leak_waiter() {
+        let resources = CompactResources::new(config()).unwrap();
+        let _all = resources.admit(8 * MIB).await.unwrap();
+        let resources_for_waiter = resources.clone();
+        let waiter = tokio::spawn(async move { resources_for_waiter.admit(MIB).await });
+        tokio::task::yield_now().await;
+        assert_eq!(resources.telemetry().weighted_waiters, 1);
+        waiter.abort();
+        let _ = waiter.await;
+        assert_eq!(resources.telemetry().weighted_waiters, 0);
+    }
+
+    #[test]
+    fn rejects_sub_budgets_outside_envelope() {
+        let mut cfg = config();
+        cfg.datafusion_memory_bytes = 124 * MIB;
+        assert!(matches!(
+            CompactResources::new(cfg),
+            Err(ResourceError::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_writer_buffers_outside_non_datafusion_budget() {
+        let mut cfg = config();
+        cfg.parquet_writer_memory_bytes = 4 * MIB as usize;
+        assert!(matches!(
+            CompactResources::new(cfg),
+            Err(ResourceError::InvalidConfig(_))
+        ));
     }
 
     #[test]

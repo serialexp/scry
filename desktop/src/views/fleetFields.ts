@@ -165,6 +165,7 @@ function sumOrMissing(...values: Array<number | null>): number | null {
 function ingestFields(data: Data): FleetField[] {
   const hasCompaction = data.compaction !== null && typeof data.compaction === "object";
   const compaction = object(data.compaction);
+  const resources = object(compaction.resources);
   const retention = object(data.retention);
   const balance = object(data.blocks);
   const lastPass = number(compaction, "last_pass_unix_ms");
@@ -199,6 +200,10 @@ function ingestFields(data: Data): FleetField[] {
     ["lease unavailable", count(number(compaction, "lease_unavailable"))],
     ["compaction failures", count(sumOrMissing(number(compaction, "pass_failed"), number(compaction, "partition_failed")))],
     ["resource deferrals", count(number(compaction, "resource_failed"))],
+    ["compaction memory", bytes(number(resources, "memory_budget_bytes"))],
+    ["compaction DF peak", bytes(number(resources, "datafusion_peak_bytes"))],
+    ["compaction merge peak", bytes(number(resources, "weighted_peak_bytes"))],
+    ["compaction spill peak", bytes(number(resources, "spill_peak_bytes"))],
     ["reap failures", count(number(compaction, "reap_failed"))],
     ["last compaction", lastPass === null ? "—" : new Date(lastPass).toLocaleString()],
     ["retention passes", count(number(retention, "passes"))],
@@ -331,9 +336,12 @@ function compactFields(data: Data): FleetField[] {
     ["resource deferrals", count(number(compaction, "resource_failed"))],
     ["memory budget", bytes(number(resources, "memory_budget_bytes"))],
     ["DataFusion reserved", bytes(number(resources, "datafusion_reserved_bytes"))],
+    ["DataFusion peak", bytes(number(resources, "datafusion_peak_bytes"))],
     ["merge memory running", bytes(number(resources, "weighted_running_bytes"))],
+    ["merge memory peak", bytes(number(resources, "weighted_peak_bytes"))],
     ["merge memory waiters", count(number(resources, "weighted_waiters"))],
     ["spill usage", `${bytes(number(resources, "spill_used_bytes"))} / ${bytes(number(resources, "spill_limit_bytes"))}`],
+    ["spill peak", bytes(number(resources, "spill_peak_bytes"))],
     ["resource admissions", count(number(resources, "admissions"))],
     ["resource rejected", count(number(resources, "rejected"))],
     ["reap failures", count(number(compaction, "reap_failed"))],

@@ -1,4 +1,138 @@
 
+## D-070 bounded memory follow-ups (review of ebffc11, blocking release)
+
+### Compaction implementation
+
+Implemented in the post-`ebffc11` hardening pass: main parquet is no longer
+charged twice at admission; waiters are cancellation-safe; standalone passes
+survive partition failures; the dedicated daemon resolves finite/nested cgroups
+and `memory.high`; postings use a sorted k-way stream; sidecar growth is
+permit-relative and fails controllably; pre-commit objects have cleanup guards;
+DataFusion resource exhaustion is classified; and live/peak telemetry is sampled.
+Remaining release work is tracked below.
+
+- [ ] Finish admission policy: the original `(main + postings + bloom) × 8`
+      estimate is charged against only one quarter of the envelope, so a default
+      512 MiB budget permanently rejects merges with more than ~16 MiB of
+      compressed inputs. Charge only genuinely non-DataFusion state, distinguish
+      permanent oversize from transient queue pressure, and prove realistic
+      L0→L1/L1→L2 merges remain admissible.
+- [x] Make standalone `scry compact --watch` absorb per-partition resource
+      failures like the leased path. One rejected partition currently aborts the
+      complete pass and exits the daemon instead of leaving inputs live and
+      continuing.
+- [x] Make weighted-admission waiter accounting cancellation-safe. `admit()`
+      increments before awaiting and only decrements on normal completion, so a
+      dropped future leaks a waiter and can eventually make every merge report
+      `QueueFull`; use an RAII waiter guard and test cancellation.
+- [ ] Consolidate cgroup detection across compactd, embedded ingest compaction,
+      query, and the legacy standalone compact entry point. The dedicated daemon
+      now resolves nested paths and `memory.high` and refuses unsafe small limits;
+      ingest still uses an independent explicit default.
+- [ ] Never resolve a finite cgroup to an envelope larger than the cgroup. A
+      small finite limit currently falls back to 512 MiB; refuse compaction when
+      the detected limit cannot support the 128 MiB minimum plus required
+      headroom. The dedicated daemon now resolves nested paths through
+      `/proc/self/cgroup`, walks ancestors, and considers `memory.high`; finish
+      mount-root mapping and apply the shared detector to embedded maintenance.
+- [ ] Fully account sidecar/cardinality peaks. Runtime limits are now relative to
+      each merge's acquired permit, but input metadata, pathological postings
+      rows/batches, and bloom finalisation still need pre-allocation reservations
+      or hard input-size caps.
+- [ ] Bound sidecar/cardinality state during a merge, not only with an up-front
+      compressed-byte estimate: postings union/encoding, distinct fingerprints,
+      logs body n-grams, `series_types`, `all_fingerprints`, and meta JSON can
+      still grow beyond the permit. Use incremental reservations and controlled
+      resource failure; move large inline metadata to versioned sidecars where
+      needed.
+- [x] Finish streaming postings output. `encode_postings_to_writer` exists, but
+      compaction still materializes the merged postings Arrow arrays and complete
+      encoded sidecar in memory. Implement a sorted k-way/external merge with
+      bounded batches and spill-backed or multipart output.
+- [ ] Complete abort/cleanup coverage for staged multipart and completed
+      pre-commit objects. Error, fence, and future-cancellation paths now clean
+      staged data, while ambiguous `meta.json` commit responses deliberately keep
+      data for reconciliation. Still add injected failures at each upload stage
+      and bucket lifecycle guidance for process crashes.
+- [x] Classify DataFusion pool exhaustion and spill-area exhaustion as
+      `resource_failed`, not generic `partition_failed`.
+- [x] Make resource telemetry live during active passes. It is currently copied
+      only immediately before and after awaiting a pass, so reserved/running/spill
+      gauges usually appear as zero. Use direct dependency-neutral atomics or a
+      periodic sampler, and retain sampled peak counters.
+- [ ] Expose status/resource telemetry in standalone compact mode and make peak
+      tracking event-driven rather than sampler-relative.
+- [ ] Warn or refuse when the spill directory is tmpfs, and account for
+      cgroup-charged page cache in deployment headroom. Sub-budget and writer
+      buffer validation is implemented.
+- [x] Validate that DataFusion + non-DataFusion sub-budgets and writer buffers
+      fit the advertised envelope.
+- [ ] Add the remaining constrained-memory coverage: concurrent forced sort
+      spill, high-cardinality postings/fingerprints, high-entropy logs bloom,
+      spill-cap exhaustion, cancellation, cleanup, permit release, daemon
+      survival, and measured peak RSS under a cgroup. Existing E2E data is too
+      small to establish the production envelope.
+
+### Ingest, WAL, and block building
+- [ ] Rotate/upload or spill block-sized chunks during WAL recovery. Replay
+      currently appends all surviving WAL frames into one builder per shard and
+      can materialize an arbitrarily large acknowledged backlog across up to 40
+      signal/shard builders before serving.
+- [ ] Add one global ingest memory envelope covering active builders and
+      encode/upload tasks. Today 5 signals × 8 shards × 128 MiB targets can retain
+      ~5 GiB before encode scratch, while upload concurrency scales with physical
+      CPU count rather than available memory.
+- [ ] Stop idle connections retaining peak scratch-builder capacity for all
+      signals. Shrink/replace oversized scratch after merge or use a bounded
+      shared pool; enforce an aggregate connection-scratch budget.
+- [ ] Reject corrupt/implausible WAL frame lengths before allocation. Replay
+      trusts a `u32` header and can attempt a nearly 4 GiB `Vec` before checking
+      truncation or CRC.
+
+### Query and queryd
+- [ ] Budget per-query fingerprint→label materialization outside DataFusion.
+      Intern while constructing, build only when projected, and cap/reserve
+      fingerprints, label pairs, candidates, and bytes.
+- [ ] Stream queryd metadata pair discovery into bounded sets. Projected postings
+      reads currently materialize a complete sidecar before applying the
+      1,000/10,000 suggestion limits, multiplied by fill concurrency.
+- [ ] Add in-flight byte admission to object-store range reads. The buffer pool
+      caps only idle retained buffers; checked-out concurrent Parquet ranges are
+      unbounded outside the DataFusion pool.
+- [ ] Treat postings/bloom cache budgets as peak-fill budgets as well as retained
+      budgets: HEAD/reserve before download, cap decoded structures, and prevent
+      concurrent oversized fills from exceeding the process envelope.
+- [ ] Do not spawn one rejection task per excess query socket. Reject/drop inline
+      under a short timeout or use a separately bounded rejection pool.
+- [ ] Tighten live-query memory: enforce a smaller frame bound before allocation,
+      reserve before decode/retention, avoid cloning the retained live rows, and
+      account capacities/container overhead.
+- [ ] Bound Fleet and live-registry discovery by instance count and total bytes;
+      avoid Lua/full-response accumulation and parse→reserialize duplication.
+- [ ] Put global byte/name/block/TTL limits on the process metadata suggestion
+      view, and remove stale UUID single-flight `Weak` entries so long-lived
+      queryd memory does not grow monotonically.
+- [ ] Reduce query response copies (Arrow payload, framed payload, wire buffer,
+      result-cache tee) and budget serialization across active queries.
+- [ ] Reconcile queryd's independent DataFusion/cache/live-fetch budgets against
+      the cgroup limit at startup, and configure/measure a bounded disk-backed
+      query spill area. One-shot/public query helpers must stop constructing
+      unbounded default DataFusion runtimes.
+
+### Gateway, replay, and tail
+- [ ] Add explicit compressed/decompressed request limits and global/per-route
+      concurrency admission to gateway HTTP/gRPC. In particular, remote-write
+      `decompress_vec` currently has no decoded-size ceiling.
+- [ ] Make gateway sink queues byte-weighted, not only item-count bounded, and
+      stream/chunk Loki/OpenSearch/native destination encoders instead of building
+      complete payloads per slow sink worker.
+- [ ] Bound OpenSearch replay by bytes as well as page/record count: cap CLI
+      sizing knobs, response/document sizes, and flush mapped batches before the
+      negotiated wire ceiling.
+- [ ] Add dedicated tail subscriber/endpoint limits and global/per-subscriber
+      byte budgets; current bounded record-count queues still multiply retained
+      payloads by subscriber count.
+
 ## D-056 replay-opensearch (follow-ups, non-blocking)
 - [ ] `--follow`: after draining to PIT open-time, re-open the PIT and continue
       past the last-seen timestamp for a live tail (core is drain-once-to-now).

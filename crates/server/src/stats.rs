@@ -150,11 +150,14 @@ pub struct CompactionResourceStats {
     memory_budget_bytes: AtomicU64,
     datafusion_limit_bytes: AtomicU64,
     datafusion_reserved_bytes: AtomicU64,
+    datafusion_peak_bytes: AtomicU64,
     non_datafusion_limit_bytes: AtomicU64,
     weighted_running_bytes: AtomicU64,
+    weighted_peak_bytes: AtomicU64,
     weighted_waiters: AtomicU64,
     spill_limit_bytes: AtomicU64,
     spill_used_bytes: AtomicU64,
+    spill_peak_bytes: AtomicU64,
     spill_active_files: AtomicU64,
     admissions: AtomicU64,
     rejected: AtomicU64,
@@ -194,6 +197,12 @@ impl CompactionResourceStats {
         ] {
             field.store(value, Ordering::Relaxed);
         }
+        self.datafusion_peak_bytes
+            .fetch_max(datafusion_reserved_bytes, Ordering::Relaxed);
+        self.weighted_peak_bytes
+            .fetch_max(weighted_running_bytes, Ordering::Relaxed);
+        self.spill_peak_bytes
+            .fetch_max(spill_used_bytes, Ordering::Relaxed);
     }
 
     fn snapshot(&self) -> serde_json::Value {
@@ -201,11 +210,14 @@ impl CompactionResourceStats {
             "memory_budget_bytes": self.memory_budget_bytes.load(Ordering::Relaxed),
             "datafusion_limit_bytes": self.datafusion_limit_bytes.load(Ordering::Relaxed),
             "datafusion_reserved_bytes": self.datafusion_reserved_bytes.load(Ordering::Relaxed),
+            "datafusion_peak_bytes": self.datafusion_peak_bytes.load(Ordering::Relaxed),
             "non_datafusion_limit_bytes": self.non_datafusion_limit_bytes.load(Ordering::Relaxed),
             "weighted_running_bytes": self.weighted_running_bytes.load(Ordering::Relaxed),
+            "weighted_peak_bytes": self.weighted_peak_bytes.load(Ordering::Relaxed),
             "weighted_waiters": self.weighted_waiters.load(Ordering::Relaxed),
             "spill_limit_bytes": self.spill_limit_bytes.load(Ordering::Relaxed),
             "spill_used_bytes": self.spill_used_bytes.load(Ordering::Relaxed),
+            "spill_peak_bytes": self.spill_peak_bytes.load(Ordering::Relaxed),
             "spill_active_files": self.spill_active_files.load(Ordering::Relaxed),
             "admissions": self.admissions.load(Ordering::Relaxed),
             "rejected": self.rejected.load(Ordering::Relaxed),

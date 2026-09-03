@@ -551,6 +551,22 @@ async fn run_leased(
         }));
     }
 
+    // Sample live pool/admission/spill gauges while merges are active. Updating
+    // the server-owned atomics is cheap and avoids status requests walking the
+    // spill directory or resource queues.
+    {
+        let stats = resource_stats.clone();
+        let resources = resources.clone();
+        bg_tasks.push(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(250));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                update_resource_stats(&stats, &resources);
+            }
+        }));
+    }
+
     // ── Compaction loop ────────────────────────────────────────────
     let lease_ttl = Duration::from_secs(args.lease_ttl.max(1));
     let interval = Duration::from_secs(args.interval.max(1));

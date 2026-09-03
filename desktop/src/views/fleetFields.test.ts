@@ -48,9 +48,12 @@ describe("fleetFields", () => {
         resources: {
           memory_budget_bytes: 1_073_741_824,
           datafusion_reserved_bytes: 134_217_728,
+          datafusion_peak_bytes: 201_326_592,
           weighted_running_bytes: 268_435_456,
+          weighted_peak_bytes: 402_653_184,
           weighted_waiters: 2,
           spill_used_bytes: 536_870_912,
+          spill_peak_bytes: 805_306_368,
           spill_limit_bytes: 4_294_967_296,
           admissions: 12,
           rejected: 3,
@@ -60,8 +63,11 @@ describe("fleetFields", () => {
     expect(fields.get("resource deferrals")).toBe("3");
     expect(fields.get("memory budget")).toBe("1.00 GiB");
     expect(fields.get("DataFusion reserved")).toBe("128.0 MiB");
+    expect(fields.get("DataFusion peak")).toBe("192.0 MiB");
+    expect(fields.get("merge memory peak")).toBe("384.0 MiB");
     expect(fields.get("merge memory waiters")).toBe("2");
     expect(fields.get("spill usage")).toBe("512.0 MiB / 4.00 GiB");
+    expect(fields.get("spill peak")).toBe("768.0 MiB");
     expect(fields.get("resource rejected")).toBe("3");
   });
 

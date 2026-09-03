@@ -332,6 +332,7 @@ async fn lease_holder_reconciles_prior_committed_output_before_remerging_inputs(
         &test_cfg(),
         &scry_block::AlwaysValid,
         &resources,
+        resources.config().non_datafusion_memory_bytes,
     )
     .await
     .unwrap()

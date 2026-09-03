@@ -34,6 +34,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use datafusion::error::DataFusionError;
 use futures::StreamExt;
 use object_store::ObjectStore;
 use scry_block::{
@@ -173,11 +174,45 @@ pub async fn compact_once(
     .await;
 
     for result in results {
-        let (outcome, inputs) = result?;
-        report.absorb(&outcome, inputs);
+        match result {
+            Ok((outcome, inputs)) => report.absorb(&outcome, inputs),
+            Err(error) if is_resource_failure(&error) => {
+                report.resource_failed += 1;
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "compaction partition exhausted resources; continuing pass"
+                );
+            }
+            Err(error) => {
+                report.partition_failed += 1;
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "compaction partition failed; continuing pass"
+                );
+            }
+        }
     }
 
     Ok(report)
+}
+
+/// Whether a partition error is an ordinary, retryable resource failure.
+///
+/// Admission failures are represented by [`crate::resource::ResourceError`].
+/// Execution-time memory and spill exhaustion can instead arrive as a
+/// context-wrapped DataFusion error, so inspect both error families throughout
+/// the anyhow chain.
+pub fn is_resource_failure(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::resource::ResourceError>()
+            .is_some()
+            || cause
+                .downcast_ref::<DataFusionError>()
+                .is_some_and(|error| {
+                    matches!(error.find_root(), DataFusionError::ResourcesExhausted(_))
+                })
+    })
 }
 
 /// Outcome of compacting one partition. The merged-block bytes/inputs count
@@ -250,24 +285,26 @@ pub async fn compact_partition<C: CatalogHandle>(
         return Ok(PartitionOutcome::Aborted);
     }
 
-    // DataFusion does not account for parquet decode, ArrowWriter row groups,
-    // postings, fingerprints, or body-bloom construction. Conservatively
-    // expand the catalog's compressed object sizes to cover decoded state and
-    // transient sidecar copies. This is intentionally pessimistic: deferring a
-    // pathological merge is preferable to crossing the process envelope.
-    let compressed = plan.inputs.iter().try_fold(0u64, |sum, entry| {
-        sum.checked_add(entry.meta.byte_size)
-            .and_then(|v| v.checked_add(entry.meta.postings_size_bytes.unwrap_or(0)))
+    // DataFusion accounts for parquet input decoding and sort state in its own
+    // spill-aware pool. Weighted admission covers the fixed output writer plus
+    // sidecar state, estimated from sidecar sizes rather than charging the main
+    // parquet a second time. A floor covers the writer and one streamed batch;
+    // the multiplier allows for decoded maps/sets and transient Arrow arrays.
+    let sidecars = plan.inputs.iter().try_fold(0u64, |sum, entry| {
+        sum.checked_add(entry.meta.postings_size_bytes.unwrap_or(0))
             .and_then(|v| v.checked_add(entry.meta.body_bloom_size_bytes.unwrap_or(0)))
     });
-    let estimated = compressed
-        .and_then(|bytes| bytes.checked_mul(8))
+    let fixed = (resources.config().output_buffer_bytes as u64)
+        .saturating_add(resources.config().parquet_writer_memory_bytes as u64)
+        .saturating_add(8 * 1024 * 1024);
+    let estimated = sidecars
+        .and_then(|bytes| bytes.checked_mul(3))
+        .and_then(|bytes| bytes.checked_add(fixed))
         .ok_or_else(|| crate::resource::ResourceError::RequestTooLarge {
             requested_bytes: u64::MAX,
             budget_bytes: resources.config().non_datafusion_memory_bytes,
-        })?
-        .max(16 * 1024 * 1024);
-    let _resource_permit = resources
+        })?;
+    let resource_permit = resources
         .admit(estimated)
         .await
         .context("compaction resource admission")?;
@@ -284,6 +321,7 @@ pub async fn compact_partition<C: CatalogHandle>(
         block_cfg,
         fence,
         resources,
+        resource_permit.reserved_bytes(),
     )
     .await
     .with_context(|| format!("merging {} {} blocks", plan.inputs.len(), plan.signal))?
@@ -372,4 +410,31 @@ fn now_unix_nano() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_resource_failure;
+    use datafusion::error::DataFusionError;
+
+    #[test]
+    fn recognizes_context_wrapped_datafusion_resource_exhaustion() {
+        let error = anyhow::Error::new(DataFusionError::Context(
+            "sorting compacted rows".into(),
+            Box::new(DataFusionError::ResourcesExhausted(
+                "memory pool exhausted".into(),
+            )),
+        ))
+        .context("merging partition");
+
+        assert!(is_resource_failure(&error));
+    }
+
+    #[test]
+    fn does_not_classify_other_datafusion_failures_as_resource_failures() {
+        let error = anyhow::Error::new(DataFusionError::Execution("bad parquet".into()))
+            .context("merging partition");
+
+        assert!(!is_resource_failure(&error));
+    }
 }

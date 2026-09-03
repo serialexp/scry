@@ -74,57 +74,61 @@ pub fn encode_postings_to_writer<W: Write + Send>(
     writer: W,
 ) -> Result<()> {
     let schema = postings_schema();
-    if entries.is_empty() {
-        let empty = RecordBatch::new_empty(schema.clone());
-        let mut w = ArrowWriter::try_new(writer, schema, Some(props.clone()))
-            .context("ArrowWriter::try_new (empty postings)")?;
-        w.write(&empty)
-            .context("ArrowWriter::write (empty postings)")?;
-        w.close().context("ArrowWriter::close (empty postings)")?;
-        return Ok(());
-    }
-
-    let names: StringArray = entries.iter().map(|((k, _), _)| Some(k.as_str())).collect();
-    let values: StringArray = entries.iter().map(|((_, v), _)| Some(v.as_str())).collect();
-
-    // The ListArray uses i32 offsets. At the 60M-series architecture
-    // ceiling each fingerprint list maxes at ~thousands of u64s and the
-    // cumulative offset stays well under i32::MAX. The checked_add below
-    // turns any future overflow into a hard panic rather than silent
-    // corruption (see the LargeListArray TODO carried from metrics.rs).
-    let total_fps: usize = entries.iter().map(|(_, fps)| fps.len()).sum();
-    let mut values_builder = UInt64Builder::with_capacity(total_fps);
-    let mut offsets: Vec<i32> = Vec::with_capacity(entries.len() + 1);
-    let mut running: i32 = 0;
-    offsets.push(running);
-    for (_, fps) in entries.iter() {
-        for &fp in fps {
-            values_builder.append_value(fp);
-        }
-        running = running
-            .checked_add(fps.len() as i32)
-            .expect("postings offset overflow (i32); see LargeListArray TODO");
-        offsets.push(running);
-    }
-    debug_assert!(running >= 0);
-    let values_array = Arc::new(values_builder.finish());
-    let offset_buf = OffsetBuffer::new(offsets.into());
-    let field = match postings_schema().field(2).data_type() {
-        DataType::List(f) => f.clone(),
-        other => anyhow::bail!("postings schema column 2 should be List, found {other:?}"),
-    };
-    let list = ListArray::new(field, offset_buf, values_array, None);
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(names), Arc::new(values), Arc::new(list)],
-    )
-    .context("constructing postings RecordBatch")?;
-
+    let batch = postings_record_batch(entries)?;
     let mut w = ArrowWriter::try_new(writer, schema, Some(props.clone()))
         .context("ArrowWriter::try_new (postings)")?;
     w.write(&batch).context("ArrowWriter::write (postings)")?;
     w.close().context("ArrowWriter::close (postings)")?;
     Ok(())
+}
+
+/// Build one canonical postings batch.
+///
+/// This is exposed for streaming writers, which call it on bounded slices rather
+/// than constructing one batch for an entire sidecar. List offsets are checked
+/// and malformed/pathological input is returned as an error instead of panicking.
+pub fn postings_record_batch(entries: &[PostingsEntry]) -> Result<RecordBatch> {
+    let schema = postings_schema();
+    if entries.is_empty() {
+        return Ok(RecordBatch::new_empty(schema));
+    }
+
+    let names: StringArray = entries.iter().map(|((k, _), _)| Some(k.as_str())).collect();
+    let values: StringArray = entries.iter().map(|((_, v), _)| Some(v.as_str())).collect();
+    let total_fps = entries.iter().try_fold(0usize, |total, (_, fps)| {
+        total
+            .checked_add(fps.len())
+            .context("postings fingerprint count overflow")
+    })?;
+    anyhow::ensure!(
+        total_fps <= i32::MAX as usize,
+        "postings batch has {total_fps} fingerprints, exceeding List offset capacity"
+    );
+    let mut values_builder = UInt64Builder::with_capacity(total_fps);
+    let mut offsets: Vec<i32> = Vec::with_capacity(entries.len() + 1);
+    let mut running: i32 = 0;
+    offsets.push(running);
+    for (_, fps) in entries {
+        values_builder.append_slice(fps);
+        let count =
+            i32::try_from(fps.len()).context("postings row exceeds List offset capacity")?;
+        running = running
+            .checked_add(count)
+            .context("postings List offset overflow")?;
+        offsets.push(running);
+    }
+    let values_array = Arc::new(values_builder.finish());
+    let offset_buf = OffsetBuffer::new(offsets.into());
+    let field = match schema.field(2).data_type() {
+        DataType::List(f) => f.clone(),
+        other => anyhow::bail!("postings schema column 2 should be List, found {other:?}"),
+    };
+    let list = ListArray::new(field, offset_buf, values_array, None);
+    RecordBatch::try_new(
+        schema,
+        vec![Arc::new(names), Arc::new(values), Arc::new(list)],
+    )
+    .context("constructing postings RecordBatch")
 }
 
 /// Read postings parquet bytes back into `Vec<PostingsEntry>`. Used by

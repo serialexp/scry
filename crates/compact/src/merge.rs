@@ -20,21 +20,24 @@
 //! `main → [postings] → [bloom] → meta.json` so the meta sidecar (the
 //! "block exists" signal for reconcile) lands last.
 
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use arrow::array::{Array, StringArray, UInt64Array};
+use arrow::array::{Array, ListArray, StringArray, UInt64Array};
+use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::prelude::{col, ParquetReadOptions, SessionConfig, SessionContext};
-use futures::StreamExt;
+use futures::{Stream, StreamExt, TryStreamExt};
 use object_store::buffered::BufWriter as ObjectStoreWriter;
 use object_store::{path::Path as ObjPath, ObjectStore, ObjectStoreExt};
+use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 use parquet::arrow::AsyncArrowWriter;
-use scry_block::postings::{
-    decode_postings, encode_postings, finish_postings_merge, merge_postings_into,
-};
+use scry_block::postings::{postings_record_batch, postings_schema, PostingsEntry};
 use scry_block::{
     block_path, compacted_ancestor_closure, BlockBuilderConfig, BlockMeta, BodyBloomBuilder, Fence,
 };
@@ -44,6 +47,48 @@ use uuid::Uuid;
 /// Per-signal knobs the merge needs: the sort key (so the merged block
 /// keeps the same intra-block ordering its readers prune on), and which
 /// sidecars to rebuild.
+struct OutputCleanupGuard {
+    store: Arc<dyn ObjectStore>,
+    paths: Vec<ObjPath>,
+    armed: Arc<AtomicBool>,
+}
+
+impl OutputCleanupGuard {
+    fn new(store: Arc<dyn ObjectStore>, paths: Vec<ObjPath>) -> Self {
+        Self {
+            store,
+            paths,
+            armed: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    fn disarm(&self) {
+        self.armed.store(false, Ordering::Release);
+    }
+
+    fn is_armed(&self) -> bool {
+        self.armed.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for OutputCleanupGuard {
+    fn drop(&mut self) {
+        if !self.armed.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let store = self.store.clone();
+        let paths = self.paths.clone();
+        // Async cleanup cannot run directly in Drop. Spawn it on the merge's
+        // Tokio runtime so cancellation still removes completed pre-commit
+        // objects; crash cleanup remains the object-store lifecycle's job.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                cleanup_paths(&store, &paths).await;
+            });
+        }
+    }
+}
+
 struct SignalSpec {
     /// Columns the merged main parquet is ordered by, ascending — must
     /// match the block builder's sort for this signal.
@@ -55,6 +100,67 @@ struct SignalSpec {
     body_col: Option<&'static str>,
     /// Whether this signal carries a `series_types` map (metrics only).
     has_series_types: bool,
+}
+
+type PostingsStream = Pin<
+    Box<dyn Stream<Item = std::result::Result<RecordBatch, parquet::errors::ParquetError>> + Send>,
+>;
+
+struct PostingsCursor {
+    stream: PostingsStream,
+    batch: Option<RecordBatch>,
+    row: usize,
+    current: Option<PostingsEntry>,
+}
+
+impl PostingsCursor {
+    async fn advance(&mut self) -> Result<()> {
+        loop {
+            if let Some(batch) = &self.batch {
+                if self.row < batch.num_rows() {
+                    let names = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .context("postings col 0 not Utf8")?;
+                    let values = batch
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .context("postings col 1 not Utf8")?;
+                    let lists = batch
+                        .column(2)
+                        .as_any()
+                        .downcast_ref::<ListArray>()
+                        .context("postings col 2 not List")?;
+                    let fps = lists.value(self.row);
+                    let fps = fps
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .context("postings fingerprint list not UInt64")?;
+                    self.current = Some((
+                        (
+                            names.value(self.row).to_owned(),
+                            values.value(self.row).to_owned(),
+                        ),
+                        fps.values().to_vec(),
+                    ));
+                    self.row += 1;
+                    return Ok(());
+                }
+            }
+            self.batch = self
+                .stream
+                .try_next()
+                .await
+                .context("read postings batch")?;
+            self.row = 0;
+            if self.batch.is_none() {
+                self.current = None;
+                return Ok(());
+            }
+        }
+    }
 }
 
 fn spec_for(signal: &str) -> Result<SignalSpec> {
@@ -121,8 +227,66 @@ pub async fn merge_blocks(
     block_cfg: &BlockBuilderConfig,
     fence: &dyn Fence,
     resources: &Arc<crate::resource::CompactResources>,
+    admitted_non_df_bytes: u64,
 ) -> Result<Option<BlockMeta>> {
     anyhow::ensure!(!inputs.is_empty(), "merge_blocks called with no inputs");
+    let block_uuid = Uuid::now_v7();
+    let ts_min = inputs
+        .iter()
+        .map(|entry| entry.meta.ts_min_unix_nano)
+        .min()
+        .expect("non-empty");
+    let staged_paths = ["body.bloom", "postings.parquet", "parquet"]
+        .into_iter()
+        .map(|suffix| ObjPath::from(block_path(signal, ts_min, writer_id, block_uuid, suffix)))
+        .collect();
+    let cleanup = OutputCleanupGuard::new(store.clone(), staged_paths);
+    let result = merge_blocks_inner(
+        store.clone(),
+        bucket,
+        signal,
+        inputs,
+        out_level,
+        writer_id,
+        block_uuid,
+        block_cfg,
+        fence,
+        resources,
+        admitted_non_df_bytes,
+        &cleanup,
+    )
+    .await;
+
+    match &result {
+        Ok(Some(_)) => cleanup.disarm(),
+        Ok(None) => {
+            cleanup_paths(&store, &cleanup.paths).await;
+            cleanup.disarm();
+        }
+        Err(_) if cleanup.is_armed() => {
+            cleanup_paths(&store, &cleanup.paths).await;
+            cleanup.disarm();
+        }
+        Err(_) => {}
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn merge_blocks_inner(
+    store: Arc<dyn ObjectStore>,
+    bucket: &str,
+    signal: &str,
+    inputs: &[CatalogEntry],
+    out_level: u32,
+    writer_id: Uuid,
+    block_uuid: Uuid,
+    block_cfg: &BlockBuilderConfig,
+    fence: &dyn Fence,
+    resources: &Arc<crate::resource::CompactResources>,
+    admitted_non_df_bytes: u64,
+    cleanup: &OutputCleanupGuard,
+) -> Result<Option<BlockMeta>> {
     let spec = spec_for(signal)?;
 
     // Catalog entries intentionally omit sidecar-only fields. Fetch every
@@ -150,7 +314,6 @@ pub async fn merge_blocks(
         input_metas.len() == inputs.len(),
         "not all input metadata sidecars were loaded"
     );
-    let block_uuid = Uuid::now_v7();
     let compacted_from = compacted_ancestor_closure(block_uuid, &input_metas)
         .context("validate compacted ancestry")?;
 
@@ -207,14 +370,22 @@ pub async fn merge_blocks(
     let df = ctx
         .read_parquet(paths, ParquetReadOptions::default())
         .await
+        .map_err(crate::resource::CompactResources::classify_datafusion)
         .context("read_parquet over input blocks")?;
     let sort_exprs: Vec<_> = spec
         .sort_cols
         .iter()
         .map(|c| col(*c).sort(true, false))
         .collect();
-    let df = df.sort(sort_exprs).context("sort merged inputs")?;
-    let mut stream = df.execute_stream().await.context("execute merge stream")?;
+    let df = df
+        .sort(sort_exprs)
+        .map_err(crate::resource::CompactResources::classify_datafusion)
+        .context("sort merged inputs")?;
+    let mut stream = df
+        .execute_stream()
+        .await
+        .map_err(crate::resource::CompactResources::classify_datafusion)
+        .context("execute merge stream")?;
     let out_schema = stream.schema();
 
     // ── Streaming pass: write main parquet, accumulate sidecar state. ─
@@ -239,75 +410,81 @@ pub async fn merge_blocks(
         .context("AsyncArrowWriter::try_new (merged main)")?;
     let mut row_count: u64 = 0;
 
-    while let Some(batch) = stream.next().await {
-        let batch = batch.context("reading merged batch")?;
-        row_count += batch.num_rows() as u64;
+    let write_result: Result<()> = async {
+        while let Some(batch) = stream.next().await {
+            let batch = batch
+                .map_err(crate::resource::CompactResources::classify_datafusion)
+                .context("reading merged batch")?;
+            row_count += batch.num_rows() as u64;
 
-        if let (Some(set), Some(idx)) = (fp_set.as_mut(), fp_idx) {
-            let arr = batch
-                .column(idx)
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .context("fingerprint column is not UInt64")?;
-            for v in arr.iter().flatten() {
-                set.insert(v);
-            }
-        }
-        if let (Some(bb), Some(idx)) = (bloom_builder.as_mut(), body_idx) {
-            let arr = batch
-                .column(idx)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .context("body column is not Utf8")?;
-            for i in 0..arr.len() {
-                if arr.is_valid(i) {
-                    bb.add_body(arr.value(i));
+            if let (Some(set), Some(idx)) = (fp_set.as_mut(), fp_idx) {
+                let arr = batch
+                    .column(idx)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .context("fingerprint column is not UInt64")?;
+                let fingerprint_budget = admitted_non_df_bytes / 6;
+                for v in arr.iter().flatten() {
+                    if !set.contains(&v)
+                        && (set.len() as u64).saturating_add(1).saturating_mul(32)
+                            > fingerprint_budget
+                    {
+                        return Err(crate::resource::ResourceError::SidecarLimit {
+                            component: "all fingerprints",
+                            budget_bytes: fingerprint_budget,
+                        }
+                        .into());
+                    }
+                    set.insert(v);
                 }
             }
+            if let (Some(bb), Some(idx)) = (bloom_builder.as_mut(), body_idx) {
+                let arr = batch
+                    .column(idx)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .context("body column is not Utf8")?;
+                // Leave room in the admitted non-DF allocation for the parquet
+                // writer, upload chunk, fingerprints, and final bloom bitset.
+                let bloom_budget = admitted_non_df_bytes / 3;
+                for i in 0..arr.len() {
+                    if arr.is_valid(i) && !bb.add_body_bounded(arr.value(i), bloom_budget as usize)
+                    {
+                        return Err(crate::resource::ResourceError::SidecarLimit {
+                            component: "body bloom n-grams",
+                            budget_bytes: bloom_budget,
+                        }
+                        .into());
+                    }
+                }
+            }
+            writer.write(&batch).await.context("write merged batch")?;
+            if writer.in_progress_size() >= resources.config().parquet_writer_memory_bytes {
+                writer
+                    .flush()
+                    .await
+                    .context("flush merged parquet row group")?;
+            }
         }
-        writer.write(&batch).await.context("write merged batch")?;
-        if writer.in_progress_size() >= resources.config().parquet_writer_memory_bytes {
-            writer
-                .flush()
-                .await
-                .context("flush merged parquet row group")?;
-        }
+        writer.finish().await.context("close merged main parquet")?;
+        Ok(())
     }
-    writer.close().await.context("close merged main parquet")?;
+    .await;
+    if let Err(error) = write_result {
+        let mut sink = writer.into_inner();
+        if let Err(abort_error) = sink.abort().await {
+            tracing::warn!(%abort_error, "failed to abort merged parquet multipart upload");
+        }
+        return Err(error);
+    }
     let byte_size = store
         .head(&main_path)
         .await
         .context("head merged main parquet")?
         .size;
 
-    // ── Postings (metrics/logs): union the inputs' postings. ─────────
+    // ── Postings (metrics/logs): bounded k-way union of sorted inputs. ─
     let (has_postings, postings_size_bytes) = if spec.fp_col.is_some() {
-        let mut postings = HashMap::new();
-        for e in inputs {
-            if !e.meta.has_postings {
-                continue;
-            }
-            let p = block_path(
-                &e.meta.signal,
-                e.meta.ts_min_unix_nano,
-                e.meta.writer_id,
-                e.meta.uuid,
-                "postings.parquet",
-            );
-            let bytes = store
-                .get(&ObjPath::from(p))
-                .await
-                .context("get input postings")?
-                .bytes()
-                .await
-                .context("read input postings body")?;
-            let decoded = decode_postings(bytes).context("decode input postings")?;
-            merge_postings_into(&mut postings, decoded);
-        }
-        let merged = finish_postings_merge(postings);
-        let props = block_cfg.postings_writer_props()?;
-        let bytes = encode_postings(&merged, &props).context("encode merged postings")?;
-        let size = bytes.len() as u64;
         let path = ObjPath::from(block_path(
             signal,
             ts_min,
@@ -315,10 +492,15 @@ pub async fn merge_blocks(
             block_uuid,
             "postings.parquet",
         ));
-        store
-            .put(&path, bytes.into())
-            .await
-            .with_context(|| format!("upload merged object {path}"))?;
+        let size = merge_postings_streaming(
+            store.clone(),
+            inputs,
+            path,
+            block_cfg,
+            resources,
+            admitted_non_df_bytes / 3,
+        )
+        .await?;
         (true, Some(size))
     } else {
         (false, None)
@@ -348,9 +530,20 @@ pub async fn merge_blocks(
     // ── series_types (metrics): union from input sidecars. ───────────
     let series_types = if spec.has_series_types {
         let mut map: HashMap<u64, u8> = HashMap::new();
+        let series_types_budget = admitted_non_df_bytes / 6;
         for meta in &input_metas {
             if let Some(types) = &meta.series_types {
                 for &(fp, t) in types {
+                    if !map.contains_key(&fp)
+                        && (map.len() as u64).saturating_add(1).saturating_mul(32)
+                            > series_types_budget
+                    {
+                        return Err(crate::resource::ResourceError::SidecarLimit {
+                            component: "series types",
+                            budget_bytes: series_types_budget,
+                        }
+                        .into());
+                    }
                     map.entry(fp).or_insert(t);
                 }
             }
@@ -396,8 +589,15 @@ pub async fn merge_blocks(
         wal_seg_max: None,
         wal_shard: None,
     };
-    let meta_bytes =
-        Bytes::from(serde_json::to_vec_pretty(&meta).context("serialise merged meta")?);
+    let meta_bytes = Bytes::from(serde_json::to_vec(&meta).context("serialise merged meta")?);
+    let meta_budget = admitted_non_df_bytes / 6;
+    if meta_bytes.len() as u64 > meta_budget {
+        return Err(crate::resource::ResourceError::SidecarLimit {
+            component: "meta.json",
+            budget_bytes: meta_budget,
+        }
+        .into());
+    }
 
     // Main and sidecars have now been uploaded in durability order. None carry
     // the "block exists" signal on their own — reconcile keys on meta.json — so
@@ -419,6 +619,10 @@ pub async fn merge_blocks(
     }
 
     // Commit: meta.json last (durability invariant — the "block exists" signal).
+    // From the first attempt onward the result can be ambiguous: a store may
+    // persist the object and lose the response. Never roll back data objects
+    // after this point; reconciliation provides idempotent completion.
+    cleanup.disarm();
     let meta_path = ObjPath::from(block_path(
         signal,
         ts_min,
@@ -441,6 +645,142 @@ pub async fn merge_blocks(
         "merged block uploaded"
     );
     Ok(Some(meta))
+}
+
+/// K-way merge the already-sorted input postings streams into bounded output
+/// batches. Only one input record batch, one current row per input, and one
+/// output batch are retained at a time. A single pathological postings row is
+/// rejected against the permit-relative budget, though parquet decoding itself
+/// may allocate that row before it can be inspected.
+async fn merge_postings_streaming(
+    store: Arc<dyn ObjectStore>,
+    inputs: &[CatalogEntry],
+    output_path: ObjPath,
+    block_cfg: &BlockBuilderConfig,
+    resources: &Arc<crate::resource::CompactResources>,
+    postings_budget: u64,
+) -> Result<u64> {
+    let mut cursors = Vec::new();
+    for entry in inputs.iter().filter(|entry| entry.meta.has_postings) {
+        let path = ObjPath::from(block_path(
+            &entry.meta.signal,
+            entry.meta.ts_min_unix_nano,
+            entry.meta.writer_id,
+            entry.meta.uuid,
+            "postings.parquet",
+        ));
+        let meta = store
+            .head(&path)
+            .await
+            .with_context(|| format!("HEAD input postings {path}"))?;
+        let reader =
+            ParquetObjectReader::new(store.clone(), path.clone()).with_file_size(meta.size);
+        let stream = ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .with_context(|| format!("open input postings {path}"))?
+            .with_batch_size(1024)
+            .build()
+            .with_context(|| format!("build input postings stream {path}"))?;
+        let mut cursor = PostingsCursor {
+            stream: Box::pin(stream),
+            batch: None,
+            row: 0,
+            current: None,
+        };
+        cursor.advance().await?;
+        cursors.push(cursor);
+    }
+
+    let props = block_cfg.postings_writer_props()?;
+    let sink = ObjectStoreWriter::with_capacity(
+        store.clone(),
+        output_path.clone(),
+        resources.config().output_buffer_bytes,
+    )
+    .with_max_concurrency(1);
+    let mut writer = AsyncArrowWriter::try_new(sink, postings_schema(), Some(props))
+        .context("create merged postings writer")?;
+    let limit = postings_budget.max(1);
+    let batch_limit = resources
+        .config()
+        .parquet_writer_memory_bytes
+        .min(limit as usize)
+        .max(1);
+    let result: Result<()> = async {
+        let mut heap = BinaryHeap::new();
+        for (index, cursor) in cursors.iter().enumerate() {
+            if let Some((key, _)) = &cursor.current {
+                heap.push(Reverse((key.clone(), index)));
+            }
+        }
+        let mut output = Vec::<PostingsEntry>::new();
+        let mut output_bytes = 0usize;
+        while let Some(Reverse((key, index))) = heap.pop() {
+            let mut fps = Vec::new();
+            let mut matching = vec![index];
+            while let Some(Reverse((next, _))) = heap.peek() {
+                if next != &key {
+                    break;
+                }
+                let Reverse((_, i)) = heap.pop().expect("peeked heap entry");
+                matching.push(i);
+            }
+            for i in matching {
+                let (_, values) = cursors[i].current.take().context("missing postings row")?;
+                let requested = fps.len().saturating_add(values.len()).saturating_mul(8) as u64;
+                if requested > limit {
+                    return Err(crate::resource::ResourceError::RequestTooLarge {
+                        requested_bytes: requested,
+                        budget_bytes: limit,
+                    }
+                    .into());
+                }
+                fps.extend(values);
+                cursors[i].advance().await?;
+                if let Some((next, _)) = &cursors[i].current {
+                    heap.push(Reverse((next.clone(), i)));
+                }
+            }
+            fps.sort_unstable();
+            fps.dedup();
+            output_bytes =
+                output_bytes.saturating_add(key.0.len() + key.1.len() + fps.len() * 8 + 16);
+            output.push((key, fps));
+            if output_bytes >= batch_limit {
+                writer.write(&postings_record_batch(&output)?).await?;
+                output.clear();
+                output_bytes = 0;
+                if writer.in_progress_size() >= batch_limit {
+                    writer.flush().await?;
+                }
+            }
+        }
+        if !output.is_empty() || cursors.is_empty() {
+            writer.write(&postings_record_batch(&output)?).await?;
+        }
+        writer.finish().await?;
+        Ok(())
+    }
+    .await;
+    if let Err(error) = result {
+        let mut sink = writer.into_inner();
+        if let Err(abort_error) = sink.abort().await {
+            tracing::warn!(%abort_error, "failed to abort postings multipart upload");
+        }
+        return Err(error);
+    }
+    Ok(store.head(&output_path).await?.size)
+}
+
+async fn cleanup_paths(store: &Arc<dyn ObjectStore>, paths: &[ObjPath]) {
+    for path in paths {
+        if let Err(error) = store.delete(path).await {
+            // A missing object is the common case when failure happened before
+            // that stage. ObjectStore has no portable not-found predicate, so
+            // retain this as debug-only diagnostics rather than masking failure.
+            tracing::debug!(%path, %error, "failed to clean uncommitted compaction object");
+        }
+    }
 }
 
 /// Fetch and parse a block's `meta.json` sidecar from the bucket.

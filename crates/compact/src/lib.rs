@@ -31,7 +31,8 @@ pub mod policy;
 pub mod resource;
 
 pub use engine::{
-    compact_once, compact_partition, reap_pending, warn_oversized, CompactReport, PartitionOutcome,
+    compact_once, compact_partition, is_resource_failure, reap_pending, warn_oversized,
+    CompactReport, PartitionOutcome,
 };
 pub use merge::merge_blocks;
 pub use policy::{
@@ -124,8 +125,21 @@ pub async fn run(args: Args) -> Result<()> {
         .validate()
         .context("invalid compaction policy")?;
     let block_cfg = BlockBuilderConfig::default();
-    let resources = CompactResources::new(ResourceConfig::default())
-        .context("constructing compaction resource envelope")?;
+    // The dedicated daemon has the full mount-aware cgroup resolver. This
+    // library entry point retains a conservative auto-detected default and an
+    // environment override for callers that need an explicit envelope.
+    let mut resource_cfg = ResourceConfig::default();
+    if let Ok(raw) = std::env::var("SCRY_COMPACT_MEMORY_BUDGET_MIB") {
+        let mib: u64 = raw
+            .parse()
+            .context("SCRY_COMPACT_MEMORY_BUDGET_MIB must be an integer")?;
+        resource_cfg = ResourceConfig::from_envelope(
+            mib.checked_mul(1024 * 1024)
+                .context("SCRY_COMPACT_MEMORY_BUDGET_MIB is too large")?,
+        );
+    }
+    let resources =
+        CompactResources::new(resource_cfg).context("constructing compaction resource envelope")?;
 
     // Bring the catalog in line with the bucket once before compacting,
     // so the tool works against a shared bucket with no online catalog.
