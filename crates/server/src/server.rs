@@ -42,7 +42,10 @@ use uuid::Uuid;
 use crate::live_ring::{LiveLogRecord, LiveRing, RetainingLogsAppender};
 use crate::pipeline::{DecodeFn, Pipeline, ShardedPipeline};
 use crate::stats::ServerMetrics;
-use crate::tail::{SubscriptionRegistry, TailPayload, TappingLogsAppender, TappingMetricsAppender};
+use crate::tail::{
+    SubscriptionRegistry, TailPayload, TappingLogsAppender, TappingMetricsAppender,
+    TappingMetricsV2Appender,
+};
 
 /// Per-subscriber live-tail delivery channel depth. Bounds how many
 /// records can queue for a slow tail client before the ingest tap starts
@@ -587,7 +590,7 @@ async fn handle(
                 scry_proto::constants::CAP_STRUCTURED_METRICS_V2
             } else {
                 0
-            }),
+            }) | scry_proto::constants::CAP_STRUCTURED_METRICS_TAIL,
             suggested_batch_bytes: DEFAULT_SUGGESTED_BATCH_BYTES,
             max_batch_bytes: DEFAULT_MAX_BATCH_BYTES,
             max_inflight_batches: DEFAULT_MAX_INFLIGHT_BATCHES,
@@ -812,9 +815,21 @@ async fn handle(
                                 .and_then(|bytes| bytes.try_into().ok())
                                 .map(u32::from_be_bytes)
                                 == Some(scry_proto::constants::METRICS_BATCH_V2_MAGIC);
-                            let decoded = if is_structured {
-                                // Structured metric tail frames are capability-gated follow-up;
-                                // storage remains authoritative and must never be scalarized.
+                            let decoded = if is_structured && tail.subscriber_count() > 0 {
+                                let mut tap = TappingMetricsV2Appender::new(
+                                    scratch,
+                                    tail.as_ref(),
+                                    Signal::Metrics as u8,
+                                )
+                                .await;
+                                scry_proto::streaming_v2::decode_metrics_batch_v2_into(
+                                    &decompressed,
+                                    scry_proto::streaming_v2::DecodeLimits::default(),
+                                    &mut tap,
+                                )
+                                .map(|(_, points)| points as usize)
+                                .map_err(|e| anyhow::anyhow!("MetricsBatchV2: {e}"))
+                            } else if is_structured {
                                 decode_fn(&decompressed, scratch)
                             } else if tail.subscriber_count() > 0 {
                                 let mut tap = TappingMetricsAppender::new(
@@ -1278,7 +1293,16 @@ async fn handle(
                     %peer, session_id, signal = sub.signal,
                     matchers = filter.len(), "tail subscribe"
                 );
-                let (sub_id, mut rx) = tail.register(sub.signal, filter, TAIL_CHANNEL_CAP).await;
+                let structured_metrics =
+                    hello.capabilities & scry_proto::constants::CAP_STRUCTURED_METRICS_TAIL != 0;
+                let (sub_id, mut rx) = tail
+                    .register_with_capabilities(
+                        sub.signal,
+                        filter,
+                        TAIL_CHANNEL_CAP,
+                        structured_metrics,
+                    )
+                    .await;
 
                 loop {
                     tokio::select! {
@@ -1312,6 +1336,17 @@ async fn handle(
                                             value: *value,
                                             labels: (*it.labels).clone(),
                                         }),
+                                        TailPayload::StructuredMetric {
+                                            series_fingerprint,
+                                            descriptor,
+                                            point,
+                                        } => build::tail_metric_point_v2(
+                                            it.signal,
+                                            *series_fingerprint,
+                                            (*it.labels).clone(),
+                                            descriptor.clone(),
+                                            point.clone(),
+                                        ),
                                     };
                                     if write_frame(&mut wr, &frame).await.is_err()
                                         || wr.flush().await.is_err()
@@ -1554,6 +1589,7 @@ fn short_msg_name(m: &FrameMsg) -> &'static str {
         FrameMsg::Subscribe(_) => "Subscribe",
         FrameMsg::TailRecord(_) => "TailRecord",
         FrameMsg::TailSample(_) => "TailSample",
+        FrameMsg::TailMetricPointV2(_) => "TailMetricPointV2",
         FrameMsg::LiveQuery(_) => "LiveQuery",
         FrameMsg::LiveBatch(_) => "LiveBatch",
     }

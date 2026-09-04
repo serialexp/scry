@@ -326,6 +326,7 @@ fn short_msg_name(m: &FrameMsg) -> &'static str {
         FrameMsg::Subscribe(_) => "Subscribe",
         FrameMsg::TailRecord(_) => "TailRecord",
         FrameMsg::TailSample(_) => "TailSample",
+        FrameMsg::TailMetricPointV2(_) => "TailMetricPointV2",
         FrameMsg::LiveQuery(_) => "LiveQuery",
         FrameMsg::LiveBatch(_) => "LiveBatch",
     }

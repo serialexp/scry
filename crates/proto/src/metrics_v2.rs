@@ -5,11 +5,46 @@
 //! enforces the same descriptor/point kind separation.
 
 use crate::generated::{
-    MetricCountV2, MetricCountV2Value, MetricDescriptorV2, MetricExemplarV2, MetricPointV2,
-    MetricPointV2Value, MetricsBatchV2,
+    LabelPair, MetricCountV2, MetricCountV2Value, MetricDescriptorV2, MetricExemplarV2,
+    MetricPointV2, MetricPointV2Value, MetricsBatchV2,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use thiserror::Error;
+
+/// Build the canonical label set and fingerprint shared by structured-metrics
+/// storage and live tail. Point attributes override scope attributes, which
+/// override resource attributes; synthetic labels always win.
+pub fn canonical_series(
+    descriptor: &MetricDescriptorV2,
+    point_attributes: &[LabelPair],
+) -> (Vec<LabelPair>, u64) {
+    let mut label_set = BTreeMap::new();
+    for label in &descriptor.resource_attrs {
+        label_set.insert(label.key.clone(), label.value.clone());
+    }
+    for label in &descriptor.scope_attrs {
+        label_set.insert(label.key.clone(), label.value.clone());
+    }
+    if !descriptor.scope_name.is_empty() {
+        label_set.insert("otel.scope.name".into(), descriptor.scope_name.clone());
+    }
+    if !descriptor.scope_version.is_empty() {
+        label_set.insert(
+            "otel.scope.version".into(),
+            descriptor.scope_version.clone(),
+        );
+    }
+    for label in point_attributes {
+        label_set.insert(label.key.clone(), label.value.clone());
+    }
+    label_set.insert("__name__".into(), descriptor.name.clone());
+    let labels: Vec<LabelPair> = label_set
+        .into_iter()
+        .map(|(key, value)| LabelPair { key, value })
+        .collect();
+    let fingerprint = crate::fingerprint::fingerprint(&labels);
+    (labels, fingerprint)
+}
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

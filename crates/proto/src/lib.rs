@@ -48,7 +48,8 @@ pub use generated::{
     Goodbye, GoodbyeInput, GoodbyeOutput, Hello, HelloAck, HelloAckInput, HelloAckOutput,
     HelloInput, HelloOutput, LabelPair, LogEntry, LogStream, LogsBatch, MetricSample, MetricsBatch,
     Ping, PingInput, PingOutput, Pong, PongInput, PongOutput, ProfileBlob, ProfilesBatch,
-    ResourceEntry, ScopeEntry, SeriesDictEntry, Span, SpanEvent, SpanLink, TracesBatch,
+    ResourceEntry, ScopeEntry, SeriesDictEntry, Span, SpanEvent, SpanLink, TailMetricPointV2,
+    TailMetricPointV2Input, TailMetricPointV2Output, TracesBatch,
 };
 
 pub use generated_query::{

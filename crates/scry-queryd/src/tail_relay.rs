@@ -25,13 +25,13 @@ use anyhow::{Context, Result};
 use scry_proto::{
     build,
     constants::{
-        Signal, ERR_BAD_MATCHER, ERR_HELLO_REQUIRED, ERR_PROTOCOL_VERSION, ERR_TAIL_UNAVAILABLE,
-        PROTOCOL_VERSION_V0,
+        Signal, CAP_STRUCTURED_METRICS_TAIL, ERR_BAD_MATCHER, ERR_HELLO_REQUIRED,
+        ERR_PROTOCOL_VERSION, ERR_TAIL_UNAVAILABLE, PROTOCOL_VERSION_V0,
     },
     framing::{read_frame, write_frame},
     Frame, FrameMsg,
 };
-use scry_tail::{dial_subscribe, TailFrame};
+use scry_tail::{dial_subscribe_with_capabilities, TailFrame};
 use scry_valkey::{discover_tail_endpoints, ValkeyClient};
 use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
@@ -156,7 +156,7 @@ async fn serve_conn(
             protocol_version: PROTOCOL_VERSION_V0,
             writer_id: "scry-queryd-tail",
             session_id: 1,
-            capabilities: 0,
+            capabilities: CAP_STRUCTURED_METRICS_TAIL,
             suggested_batch_bytes: 0,
             max_batch_bytes: 0,
             max_inflight_batches: 0,
@@ -201,6 +201,9 @@ async fn serve_conn(
         return Ok(());
     }
     let signal = sub.signal;
+    // Only request structured points upstream when the downstream client opted
+    // in; legacy clients continue receiving the scalar TailSample projection.
+    let upstream_capabilities = hello.capabilities & CAP_STRUCTURED_METRICS_TAIL;
 
     let specs: Vec<String> = sub.matchers.into_iter().map(|m| m.spec).collect();
     // Validate locally for a clean error (each upstream re-validates too).
@@ -241,6 +244,7 @@ async fn serve_conn(
         Arc::new(specs),
         rediscover,
         signal,
+        upstream_capabilities,
     )
     .await
 }
@@ -258,6 +262,7 @@ async fn relay<R, W>(
     // The signal the client subscribed to; every upstream is dialed with it
     // and the reply frame type follows from it.
     signal: u8,
+    upstream_capabilities: u32,
 ) -> Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -297,6 +302,13 @@ where
                                 value: s.value,
                                 labels: s.labels,
                             }),
+                            TailFrame::StructuredMetric(m) => build::tail_metric_point_v2(
+                                m.signal,
+                                m.series_fingerprint,
+                                m.labels,
+                                m.descriptor,
+                                m.point,
+                            ),
                         };
                         if write_frame(wr, &frame).await.is_err() || wr.flush().await.is_err() {
                             break Ok(()); // client gone
@@ -308,7 +320,14 @@ where
             // Periodic rediscovery: reconcile the upstream set.
             _ = tick.tick() => {
                 match discover_tail_endpoints(&valkey).await {
-                    Ok(addrs) => reconcile(&addrs, &mut upstreams, &tx, &matchers, signal),
+                    Ok(addrs) => reconcile(
+                        &addrs,
+                        &mut upstreams,
+                        &tx,
+                        &matchers,
+                        signal,
+                        upstream_capabilities,
+                    ),
                     Err(e) => warn!(%peer, error = %e, "tail rediscovery failed; keeping current upstreams"),
                 }
             }
@@ -339,6 +358,7 @@ fn reconcile(
     tx: &mpsc::Sender<TailFrame>,
     matchers: &Arc<Vec<String>>,
     signal: u8,
+    capabilities: u32,
 ) {
     use std::collections::HashSet;
     let desired: HashSet<&str> = addrs.iter().map(String::as_str).collect();
@@ -365,7 +385,16 @@ fn reconcile(
         let matchers = matchers.clone();
         debug!(upstream = %addr_owned, "tail relay dialing ingester");
         let handle = tokio::spawn(async move {
-            if let Err(e) = dial_subscribe(&addr_owned, signal, &matchers, tx, None).await {
+            if let Err(e) = dial_subscribe_with_capabilities(
+                &addr_owned,
+                signal,
+                &matchers,
+                tx,
+                None,
+                capabilities,
+            )
+            .await
+            {
                 debug!(upstream = %addr_owned, error = %format!("{e:#}"), "tail upstream ended");
             }
         });

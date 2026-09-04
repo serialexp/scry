@@ -19,7 +19,10 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use scry_proto::{
     build,
-    constants::{Signal, PROTOCOL_VERSION_V0, SIGNAL_BIT_LOGS, SIGNAL_BIT_METRICS},
+    constants::{
+        Signal, CAP_STRUCTURED_METRICS_TAIL, PROTOCOL_VERSION_V0, SIGNAL_BIT_LOGS,
+        SIGNAL_BIT_METRICS,
+    },
     framing::{read_frame, write_frame, FrameError},
     Frame, FrameMsg, LabelPair,
 };
@@ -77,6 +80,8 @@ pub enum TailFrame {
     Record(scry_proto::generated::TailRecordOutput),
     /// A metric sample (`TailSample`, signal = Metrics, D-065).
     Sample(scry_proto::generated::TailSampleOutput),
+    /// A structured metric point negotiated with `CAP_STRUCTURED_METRICS_TAIL`.
+    StructuredMetric(scry_proto::generated::TailMetricPointV2Output),
 }
 
 /// The Hello `signals` bitmask to announce for a tail of `signal`. The
@@ -188,6 +193,7 @@ async fn tail_one(
                 text: match &rec {
                     TailFrame::Record(r) => format_record(r),
                     TailFrame::Sample(s) => format_sample(s),
+                    TailFrame::StructuredMetric(m) => format_structured_metric(m),
                 },
             };
             if out_tx.send(line).await.is_err() {
@@ -229,6 +235,27 @@ pub async fn dial_subscribe(
     tx: mpsc::Sender<TailFrame>,
     on_subscribed: Option<oneshot::Sender<()>>,
 ) -> Result<()> {
+    dial_subscribe_with_capabilities(
+        addr,
+        signal,
+        matchers,
+        tx,
+        on_subscribed,
+        CAP_STRUCTURED_METRICS_TAIL,
+    )
+    .await
+}
+
+/// Variant used by relays that must preserve the downstream client's negotiated
+/// capabilities when opening their upstream subscriptions.
+pub async fn dial_subscribe_with_capabilities(
+    addr: &str,
+    signal: u8,
+    matchers: &[String],
+    tx: mpsc::Sender<TailFrame>,
+    on_subscribed: Option<oneshot::Sender<()>>,
+    capabilities: u32,
+) -> Result<()> {
     let stream = TcpStream::connect(addr)
         .await
         .with_context(|| format!("connecting to {addr}"))?;
@@ -249,7 +276,7 @@ pub async fn dial_subscribe(
             agent_version: env!("CARGO_PKG_VERSION"),
             hostname: &hostname_string(),
             signals: signal_bit(signal),
-            capabilities: 0,
+            capabilities,
             resource_attrs: Vec::new(),
         }),
     )
@@ -287,6 +314,11 @@ pub async fn dial_subscribe(
                         break;
                     }
                 }
+                FrameMsg::TailMetricPointV2(m) => {
+                    if tx.send(TailFrame::StructuredMetric(m)).await.is_err() {
+                        break;
+                    }
+                }
                 FrameMsg::Error(e) => {
                     bail!("server sent Error: code={} msg={:?}", e.code, e.message)
                 }
@@ -310,6 +342,16 @@ fn format_record(t: &scry_proto::generated::TailRecordOutput) -> String {
     } else {
         format!("{ts} {level} {labels} {}", t.body)
     }
+}
+
+/// Render a structured point without collapsing histogram or summary data.
+fn format_structured_metric(m: &scry_proto::generated::TailMetricPointV2Output) -> String {
+    format!(
+        "{} {} {:?}",
+        m.descriptor.name,
+        format_labels(&m.labels),
+        m.point.value
+    )
 }
 
 /// Render one metric sample as `<rfc3339 ts> <metric-name> {k=v,…} <value>`

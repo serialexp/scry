@@ -76,6 +76,10 @@
               "when": "value === 0x54"
             },
             {
+              "type": "TailMetricPointV2",
+              "when": "value === 0x55"
+            },
+            {
               "type": "Error",
               "when": "value === 0xF0"
             }
@@ -504,6 +508,17 @@
             "type": "LabelPair"
           }
         }
+      ]
+    },
+    "TailMetricPointV2": {
+      "description": "Capability-gated, self-contained structured metric tail point. Descriptor repetition makes best-effort frame drops safe.",
+      "sequence": [
+        { "name": "tag", "type": "uint8", "const": 85 },
+        { "name": "signal", "type": "uint8" },
+        { "name": "series_fingerprint", "type": "uint64" },
+        { "name": "labels", "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "LabelPair" } },
+        { "name": "descriptor", "type": "MetricDescriptorV2" },
+        { "name": "point", "type": "MetricPointV2" }
       ]
     },
     "LiveQuery": {

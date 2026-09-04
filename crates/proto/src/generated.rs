@@ -23,6 +23,7 @@ pub enum FrameMsg {
     LiveQuery(LiveQueryOutput),
     LiveBatch(LiveBatchOutput),
     TailSample(TailSampleOutput),
+    TailMetricPointV2(TailMetricPointV2Output),
     Error(ErrorOutput),
 }
 
@@ -199,6 +200,17 @@ impl FrameMsg {
                     item.encode_into(encoder)?;
                 }
             }
+            FrameMsg::TailMetricPointV2(v) => {
+                encoder.write_uint8(85);
+                encoder.write_uint8(v.signal);
+                encoder.write_uint64(v.series_fingerprint, Endianness::BigEndian);
+                encoder.write_uint16(v.labels.len() as u16, Endianness::BigEndian);
+                for item in &v.labels {
+                    item.encode_into(encoder)?;
+                }
+                v.descriptor.encode_into(encoder)?;
+                v.point.encode_into(encoder)?;
+            }
             FrameMsg::Error(v) => {
                 encoder.write_uint8(240);
                 encoder.write_uint16(v.code, Endianness::BigEndian);
@@ -228,6 +240,7 @@ impl FrameMsg {
             FrameMsg::LiveQuery(_) => "LiveQuery",
             FrameMsg::LiveBatch(_) => "LiveBatch",
             FrameMsg::TailSample(_) => "TailSample",
+            FrameMsg::TailMetricPointV2(_) => "TailMetricPointV2",
             FrameMsg::Error(_) => "Error",
         }
     }
@@ -294,6 +307,10 @@ impl FrameMsg {
         decoder.seek(start_pos)?;
         if let Ok(v) = TailSampleOutput::decode_with_decoder(decoder) {
             return Ok(FrameMsg::TailSample(v));
+        }
+        decoder.seek(start_pos)?;
+        if let Ok(v) = TailMetricPointV2Output::decode_with_decoder(decoder) {
+            return Ok(FrameMsg::TailMetricPointV2(v));
         }
         decoder.seek(start_pos)?;
         if let Ok(v) = ErrorOutput::decode_with_decoder(decoder) {
@@ -1947,6 +1964,150 @@ impl From<TailSampleInput> for TailSampleOutput {
             series_fingerprint: i.series_fingerprint,
             value: i.value,
             labels: i.labels,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TailMetricPointV2Input {
+    pub signal: u8,
+    pub series_fingerprint: u64,
+    pub labels: Vec<LabelPair>,
+    pub descriptor: MetricDescriptorV2,
+    pub point: MetricPointV2,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TailMetricPointV2Output {
+    pub tag: u8,
+    pub signal: u8,
+    pub series_fingerprint: u64,
+    pub labels: Vec<LabelPair>,
+    pub descriptor: MetricDescriptorV2,
+    pub point: MetricPointV2,
+}
+
+pub type TailMetricPointV2 = TailMetricPointV2Output;
+
+impl TailMetricPointV2Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, &EncodeContext::new())?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.encode_into_with_context(encoder, &EncodeContext::new())
+    }
+
+    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, ctx)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
+
+        // Build parent context for nested struct encoding
+        let mut parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+        parent_fields.insert("signal".to_string(), FieldValue::U8(self.signal));
+        parent_fields.insert("series_fingerprint".to_string(), FieldValue::U64(self.series_fingerprint));
+        // Collect items with sub-field values for typed array 'labels'
+        {
+            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
+            for item in &self.labels {
+                let item_bytes = item.encode()?;
+                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
+                item_fields.insert("key".to_string(), FieldValue::String(item.key.clone()));
+                item_fields.insert("value".to_string(), FieldValue::String(item.value.clone()));
+                items_data.push(("LabelPair".to_string(), item_fields));
+            }
+            parent_fields.insert("labels".to_string(), FieldValue::Items(items_data));
+        }
+        let child_ctx = ctx.extend_with_parent(parent_fields);
+        let _ = &child_ctx; // Used by nested struct encoding
+        encoder.write_byte(85);
+        encoder.write_byte(self.signal);
+        encoder.write_u64_be(self.series_fingerprint);
+        encoder.write_u16_be(self.labels.len() as u16);
+        for item in &self.labels {
+            item.encode_into(encoder)?;
+        }
+        // Encode nested struct descriptor
+        self.descriptor.encode_into(encoder)?;
+        // Encode nested struct point
+        self.point.encode_into(encoder)?;
+        Ok(())
+    }
+
+}
+
+impl TailMetricPointV2Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let tag = decoder.read_byte()?;
+        if tag != 85u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 85, got {}", tag)));
+        }
+        let signal = decoder.read_byte()?;
+        let series_fingerprint = decoder.read_u64_be()?;
+        let length = decoder.read_u16_be()? as usize;
+        let mut labels = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = LabelPair::decode_with_decoder(decoder)?;
+            labels.push(item);
+        }
+        let descriptor = MetricDescriptorV2::decode_with_decoder(decoder)?;
+        let point = MetricPointV2::decode_with_decoder(decoder)?;
+        Ok(Self {
+            tag,
+            signal,
+            series_fingerprint,
+            labels,
+            descriptor,
+            point,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        TailMetricPointV2Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        TailMetricPointV2Input::from(self.clone()).encode_into(encoder)
+    }
+    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
+        TailMetricPointV2Input::from(self.clone()).encode_with_context(ctx)
+    }
+    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
+        TailMetricPointV2Input::from(self.clone()).encode_into_with_context(encoder, ctx)
+    }
+}
+
+impl From<TailMetricPointV2Output> for TailMetricPointV2Input {
+    fn from(o: TailMetricPointV2Output) -> Self {
+        Self {
+            signal: o.signal,
+            series_fingerprint: o.series_fingerprint,
+            labels: o.labels,
+            descriptor: o.descriptor,
+            point: o.point,
+        }
+    }
+}
+
+impl From<TailMetricPointV2Input> for TailMetricPointV2Output {
+    fn from(i: TailMetricPointV2Input) -> Self {
+        Self {
+            tag: 85u8,
+            signal: i.signal,
+            series_fingerprint: i.series_fingerprint,
+            labels: i.labels,
+            descriptor: i.descriptor,
+            point: i.point,
         }
     }
 }

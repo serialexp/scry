@@ -29,6 +29,8 @@ pub const QUERY_WORKER_ERROR_LIMIT: u16 = 3;
 pub const CAP_AGENT_STATUS: u32 = 0x0000_0001;
 /// Peer accepts `MetricsBatchV2` as the decompressed metrics payload.
 pub const CAP_STRUCTURED_METRICS_V2: u32 = 0x0000_0002;
+/// Peer accepts self-contained structured metric points on live-tail streams.
+pub const CAP_STRUCTURED_METRICS_TAIL: u32 = 0x0000_0004;
 
 // ── Hello.signals bitmask ──────────────────────────────────────────────
 pub const SIGNAL_BIT_METRICS: u8 = 0x01;

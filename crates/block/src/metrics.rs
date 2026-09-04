@@ -34,7 +34,7 @@
 //! Same lesson as `crates/block/src/dummy.rs`; see CLAUDE.md
 //! § Performance.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -920,35 +920,8 @@ impl MetricsV2Appender for MetricsBlockBuilder {
             .descriptors
             .get(&id)
             .ok_or_else(|| format!("unknown metric descriptor {id}"))?;
-        // A metric series is a label *set*. Canonicalise with deterministic
-        // precedence (point > scope > resource; synthetic labels always win),
-        // both to avoid duplicate postings and to keep the fingerprint stable
-        // when input attributes arrive in a different order.
-        let mut label_set = BTreeMap::new();
-        for label in &descriptor.resource_attrs {
-            label_set.insert(label.key.clone(), label.value.clone());
-        }
-        for label in &descriptor.scope_attrs {
-            label_set.insert(label.key.clone(), label.value.clone());
-        }
-        if !descriptor.scope_name.is_empty() {
-            label_set.insert("otel.scope.name".into(), descriptor.scope_name.clone());
-        }
-        if !descriptor.scope_version.is_empty() {
-            label_set.insert(
-                "otel.scope.version".into(),
-                descriptor.scope_version.clone(),
-            );
-        }
-        for label in attrs {
-            label_set.insert(label.key.clone(), label.value.clone());
-        }
-        label_set.insert("__name__".into(), descriptor.name.clone());
-        let labels: Vec<LabelPair> = label_set
-            .into_iter()
-            .map(|(key, value)| LabelPair { key, value })
-            .collect();
-        let fingerprint = scry_proto::fingerprint::fingerprint(&labels);
+        // Storage and live tail must identify a structured series identically.
+        let (labels, fingerprint) = scry_proto::metrics_v2::canonical_series(descriptor, attrs);
         if self.series_seen.insert(fingerprint) {
             self.series_dict.push(OwnedSeries {
                 fingerprint,

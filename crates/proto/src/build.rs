@@ -270,6 +270,27 @@ pub struct TailSampleArgs {
 /// [`tail_record`] counterpart for the metrics signal (D-065). Same
 /// best-effort contract: no ordering, no completeness, no relationship to
 /// stored blocks.
+pub fn tail_metric_point_v2(
+    signal: u8,
+    series_fingerprint: u64,
+    labels: Vec<crate::LabelPair>,
+    descriptor: crate::generated::MetricDescriptorV2,
+    point: crate::generated::MetricPointV2,
+) -> Frame {
+    Frame {
+        msg: FrameMsg::TailMetricPointV2(
+            crate::generated::TailMetricPointV2Input {
+                signal,
+                series_fingerprint,
+                labels,
+                descriptor,
+                point,
+            }
+            .into(),
+        ),
+    }
+}
+
 pub fn tail_sample(a: TailSampleArgs) -> Frame {
     Frame {
         msg: FrameMsg::TailSample(

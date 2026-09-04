@@ -42,7 +42,9 @@ use std::sync::{
 
 use scry_match::LabelFilter;
 use scry_proto::generated::LabelPair;
+use scry_proto::generated::{MetricDescriptorV2, MetricPointV2, MetricPointV2Value};
 use scry_proto::streaming::{LogsAppender, MetricsAppender};
+use scry_proto::streaming_v2::MetricsV2Appender;
 use std::collections::HashMap;
 use tokio::sync::{mpsc, RwLock};
 
@@ -69,6 +71,11 @@ pub enum TailPayload {
         series_fingerprint: u64,
         value: f64,
     },
+    StructuredMetric {
+        series_fingerprint: u64,
+        descriptor: MetricDescriptorV2,
+        point: MetricPointV2,
+    },
 }
 
 /// A single record forwarded from the ingest tap to a subscriber. Cheap to
@@ -91,6 +98,7 @@ struct SubHandle {
     id: SubId,
     signal: u8,
     filter: Arc<LabelFilter>,
+    structured_metrics: bool,
     tx: mpsc::Sender<Arc<TailItem>>,
 }
 
@@ -146,6 +154,17 @@ impl SubscriptionRegistry {
         filter: LabelFilter,
         capacity: usize,
     ) -> (SubId, mpsc::Receiver<Arc<TailItem>>) {
+        self.register_with_capabilities(signal, filter, capacity, false)
+            .await
+    }
+
+    pub async fn register_with_capabilities(
+        &self,
+        signal: u8,
+        filter: LabelFilter,
+        capacity: usize,
+        structured_metrics: bool,
+    ) -> (SubId, mpsc::Receiver<Arc<TailItem>>) {
         let (tx, rx) = mpsc::channel(capacity.max(1));
         let mut inner = self.inner.write().await;
         let id = SubId(inner.next_id);
@@ -154,6 +173,7 @@ impl SubscriptionRegistry {
             id,
             signal,
             filter: Arc::new(filter),
+            structured_metrics,
             tx,
         });
         // Publish the new length *after* the push so a concurrent
@@ -391,6 +411,81 @@ impl<A: MetricsAppender> MetricsAppender for TappingMetricsAppender<'_, A> {
     }
 }
 
+/// Structured-metric equivalent of `TappingMetricsAppender`. The descriptor is
+/// repeated in each tail item so drop-on-full delivery cannot orphan a point.
+pub struct TappingMetricsV2Appender<'a, A: MetricsV2Appender> {
+    inner: &'a mut A,
+    descriptors: HashMap<u32, MetricDescriptorV2>,
+    subs: Vec<SubHandle>,
+    dropped: &'a AtomicU64,
+    signal: u8,
+}
+
+impl<'a, A: MetricsV2Appender> TappingMetricsV2Appender<'a, A> {
+    pub async fn new(inner: &'a mut A, registry: &'a SubscriptionRegistry, signal: u8) -> Self {
+        let subs = registry
+            .snapshot_for(signal)
+            .await
+            .into_iter()
+            .filter(|sub| sub.structured_metrics)
+            .collect();
+        Self {
+            inner,
+            descriptors: HashMap::new(),
+            subs,
+            dropped: &registry.dropped,
+            signal,
+        }
+    }
+}
+
+impl<A: MetricsV2Appender> MetricsV2Appender for TappingMetricsV2Appender<'_, A> {
+    fn descriptor(&mut self, descriptor: &MetricDescriptorV2) -> Result<(), String> {
+        self.inner.descriptor(descriptor)?;
+        self.descriptors.insert(descriptor.id, descriptor.clone());
+        Ok(())
+    }
+
+    fn point(&mut self, point: &MetricPointV2) -> Result<(), String> {
+        self.inner.point(point)?;
+        let (descriptor_id, timestamp, attrs) = match &point.value {
+            MetricPointV2Value::ScalarPointV2(v) => {
+                (v.descriptor_id, v.ts_unix_nano, &v.attributes)
+            }
+            MetricPointV2Value::HistogramPointV2(v) => {
+                (v.descriptor_id, v.ts_unix_nano, &v.attributes)
+            }
+            MetricPointV2Value::ExponentialHistogramPointV2(v) => {
+                (v.descriptor_id, v.ts_unix_nano, &v.attributes)
+            }
+            MetricPointV2Value::SummaryPointV2(v) => {
+                (v.descriptor_id, v.ts_unix_nano, &v.attributes)
+            }
+        };
+        let Some(descriptor) = self.descriptors.get(&descriptor_id) else {
+            return Ok(());
+        };
+        let (labels, fingerprint) = scry_proto::metrics_v2::canonical_series(descriptor, attrs);
+        let labels = Arc::new(labels);
+        let item = Arc::new(TailItem {
+            signal: self.signal,
+            ts_unix_nano: timestamp,
+            labels: labels.clone(),
+            payload: TailPayload::StructuredMetric {
+                series_fingerprint: fingerprint,
+                descriptor: descriptor.clone(),
+                point: point.clone(),
+            },
+        });
+        for sub in &self.subs {
+            if sub.filter.keeps(&labels) && sub.tx.try_send(item.clone()).is_err() {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,7 +524,9 @@ mod tests {
     fn body_of(item: &TailItem) -> &str {
         match &item.payload {
             TailPayload::Log { body, .. } => body,
-            TailPayload::Sample { .. } => panic!("expected a Log payload, got a Sample"),
+            TailPayload::Sample { .. } | TailPayload::StructuredMetric { .. } => {
+                panic!("expected a Log payload, got a metric")
+            }
         }
     }
 
@@ -441,7 +538,9 @@ mod tests {
                 series_fingerprint,
                 value,
             } => (*metric_type, *series_fingerprint, *value),
-            TailPayload::Log { .. } => panic!("expected a Sample payload, got a Log"),
+            TailPayload::Log { .. } | TailPayload::StructuredMetric { .. } => {
+                panic!("expected a Sample payload, got another payload")
+            }
         }
     }
 
