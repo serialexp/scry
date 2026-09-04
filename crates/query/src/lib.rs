@@ -46,6 +46,7 @@ pub mod label_enrich;
 pub mod logs;
 pub mod metadata;
 mod metrics_normalize;
+pub mod metrics_sql;
 pub mod postings;
 pub mod postings_cache;
 pub mod profiles;
@@ -390,6 +391,7 @@ pub async fn register_metrics_table_from_candidates(
     q: &Query,
 ) -> Result<()> {
     let table = build_metrics_table_from_candidates(candidates, store.clone(), cache, q).await?;
+    metrics_sql::register_metrics_udfs(ctx);
 
     // Register the object store under the URL the table will query.
     // `register_object_store` routes on (scheme, host).

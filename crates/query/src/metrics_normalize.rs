@@ -110,7 +110,7 @@ fn sparse_type() -> DataType {
     ]))
 }
 
-fn point_fields() -> Fields {
+pub(crate) fn point_fields() -> Fields {
     let floats = || DataType::List(Arc::new(Field::new("item", DataType::Float64, false)));
     let uints = || DataType::List(Arc::new(Field::new("item", DataType::UInt64, false)));
     let histogram = DataType::Struct(fields(vec![
@@ -169,7 +169,7 @@ fn point_fields() -> Fields {
     ])
 }
 
-fn descriptor_fields() -> Fields {
+pub(crate) fn descriptor_fields() -> Fields {
     fields(vec![
         Field::new("name", DataType::Utf8, false),
         Field::new("description", DataType::Utf8, false),
