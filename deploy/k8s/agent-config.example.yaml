@@ -54,3 +54,21 @@ data:
     port = 9100
     # path   = "/metrics"   # default
     # scheme = "http"       # default
+
+    # ── Profiles ──────────────────────────────────────────────────────────────
+    # Pull CPU pprof from pods that explicitly opt in. The pod selects at most
+    # one regular container; operator config below owns all cost ceilings.
+    [profiles]
+    enabled = true
+    interval = "60s"
+    duration = "10s"
+    timeout = "15s"          # must be greater than duration
+    max_body_bytes = 8388608 # hard ceiling; native profile batches are bounded
+    static_labels = { cluster = "gothab-prod" }
+
+    # Workload contract:
+    # metadata.labels["profiles.scry.dev/enabled"] = "true"
+    # metadata.annotations["profiles.scry.dev/port"] = "6060"          # required
+    # metadata.annotations["profiles.scry.dev/container"] = "api"      # required only when spec.containers has >1 entry
+    # metadata.annotations["profiles.scry.dev/path"] = "/debug/pprof/profile" # optional
+    # metadata.annotations["profiles.scry.dev/scheme"] = "http"        # optional: http/https

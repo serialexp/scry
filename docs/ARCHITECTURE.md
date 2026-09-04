@@ -621,6 +621,13 @@ The agent runs a configurable set of collectors:
 - **Prometheus scraper.** Scrapes HTTP `/metrics` endpoints on a
   schedule. Targets discovered via static config, file SD, or a
   pluggable discovery (k8s, EC2, etc. — same shape Prometheus uses).
+- **CPU pprof puller.** The node-local Kubernetes watch discovers pods carrying
+  `profiles.scry.dev/enabled=true`. A pod selects exactly one regular container
+  (inferred only when unambiguous), declares its pprof port, and the operator-owned
+  `[profiles]` config bounds duration, interval, timeout, and payload size. Pulls
+  never overlap, validate and gzip-normalize pprof, then ship `ProfilesBatch` on
+  the native wire. Privileged process sampling is a separate backend milestone,
+  never an automatic fallback for a failed HTTP endpoint.
 - **File tail.** Watches log files with rotation handling. Parses
   according to a configurable format (JSON, plain text with a
   timestamp regex, logfmt).

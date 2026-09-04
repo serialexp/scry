@@ -1,5 +1,6 @@
-# One scry-agent per node. Tails CRI container logs from the host and ships
-# them to the ingest server. Runs as root because /var/log/pods is root-owned.
+# One scry-agent per node. Tails CRI logs, scrapes metrics, and optionally pulls
+# pprof from selected pods. Runs as root because /var/log/pods is root-owned;
+# HTTP pprof pulling itself needs no host PID namespace or kernel capabilities.
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:

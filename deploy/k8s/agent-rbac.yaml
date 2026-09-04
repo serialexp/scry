@@ -1,5 +1,6 @@
 # The agent watches pods (cluster-wide, but field-selected to its own node at
-# runtime) purely to enrich log streams with pod labels. Read-only on pods.
+# runtime) for log enrichment, metrics discovery, and opted-in pprof targets.
+# All access is read-only.
 apiVersion: v1
 kind: ServiceAccount
 metadata:

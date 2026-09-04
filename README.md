@@ -46,9 +46,9 @@ of it. That's `scry`.
   - the **agent** (`scry agent`) — a per-node collector that tails CRI
     container logs **and scrapes Prometheus `/metrics` endpoints**
     (static `--scrape-target`, `prometheus.io/scrape` annotations, the
-    node's kubelet/cadvisor, and label-selector pod discovery), shipping
-    both over the native wire (pprof pull is still planned). A node-side
-    **keep-only label allow-list** (`--keep`, opt-in) lets a busy node
+    node's kubelet/cadvisor, and label-selector pod discovery), plus CPU pprof
+    from explicitly opted-in pods, shipping enabled signals over the native wire.
+    A node-side **keep-only label allow-list** (`--keep`, opt-in) lets a busy node
     forward only the streams that match, dropping the rest before they
     hit the wire (D-043);
   - the **gateway** (`scry gateway`) — a **fan-out hub**. It terminates
@@ -145,8 +145,9 @@ in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); decisions in
   `scripts/smoke-gateway.sh` drives every receiver and encoding end to end
   against a Garage-backed server and queries exact rows for all four signals.
 - **`scry agent`** is a per-node collector (Alloy replacement): it tails
-  Kubernetes pod logs and **scrapes Prometheus `/metrics` endpoints**,
-  shipping both over one native-wire connection. Scrape targets come from
+  Kubernetes pod logs, **scrapes Prometheus `/metrics` endpoints**, and can
+  **pull CPU pprof** from explicitly opted-in pods, shipping all enabled signals
+  over one native-wire connection. Scrape targets come from
   static `--scrape-target` URLs, pods annotated `prometheus.io/scrape`, the
   node's own **kubelet/cadvisor** (HTTPS :10250, SA bearer, configurable TLS),
   and **label-selector pod SD** (`[[metrics.scrape_pods]]`); a **hand-rolled**
@@ -264,9 +265,9 @@ cargo build --release --workspace
 You'll see the sink report something like
 `batches=150 samples=15200 log_entries=2280 spans=740 profiles=37 rejected=0`.
 
-To collect real telemetry, run the **agent** — it tails CRI container logs
-*and* scrapes Prometheus `/metrics` endpoints, shipping both to the server
-over one native-wire connection:
+To collect real telemetry, run the **agent** — it tails CRI container logs,
+scrapes Prometheus `/metrics`, and optionally pulls CPU pprof, shipping enabled
+signals to the server over one native-wire connection:
 
 ```bash
 # Logs only: tail this node's container logs (pod-watch enriches labels).
@@ -332,6 +333,37 @@ fields → stream labels (→ postings, low cardinality), (5) JSON body fields
 → per-entry structured attributes (`Map<Utf8,Utf8>` column), (6) metric
 label key rename + old-key suppression. `deny_unknown_fields` catches typos
 loudly at startup. Sealed by `scripts/smoke-agent-config.sh`.
+
+CPU profiling is operator-enabled in the same file while workload owners select
+one regular container from an opted-in pod:
+
+```toml
+[profiles]
+enabled = true
+interval = "60s"
+duration = "10s"
+timeout = "15s"
+max_body_bytes = 8388608
+static_labels = { cluster = "gothab-prod" }
+```
+
+```yaml
+metadata:
+  labels:
+    profiles.scry.dev/enabled: "true"
+  annotations:
+    profiles.scry.dev/port: "6060"
+    # Required only for multi-container pods; exactly one regular container is profiled.
+    profiles.scry.dev/container: "api"
+    # profiles.scry.dev/path: /debug/pprof/profile
+    # profiles.scry.dev/scheme: http
+```
+
+With one regular container the container annotation may be omitted. Init and
+ephemeral containers are never eligible. Pulls are non-overlapping, responses
+are bounded and validated as pprof, and raw payloads are normalized to gzipped
+pprof before native-wire shipment. Pod annotations cannot raise duration,
+frequency, timeout, or size ceilings.
 
 The `[metrics]` section also owns two more SD pieces for k8s parity (D-048):
 **kubelet/cadvisor scraping** and **label-selector pod discovery**.
@@ -450,6 +482,8 @@ MULTI=1        scripts/smoke.sh   # two instances on one bucket (needs dev-valke
 scripts/smoke-gateway.sh          # OTLP + Pyroscope + remote-write through the gateway
 scripts/smoke-agent-metrics.sh    # scry agent Prometheus scrape → store → query
 scripts/smoke-agent-config.sh     # scry agent TOML pipeline (logs json + metric label_map)
+# Agent pprof HTTP/normalization + Kubernetes selection are covered by focused Rust tests;
+# storage/query profile round-trip remains covered by SIGNAL=profiles scripts/smoke.sh.
 scripts/smoke-webui.sh            # scry web browser surface (auth + multi-target relay)
 ```
 

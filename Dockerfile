@@ -9,7 +9,8 @@
 # gateway` (foreign-protocol push hub — OTLP traces / Pyroscope profiles /
 # Prometheus remote-write), `scry web` (browser query UI), `scry compact`, and
 # `scry retention`. The Kubernetes manifests pick the role via `command:`
-# (e.g. `["scry","ingest",…]`).
+# (e.g. `["scry","ingest",…]`). The agent tails logs, scrapes Prometheus
+# metrics, and can pull pprof from explicitly opted-in pods.
 #
 # kube-rs 3.x sets the toolchain floor (MSRV 1.88) and uses rustls, so the
 # runtime needs no OpenSSL — only CA certificates for TLS to R2/Hetzner.

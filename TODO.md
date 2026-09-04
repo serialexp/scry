@@ -123,6 +123,12 @@ work is tracked below.
       histogram merge, exponential scale alignment, histogram quantile/fraction,
       and PromQL range-vector/staleness semantics. Summary quantiles must remain
       non-mergeable and exact-match only.
+- [ ] Add the bundled Linux process-sampling backend for `scry agent`: resolve the
+      opted-in pod's current container ID to stable cgroup/process handles, ship an
+      isolated opt-in `hostPID` deployment overlay with minimal perf/eBPF capabilities,
+      generate and symbolize pprof, probe degraded capabilities, and qualify amd64 +
+      arm64 across supported kernels. The bounded pod-selected pprof puller is the
+      safe first backend; do not silently fall back to privileged sampling.
 - [ ] Add alpha OTLP Profiles (`v1development`) only with a complete structured
       OTLP-to-pprof conversion; Pyroscope Push v1 is the stable profile ingress.
 - [ ] Add global/per-route concurrency admission to gateway HTTP/gRPC. Request
