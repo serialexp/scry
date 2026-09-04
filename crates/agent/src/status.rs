@@ -9,12 +9,16 @@ pub struct AgentRuntimeStats {
     started: Instant,
     pub log_batches: u64,
     pub metric_batches: u64,
+    pub profile_batches: u64,
     pub log_records: u64,
     pub metric_samples: u64,
+    pub profile_blobs: u64,
     pub log_uncompressed_bytes: u64,
     pub metric_uncompressed_bytes: u64,
+    pub profile_uncompressed_bytes: u64,
     pub log_compressed_bytes: u64,
     pub metric_compressed_bytes: u64,
+    pub profile_compressed_bytes: u64,
     pub reconnect_attempts: u64,
     pub reconnect_successes: u64,
     pub status_send_failures: u64,
@@ -27,12 +31,16 @@ impl Default for AgentRuntimeStats {
             started: Instant::now(),
             log_batches: 0,
             metric_batches: 0,
+            profile_batches: 0,
             log_records: 0,
             metric_samples: 0,
+            profile_blobs: 0,
             log_uncompressed_bytes: 0,
             metric_uncompressed_bytes: 0,
+            profile_uncompressed_bytes: 0,
             log_compressed_bytes: 0,
             metric_compressed_bytes: 0,
+            profile_compressed_bytes: 0,
             reconnect_attempts: 0,
             reconnect_successes: 0,
             status_send_failures: 0,
@@ -50,8 +58,12 @@ pub struct SnapshotInputs<'a> {
     pub metric_pending_bytes: usize,
     pub log_queue_remaining: usize,
     pub metric_queue_remaining: usize,
+    pub profile_queue_remaining: usize,
     pub log_dropped: u64,
     pub metric_dropped: u64,
+    pub profile_pull_failures: u64,
+    pub profile_backpressure_drops: u64,
+    pub profile_targets: usize,
 }
 
 impl AgentRuntimeStats {
@@ -71,10 +83,20 @@ impl AgentRuntimeStats {
         self.last_send_unix_ms = Some(unix_ms());
     }
 
+    pub fn record_profile_batch(&mut self, blobs: u32, uncompressed: u32, compressed: usize) {
+        self.profile_batches += 1;
+        self.profile_blobs += u64::from(blobs);
+        self.profile_uncompressed_bytes += u64::from(uncompressed);
+        self.profile_compressed_bytes += compressed as u64;
+        self.last_send_unix_ms = Some(unix_ms());
+    }
+
     pub fn snapshot(&self, inputs: SnapshotInputs<'_>) -> serde_json::Value {
         let log_depth = LOG_QUEUE_CAPACITY.saturating_sub(inputs.log_queue_remaining);
         let metrics_depth =
             super::METRICS_QUEUE_CAPACITY.saturating_sub(inputs.metric_queue_remaining);
+        let profile_depth =
+            super::PROFILE_QUEUE_CAPACITY.saturating_sub(inputs.profile_queue_remaining);
         json!({
             "role": "agent",
             "instance_id": format!("agent/{}", inputs.node),
@@ -87,14 +109,21 @@ impl AgentRuntimeStats {
                 "server_addr": inputs.server_addr,
                 "log_batches": self.log_batches,
                 "metric_batches": self.metric_batches,
+                "profile_batches": self.profile_batches,
                 "log_records": self.log_records,
                 "metric_samples": self.metric_samples,
+                "profile_blobs": self.profile_blobs,
                 "log_uncompressed_bytes": self.log_uncompressed_bytes,
                 "metric_uncompressed_bytes": self.metric_uncompressed_bytes,
+                "profile_uncompressed_bytes": self.profile_uncompressed_bytes,
                 "log_compressed_bytes": self.log_compressed_bytes,
                 "metric_compressed_bytes": self.metric_compressed_bytes,
+                "profile_compressed_bytes": self.profile_compressed_bytes,
                 "log_dropped": inputs.log_dropped,
                 "metric_dropped": inputs.metric_dropped,
+                "profile_pull_failures": inputs.profile_pull_failures,
+                "profile_backpressure_drops": inputs.profile_backpressure_drops,
+                "profile_targets": inputs.profile_targets,
                 "log_pending_records": inputs.log_pending_records,
                 "log_pending_bytes": inputs.log_pending_bytes,
                 "metric_pending_samples": inputs.metric_pending_samples,
@@ -103,6 +132,8 @@ impl AgentRuntimeStats {
                 "log_queue_capacity": LOG_QUEUE_CAPACITY,
                 "metric_queue_depth": metrics_depth,
                 "metric_queue_capacity": super::METRICS_QUEUE_CAPACITY,
+                "profile_queue_depth": profile_depth,
+                "profile_queue_capacity": super::PROFILE_QUEUE_CAPACITY,
                 "reconnect_attempts": self.reconnect_attempts,
                 "reconnect_successes": self.reconnect_successes,
                 "status_send_failures": self.status_send_failures,
@@ -149,8 +180,12 @@ mod tests {
             metric_pending_bytes: 120,
             log_queue_remaining: LOG_QUEUE_CAPACITY - 2,
             metric_queue_remaining: super::super::METRICS_QUEUE_CAPACITY - 1,
+            profile_queue_remaining: super::super::PROFILE_QUEUE_CAPACITY,
             log_dropped: 5,
             metric_dropped: 6,
+            profile_pull_failures: 2,
+            profile_backpressure_drops: 1,
+            profile_targets: 3,
         });
         assert_eq!(snapshot["instance_id"], "agent/worker-1");
         assert_eq!(snapshot["version"], env!("CARGO_PKG_VERSION"));

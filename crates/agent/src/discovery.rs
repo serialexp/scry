@@ -23,6 +23,7 @@ use scry_proto::LabelPair;
 
 use crate::config::PodScrapeJob;
 use crate::cri::{spawn_tailer, PodPath, RawLog};
+use crate::profile::ProfileTarget;
 use crate::scrape::{self, ClientPool, ScrapeResult, ScrapeTarget};
 
 /// Shared uid → pod-labels map, written by the watcher, read by the batcher.
@@ -40,6 +41,12 @@ pub fn new_target_registry() -> ScrapeTargetRegistry {
     Arc::new(RwLock::new(HashMap::new()))
 }
 
+pub type ProfileTargetRegistry = Arc<RwLock<HashMap<String, ProfileTarget>>>;
+
+pub fn new_profile_target_registry() -> ProfileTargetRegistry {
+    Arc::new(RwLock::new(HashMap::new()))
+}
+
 /// Watch pods scheduled on `node_name` and keep `registry` in sync with their
 /// labels. Runs until `shutdown` flips. Best-effort: if we can't build a
 /// Kubernetes client (e.g. running outside a cluster), we log and return so
@@ -48,6 +55,7 @@ pub fn spawn_pod_watcher(
     node_name: String,
     registry: PodRegistry,
     targets: ScrapeTargetRegistry,
+    profile_targets: ProfileTargetRegistry,
     // Config-driven pod-label SD jobs: a pod matching a job's selector becomes
     // a scrape target even without `prometheus.io/scrape` annotations.
     scrape_pods: Arc<Vec<PodScrapeJob>>,
@@ -73,7 +81,7 @@ pub fn spawn_pod_watcher(
                 }
                 next = stream.try_next() => {
                     match next {
-                        Ok(Some(event)) => apply_event(&registry, &targets, &node_name, &scrape_pods, event).await,
+                        Ok(Some(event)) => apply_event(&registry, &targets, &profile_targets, &node_name, &scrape_pods, event).await,
                         Ok(None) => break,
                         Err(e) => {
                             warn!(error = %e, "pod watch error; backing off");
@@ -90,6 +98,7 @@ pub fn spawn_pod_watcher(
 async fn apply_event(
     registry: &PodRegistry,
     targets: &ScrapeTargetRegistry,
+    profile_targets: &ProfileTargetRegistry,
     node: &str,
     scrape_pods: &[PodScrapeJob],
     event: watcher::Event<Pod>,
@@ -104,11 +113,29 @@ async fn apply_event(
                 // (or loses its IP) is removed.
                 match build_scrape_target(&pod, node, scrape_pods) {
                     Some(t) => {
-                        targets.write().await.insert(uid, t);
+                        targets.write().await.insert(uid.clone(), t);
                     }
                     None => {
                         targets.write().await.remove(&uid);
                     }
+                }
+                let mut profile_guard = profile_targets.write().await;
+                profile_guard.retain(|_, target| !target.key.starts_with(&format!("{uid}/")));
+                if let Some(target) = build_profile_target(&pod, node) {
+                    profile_guard.insert(target.key.clone(), target);
+                } else if pod
+                    .metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|labels| labels.get("profiles.scry.dev/enabled"))
+                    .map(String::as_str)
+                    == Some("true")
+                {
+                    warn!(
+                        pod = %pod.metadata.name.as_deref().unwrap_or(""),
+                        namespace = %pod.metadata.namespace.as_deref().unwrap_or(""),
+                        "ignoring invalid pprof opt-in; require pod IP, a valid port, and exactly one selected regular container"
+                    );
                 }
             }
         }
@@ -116,6 +143,10 @@ async fn apply_event(
             if let Some(uid) = pod.metadata.uid.as_ref() {
                 registry.write().await.remove(uid);
                 targets.write().await.remove(uid);
+                profile_targets
+                    .write()
+                    .await
+                    .retain(|_, target| !target.key.starts_with(&format!("{uid}/")));
             }
         }
         watcher::Event::Init | watcher::Event::InitDone => {}
@@ -265,6 +296,88 @@ fn ensure_leading_slash(path: &str) -> String {
     } else {
         format!("/{path}")
     }
+}
+
+/// Pure Kubernetes pod-to-CPU-profile target selection.
+pub fn build_profile_target(pod: &Pod, node: &str) -> Option<ProfileTarget> {
+    let labels = pod.metadata.labels.as_ref()?;
+    if labels.get("profiles.scry.dev/enabled").map(String::as_str) != Some("true") {
+        return None;
+    }
+    let uid = pod.metadata.uid.clone()?;
+    let ip = pod.status.as_ref()?.pod_ip.clone()?;
+    let containers = &pod.spec.as_ref()?.containers;
+    let annotations = pod.metadata.annotations.as_ref();
+    let selected = match annotations.and_then(|a| a.get("profiles.scry.dev/container")) {
+        Some(name) => containers.iter().find(|c| &c.name == name)?,
+        None if containers.len() == 1 => &containers[0],
+        None => return None,
+    };
+    let port: u16 = annotations?.get("profiles.scry.dev/port")?.parse().ok()?;
+    if port == 0 {
+        return None;
+    }
+    let scheme = annotations
+        .and_then(|a| a.get("profiles.scry.dev/scheme"))
+        .map(String::as_str)
+        .unwrap_or("http");
+    if !matches!(scheme, "http" | "https") {
+        return None;
+    }
+    let path = ensure_leading_slash(
+        annotations
+            .and_then(|a| a.get("profiles.scry.dev/path"))
+            .map(String::as_str)
+            .unwrap_or("/debug/pprof/profile"),
+    );
+    let namespace = pod.metadata.namespace.clone().unwrap_or_default();
+    let name = pod.metadata.name.clone().unwrap_or_default();
+    let service = derive_job(labels, pod);
+    let mut target_labels = vec![
+        LabelPair {
+            key: "namespace".into(),
+            value: namespace,
+        },
+        LabelPair {
+            key: "pod".into(),
+            value: name,
+        },
+        LabelPair {
+            key: "container".into(),
+            value: selected.name.clone(),
+        },
+        LabelPair {
+            key: "node".into(),
+            value: node.into(),
+        },
+        LabelPair {
+            key: "service.name".into(),
+            value: service,
+        },
+        LabelPair {
+            key: "profile.type".into(),
+            value: "cpu".into(),
+        },
+    ];
+    for (key, value) in labels {
+        target_labels.push(LabelPair {
+            key: format!("k8s_{key}"),
+            value: value.clone(),
+        });
+    }
+    let container_id = pod
+        .status
+        .as_ref()?
+        .container_statuses
+        .as_ref()
+        .and_then(|statuses| statuses.iter().find(|s| s.name == selected.name))
+        .and_then(|s| s.container_id.clone());
+    Some(ProfileTarget {
+        key: format!("{uid}/{}", selected.name),
+        url: format!("{scheme}://{ip}:{port}{path}"),
+        labels: target_labels,
+        container_id,
+    })
 }
 
 /// Periodically scan `logs_root` for container log files and keep one tailer
@@ -503,7 +616,7 @@ fn spawn_scrape_task(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use k8s_openapi::api::core::v1::PodStatus;
+    use k8s_openapi::api::core::v1::{Container, ContainerStatus, PodSpec, PodStatus};
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 
     fn sel(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -538,6 +651,97 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    fn profile_pod(containers: &[&str], selected: Option<&str>) -> Pod {
+        let mut annotations = vec![("profiles.scry.dev/port", "6060")];
+        if let Some(name) = selected {
+            annotations.push(("profiles.scry.dev/container", name));
+        }
+        let mut pod = mk_pod(
+            "api-1",
+            &[
+                ("profiles.scry.dev/enabled", "true"),
+                ("app.kubernetes.io/name", "api"),
+            ],
+            &annotations,
+            Some("10.0.0.4"),
+        );
+        pod.spec = Some(PodSpec {
+            containers: containers
+                .iter()
+                .map(|name| Container {
+                    name: (*name).to_string(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        });
+        pod.status.as_mut().unwrap().container_statuses = Some(
+            containers
+                .iter()
+                .map(|name| ContainerStatus {
+                    name: (*name).to_string(),
+                    container_id: Some(format!("containerd://{name}")),
+                    ..Default::default()
+                })
+                .collect(),
+        );
+        pod
+    }
+
+    #[test]
+    fn profile_target_infers_one_container_and_builds_labels() {
+        let target = build_profile_target(&profile_pod(&["api"], None), "node-a").unwrap();
+        assert_eq!(target.key, "uid-api-1/api");
+        assert_eq!(target.url, "http://10.0.0.4:6060/debug/pprof/profile");
+        assert_eq!(target.container_id.as_deref(), Some("containerd://api"));
+        let label = |key: &str| {
+            target
+                .labels
+                .iter()
+                .find(|label| label.key == key)
+                .map(|label| label.value.as_str())
+        };
+        assert_eq!(label("container"), Some("api"));
+        assert_eq!(label("service.name"), Some("api"));
+        assert_eq!(label("profile.type"), Some("cpu"));
+    }
+
+    #[test]
+    fn profile_target_requires_explicit_regular_container_when_ambiguous() {
+        assert!(build_profile_target(&profile_pod(&["api", "sidecar"], None), "n").is_none());
+        let target =
+            build_profile_target(&profile_pod(&["api", "sidecar"], Some("api")), "n").unwrap();
+        assert!(target
+            .labels
+            .iter()
+            .any(|l| l.key == "container" && l.value == "api"));
+        assert!(
+            build_profile_target(&profile_pod(&["api", "sidecar"], Some("missing")), "n").is_none()
+        );
+    }
+
+    #[test]
+    fn profile_target_requires_exact_opt_in_and_valid_endpoint() {
+        let mut pod = profile_pod(&["api"], None);
+        pod.metadata
+            .labels
+            .as_mut()
+            .unwrap()
+            .insert("profiles.scry.dev/enabled".into(), "True".into());
+        assert!(build_profile_target(&pod, "n").is_none());
+        pod.metadata
+            .labels
+            .as_mut()
+            .unwrap()
+            .insert("profiles.scry.dev/enabled".into(), "true".into());
+        pod.metadata
+            .annotations
+            .as_mut()
+            .unwrap()
+            .insert("profiles.scry.dev/scheme".into(), "ftp".into());
+        assert!(build_profile_target(&pod, "n").is_none());
     }
 
     fn job(selector: &[(&str, &str)], port: u16, name: Option<&str>) -> PodScrapeJob {

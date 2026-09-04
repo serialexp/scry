@@ -1,9 +1,8 @@
 //! scry-agent — Kubernetes log-collection agent.
 //!
-//! Discovers pods on this node via the Kubernetes API, tails their CRI
-//! container logs, and ships them as `Signal::Logs` batches over the native
-//! binschema wire to a scry ingest server. Logs only, ingest only — the
-//! first dogfood signal.
+//! Discovers pods on this node, tails CRI logs, scrapes Prometheus metrics,
+//! pulls CPU pprof from explicitly opted-in pods, and ships all enabled signals
+//! over the native binschema wire to a scry ingest server.
 
 use scry_duration::parse_duration;
 use std::collections::HashMap;
@@ -11,12 +10,17 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use scry_proto::{
     build,
-    constants::{Signal, COMPRESSION_ZSTD, SIGNAL_BIT_LOGS, SIGNAL_BIT_METRICS},
-    generated::{LogEntry, LogStream, LogsBatch, MetricSample, MetricsBatch, SeriesDictEntry},
+    constants::{
+        Signal, COMPRESSION_ZSTD, SIGNAL_BIT_LOGS, SIGNAL_BIT_METRICS, SIGNAL_BIT_PROFILES,
+    },
+    generated::{
+        LogEntry, LogStream, LogsBatch, MetricSample, MetricsBatch, ProfileBlob, ProfilesBatch,
+        SeriesDictEntry,
+    },
     LabelPair,
 };
 use tokio::sync::{mpsc, watch};
@@ -26,6 +30,7 @@ use uuid::Uuid;
 mod config;
 mod cri;
 mod discovery;
+mod profile;
 mod promparse;
 mod scrape;
 mod status;
@@ -40,6 +45,7 @@ const ZSTD_LEVEL: i32 = 3;
 // only a few waiting behind the batcher so upstream trouble cannot retain a huge
 // number of complete scrapes in memory.
 const METRICS_QUEUE_CAPACITY: usize = 4;
+const PROFILE_QUEUE_CAPACITY: usize = 2;
 const METRIC_SAMPLE_WIRE_BYTES: usize = 24;
 const SERIES_WIRE_FIXED_BYTES: usize = 11; // fingerprint + type + label count
 const LABEL_WIRE_FIXED_BYTES: usize = 3; // key length + value length
@@ -47,7 +53,7 @@ const STATUS_INTERVAL: Duration = Duration::from_secs(5);
 
 /// CLI arguments for the `scry agent` subcommand.
 #[derive(Parser, Debug)]
-#[command(about = "Kubernetes log-collection + Prometheus-scrape agent")]
+#[command(about = "Kubernetes logs, Prometheus metrics, and pprof collection agent")]
 pub struct Args {
     /// Ingest server address (host:port).
     #[arg(long, env = "SCRY_SERVER_ADDR", default_value = "127.0.0.1:4000")]
@@ -151,7 +157,13 @@ pub struct Args {
 pub async fn run(args: Args) -> Result<()> {
     // Config owns the processing pipeline; flags own runtime. Without --config,
     // the global --keep flag is synthesized into a degenerate per-signal config.
-    let (log_pipeline, metric_pipeline) = config::resolve(args.config.as_deref(), &args.keep)?;
+    let (log_pipeline, metric_pipeline, profile_config) =
+        config::resolve(args.config.as_deref(), &args.keep)?;
+    if profile_config.enabled && args.no_discovery {
+        anyhow::bail!(
+            "[profiles].enabled=true requires Kubernetes discovery; remove --no-discovery"
+        );
+    }
     if let Some(path) = &args.config {
         info!(config = %path.display(), "loaded agent pipeline config");
     }
@@ -175,10 +187,13 @@ pub async fn run(args: Args) -> Result<()> {
     // ── Shared state + shutdown ────────────────────────────────────────
     let registry = discovery::new_registry();
     let target_registry = discovery::new_target_registry();
+    let profile_target_registry = discovery::new_profile_target_registry();
+    let profile_stats = Arc::new(profile::ProfileStats::default());
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (log_tx, mut log_rx) = mpsc::channel::<RawLog>(8192);
     let (metrics_tx, mut metrics_rx) =
         mpsc::channel::<scrape::ScrapeResult>(METRICS_QUEUE_CAPACITY);
+    let (profiles_tx, mut profiles_rx) = mpsc::channel::<ProfileBlob>(PROFILE_QUEUE_CAPACITY);
 
     // Config-driven pod-label SD jobs + kubelet scraping (shared by the
     // enable-decision, the pod watch, and the scheduler).
@@ -211,6 +226,7 @@ pub async fn run(args: Args) -> Result<()> {
             node.clone(),
             registry.clone(),
             target_registry.clone(),
+            profile_target_registry.clone(),
             scrape_pods.clone(),
             shutdown_rx.clone(),
         ))
@@ -265,12 +281,36 @@ pub async fn run(args: Args) -> Result<()> {
     };
     drop(metrics_tx); // only the scheduler's scrape tasks keep the channel alive
 
-    // ── Connect ────────────────────────────────────────────────────────
-    let signals = if metrics_enabled {
-        SIGNAL_BIT_LOGS | SIGNAL_BIT_METRICS
+    // ── Profiles: pod-selected pprof pull scheduler (optional) ─────────
+    let profile_scheduler_handle = if profile_config.enabled {
+        let http = reqwest::Client::builder()
+            .timeout(profile_config.timeout)
+            .build()
+            .context("building pprof HTTP client")?;
+        info!(
+            interval_secs = profile_config.interval.as_secs(),
+            duration_secs = profile_config.duration.as_secs(),
+            "pprof pulling enabled"
+        );
+        Some(profile::spawn_scheduler(
+            profile_target_registry.clone(),
+            http,
+            profile_config.interval,
+            profile_config.duration,
+            profile_config.max_body_bytes,
+            args.scan_interval,
+            profile_config.static_labels.clone(),
+            profiles_tx.clone(),
+            profile_stats.clone(),
+            shutdown_rx.clone(),
+        ))
     } else {
-        SIGNAL_BIT_LOGS
+        None
     };
+    drop(profiles_tx);
+
+    // ── Connect ────────────────────────────────────────────────────────
+    let signals = signal_mask(metrics_enabled, profile_config.enabled);
     let mut conn = Client::connect(
         &args.server_addr,
         agent_id,
@@ -320,6 +360,7 @@ pub async fn run(args: Args) -> Result<()> {
     let mut metrics_dropped: u64 = 0;
     let mut batch_id: u64 = 0;
     let mut metrics_batch_id: u64 = 0;
+    let mut profiles_batch_id: u64 = 0;
     let mut runtime_stats = AgentRuntimeStats::default();
     let mut status_sequence = 0_u64;
     let mut flush_timer = tokio::time::interval(args.flush_interval);
@@ -344,6 +385,17 @@ pub async fn run(args: Args) -> Result<()> {
                         // All tailers gone (shouldn't happen until shutdown).
                         break;
                     }
+                }
+            }
+            maybe = profiles_rx.recv(), if profile_config.enabled => {
+                if let Some(blob) = maybe {
+                    flush_profile(
+                        &mut conn,
+                        blob,
+                        &mut profiles_batch_id,
+                        &mut runtime_stats,
+                        &mut flush_sig,
+                    ).await?;
                 }
             }
             maybe = metrics_rx.recv(), if metrics_enabled => {
@@ -385,8 +437,12 @@ pub async fn run(args: Args) -> Result<()> {
                         metric_pending_bytes: metrics_pending.approx_bytes,
                         log_queue_remaining: log_rx.capacity(),
                         metric_queue_remaining: metrics_rx.capacity(),
+                        profile_queue_remaining: profiles_rx.capacity(),
                         log_dropped: dropped,
                         metric_dropped: metrics_dropped,
+                        profile_pull_failures: profile_stats.pull_failures.load(std::sync::atomic::Ordering::Relaxed),
+                        profile_backpressure_drops: profile_stats.backpressure_drops.load(std::sync::atomic::Ordering::Relaxed),
+                        profile_targets: profile_target_registry.read().await.len(),
                     }).to_string();
                     if let Err(e) = conn.send_agent_status(status_sequence, &snapshot).await {
                         runtime_stats.status_send_failures += 1;
@@ -414,6 +470,16 @@ pub async fn run(args: Args) -> Result<()> {
             &mut dropped,
         )
         .await;
+    }
+    while let Ok(blob) = profiles_rx.try_recv() {
+        flush_profile(
+            &mut conn,
+            blob,
+            &mut profiles_batch_id,
+            &mut runtime_stats,
+            &mut flush_sig,
+        )
+        .await?;
     }
     while let Ok(result) = metrics_rx.try_recv() {
         ingest_metrics(
@@ -459,10 +525,14 @@ pub async fn run(args: Args) -> Result<()> {
     if let Some(h) = scheduler_handle {
         let _ = h.await;
     }
+    if let Some(h) = profile_scheduler_handle {
+        let _ = h.await;
+    }
     let _ = scanner_handle.await;
     info!(
         batches = batch_id,
         metrics_batches = metrics_batch_id,
+        profile_batches = profiles_batch_id,
         dropped_by_filter = dropped,
         metrics_dropped_by_filter = metrics_dropped,
         "agent done"
@@ -863,6 +933,56 @@ async fn flush_metrics(
     Ok(())
 }
 
+fn signal_mask(metrics: bool, profiles: bool) -> u8 {
+    SIGNAL_BIT_LOGS
+        | if metrics { SIGNAL_BIT_METRICS } else { 0 }
+        | if profiles { SIGNAL_BIT_PROFILES } else { 0 }
+}
+
+fn build_profile_frame(blob: ProfileBlob, batch_id: u64) -> (scry_proto::Frame, u32, usize) {
+    let ts_min = blob.ts_unix_nano;
+    let ts_max = blob.ts_unix_nano.saturating_add(blob.duration_nano);
+    let payload = ProfilesBatch {
+        samples: vec![blob],
+    }
+    .encode()
+    .expect("ProfilesBatch encode is infallible for well-formed inputs");
+    let uncompressed_size = payload.len() as u32;
+    let compressed = zstd::encode_all(payload.as_slice(), ZSTD_LEVEL)
+        .expect("zstd encode_all is infallible on Vec input");
+    let compressed_size = compressed.len();
+    let frame = build::batch(build::BatchArgs {
+        session_id: 0,
+        batch_id,
+        signal: Signal::Profiles.as_u8(),
+        ts_min_unix_nano: ts_min,
+        ts_max_unix_nano: ts_max,
+        record_count: 1,
+        compression: COMPRESSION_ZSTD,
+        uncompressed_size,
+        payload: compressed,
+    });
+    (frame, uncompressed_size, compressed_size)
+}
+
+/// Ship one bounded pprof blob per native batch so profiles never accumulate in
+/// the main loop. Profiles inherit the agent's reconnect-aware at-most-once path.
+async fn flush_profile(
+    conn: &mut Client,
+    blob: ProfileBlob,
+    batch_id: &mut u64,
+    runtime_stats: &mut AgentRuntimeStats,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<()> {
+    let (mut frame, uncompressed_size, compressed_size) = build_profile_frame(blob, *batch_id);
+    if ship_frame(conn, &mut frame, runtime_stats, shutdown).await? {
+        runtime_stats.record_profile_batch(1, uncompressed_size, compressed_size);
+        info!(batch_id = *batch_id, "shipped profile batch");
+        *batch_id += 1;
+    }
+    Ok(())
+}
+
 /// Send a built batch frame, reconnecting with capped exponential backoff if the
 /// ingest server has gone away. Returns `Ok(true)` once shipped, `Ok(false)` if
 /// `shutdown` fired mid-reconnect (the caller drops the in-flight batch —
@@ -1082,6 +1202,44 @@ mod tests {
             .iter()
             .find(|p| p.key == key)
             .map(|p| p.value.clone())
+    }
+
+    #[test]
+    fn profile_signal_is_advertised_only_when_enabled() {
+        assert_eq!(signal_mask(false, false), SIGNAL_BIT_LOGS);
+        assert_eq!(
+            signal_mask(true, true),
+            SIGNAL_BIT_LOGS | SIGNAL_BIT_METRICS | SIGNAL_BIT_PROFILES
+        );
+        assert_eq!(
+            signal_mask(false, true),
+            SIGNAL_BIT_LOGS | SIGNAL_BIT_PROFILES
+        );
+    }
+
+    #[test]
+    fn profile_frame_is_a_single_lossless_profiles_batch() {
+        let blob = ProfileBlob {
+            ts_unix_nano: 100,
+            duration_nano: 25,
+            labels: vec![LabelPair {
+                key: "pod".into(),
+                value: "api-1".into(),
+            }],
+            format: 1,
+            data: vec![0x1f, 0x8b, 1, 2],
+        };
+        let (frame, uncompressed, _) = build_profile_frame(blob.clone(), 7);
+        let scry_proto::generated::FrameMsg::Batch(batch) = frame.msg else {
+            panic!("expected batch frame");
+        };
+        assert_eq!(batch.signal, Signal::Profiles.as_u8());
+        assert_eq!(batch.batch_id, 7);
+        assert_eq!(batch.record_count, 1);
+        assert_eq!((batch.ts_min_unix_nano, batch.ts_max_unix_nano), (100, 125));
+        let decoded = zstd::decode_all(batch.payload.as_slice()).unwrap();
+        assert_eq!(decoded.len(), uncompressed as usize);
+        assert_eq!(ProfilesBatch::decode(&decoded).unwrap().samples, vec![blob]);
     }
 
     #[test]

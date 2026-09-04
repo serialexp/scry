@@ -27,9 +27,10 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use scry_proto::LabelPair;
 
@@ -47,6 +48,43 @@ use scry_match::LabelFilter;
 pub struct FileConfig {
     pub logs: LogsSection,
     pub metrics: MetricsSection,
+    pub profiles: ProfilesSection,
+}
+
+/// `[profiles]` — periodic CPU pprof collection from explicitly opted-in pods.
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProfilesSection {
+    pub enabled: bool,
+    #[serde(deserialize_with = "deserialize_duration")]
+    pub interval: Duration,
+    #[serde(deserialize_with = "deserialize_duration")]
+    pub duration: Duration,
+    #[serde(deserialize_with = "deserialize_duration")]
+    pub timeout: Duration,
+    pub max_body_bytes: usize,
+    pub static_labels: BTreeMap<String, String>,
+}
+
+impl Default for ProfilesSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval: Duration::from_secs(60),
+            duration: Duration::from_secs(10),
+            timeout: Duration::from_secs(15),
+            max_body_bytes: 8 * 1024 * 1024,
+            static_labels: BTreeMap::new(),
+        }
+    }
+}
+
+fn deserialize_duration<'de, D>(deserializer: D) -> std::result::Result<Duration, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    scry_duration::parse_duration(&value).map_err(serde::de::Error::custom)
 }
 
 /// `[logs]` — the log-stream pipeline.
@@ -287,6 +325,31 @@ pub struct PodScrapeJob {
     pub scheme: String,
 }
 
+/// Compiled CPU profile collection settings.
+#[derive(Debug, Clone)]
+pub struct ProfileConfig {
+    pub enabled: bool,
+    pub interval: Duration,
+    pub duration: Duration,
+    pub timeout: Duration,
+    pub max_body_bytes: usize,
+    pub static_labels: Vec<LabelPair>,
+}
+
+impl Default for ProfileConfig {
+    fn default() -> Self {
+        let p = ProfilesSection::default();
+        Self {
+            enabled: p.enabled,
+            interval: p.interval,
+            duration: p.duration,
+            timeout: p.timeout,
+            max_body_bytes: p.max_body_bytes,
+            static_labels: Vec::new(),
+        }
+    }
+}
+
 impl FileConfig {
     /// Synthesize a config from the legacy global `--keep` flag, applied to both
     /// signals. Used when no `--config` file is given so there is one downstream
@@ -301,11 +364,12 @@ impl FileConfig {
                 keep: keep.to_vec(),
                 ..Default::default()
             },
+            profiles: ProfilesSection::default(),
         }
     }
 
-    /// Compile the file shape into runtime pipelines, validating keep regexes.
-    pub fn compile(self) -> Result<(LogPipeline, MetricPipeline)> {
+    /// Compile the file shape into runtime pipelines, validating all settings.
+    pub fn compile(self) -> Result<(LogPipeline, MetricPipeline, ProfileConfig)> {
         let logs = LogPipeline {
             keep: LabelFilter::parse(&self.logs.keep).context("compiling [logs] keep")?,
             static_labels: to_label_pairs(self.logs.static_labels),
@@ -346,7 +410,28 @@ impl FileConfig {
             kubelet,
             scrape_pods,
         };
-        Ok((logs, metrics))
+        let p = self.profiles;
+        if p.interval.is_zero() || p.duration.is_zero() || p.timeout.is_zero() {
+            bail!("[profiles] interval, duration, and timeout must be nonzero");
+        }
+        if p.duration > p.interval {
+            bail!("[profiles] duration must be less than or equal to interval");
+        }
+        if p.timeout <= p.duration {
+            bail!("[profiles] timeout must be greater than duration");
+        }
+        if !(1..=8 * 1024 * 1024).contains(&p.max_body_bytes) {
+            bail!("[profiles] max_body_bytes must be in 1..=8388608");
+        }
+        let profiles = ProfileConfig {
+            enabled: p.enabled,
+            interval: p.interval,
+            duration: p.duration,
+            timeout: p.timeout,
+            max_body_bytes: p.max_body_bytes,
+            static_labels: to_label_pairs(p.static_labels),
+        };
+        Ok((logs, metrics, profiles))
     }
 }
 
@@ -369,7 +454,7 @@ pub fn load(path: &Path) -> Result<FileConfig> {
 pub fn resolve(
     config_path: Option<&Path>,
     global_keep: &[String],
-) -> Result<(LogPipeline, MetricPipeline)> {
+) -> Result<(LogPipeline, MetricPipeline, ProfileConfig)> {
     let file = match config_path {
         Some(p) => {
             if !global_keep.is_empty() {
@@ -411,7 +496,7 @@ mod tests {
     #[test]
     fn empty_file_compiles_to_noop() {
         let cfg: FileConfig = toml::from_str("").unwrap();
-        let (logs, metrics) = cfg.compile().unwrap();
+        let (logs, metrics, _profiles) = cfg.compile().unwrap();
         assert!(logs.keep.is_empty());
         assert!(logs.static_labels.is_empty());
         assert!(logs.label_map.is_empty());
@@ -440,7 +525,7 @@ mod tests {
             label_map = { container_name = "container" }
         "#;
         let cfg: FileConfig = toml::from_str(toml_src).unwrap();
-        let (logs, metrics) = cfg.compile().unwrap();
+        let (logs, metrics, _profiles) = cfg.compile().unwrap();
 
         assert_eq!(logs.keep.len(), 1);
         assert_eq!(
@@ -466,6 +551,39 @@ mod tests {
     }
 
     #[test]
+    fn profiles_config_compiles_and_validates_limits() {
+        let cfg: FileConfig = toml::from_str(
+            r#"
+            [profiles]
+            enabled = true
+            interval = "30s"
+            duration = "5s"
+            timeout = "8s"
+            max_body_bytes = 1048576
+            static_labels = { cluster = "prod" }
+            "#,
+        )
+        .unwrap();
+        let (_, _, profiles) = cfg.compile().unwrap();
+        assert!(profiles.enabled);
+        assert_eq!(profiles.interval, Duration::from_secs(30));
+        assert_eq!(profiles.duration, Duration::from_secs(5));
+        assert_eq!(profiles.timeout, Duration::from_secs(8));
+        assert_eq!(profiles.max_body_bytes, 1_048_576);
+        assert_eq!(profiles.static_labels[0].key, "cluster");
+
+        for invalid in [
+            "[profiles]\nduration = \"0s\"",
+            "[profiles]\ninterval = \"5s\"\nduration = \"10s\"",
+            "[profiles]\nduration = \"10s\"\ntimeout = \"10s\"",
+            "[profiles]\nmax_body_bytes = 8388609",
+        ] {
+            let cfg: FileConfig = toml::from_str(invalid).unwrap();
+            assert!(cfg.compile().is_err(), "accepted invalid config: {invalid}");
+        }
+    }
+
+    #[test]
     fn unknown_field_is_rejected() {
         // `static_label` (singular) is a typo; deny_unknown_fields catches it.
         let err = toml::from_str::<FileConfig>("[logs]\nstatic_label = { a = \"b\" }\n");
@@ -480,9 +598,10 @@ mod tests {
 
     #[test]
     fn from_global_keep_applies_to_both_signals() {
-        let (logs, metrics) = FileConfig::from_global_keep(&["namespace=prod".to_string()])
-            .compile()
-            .unwrap();
+        let (logs, metrics, _profiles) =
+            FileConfig::from_global_keep(&["namespace=prod".to_string()])
+                .compile()
+                .unwrap();
         assert_eq!(logs.keep.len(), 1);
         assert_eq!(metrics.keep.len(), 1);
     }
@@ -500,7 +619,7 @@ mod tests {
 
     #[test]
     fn resolve_without_config_uses_global_keep() {
-        let (logs, metrics) = resolve(None, &["namespace=prod".to_string()]).unwrap();
+        let (logs, metrics, _profiles) = resolve(None, &["namespace=prod".to_string()]).unwrap();
         assert_eq!(logs.keep.len(), 1);
         assert_eq!(metrics.keep.len(), 1);
     }
@@ -527,7 +646,7 @@ mod tests {
             scheme = "http"
         "#;
         let cfg: FileConfig = toml::from_str(toml_src).unwrap();
-        let (_logs, metrics) = cfg.compile().unwrap();
+        let (_logs, metrics, _profiles) = cfg.compile().unwrap();
 
         let k = metrics.kubelet.expect("kubelet present");
         assert!(k.enabled);
@@ -563,7 +682,7 @@ mod tests {
         // An empty [metrics.kubelet] table: enabled defaults false, endpoints on,
         // skip-verify on, default address + SA token path.
         let cfg: FileConfig = toml::from_str("[metrics.kubelet]\n").unwrap();
-        let (_logs, metrics) = cfg.compile().unwrap();
+        let (_logs, metrics, _profiles) = cfg.compile().unwrap();
         let k = metrics.kubelet.expect("kubelet present");
         assert!(!k.enabled);
         assert_eq!(k.address, "https://${NODE_IP}:10250");
@@ -574,7 +693,7 @@ mod tests {
     #[test]
     fn no_kubelet_table_means_none() {
         let cfg: FileConfig = toml::from_str("[metrics]\nstatic_labels = { a = \"b\" }\n").unwrap();
-        let (_logs, metrics) = cfg.compile().unwrap();
+        let (_logs, metrics, _profiles) = cfg.compile().unwrap();
         assert!(metrics.kubelet.is_none());
         assert!(metrics.scrape_pods.is_empty());
     }
