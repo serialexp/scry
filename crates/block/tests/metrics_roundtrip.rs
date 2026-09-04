@@ -13,12 +13,19 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, Float64Array, ListArray, StringArray, UInt64Array};
+use arrow::array::{
+    Array, Float64Array, ListArray, StringArray, StructArray, UInt64Array, UInt8Array,
+};
 use bytes::Bytes;
 use object_store::{memory::InMemory, path::Path as ObjPath, ObjectStore, ObjectStoreExt};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use scry_block::{BlockBuilder, BlockBuilderConfig, BlockMeta, MetricsBlockBuilder};
+use scry_proto::generated::{
+    IntegerValueV2Input, LabelPair, MetricDescriptorV2, MetricNumberV2, MetricPointV2,
+    MetricPointV2Value, ScalarPointV2Input,
+};
 use scry_proto::streaming::MetricsAppender;
+use scry_proto::streaming_v2::MetricsV2Appender;
 use uuid::Uuid;
 
 /// `metric_type` byte. We don't import the proto enum just to read
@@ -107,7 +114,7 @@ async fn metrics_block_roundtrip() {
 
     // Sidecar invariants.
     assert_eq!(meta.signal, "metrics");
-    assert_eq!(meta.schema_version, 2);
+    assert_eq!(meta.schema_version, 3);
     assert_eq!(meta.writer_id, writer);
     assert_eq!(meta.row_count, 5);
     assert_eq!(meta.ts_min_unix_nano, 50);
@@ -163,9 +170,9 @@ async fn metrics_block_roundtrip() {
     assert_eq!(main_batch.schema().field(0).name(), "series_fingerprint");
     assert_eq!(main_batch.schema().field(1).name(), "ts_unix_nano");
     assert_eq!(main_batch.schema().field(2).name(), "value");
-    assert_eq!(main_batch.schema().field(7).name(), "descriptor");
-    assert_eq!(main_batch.schema().field(8).name(), "point");
-    assert_eq!(main_batch.num_columns(), 9);
+    assert_eq!(main_batch.schema().field(4).name(), "descriptor");
+    assert_eq!(main_batch.schema().field(5).name(), "point");
+    assert_eq!(main_batch.num_columns(), 6);
 
     let fps = main_batch
         .column(0)
@@ -251,6 +258,119 @@ async fn metrics_block_roundtrip() {
     assert!(parsed.has_postings);
     assert_eq!(parsed.postings_size_bytes, meta.postings_size_bytes);
     assert_eq!(parsed.series_types, meta.series_types);
+}
+
+#[tokio::test]
+async fn metrics_structured_scalar_roundtrip() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let writer = Uuid::now_v7();
+    let mut b = MetricsBlockBuilder::new(writer, BlockBuilderConfig::default());
+    let descriptor = MetricDescriptorV2 {
+        id: 7,
+        name: "requests".into(),
+        description: "request count".into(),
+        unit: "1".into(),
+        metric_kind: 1,
+        temporality: 2,
+        monotonic: 1,
+        resource_attrs: vec![LabelPair {
+            key: "service".into(),
+            value: "api".into(),
+        }],
+        scope_name: "test-scope".into(),
+        scope_version: "1.0".into(),
+        scope_attrs: vec![],
+    };
+    b.descriptor(&descriptor).unwrap();
+    let point = MetricPointV2 {
+        value: MetricPointV2Value::ScalarPointV2(
+            ScalarPointV2Input {
+                descriptor_id: 7,
+                start_unix_nano: 100,
+                ts_unix_nano: 200,
+                flags: 3,
+                attributes: vec![LabelPair {
+                    key: "route".into(),
+                    value: "/health".into(),
+                }],
+                exemplars: vec![],
+                number: MetricNumberV2 {
+                    value: scry_proto::generated::MetricNumberV2Value::IntegerValueV2(
+                        IntegerValueV2Input { value: 42 }.into(),
+                    ),
+                },
+            }
+            .into(),
+        ),
+    };
+    b.point(&point).unwrap();
+    let meta = b.finish_and_upload(store.as_ref()).await.unwrap().unwrap();
+    let prefix = ObjPath::from(format!(
+        "metrics/1970/01/01/{}/{}",
+        meta.writer_id, meta.uuid
+    ));
+    let bytes = store
+        .get(&ObjPath::from(format!("{prefix}.parquet")))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let batch = read_parquet(bytes);
+    assert_eq!(batch.num_columns(), 6);
+    assert_eq!(
+        batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .value(0),
+        42.0
+    );
+    let descriptors = batch
+        .column(4)
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    assert!(!descriptors.is_null(0));
+    assert_eq!(
+        descriptors
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0),
+        "requests"
+    );
+    let points = batch
+        .column(5)
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    assert!(!points.is_null(0));
+    assert_eq!(
+        points
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt8Array>()
+            .unwrap()
+            .value(0),
+        1
+    );
+    let scalar = points
+        .column(5)
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    assert_eq!(
+        scalar
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap()
+            .value(0),
+        42
+    );
 }
 
 #[tokio::test]

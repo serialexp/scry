@@ -45,6 +45,7 @@ pub mod evict;
 pub mod label_enrich;
 pub mod logs;
 pub mod metadata;
+mod metrics_normalize;
 pub mod postings;
 pub mod postings_cache;
 pub mod profiles;

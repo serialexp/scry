@@ -60,6 +60,7 @@ use scry_block::{block_path, BlockMeta, MetricsBlockBuilder};
 use scry_catalog::CatalogEntry;
 
 use crate::label_enrich::{expr_references_labels, labels_field, FpLabels, LabelEnrichExec};
+use crate::metrics_normalize::{physical_schema as metrics_physical_schema, MetricsNormalizeExec};
 
 /// The Arrow schema of a metrics block's main parquet, as written by
 /// `crates/block/src/metrics.rs::MetricsBlockBuilder::main_schema`.
@@ -166,7 +167,7 @@ impl MetricsTable {
         fp_labels: Option<Arc<FpLabels>>,
     ) -> DfResult<Self> {
         for block in &blocks {
-            if !matches!(block.entry.meta.schema_version, 1 | 2) {
+            if !matches!(block.entry.meta.schema_version, 1..=3) {
                 return Err(datafusion::common::DataFusionError::Plan(format!(
                     "unsupported metrics block schema version {} for block {}",
                     block.entry.meta.schema_version, block.entry.meta.uuid
@@ -259,7 +260,6 @@ impl TableProvider for MetricsTable {
         let physical_schema = metrics_schema();
         let table_schema = self.schema();
         let labels_idx = physical_schema.fields().len();
-        let df_schema = DFSchema::try_from(physical_schema.clone())?;
 
         // Is the synthesised `labels` column both available (the query opted
         // in) and actually requested (`None` projection = all columns = yes)?
@@ -283,8 +283,14 @@ impl TableProvider for MetricsTable {
 
         let make_branch = |fp_set: Option<&Arc<Vec<u64>>>,
                            file_path: String,
-                           file_size: u64|
+                           file_size: u64,
+                           schema_version: u32|
          -> DfResult<Arc<dyn ExecutionPlan>> {
+            // Each parquet file must be read with the schema it was written
+            // with. Scalar columns have stable names/types across versions, so
+            // filters can still be evaluated before historical normalization.
+            let branch_schema = metrics_physical_schema(schema_version)?;
+            let branch_df_schema = DFSchema::try_from(branch_schema.clone())?;
             let mut block_filters: Vec<Expr> = filters.to_vec();
             if let Some(fp_set) = fp_set {
                 // Materialise the IN-list. DataFusion's `InListExpr`
@@ -311,7 +317,7 @@ impl TableProvider for MetricsTable {
             }
 
             let predicate = conjunction(block_filters)
-                .map(|p| state.create_physical_expr(p, &df_schema))
+                .map(|p| state.create_physical_expr(p, &branch_df_schema))
                 .transpose()?
                 .unwrap_or_else(|| physical_lit(true));
 
@@ -321,7 +327,7 @@ impl TableProvider for MetricsTable {
             // this our ts bounds + fp IN-list would prune row groups
             // but still hand back every row in the surviving groups.
             let source = Arc::new(
-                ParquetSource::new(physical_schema.clone())
+                ParquetSource::new(branch_schema)
                     .with_predicate(predicate)
                     .with_pushdown_filters(true),
             );
@@ -332,11 +338,30 @@ impl TableProvider for MetricsTable {
             // adds a `GlobalLimitExec` above the union that terminates
             // the stream early once enough rows arrive.
             let builder = FileScanConfigBuilder::new(self.object_store_url.clone(), source)
-                .with_projection_indices(phys_projection.clone())?
                 .with_limit(limit)
                 .with_file(PartitionedFile::new(file_path, file_size));
 
-            Ok(DataSourceExec::from_data_source(builder.build()))
+            let scan = DataSourceExec::from_data_source(builder.build());
+            // Projection is deliberately applied after normalization: v1/v2
+            // column positions differ from v3, while callers index the v3
+            // table schema.
+            let normalized: Arc<dyn ExecutionPlan> =
+                Arc::new(MetricsNormalizeExec::new(scan, schema_version));
+            if let Some(proj) = &phys_projection {
+                let exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = proj
+                    .iter()
+                    .map(|&i| {
+                        let f = physical_schema.field(i);
+                        (
+                            Arc::new(Column::new(f.name(), i)) as Arc<dyn PhysicalExpr>,
+                            f.name().clone(),
+                        )
+                    })
+                    .collect();
+                Ok(Arc::new(ProjectionExec::try_new(exprs, normalized)?) as Arc<dyn ExecutionPlan>)
+            } else {
+                Ok(normalized)
+            }
         };
 
         // Build the physical scan plan (the parquet union), producing the
@@ -364,7 +389,12 @@ impl TableProvider for MetricsTable {
                     meta.uuid,
                     "parquet",
                 );
-                branches.push(make_branch(block.fp_set.as_ref(), path, meta.byte_size)?);
+                branches.push(make_branch(
+                    block.fp_set.as_ref(),
+                    path,
+                    meta.byte_size,
+                    meta.schema_version,
+                )?);
             }
             // `try_new` returns the single branch directly when there's only
             // one, so we don't gain a UnionExec layer for 1-block queries. For
