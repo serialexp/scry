@@ -232,7 +232,9 @@ function gatewayFields(data: Data): FleetField[] {
     ["otlp_http", "OTLP HTTP"],
     ["otlp_grpc", "OTLP gRPC"],
     ["prom_remote_write_http", "remote-write HTTP"],
-    ["pyroscope_http", "Pyroscope HTTP"],
+    ["loki_http", "Loki HTTP"],
+    ["pyroscope_http", "Pyroscope legacy HTTP"],
+    ["pyroscope_push_http", "Pyroscope Push HTTP"],
     ["native_wire", "native wire"],
   ] as const) {
     const protocol = object(inbound[key]);

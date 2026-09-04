@@ -134,6 +134,20 @@ impl BloomCacheStats {
     }
 }
 
+/// The exact state of a block in the bloom cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BloomCacheResidency {
+    /// A slot exists and its single-flight fill has not completed.
+    Loading,
+    /// A parsed bloom is retained and can provide locality.
+    Usable,
+    /// A completed slot is retained, but it contains no usable bloom.
+    /// This is a cached absence, not usable bloom locality.
+    Absent,
+    /// No slot is currently retained for this UUID.
+    Cold,
+}
+
 /// A cached bloom slot. `None` inside the resolved cell means "the block
 /// has no usable bloom" (no sidecar, or it failed to parse) — a valid,
 /// cacheable answer that means "never skip this block". `Some(bloom)` is a
@@ -208,6 +222,25 @@ impl BloomCache {
             budget_bytes,
             ..Default::default()
         })
+    }
+
+    /// Inspect a UUID without fetching, awaiting, or refreshing its LRU
+    /// position. The mutex is held only for this map lookup.
+    pub fn residency(&self, uuid: Uuid) -> BloomCacheResidency {
+        let state = self.state.lock().expect("bloom cache mutex poisoned");
+        let Some(slot) = state.map.get(&uuid) else {
+            return BloomCacheResidency::Cold;
+        };
+        // Weight zero is the authoritative loading marker. Check it first so
+        // the brief interval between cell initialization and accounting is not
+        // reported as retained.
+        if slot.weight.load(Ordering::Acquire) == 0 {
+            return BloomCacheResidency::Loading;
+        }
+        match slot.cell.get().and_then(|value| value.as_ref().as_ref()) {
+            Some(_) => BloomCacheResidency::Usable,
+            None => BloomCacheResidency::Absent,
+        }
     }
 
     /// Take a snapshot for telemetry.
@@ -446,8 +479,10 @@ mod tests {
     async fn cold_then_warm() {
         let cache = BloomCache::with_budget_bytes(64 * 1024 * 1024);
         let uuid = Uuid::new_v4();
+        assert_eq!(cache.residency(uuid), BloomCacheResidency::Cold);
         let v = bloom_for(&["connection refused", "timeout waiting"]);
         install(&cache, uuid, v.clone()).await;
+        assert_eq!(cache.residency(uuid), BloomCacheResidency::Usable);
         install(&cache, uuid, v.clone()).await;
         install(&cache, uuid, v).await;
         let s = cache.stats();
@@ -513,6 +548,7 @@ mod tests {
         let cache = BloomCache::with_budget_bytes(64 * 1024);
         let uuid = Uuid::new_v4();
         install(&cache, uuid, Arc::new(None)).await;
+        assert_eq!(cache.residency(uuid), BloomCacheResidency::Absent);
         install(&cache, uuid, Arc::new(None)).await;
         let s = cache.stats();
         assert_eq!(s.entries, 1);

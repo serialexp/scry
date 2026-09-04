@@ -1,15 +1,34 @@
-//! Numeric constants from `proto/{ingest,query}.schema.json`.
+//! Numeric constants from `proto/{ingest,query,query-worker}.schema.json`.
 //!
 //! Kept in sync by hand against the schemas. When a schema gains a new
 //! constant, mirror it here. The binschema bindings are generated from
 //! the binary structure only; constants are not.
 
-/// Wire-format version. `(major << 8) | minor`.
+/// Legacy ingest wire-format version. Preserved for protocol-v1 peers.
 pub const PROTOCOL_VERSION_V0: u16 = 0x0001;
+/// Canonical structured-metrics ingest protocol.
+pub const PROTOCOL_VERSION_V2: u16 = 0x0002;
+/// Fixed prefix on `MetricsBatchV2` payloads, used for WAL replay dispatch.
+pub const METRICS_BATCH_V2_MAGIC: u32 = 1_397_568_000;
+
+// ── Private query-worker protocol ──────────────────────────────────────
+pub const QUERY_WORKER_PROTOCOL_VERSION_V1: u16 = 1;
+pub const QUERY_WORKER_DECLINE_BUSY: u16 = 1;
+pub const QUERY_WORKER_DECLINE_QUEUED: u16 = 2;
+pub const QUERY_WORKER_DECLINE_MEMORY_PRESSURE: u16 = 3;
+pub const QUERY_WORKER_DECLINE_DRAINING: u16 = 4;
+pub const QUERY_WORKER_DECLINE_DEADLINE: u16 = 5;
+pub const QUERY_WORKER_DECLINE_UNSUPPORTED: u16 = 6;
+pub const QUERY_WORKER_DECLINE_STALE_OFFER: u16 = 7;
+pub const QUERY_WORKER_ERROR_AUTH: u16 = 1;
+pub const QUERY_WORKER_ERROR_PROTOCOL: u16 = 2;
+pub const QUERY_WORKER_ERROR_LIMIT: u16 = 3;
 
 // ── Hello/HelloAck.capabilities bitmask ────────────────────────────────
 /// Server accepts best-effort `AgentStatus` control frames after handshake.
 pub const CAP_AGENT_STATUS: u32 = 0x0000_0001;
+/// Peer accepts `MetricsBatchV2` as the decompressed metrics payload.
+pub const CAP_STRUCTURED_METRICS_V2: u32 = 0x0000_0002;
 
 // ── Hello.signals bitmask ──────────────────────────────────────────────
 pub const SIGNAL_BIT_METRICS: u8 = 0x01;

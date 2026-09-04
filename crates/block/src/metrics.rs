@@ -34,23 +34,42 @@
 //! Same lesson as `crates/block/src/dummy.rs`; see CLAUDE.md
 //! § Performance.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use arrow::array::{ArrayRef, Float64Array, UInt64Array};
+use arrow::array::{
+    ArrayRef, BinaryArray, Float64Array, Int64Array, UInt32Array, UInt64Array, UInt8Array,
+};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use object_store::{path::Path, ObjectStore};
 use parquet::arrow::ArrowWriter;
+use scry_proto::generated::{
+    LabelPair, MetricDescriptorV2, MetricNumberV2Value, MetricPointV2, MetricPointV2Value,
+};
 use scry_proto::streaming::MetricsAppender;
+use scry_proto::streaming_v2::MetricsV2Appender;
 use uuid::Uuid;
 
 use crate::{block_path, BlockBuilder, BlockBuilderConfig, BlockMeta, EncodedBlock};
 
 const SIGNAL: &str = "metrics";
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
+
+#[derive(Clone)]
+struct MetricRow {
+    fingerprint: u64,
+    ts: u64,
+    value: Option<f64>,
+    descriptor_id: Option<u32>,
+    kind: Option<u8>,
+    scalar_i64: Option<i64>,
+    scalar_f64: Option<f64>,
+    descriptor: Option<Vec<u8>>,
+    point: Option<Vec<u8>>,
+}
 
 /// One unique series accumulated for this block. Owned labels because
 /// we dedup by fingerprint and the wire payload is dropped after
@@ -77,17 +96,28 @@ pub struct MetricsBlockBuilder {
     // correctness).
     series_seen: HashSet<u64>,
     series_dict: Vec<OwnedSeries>,
+    descriptors: HashMap<u32, MetricDescriptorV2>,
+    v2_points: Vec<MetricRow>,
     bytes_est: u64,
     ts_min: u64,
     ts_max: u64,
 }
 
 impl MetricsBlockBuilder {
+    /// Metrics parquet v2. `value` remains the lossy Float64 compatibility
+    /// projection; exact scalar values and canonical structured payloads live in
+    /// the nullable v2 columns.
     pub fn main_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
             Field::new("series_fingerprint", DataType::UInt64, false),
             Field::new("ts_unix_nano", DataType::UInt64, false),
-            Field::new("value", DataType::Float64, false),
+            Field::new("value", DataType::Float64, true),
+            Field::new("descriptor_id", DataType::UInt32, true),
+            Field::new("metric_kind", DataType::UInt8, true),
+            Field::new("scalar_i64", DataType::Int64, true),
+            Field::new("scalar_f64", DataType::Float64, true),
+            Field::new("descriptor", DataType::Binary, true),
+            Field::new("point", DataType::Binary, true),
         ]))
     }
 
@@ -96,7 +126,7 @@ impl MetricsBlockBuilder {
     }
 
     pub fn row_count(&self) -> u64 {
-        self.fingerprints.len() as u64
+        (self.fingerprints.len() + self.v2_points.len()) as u64
     }
 }
 
@@ -112,6 +142,8 @@ impl BlockBuilder for MetricsBlockBuilder {
             values: Vec::with_capacity(4096),
             series_seen: HashSet::with_capacity(256),
             series_dict: Vec::with_capacity(256),
+            descriptors: HashMap::new(),
+            v2_points: Vec::new(),
             bytes_est: 0,
             ts_min: u64::MAX,
             ts_max: 0,
@@ -119,7 +151,7 @@ impl BlockBuilder for MetricsBlockBuilder {
     }
 
     fn is_empty(&self) -> bool {
-        self.fingerprints.is_empty()
+        self.fingerprints.is_empty() && self.v2_points.is_empty()
     }
 
     fn should_close(&self) -> bool {
@@ -132,6 +164,8 @@ impl BlockBuilder for MetricsBlockBuilder {
         self.fingerprints.append(&mut other.fingerprints);
         self.ts.append(&mut other.ts);
         self.values.append(&mut other.values);
+        self.v2_points.append(&mut other.v2_points);
+        self.descriptors.extend(other.descriptors.drain());
 
         // Series dictionary: dedup against the *shared* builder's
         // `series_seen` so cross-batch dedup scope matches decoding
@@ -160,6 +194,8 @@ impl BlockBuilder for MetricsBlockBuilder {
         self.values.clear();
         self.series_seen.clear();
         self.series_dict.clear();
+        self.descriptors.clear();
+        self.v2_points.clear();
         self.bytes_est = 0;
         self.ts_min = u64::MAX;
         self.ts_max = 0;
@@ -234,6 +270,98 @@ impl MetricsAppender for MetricsBlockBuilder {
     }
 }
 
+impl MetricsV2Appender for MetricsBlockBuilder {
+    fn descriptor(&mut self, descriptor: &MetricDescriptorV2) -> std::result::Result<(), String> {
+        if self.descriptors.contains_key(&descriptor.id) {
+            return Err(format!("duplicate metric descriptor {}", descriptor.id));
+        }
+        self.descriptors.insert(descriptor.id, descriptor.clone());
+        Ok(())
+    }
+
+    fn point(&mut self, point: &MetricPointV2) -> std::result::Result<(), String> {
+        let (id, ts, attrs, number) = match &point.value {
+            MetricPointV2Value::ScalarPointV2(p) => (
+                p.descriptor_id,
+                p.ts_unix_nano,
+                &p.attributes,
+                Some(&p.number.value),
+            ),
+            MetricPointV2Value::HistogramPointV2(p) => {
+                (p.descriptor_id, p.ts_unix_nano, &p.attributes, None)
+            }
+            MetricPointV2Value::ExponentialHistogramPointV2(p) => {
+                (p.descriptor_id, p.ts_unix_nano, &p.attributes, None)
+            }
+            MetricPointV2Value::SummaryPointV2(p) => {
+                (p.descriptor_id, p.ts_unix_nano, &p.attributes, None)
+            }
+        };
+        let descriptor = self
+            .descriptors
+            .get(&id)
+            .ok_or_else(|| format!("unknown metric descriptor {id}"))?;
+        // A metric series is a label *set*. Canonicalise with deterministic
+        // precedence (point > scope > resource; synthetic labels always win),
+        // both to avoid duplicate postings and to keep the fingerprint stable
+        // when input attributes arrive in a different order.
+        let mut label_set = BTreeMap::new();
+        for label in &descriptor.resource_attrs {
+            label_set.insert(label.key.clone(), label.value.clone());
+        }
+        for label in &descriptor.scope_attrs {
+            label_set.insert(label.key.clone(), label.value.clone());
+        }
+        if !descriptor.scope_name.is_empty() {
+            label_set.insert("otel.scope.name".into(), descriptor.scope_name.clone());
+        }
+        if !descriptor.scope_version.is_empty() {
+            label_set.insert(
+                "otel.scope.version".into(),
+                descriptor.scope_version.clone(),
+            );
+        }
+        for label in attrs {
+            label_set.insert(label.key.clone(), label.value.clone());
+        }
+        label_set.insert("__name__".into(), descriptor.name.clone());
+        let labels: Vec<LabelPair> = label_set
+            .into_iter()
+            .map(|(key, value)| LabelPair { key, value })
+            .collect();
+        let fingerprint = scry_proto::fingerprint::fingerprint(&labels);
+        if self.series_seen.insert(fingerprint) {
+            self.series_dict.push(OwnedSeries {
+                fingerprint,
+                metric_type: descriptor.metric_kind,
+                labels: labels.into_iter().map(|p| (p.key, p.value)).collect(),
+            });
+        }
+        let (scalar_i64, scalar_f64) = match number {
+            Some(MetricNumberV2Value::IntegerValueV2(v)) => (Some(v.value), None),
+            Some(MetricNumberV2Value::DoubleValueV2(v)) => (None, Some(v.value)),
+            None => (None, None),
+        };
+        let encoded_descriptor = descriptor.encode().map_err(|e| e.to_string())?;
+        let encoded_point = point.encode().map_err(|e| e.to_string())?;
+        self.ts_min = self.ts_min.min(ts);
+        self.ts_max = self.ts_max.max(ts);
+        self.bytes_est += (64 + encoded_descriptor.len() + encoded_point.len()) as u64;
+        self.v2_points.push(MetricRow {
+            fingerprint,
+            ts,
+            value: scalar_f64.or_else(|| scalar_i64.map(|value| value as f64)),
+            descriptor_id: Some(id),
+            kind: Some(descriptor.metric_kind),
+            scalar_i64,
+            scalar_f64,
+            descriptor: Some(encoded_descriptor),
+            point: Some(encoded_point),
+        });
+        Ok(())
+    }
+}
+
 impl MetricsBlockBuilder {
     /// Body of [`BlockBuilder::finish_and_upload`]. Split out for the
     /// `mut self` rebinding ergonomic — see `dummy.rs` for the same
@@ -268,7 +396,7 @@ impl MetricsBlockBuilder {
     /// `spawn_blocking`. The async `finish_and_upload_impl` performs the
     /// PUTs.
     fn encode(mut self) -> Result<EncodedBlock> {
-        let n = self.fingerprints.len();
+        let n = self.fingerprints.len() + self.v2_points.len();
 
         // ── Main parquet ───────────────────────────────────────────
         //
@@ -292,24 +420,70 @@ impl MetricsBlockBuilder {
         // `sort_unstable_by`: rows sharing an identical (fp, ts) are
         // interchangeable to every reader, so we skip the stable sort's
         // O(n) scratch buffer and take the faster algorithm.
-        let mut rows: Vec<(u64, u64, f64)> = (0..n)
-            .map(|i| (self.fingerprints[i], self.ts[i], self.values[i]))
-            .collect();
-        // Release the source columns now — `rows` owns everything the
-        // column build needs.
-        self.fingerprints = Vec::new();
-        self.ts = Vec::new();
-        self.values = Vec::new();
-        rows.sort_unstable_by_key(|row| (row.0, row.1));
+        debug_assert_eq!(self.fingerprints.len(), self.ts.len());
+        debug_assert_eq!(self.fingerprints.len(), self.values.len());
+        let mut rows: Vec<MetricRow> = std::mem::take(&mut self.v2_points);
+        rows.extend(
+            self.fingerprints
+                .drain(..)
+                .zip(self.ts.drain(..))
+                .zip(self.values.drain(..))
+                .map(|((fingerprint, ts), value)| MetricRow {
+                    fingerprint,
+                    ts,
+                    value: Some(value),
+                    descriptor_id: None,
+                    kind: None,
+                    scalar_i64: None,
+                    scalar_f64: None,
+                    descriptor: None,
+                    point: None,
+                }),
+        );
+        rows.sort_unstable_by_key(|row| (row.fingerprint, row.ts));
 
         let main_schema = Self::main_schema();
-        let fp_arr: ArrayRef = Arc::new(UInt64Array::from_iter_values(rows.iter().map(|r| r.0)));
-        let ts_arr: ArrayRef = Arc::new(UInt64Array::from_iter_values(rows.iter().map(|r| r.1)));
-        let val_arr: ArrayRef = Arc::new(Float64Array::from_iter_values(rows.iter().map(|r| r.2)));
-        drop(rows);
+        let fp_arr: ArrayRef = Arc::new(UInt64Array::from_iter_values(
+            rows.iter().map(|r| r.fingerprint),
+        ));
+        let ts_arr: ArrayRef = Arc::new(UInt64Array::from_iter_values(rows.iter().map(|r| r.ts)));
+        let val_arr: ArrayRef = Arc::new(Float64Array::from(
+            rows.iter().map(|r| r.value).collect::<Vec<_>>(),
+        ));
+        let descriptor_ids: ArrayRef = Arc::new(UInt32Array::from(
+            rows.iter().map(|r| r.descriptor_id).collect::<Vec<_>>(),
+        ));
+        let kinds: ArrayRef = Arc::new(UInt8Array::from(
+            rows.iter().map(|r| r.kind).collect::<Vec<_>>(),
+        ));
+        let ints: ArrayRef = Arc::new(Int64Array::from(
+            rows.iter().map(|r| r.scalar_i64).collect::<Vec<_>>(),
+        ));
+        let floats: ArrayRef = Arc::new(Float64Array::from(
+            rows.iter().map(|r| r.scalar_f64).collect::<Vec<_>>(),
+        ));
+        let descriptors: ArrayRef = Arc::new(BinaryArray::from_opt_vec(
+            rows.iter().map(|r| r.descriptor.as_deref()).collect(),
+        ));
+        let points: ArrayRef = Arc::new(BinaryArray::from_opt_vec(
+            rows.iter().map(|r| r.point.as_deref()).collect(),
+        ));
 
-        let main_batch = RecordBatch::try_new(main_schema.clone(), vec![fp_arr, ts_arr, val_arr])
-            .context("constructing metrics main RecordBatch")?;
+        let main_batch = RecordBatch::try_new(
+            main_schema.clone(),
+            vec![
+                fp_arr,
+                ts_arr,
+                val_arr,
+                descriptor_ids,
+                kinds,
+                ints,
+                floats,
+                descriptors,
+                points,
+            ],
+        )
+        .context("constructing metrics main RecordBatch")?;
 
         let props = self.cfg.main_writer_props()?;
         let mut main_buf: Vec<u8> = Vec::with_capacity(self.bytes_est as usize);

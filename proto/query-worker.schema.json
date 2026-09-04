@@ -1,0 +1,129 @@
+{
+  "meta": {
+    "title": "scry private query-worker control protocol",
+    "description": "Authenticated queryd-to-queryd Phase-1 control plane. Private network only; no client SQL or execution plans.",
+    "version": "0.1.0"
+  },
+  "config": { "endianness": "big_endian", "bit_order": "msb_first" },
+  "types": {
+    "QueryWorkerFrame": {
+      "description": "Private worker control-plane union. Every decoded message is subject to stricter semantic size/count limits before use.",
+      "sequence": [{
+        "name": "msg", "type": "discriminated_union", "discriminator": { "peek": "uint8" },
+        "variants": [
+          { "type": "WorkerClientHello", "when": "value === 0x01" },
+          { "type": "WorkerServerHello", "when": "value === 0x02" },
+          { "type": "WorkerAuthenticated", "when": "value === 0x03" },
+          { "type": "WorkerBidRequest", "when": "value === 0x10" },
+          { "type": "WorkerBidResponse", "when": "value === 0x11" },
+          { "type": "WorkerBidDecline", "when": "value === 0x12" },
+          { "type": "WorkerRelease", "when": "value === 0x20" },
+          { "type": "WorkerReleaseAck", "when": "value === 0x21" },
+          { "type": "WorkerCancel", "when": "value === 0x30" },
+          { "type": "WorkerCancelAck", "when": "value === 0x31" },
+          { "type": "WorkerError", "when": "value === 0xF0" }
+        ]
+      }]
+    },
+    "WorkerClientHello": { "sequence": [
+      { "name": "tag", "type": "uint8", "const": 1 },
+      { "name": "protocol_version", "type": "uint16" },
+      { "name": "coordinator_id", "type": "bytes", "kind": "fixed", "length": 16 },
+      { "name": "expected_worker_id", "type": "bytes", "kind": "fixed", "length": 16 },
+      { "name": "deployment", "type": "string", "kind": "length_prefixed", "length_type": "uint16", "encoding": "utf8" },
+      { "name": "timestamp_unix_ms", "type": "uint64" },
+      { "name": "nonce", "type": "bytes", "kind": "fixed", "length": 32 },
+      { "name": "key_id", "type": "string", "kind": "length_prefixed", "length_type": "uint8", "encoding": "ascii" },
+      { "name": "mac", "type": "bytes", "kind": "fixed", "length": 32 }
+    ]},
+    "WorkerServerHello": { "sequence": [
+      { "name": "tag", "type": "uint8", "const": 2 },
+      { "name": "protocol_version", "type": "uint16" },
+      { "name": "worker_id", "type": "bytes", "kind": "fixed", "length": 16 },
+      { "name": "coordinator_nonce", "type": "bytes", "kind": "fixed", "length": 32 },
+      { "name": "worker_nonce", "type": "bytes", "kind": "fixed", "length": 32 },
+      { "name": "timestamp_unix_ms", "type": "uint64" },
+      { "name": "key_id", "type": "string", "kind": "length_prefixed", "length_type": "uint8", "encoding": "ascii" },
+      { "name": "mac", "type": "bytes", "kind": "fixed", "length": 32 }
+    ]},
+    "WorkerAuthenticated": {
+      "description": "Authenticated record envelope used after the mutual hello. The MAC covers direction, monotonically increasing sequence, and the exact nested encoded frame bytes. Nested authenticated envelopes are rejected.",
+      "sequence": [
+        { "name": "tag", "type": "uint8", "const": 3 },
+        { "name": "sequence", "type": "uint64" },
+        { "name": "payload", "type": "bytes", "kind": "length_prefixed", "length_type": "uint32" },
+        { "name": "mac", "type": "bytes", "kind": "fixed", "length": 32 }
+      ]
+    },
+    "WorkerBlockOffer": { "sequence": [
+      { "name": "uuid", "type": "bytes", "kind": "fixed", "length": 16 },
+      { "name": "estimated_scan_bytes", "type": "uint64" }
+    ]},
+    "WorkerBlockLocality": { "sequence": [
+      { "name": "uuid", "type": "bytes", "kind": "fixed", "length": 16 },
+      { "name": "locality", "type": "uint8" }
+    ]},
+    "WorkerBidRequest": { "sequence": [
+      { "name": "tag", "type": "uint8", "const": 16 },
+      { "name": "coordinator_id", "type": "bytes", "kind": "fixed", "length": 16 },
+      { "name": "query_attempt", "type": "uint32" },
+      { "name": "offer_id", "type": "bytes", "kind": "fixed", "length": 16 },
+      { "name": "deadline_unix_ms", "type": "uint64" },
+      { "name": "signal", "type": "uint8" },
+      { "name": "required_columns", "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "string", "kind": "length_prefixed", "length_type": "uint8", "encoding": "utf8" } },
+      { "name": "requires_postings", "type": "uint8" },
+      { "name": "requires_bloom", "type": "uint8" },
+      { "name": "blocks", "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "WorkerBlockOffer" } },
+      { "name": "operation", "type": "uint8" },
+      { "name": "estimated_output_bytes", "type": "uint64" },
+      { "name": "memory_units", "type": "uint32" },
+      { "name": "block_set_digest", "type": "bytes", "kind": "fixed", "length": 32 }
+    ]},
+    "WorkerBidResponse": { "sequence": [
+      { "name": "tag", "type": "uint8", "const": 17 },
+      { "name": "offer_id", "type": "bytes", "kind": "fixed", "length": 16 },
+      { "name": "worker_id", "type": "bytes", "kind": "fixed", "length": 16 },
+      { "name": "locality_generation", "type": "uint64" },
+      { "name": "locality", "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "WorkerBlockLocality" } },
+      { "name": "reservation_token", "type": "bytes", "kind": "fixed", "length": 32 },
+      { "name": "reservation_expires_unix_ms", "type": "uint64" },
+      { "name": "estimated_start_delay_ms", "type": "uint32" },
+      { "name": "available_fragment_slots", "type": "uint16" },
+      { "name": "memory_pressure_per_mille", "type": "uint16" }
+    ]},
+    "WorkerBidDecline": { "sequence": [
+      { "name": "tag", "type": "uint8", "const": 18 },
+      { "name": "offer_id", "type": "bytes", "kind": "fixed", "length": 16 },
+      { "name": "reason", "type": "uint16" },
+      { "name": "message", "type": "string", "kind": "length_prefixed", "length_type": "uint16", "encoding": "utf8" }
+    ]},
+    "WorkerRelease": { "sequence": [
+      { "name": "tag", "type": "uint8", "const": 32 },
+      { "name": "coordinator_id", "type": "bytes", "kind": "fixed", "length": 16 },
+      { "name": "reservation_token", "type": "bytes", "kind": "fixed", "length": 32 }
+    ]},
+    "WorkerReleaseAck": { "sequence": [
+      { "name": "tag", "type": "uint8", "const": 33 },
+      { "name": "reservation_token", "type": "bytes", "kind": "fixed", "length": 32 },
+      { "name": "released", "type": "uint8" }
+    ]},
+    "WorkerCancel": { "sequence": [
+      { "name": "tag", "type": "uint8", "const": 48 },
+      { "name": "coordinator_id", "type": "bytes", "kind": "fixed", "length": 16 },
+      { "name": "query_attempt", "type": "uint32" },
+      { "name": "fragment_id", "type": "bytes", "kind": "fixed", "length": 16 },
+      { "name": "fragment_attempt", "type": "uint32" }
+    ]},
+    "WorkerCancelAck": { "sequence": [
+      { "name": "tag", "type": "uint8", "const": 49 },
+      { "name": "fragment_id", "type": "bytes", "kind": "fixed", "length": 16 },
+      { "name": "fragment_attempt", "type": "uint32" },
+      { "name": "cancelled", "type": "uint8" }
+    ]},
+    "WorkerError": { "sequence": [
+      { "name": "tag", "type": "uint8", "const": 240 },
+      { "name": "code", "type": "uint16" },
+      { "name": "message", "type": "string", "kind": "length_prefixed", "length_type": "uint16", "encoding": "utf8" }
+    ]}
+  }
+}

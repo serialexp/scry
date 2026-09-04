@@ -9,7 +9,7 @@
 //! - `scry get` — one-shot query CLI (locally or against a `scry query` daemon).
 //! - `scry list` — catalog inspector / bucket reconciler.
 //! - `scry agent` — Kubernetes log-collection + Prometheus-scrape agent.
-//! - `scry gateway` — foreign-protocol fan-out hub (OTLP / Pyroscope / remote-write → sinks).
+//! - `scry gateway` — foreign-protocol fan-out hub (OTLP / Loki / Pyroscope / remote-write → sinks).
 //! - `scry web` — browser query UI + byte-pipe relay to `scry query`.
 //! - `scry compact` — size-tiered block compaction (one-shot / watch).
 //! - `scry retention` — per-signal TTL retention (dry-run by default).

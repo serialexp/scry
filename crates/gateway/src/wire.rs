@@ -165,7 +165,10 @@ async fn handle_conn(
         }
     };
 
-    if hello.protocol_version != PROTOCOL_VERSION_V0 {
+    if !matches!(
+        hello.protocol_version,
+        PROTOCOL_VERSION_V0 | scry_proto::constants::PROTOCOL_VERSION_V2
+    ) {
         let _ = write_frame(
             &mut wr,
             &build::error(ERR_PROTOCOL_VERSION, "unsupported protocol version"),
@@ -189,10 +192,14 @@ async fn handle_conn(
     write_frame(
         &mut wr,
         &build::hello_ack(build::HelloAckArgs {
-            protocol_version: PROTOCOL_VERSION_V0,
+            protocol_version: hello.protocol_version,
             writer_id: WRITER_ID,
             session_id,
-            capabilities: 0,
+            capabilities: if hello.protocol_version == scry_proto::constants::PROTOCOL_VERSION_V2 {
+                scry_proto::constants::CAP_STRUCTURED_METRICS_V2
+            } else {
+                0
+            },
             suggested_batch_bytes: DEFAULT_SUGGESTED_BATCH_BYTES,
             max_batch_bytes: DEFAULT_MAX_BATCH_BYTES,
             max_inflight_batches: DEFAULT_MAX_INFLIGHT_BATCHES,
@@ -301,6 +308,22 @@ async fn handle_conn(
                     Signal::Logs => LogsBatch::decode(&decompressed)
                         .map(|batch| state.offer_logs(batch))
                         .map_err(|e| anyhow::anyhow!("LogsBatch: {e}")),
+                    Signal::Metrics
+                        if decompressed
+                            .get(..4)
+                            .and_then(|bytes| bytes.try_into().ok())
+                            .map(u32::from_be_bytes)
+                            == Some(scry_proto::constants::METRICS_BATCH_V2_MAGIC) =>
+                    {
+                        scry_proto::generated::MetricsBatchV2::decode(&decompressed)
+                            .map_err(|e| anyhow::anyhow!("MetricsBatchV2: {e}"))
+                            .and_then(|batch| {
+                                scry_proto::metrics_v2::validate(&batch)
+                                    .map_err(|e| anyhow::anyhow!("MetricsBatchV2: {e}"))?;
+                                state.offer_structured_metrics(batch);
+                                Ok(())
+                            })
+                    }
                     Signal::Metrics => MetricsBatch::decode(&decompressed)
                         .map(|batch| state.offer_metrics(batch))
                         .map_err(|e| anyhow::anyhow!("MetricsBatch: {e}")),

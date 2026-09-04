@@ -35,15 +35,15 @@ use tokio::sync::watch;
 /// CLI arguments for the `scry gateway` subcommand.
 #[derive(Parser, Debug)]
 #[command(
-    about = "fan-out push gateway for scry (native + OTLP/HTTP + OTLP/gRPC + Pyroscope + remote-write in; scry + Loki + OpenSearch + Mimir out)"
+    about = "fan-out push gateway for scry (native + OTLP + Loki + Pyroscope + remote-write in; scry + Loki + OpenSearch + Mimir out)"
 )]
 pub struct Args {
-    /// HTTP listen address (foreign protocols: /v1/traces, /ingest, /api/v1/write).
+    /// HTTP listen address (OTLP traces/logs/metrics, Loki, Pyroscope, remote-write).
     #[arg(long, default_value = "0.0.0.0:4318")]
     listen: String,
 
-    /// OTLP/gRPC trace listen address. Opt-in: when unset, the gateway accepts
-    /// OTLP/HTTP protobuf only. Use 0.0.0.0:4317 for standard OTel exporters.
+    /// OTLP/gRPC traces/logs/metrics listen address. Opt-in: when unset, the
+    /// gateway accepts OTLP/HTTP only. Use 0.0.0.0:4317 for OTel exporters.
     #[arg(long)]
     listen_otlp_grpc: Option<String>,
 

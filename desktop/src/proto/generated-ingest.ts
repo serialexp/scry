@@ -5649,3 +5649,3306 @@ export class DummyRecordDecoder extends SeekableBitStreamDecoder {
   }
 }
 
+/**
+ * Protocol-v2 canonical structured metrics payload. Unlike MetricsBatch v1, structured values are never exploded into synthetic scalar series. A fixed magic prefix makes WAL replay and defensive decoders distinguish it from positional v1 payloads.
+ */
+export interface MetricsBatchV2Input {
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  descriptors: MetricDescriptorV2Input[];
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  points: MetricPointV2Input[];
+}
+
+/**
+ * Protocol-v2 canonical structured metrics payload. Unlike MetricsBatch v1, structured values are never exploded into synthetic scalar series. A fixed magic prefix makes WAL replay and defensive decoders distinguish it from positional v1 payloads.
+ */
+export interface MetricsBatchV2Output {
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  magic: number;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  descriptors: MetricDescriptorV2Output[];
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  points: MetricPointV2Output[];
+}
+
+export type MetricsBatchV2 = MetricsBatchV2Output;
+
+export class MetricsBatchV2Encoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("msb_first");
+  }
+
+  encode(value: MetricsBatchV2Input): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint32(1397568000, "big_endian");
+    this.writeUint32(value.descriptors.length, "big_endian");
+    for (let value_descriptors__iter_index = 0; value_descriptors__iter_index < value.descriptors.length; value_descriptors__iter_index++) {
+      const value_descriptors__iter = value.descriptors[value_descriptors__iter_index];
+      const encoder_value_descriptors__iter = new MetricDescriptorV2Encoder();
+      const encoded_value_descriptors__iter = encoder_value_descriptors__iter.encode(value_descriptors__iter);
+      for (const byte of encoded_value_descriptors__iter) {
+        this.writeUint8(byte);
+      }
+    }
+    this.writeUint32(value.points.length, "big_endian");
+    for (let value_points__iter_index = 0; value_points__iter_index < value.points.length; value_points__iter_index++) {
+      const value_points__iter = value.points[value_points__iter_index];
+      const encoder_value_points__iter = new MetricPointV2Encoder();
+      const encoded_value_points__iter = encoder_value_points__iter.encode(value_points__iter);
+      for (const byte of encoded_value_points__iter) {
+        this.writeUint8(byte);
+      }
+    }
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a MetricsBatchV2 value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: MetricsBatchV2): number {
+    let size = 0;
+    size += 4; // magic (const)
+    // descriptors: array (kind: length_prefixed)
+    for (const item of value.descriptors) {
+      const descriptors_itemEncoder = new MetricDescriptorV2Encoder();
+      size += descriptors_itemEncoder.calculateSize(item);
+    }
+    size += 4; // length prefix (uint32)
+    // points: array (kind: length_prefixed)
+    for (const item of value.points) {
+      const points_itemEncoder = new MetricPointV2Encoder();
+      size += points_itemEncoder.calculateSize(item);
+    }
+    size += 4; // length prefix (uint32)
+    return size;
+  }
+}
+
+export class MetricsBatchV2Decoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "msb_first");
+  }
+
+  decode(): MetricsBatchV2Output {
+    const value: any = {};
+
+    value.magic = this.readUint32("big_endian");
+    value.descriptors = [];
+    const descriptors_length = this.readUint32("big_endian");
+    for (let i = 0; i < descriptors_length; i++) {
+      let descriptors__iter: any;
+      descriptors__iter = {};
+      descriptors__iter.id = this.readUint32("big_endian");
+      const descriptors__iter_name_length = this.readUint16("big_endian");
+      const descriptors__iter_name_bytes = this.readBytesSlice(descriptors__iter_name_length);
+      try {
+        descriptors__iter.name = new TextDecoder("utf-8", { fatal: true }).decode(descriptors__iter_name_bytes);
+      } catch (e) {
+        throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
+      }
+      const descriptors__iter_description_length = this.readUint16("big_endian");
+      const descriptors__iter_description_bytes = this.readBytesSlice(descriptors__iter_description_length);
+      try {
+        descriptors__iter.description = new TextDecoder("utf-8", { fatal: true }).decode(descriptors__iter_description_bytes);
+      } catch (e) {
+        throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
+      }
+      const descriptors__iter_unit_length = this.readUint16("big_endian");
+      const descriptors__iter_unit_bytes = this.readBytesSlice(descriptors__iter_unit_length);
+      try {
+        descriptors__iter.unit = new TextDecoder("utf-8", { fatal: true }).decode(descriptors__iter_unit_bytes);
+      } catch (e) {
+        throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
+      }
+      descriptors__iter.metric_kind = this.readUint8();
+      descriptors__iter.temporality = this.readUint8();
+      descriptors__iter.monotonic = this.readUint8();
+      descriptors__iter.resource_attrs = [];
+      const descriptors__iter_resource_attrs_length = this.readUint16("big_endian");
+      for (let i = 0; i < descriptors__iter_resource_attrs_length; i++) {
+        let descriptors__iter_resource_attrs__iter: any;
+        descriptors__iter_resource_attrs__iter = {};
+        const descriptors__iter_resource_attrs__iter_key_length = this.readUint8();
+        const descriptors__iter_resource_attrs__iter_key_bytes = this.readBytesSlice(descriptors__iter_resource_attrs__iter_key_length);
+        try {
+          descriptors__iter_resource_attrs__iter.key = new TextDecoder("utf-8", { fatal: true }).decode(descriptors__iter_resource_attrs__iter_key_bytes);
+        } catch (e) {
+          throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
+        }
+        const descriptors__iter_resource_attrs__iter_value_length = this.readUint16("big_endian");
+        const descriptors__iter_resource_attrs__iter_value_bytes = this.readBytesSlice(descriptors__iter_resource_attrs__iter_value_length);
+        try {
+          descriptors__iter_resource_attrs__iter.value = new TextDecoder("utf-8", { fatal: true }).decode(descriptors__iter_resource_attrs__iter_value_bytes);
+        } catch (e) {
+          throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
+        }
+        descriptors__iter.resource_attrs.push(descriptors__iter_resource_attrs__iter);
+      }
+      const descriptors__iter_scope_name_length = this.readUint8();
+      const descriptors__iter_scope_name_bytes = this.readBytesSlice(descriptors__iter_scope_name_length);
+      try {
+        descriptors__iter.scope_name = new TextDecoder("utf-8", { fatal: true }).decode(descriptors__iter_scope_name_bytes);
+      } catch (e) {
+        throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
+      }
+      const descriptors__iter_scope_version_length = this.readUint8();
+      const descriptors__iter_scope_version_bytes = this.readBytesSlice(descriptors__iter_scope_version_length);
+      try {
+        descriptors__iter.scope_version = new TextDecoder("utf-8", { fatal: true }).decode(descriptors__iter_scope_version_bytes);
+      } catch (e) {
+        throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
+      }
+      descriptors__iter.scope_attrs = [];
+      const descriptors__iter_scope_attrs_length = this.readUint16("big_endian");
+      for (let i = 0; i < descriptors__iter_scope_attrs_length; i++) {
+        let descriptors__iter_scope_attrs__iter: any;
+        descriptors__iter_scope_attrs__iter = {};
+        const descriptors__iter_scope_attrs__iter_key_length = this.readUint8();
+        const descriptors__iter_scope_attrs__iter_key_bytes = this.readBytesSlice(descriptors__iter_scope_attrs__iter_key_length);
+        try {
+          descriptors__iter_scope_attrs__iter.key = new TextDecoder("utf-8", { fatal: true }).decode(descriptors__iter_scope_attrs__iter_key_bytes);
+        } catch (e) {
+          throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
+        }
+        const descriptors__iter_scope_attrs__iter_value_length = this.readUint16("big_endian");
+        const descriptors__iter_scope_attrs__iter_value_bytes = this.readBytesSlice(descriptors__iter_scope_attrs__iter_value_length);
+        try {
+          descriptors__iter_scope_attrs__iter.value = new TextDecoder("utf-8", { fatal: true }).decode(descriptors__iter_scope_attrs__iter_value_bytes);
+        } catch (e) {
+          throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
+        }
+        descriptors__iter.scope_attrs.push(descriptors__iter_scope_attrs__iter);
+      }
+      value.descriptors.push(descriptors__iter);
+    }
+    value.points = [];
+    const points_length = this.readUint32("big_endian");
+    for (let i = 0; i < points_length; i++) {
+      let points__iter: any;
+      points__iter = {};
+      const discriminator = this.peekUint8();
+      if (discriminator === 1) {
+        const decoder = new ScalarPointV2Decoder(this.bytes.slice(this.byteOffset), points__iter);
+        const decodedValue = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        points__iter.value = { type: 'ScalarPointV2', value: decodedValue };
+      }
+      else if (discriminator === 2) {
+        const decoder = new HistogramPointV2Decoder(this.bytes.slice(this.byteOffset), points__iter);
+        const decodedValue = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        points__iter.value = { type: 'HistogramPointV2', value: decodedValue };
+      }
+      else if (discriminator === 3) {
+        const decoder = new ExponentialHistogramPointV2Decoder(this.bytes.slice(this.byteOffset), points__iter);
+        const decodedValue = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        points__iter.value = { type: 'ExponentialHistogramPointV2', value: decodedValue };
+      }
+      else if (discriminator === 4) {
+        const decoder = new SummaryPointV2Decoder(this.bytes.slice(this.byteOffset), points__iter);
+        const decodedValue = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        points__iter.value = { type: 'SummaryPointV2', value: decodedValue };
+      } else {
+        throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator: 0x${discriminator.toString(16)}`);
+      }
+      value.points.push(points__iter);
+    }
+    return value;
+  }
+}
+
+/**
+ * Batch-local metric identity and common OpenTelemetry/Prometheus metadata.
+ */
+export interface MetricDescriptorV2Input {
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  id: number;
+  /**
+   * String kind: length_prefixed
+   * Encoding: utf8
+   * Length prefix type: uint16
+   */
+  name: string;
+  /**
+   * String kind: length_prefixed
+   * Encoding: utf8
+   * Length prefix type: uint16
+   */
+  description: string;
+  /**
+   * String kind: length_prefixed
+   * Encoding: utf8
+   * Length prefix type: uint16
+   */
+  unit: string;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  metric_kind: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  temporality: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  monotonic: number;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint16
+   */
+  resource_attrs: LabelPairInput[];
+  /**
+   * String kind: length_prefixed
+   * Encoding: utf8
+   * Length prefix type: uint8
+   */
+  scope_name: string;
+  /**
+   * String kind: length_prefixed
+   * Encoding: utf8
+   * Length prefix type: uint8
+   */
+  scope_version: string;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint16
+   */
+  scope_attrs: LabelPairInput[];
+}
+
+/**
+ * Batch-local metric identity and common OpenTelemetry/Prometheus metadata.
+ */
+export interface MetricDescriptorV2Output {
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  id: number;
+  /**
+   * String kind: length_prefixed
+   * Encoding: utf8
+   * Length prefix type: uint16
+   */
+  name: string;
+  /**
+   * String kind: length_prefixed
+   * Encoding: utf8
+   * Length prefix type: uint16
+   */
+  description: string;
+  /**
+   * String kind: length_prefixed
+   * Encoding: utf8
+   * Length prefix type: uint16
+   */
+  unit: string;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  metric_kind: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  temporality: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  monotonic: number;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint16
+   */
+  resource_attrs: LabelPairOutput[];
+  /**
+   * String kind: length_prefixed
+   * Encoding: utf8
+   * Length prefix type: uint8
+   */
+  scope_name: string;
+  /**
+   * String kind: length_prefixed
+   * Encoding: utf8
+   * Length prefix type: uint8
+   */
+  scope_version: string;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint16
+   */
+  scope_attrs: LabelPairOutput[];
+}
+
+export type MetricDescriptorV2 = MetricDescriptorV2Output;
+
+export class MetricDescriptorV2Encoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("msb_first");
+  }
+
+  encode(value: MetricDescriptorV2Input): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint32(value.id, "big_endian");
+    const value_name_bytes = new TextEncoder().encode(value.name);
+    this.writeUint16(value_name_bytes.length, "big_endian");
+    for (const byte of value_name_bytes) {
+      this.writeUint8(byte);
+    }
+    const value_description_bytes = new TextEncoder().encode(value.description);
+    this.writeUint16(value_description_bytes.length, "big_endian");
+    for (const byte of value_description_bytes) {
+      this.writeUint8(byte);
+    }
+    const value_unit_bytes = new TextEncoder().encode(value.unit);
+    this.writeUint16(value_unit_bytes.length, "big_endian");
+    for (const byte of value_unit_bytes) {
+      this.writeUint8(byte);
+    }
+    this.writeUint8(value.metric_kind);
+    this.writeUint8(value.temporality);
+    this.writeUint8(value.monotonic);
+    this.writeUint16(value.resource_attrs.length, "big_endian");
+    for (let value_resource_attrs__iter_index = 0; value_resource_attrs__iter_index < value.resource_attrs.length; value_resource_attrs__iter_index++) {
+      const value_resource_attrs__iter = value.resource_attrs[value_resource_attrs__iter_index];
+      const encoder_value_resource_attrs__iter = new LabelPairEncoder();
+      const encoded_value_resource_attrs__iter = encoder_value_resource_attrs__iter.encode(value_resource_attrs__iter);
+      for (const byte of encoded_value_resource_attrs__iter) {
+        this.writeUint8(byte);
+      }
+    }
+    const value_scope_name_bytes = new TextEncoder().encode(value.scope_name);
+    this.writeUint8(value_scope_name_bytes.length);
+    for (const byte of value_scope_name_bytes) {
+      this.writeUint8(byte);
+    }
+    const value_scope_version_bytes = new TextEncoder().encode(value.scope_version);
+    this.writeUint8(value_scope_version_bytes.length);
+    for (const byte of value_scope_version_bytes) {
+      this.writeUint8(byte);
+    }
+    this.writeUint16(value.scope_attrs.length, "big_endian");
+    for (let value_scope_attrs__iter_index = 0; value_scope_attrs__iter_index < value.scope_attrs.length; value_scope_attrs__iter_index++) {
+      const value_scope_attrs__iter = value.scope_attrs[value_scope_attrs__iter_index];
+      const encoder_value_scope_attrs__iter = new LabelPairEncoder();
+      const encoded_value_scope_attrs__iter = encoder_value_scope_attrs__iter.encode(value_scope_attrs__iter);
+      for (const byte of encoded_value_scope_attrs__iter) {
+        this.writeUint8(byte);
+      }
+    }
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a MetricDescriptorV2 value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: MetricDescriptorV2): number {
+    let size = 0;
+    size += 4; // id
+    // name: string (utf8)
+    size += new TextEncoder().encode(value.name).length;
+    // description: string (utf8)
+    size += new TextEncoder().encode(value.description).length;
+    // unit: string (utf8)
+    size += new TextEncoder().encode(value.unit).length;
+    size += 3; // metric_kind + temporality + monotonic
+    // resource_attrs: array (kind: length_prefixed)
+    for (const item of value.resource_attrs) {
+      const resource_attrs_itemEncoder = new LabelPairEncoder();
+      size += resource_attrs_itemEncoder.calculateSize(item);
+    }
+    size += 2; // length prefix (uint16)
+    // scope_name: string (utf8)
+    size += new TextEncoder().encode(value.scope_name).length;
+    // scope_version: string (utf8)
+    size += new TextEncoder().encode(value.scope_version).length;
+    // scope_attrs: array (kind: length_prefixed)
+    for (const item of value.scope_attrs) {
+      const scope_attrs_itemEncoder = new LabelPairEncoder();
+      size += scope_attrs_itemEncoder.calculateSize(item);
+    }
+    size += 2; // length prefix (uint16)
+    return size;
+  }
+}
+
+export class MetricDescriptorV2Decoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "msb_first");
+  }
+
+  decode(): MetricDescriptorV2Output {
+    const value: any = {};
+
+    value.id = this.readUint32("big_endian");
+    const name_length = this.readUint16("big_endian");
+    const name_bytes = this.readBytesSlice(name_length);
+    try {
+      value.name = new TextDecoder("utf-8", { fatal: true }).decode(name_bytes);
+    } catch (e) {
+      throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
+    }
+    const description_length = this.readUint16("big_endian");
+    const description_bytes = this.readBytesSlice(description_length);
+    try {
+      value.description = new TextDecoder("utf-8", { fatal: true }).decode(description_bytes);
+    } catch (e) {
+      throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
+    }
+    const unit_length = this.readUint16("big_endian");
+    const unit_bytes = this.readBytesSlice(unit_length);
+    try {
+      value.unit = new TextDecoder("utf-8", { fatal: true }).decode(unit_bytes);
+    } catch (e) {
+      throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
+    }
+    value.metric_kind = this.readUint8();
+    value.temporality = this.readUint8();
+    value.monotonic = this.readUint8();
+    value.resource_attrs = [];
+    const resource_attrs_length = this.readUint16("big_endian");
+    for (let i = 0; i < resource_attrs_length; i++) {
+      let resource_attrs__iter: any;
+      resource_attrs__iter = {};
+      const resource_attrs__iter_key_length = this.readUint8();
+      const resource_attrs__iter_key_bytes = this.readBytesSlice(resource_attrs__iter_key_length);
+      try {
+        resource_attrs__iter.key = new TextDecoder("utf-8", { fatal: true }).decode(resource_attrs__iter_key_bytes);
+      } catch (e) {
+        throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
+      }
+      const resource_attrs__iter_value_length = this.readUint16("big_endian");
+      const resource_attrs__iter_value_bytes = this.readBytesSlice(resource_attrs__iter_value_length);
+      try {
+        resource_attrs__iter.value = new TextDecoder("utf-8", { fatal: true }).decode(resource_attrs__iter_value_bytes);
+      } catch (e) {
+        throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
+      }
+      value.resource_attrs.push(resource_attrs__iter);
+    }
+    const scope_name_length = this.readUint8();
+    const scope_name_bytes = this.readBytesSlice(scope_name_length);
+    try {
+      value.scope_name = new TextDecoder("utf-8", { fatal: true }).decode(scope_name_bytes);
+    } catch (e) {
+      throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
+    }
+    const scope_version_length = this.readUint8();
+    const scope_version_bytes = this.readBytesSlice(scope_version_length);
+    try {
+      value.scope_version = new TextDecoder("utf-8", { fatal: true }).decode(scope_version_bytes);
+    } catch (e) {
+      throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
+    }
+    value.scope_attrs = [];
+    const scope_attrs_length = this.readUint16("big_endian");
+    for (let i = 0; i < scope_attrs_length; i++) {
+      let scope_attrs__iter: any;
+      scope_attrs__iter = {};
+      const scope_attrs__iter_key_length = this.readUint8();
+      const scope_attrs__iter_key_bytes = this.readBytesSlice(scope_attrs__iter_key_length);
+      try {
+        scope_attrs__iter.key = new TextDecoder("utf-8", { fatal: true }).decode(scope_attrs__iter_key_bytes);
+      } catch (e) {
+        throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
+      }
+      const scope_attrs__iter_value_length = this.readUint16("big_endian");
+      const scope_attrs__iter_value_bytes = this.readBytesSlice(scope_attrs__iter_value_length);
+      try {
+        scope_attrs__iter.value = new TextDecoder("utf-8", { fatal: true }).decode(scope_attrs__iter_value_bytes);
+      } catch (e) {
+        throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
+      }
+      value.scope_attrs.push(scope_attrs__iter);
+    }
+    return value;
+  }
+}
+
+/**
+ * A tagged canonical metric point. Tag 1 scalar, 2 explicit histogram, 3 exponential/native histogram, 4 summary.
+ */
+export interface MetricPointV2Input {
+  /**
+   * Discriminated Union
+   * Type that can be one of several variants, chosen based on a discriminator value. Supports peek-based (read ahead) or field-based (reference earlier field) discrimination.
+   *
+   * @remarks
+   *
+   * Discriminator: peek uint8
+   * Variants: 4
+   * - ScalarPointV2 (when value === 1)
+   * - HistogramPointV2 (when value === 2)
+   * - ExponentialHistogramPointV2 (when value === 3)
+   * - SummaryPointV2 (when value === 4)
+   */
+  value: { type: 'ScalarPointV2'; value: ScalarPointV2Input } | { type: 'HistogramPointV2'; value: HistogramPointV2Input } | { type: 'ExponentialHistogramPointV2'; value: ExponentialHistogramPointV2Input } | { type: 'SummaryPointV2'; value: SummaryPointV2Input };
+}
+
+/**
+ * A tagged canonical metric point. Tag 1 scalar, 2 explicit histogram, 3 exponential/native histogram, 4 summary.
+ */
+export interface MetricPointV2Output {
+  /**
+   * Discriminated Union
+   * Type that can be one of several variants, chosen based on a discriminator value. Supports peek-based (read ahead) or field-based (reference earlier field) discrimination.
+   *
+   * @remarks
+   *
+   * Discriminator: peek uint8
+   * Variants: 4
+   * - ScalarPointV2 (when value === 1)
+   * - HistogramPointV2 (when value === 2)
+   * - ExponentialHistogramPointV2 (when value === 3)
+   * - SummaryPointV2 (when value === 4)
+   */
+  value: { type: 'ScalarPointV2'; value: ScalarPointV2Output } | { type: 'HistogramPointV2'; value: HistogramPointV2Output } | { type: 'ExponentialHistogramPointV2'; value: ExponentialHistogramPointV2Output } | { type: 'SummaryPointV2'; value: SummaryPointV2Output };
+}
+
+export type MetricPointV2 = MetricPointV2Output;
+
+/**
+ * Variant tags for MetricPointV2.value
+ */
+export const enum MetricPointV2ValueVariant {
+  ScalarPointV2 = 'ScalarPointV2',
+  HistogramPointV2 = 'HistogramPointV2',
+  ExponentialHistogramPointV2 = 'ExponentialHistogramPointV2',
+  SummaryPointV2 = 'SummaryPointV2',
+}
+
+export class MetricPointV2Encoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("msb_first");
+  }
+
+  encode(value: MetricPointV2Input): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    if (value.value.type === 'ScalarPointV2') {
+      const encoder_value = new ScalarPointV2Encoder();
+      const encoded_value = encoder_value.encode(value.value.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
+    }
+    else if (value.value.type === 'HistogramPointV2') {
+      const encoder_value = new HistogramPointV2Encoder();
+      const encoded_value = encoder_value.encode(value.value.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
+    }
+    else if (value.value.type === 'ExponentialHistogramPointV2') {
+      const encoder_value = new ExponentialHistogramPointV2Encoder();
+      const encoded_value = encoder_value.encode(value.value.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
+    }
+    else if (value.value.type === 'SummaryPointV2') {
+      const encoder_value = new SummaryPointV2Encoder();
+      const encoded_value = encoder_value.encode(value.value.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
+    } else {
+      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown variant type: ${(value.value as any).type}`);
+    }
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a MetricPointV2 value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: MetricPointV2): number {
+    let size = 0;
+    if (value.type === 'ScalarPointV2') {
+      const _enc = new ScalarPointV2Encoder();
+      size += _enc.calculateSize(value.value);
+    }
+    else if (value.type === 'HistogramPointV2') {
+      const _enc = new HistogramPointV2Encoder();
+      size += _enc.calculateSize(value.value);
+    }
+    else if (value.type === 'ExponentialHistogramPointV2') {
+      const _enc = new ExponentialHistogramPointV2Encoder();
+      size += _enc.calculateSize(value.value);
+    }
+    else if (value.type === 'SummaryPointV2') {
+      const _enc = new SummaryPointV2Encoder();
+      size += _enc.calculateSize(value.value);
+    }
+    else {
+      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown variant type for value: ${(value as any).type}`);
+    }
+    return size;
+  }
+}
+
+export class MetricPointV2Decoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "msb_first");
+  }
+
+  decode(): MetricPointV2Output {
+    const value: any = {};
+
+    const discriminator = this.peekUint8();
+    if (discriminator === 1) {
+      const decoder = new ScalarPointV2Decoder(this.bytes.slice(this.byteOffset), value);
+      const decodedValue = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.value = { type: 'ScalarPointV2', value: decodedValue };
+    }
+    else if (discriminator === 2) {
+      const decoder = new HistogramPointV2Decoder(this.bytes.slice(this.byteOffset), value);
+      const decodedValue = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.value = { type: 'HistogramPointV2', value: decodedValue };
+    }
+    else if (discriminator === 3) {
+      const decoder = new ExponentialHistogramPointV2Decoder(this.bytes.slice(this.byteOffset), value);
+      const decodedValue = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.value = { type: 'ExponentialHistogramPointV2', value: decodedValue };
+    }
+    else if (discriminator === 4) {
+      const decoder = new SummaryPointV2Decoder(this.bytes.slice(this.byteOffset), value);
+      const decodedValue = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.value = { type: 'SummaryPointV2', value: decodedValue };
+    } else {
+      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator: 0x${discriminator.toString(16)}`);
+    }
+    return value;
+  }
+}
+
+/**
+ * An exact signed integer or IEEE-754 double point.
+ */
+export interface ScalarPointV2Input {
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  descriptor_id: number;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  start_unix_nano: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  ts_unix_nano: bigint;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  flags: number;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint16
+   */
+  attributes: LabelPairInput[];
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint16
+   */
+  exemplars: MetricExemplarV2Input[];
+  /**
+   * Lossless scalar value union.
+   */
+  number: MetricNumberV2Input;
+}
+
+/**
+ * An exact signed integer or IEEE-754 double point.
+ */
+export interface ScalarPointV2Output {
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  tag: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  descriptor_id: number;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  start_unix_nano: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  ts_unix_nano: bigint;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  flags: number;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint16
+   */
+  attributes: LabelPairOutput[];
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint16
+   */
+  exemplars: MetricExemplarV2Output[];
+  /**
+   * Lossless scalar value union.
+   */
+  number: MetricNumberV2Output;
+}
+
+export type ScalarPointV2 = ScalarPointV2Output;
+
+export class ScalarPointV2Encoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("msb_first");
+  }
+
+  encode(value: ScalarPointV2Input): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint8(1);
+    this.writeUint32(value.descriptor_id, "big_endian");
+    this.writeUint64(value.start_unix_nano, "big_endian");
+    this.writeUint64(value.ts_unix_nano, "big_endian");
+    this.writeUint32(value.flags, "big_endian");
+    this.writeUint16(value.attributes.length, "big_endian");
+    for (let value_attributes__iter_index = 0; value_attributes__iter_index < value.attributes.length; value_attributes__iter_index++) {
+      const value_attributes__iter = value.attributes[value_attributes__iter_index];
+      const encoder_value_attributes__iter = new LabelPairEncoder();
+      const encoded_value_attributes__iter = encoder_value_attributes__iter.encode(value_attributes__iter);
+      for (const byte of encoded_value_attributes__iter) {
+        this.writeUint8(byte);
+      }
+    }
+    this.writeUint16(value.exemplars.length, "big_endian");
+    for (let value_exemplars__iter_index = 0; value_exemplars__iter_index < value.exemplars.length; value_exemplars__iter_index++) {
+      const value_exemplars__iter = value.exemplars[value_exemplars__iter_index];
+      const encoder_value_exemplars__iter = new MetricExemplarV2Encoder();
+      const encoded_value_exemplars__iter = encoder_value_exemplars__iter.encode(value_exemplars__iter);
+      for (const byte of encoded_value_exemplars__iter) {
+        this.writeUint8(byte);
+      }
+    }
+    const encoder_number = new MetricNumberV2Encoder();
+    const encoded_number = encoder_number.encode(value.number);
+    for (const byte of encoded_number) {
+      this.writeUint8(byte);
+    }
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a ScalarPointV2 value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: ScalarPointV2): number {
+    let size = 0;
+    size += 25; // tag (const) + descriptor_id + start_unix_nano + ts_unix_nano + flags
+    // attributes: array (kind: length_prefixed)
+    for (const item of value.attributes) {
+      const attributes_itemEncoder = new LabelPairEncoder();
+      size += attributes_itemEncoder.calculateSize(item);
+    }
+    size += 2; // length prefix (uint16)
+    // exemplars: array (kind: length_prefixed)
+    for (const item of value.exemplars) {
+      const exemplars_itemEncoder = new MetricExemplarV2Encoder();
+      size += exemplars_itemEncoder.calculateSize(item);
+    }
+    size += 2; // length prefix (uint16)
+    // number: custom type (MetricNumberV2)
+    const number_encoder = new MetricNumberV2Encoder();
+    size += number_encoder.calculateSize(value.number);
+    return size;
+  }
+}
+
+export class ScalarPointV2Decoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "msb_first");
+  }
+
+  decode(): ScalarPointV2Output {
+    const value: any = {};
+
+    value.tag = this.readUint8();
+    value.descriptor_id = this.readUint32("big_endian");
+    value.start_unix_nano = this.readUint64("big_endian");
+    value.ts_unix_nano = this.readUint64("big_endian");
+    value.flags = this.readUint32("big_endian");
+    value.attributes = [];
+    const attributes_length = this.readUint16("big_endian");
+    for (let i = 0; i < attributes_length; i++) {
+      let attributes__iter: any;
+      attributes__iter = {};
+      const attributes__iter_key_length = this.readUint8();
+      const attributes__iter_key_bytes = this.readBytesSlice(attributes__iter_key_length);
+      try {
+        attributes__iter.key = new TextDecoder("utf-8", { fatal: true }).decode(attributes__iter_key_bytes);
+      } catch (e) {
+        throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
+      }
+      const attributes__iter_value_length = this.readUint16("big_endian");
+      const attributes__iter_value_bytes = this.readBytesSlice(attributes__iter_value_length);
+      try {
+        attributes__iter.value = new TextDecoder("utf-8", { fatal: true }).decode(attributes__iter_value_bytes);
+      } catch (e) {
+        throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
+      }
+      value.attributes.push(attributes__iter);
+    }
+    value.exemplars = [];
+    const exemplars_length = this.readUint16("big_endian");
+    for (let i = 0; i < exemplars_length; i++) {
+      let exemplars__iter: any;
+      exemplars__iter = {};
+      exemplars__iter.ts_unix_nano = this.readUint64("big_endian");
+      exemplars__iter.number = {};
+      const discriminator = this.peekUint8();
+      if (discriminator === 1) {
+        const decoder = new IntegerValueV2Decoder(this.bytes.slice(this.byteOffset), exemplars__iter.number);
+        const decodedValue = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        exemplars__iter.number.value = { type: 'IntegerValueV2', value: decodedValue };
+      }
+      else if (discriminator === 2) {
+        const decoder = new DoubleValueV2Decoder(this.bytes.slice(this.byteOffset), exemplars__iter.number);
+        const decodedValue = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        exemplars__iter.number.value = { type: 'DoubleValueV2', value: decodedValue };
+      } else {
+        throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator: 0x${discriminator.toString(16)}`);
+      }
+      exemplars__iter.filtered_attrs = [];
+      const exemplars__iter_filtered_attrs_length = this.readUint16("big_endian");
+      for (let i = 0; i < exemplars__iter_filtered_attrs_length; i++) {
+        let exemplars__iter_filtered_attrs__iter: any;
+        exemplars__iter_filtered_attrs__iter = {};
+        const exemplars__iter_filtered_attrs__iter_key_length = this.readUint8();
+        const exemplars__iter_filtered_attrs__iter_key_bytes = this.readBytesSlice(exemplars__iter_filtered_attrs__iter_key_length);
+        try {
+          exemplars__iter_filtered_attrs__iter.key = new TextDecoder("utf-8", { fatal: true }).decode(exemplars__iter_filtered_attrs__iter_key_bytes);
+        } catch (e) {
+          throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
+        }
+        const exemplars__iter_filtered_attrs__iter_value_length = this.readUint16("big_endian");
+        const exemplars__iter_filtered_attrs__iter_value_bytes = this.readBytesSlice(exemplars__iter_filtered_attrs__iter_value_length);
+        try {
+          exemplars__iter_filtered_attrs__iter.value = new TextDecoder("utf-8", { fatal: true }).decode(exemplars__iter_filtered_attrs__iter_value_bytes);
+        } catch (e) {
+          throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
+        }
+        exemplars__iter.filtered_attrs.push(exemplars__iter_filtered_attrs__iter);
+      }
+      exemplars__iter.trace_id = [];
+      for (let i = 0; i < 16; i++) {
+        let exemplars__iter_trace_id__iter: any;
+        exemplars__iter_trace_id__iter = this.readUint8();
+        exemplars__iter.trace_id.push(exemplars__iter_trace_id__iter);
+      }
+      exemplars__iter.span_id = [];
+      for (let i = 0; i < 8; i++) {
+        let exemplars__iter_span_id__iter: any;
+        exemplars__iter_span_id__iter = this.readUint8();
+        exemplars__iter.span_id.push(exemplars__iter_span_id__iter);
+      }
+      value.exemplars.push(exemplars__iter);
+    }
+    value.number = {};
+    const discriminator = this.peekUint8();
+    if (discriminator === 1) {
+      const decoder = new IntegerValueV2Decoder(this.bytes.slice(this.byteOffset), value.number);
+      const decodedValue = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.number.value = { type: 'IntegerValueV2', value: decodedValue };
+    }
+    else if (discriminator === 2) {
+      const decoder = new DoubleValueV2Decoder(this.bytes.slice(this.byteOffset), value.number);
+      const decodedValue = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.number.value = { type: 'DoubleValueV2', value: decodedValue };
+    } else {
+      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator: 0x${discriminator.toString(16)}`);
+    }
+    return value;
+  }
+}
+
+/**
+ * Explicit-bound histogram; bucket_counts length must equal explicit_bounds length + 1.
+ */
+export interface HistogramPointV2Input {
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  descriptor_id: number;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  start_unix_nano: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  ts_unix_nano: bigint;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  flags: number;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint16
+   */
+  attributes: LabelPairInput[];
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint16
+   */
+  exemplars: MetricExemplarV2Input[];
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  count: bigint;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  has_sum: number;
+  /**
+   * 64-bit Floating Point
+   * IEEE 754 double-precision floating point (64-bit). Provides ~15 decimal digits of precision.
+   */
+  sum: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  has_min: number;
+  /**
+   * 64-bit Floating Point
+   * IEEE 754 double-precision floating point (64-bit). Provides ~15 decimal digits of precision.
+   */
+  min: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  has_max: number;
+  /**
+   * 64-bit Floating Point
+   * IEEE 754 double-precision floating point (64-bit). Provides ~15 decimal digits of precision.
+   */
+  max: number;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  explicit_bounds: number[];
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  bucket_counts: bigint[];
+}
+
+/**
+ * Explicit-bound histogram; bucket_counts length must equal explicit_bounds length + 1.
+ */
+export interface HistogramPointV2Output {
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  tag: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  descriptor_id: number;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  start_unix_nano: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  ts_unix_nano: bigint;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  flags: number;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint16
+   */
+  attributes: LabelPairOutput[];
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint16
+   */
+  exemplars: MetricExemplarV2Output[];
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  count: bigint;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  has_sum: number;
+  /**
+   * 64-bit Floating Point
+   * IEEE 754 double-precision floating point (64-bit). Provides ~15 decimal digits of precision.
+   */
+  sum: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  has_min: number;
+  /**
+   * 64-bit Floating Point
+   * IEEE 754 double-precision floating point (64-bit). Provides ~15 decimal digits of precision.
+   */
+  min: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  has_max: number;
+  /**
+   * 64-bit Floating Point
+   * IEEE 754 double-precision floating point (64-bit). Provides ~15 decimal digits of precision.
+   */
+  max: number;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  explicit_bounds: number[];
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  bucket_counts: bigint[];
+}
+
+export type HistogramPointV2 = HistogramPointV2Output;
+
+export class HistogramPointV2Encoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("msb_first");
+  }
+
+  encode(value: HistogramPointV2Input): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint8(2);
+    this.writeUint32(value.descriptor_id, "big_endian");
+    this.writeUint64(value.start_unix_nano, "big_endian");
+    this.writeUint64(value.ts_unix_nano, "big_endian");
+    this.writeUint32(value.flags, "big_endian");
+    this.writeUint16(value.attributes.length, "big_endian");
+    for (let value_attributes__iter_index = 0; value_attributes__iter_index < value.attributes.length; value_attributes__iter_index++) {
+      const value_attributes__iter = value.attributes[value_attributes__iter_index];
+      const encoder_value_attributes__iter = new LabelPairEncoder();
+      const encoded_value_attributes__iter = encoder_value_attributes__iter.encode(value_attributes__iter);
+      for (const byte of encoded_value_attributes__iter) {
+        this.writeUint8(byte);
+      }
+    }
+    this.writeUint16(value.exemplars.length, "big_endian");
+    for (let value_exemplars__iter_index = 0; value_exemplars__iter_index < value.exemplars.length; value_exemplars__iter_index++) {
+      const value_exemplars__iter = value.exemplars[value_exemplars__iter_index];
+      const encoder_value_exemplars__iter = new MetricExemplarV2Encoder();
+      const encoded_value_exemplars__iter = encoder_value_exemplars__iter.encode(value_exemplars__iter);
+      for (const byte of encoded_value_exemplars__iter) {
+        this.writeUint8(byte);
+      }
+    }
+    this.writeUint64(value.count, "big_endian");
+    this.writeUint8(value.has_sum);
+    this.writeFloat64(value.sum, "big_endian");
+    this.writeUint8(value.has_min);
+    this.writeFloat64(value.min, "big_endian");
+    this.writeUint8(value.has_max);
+    this.writeFloat64(value.max, "big_endian");
+    this.writeUint32(value.explicit_bounds.length, "big_endian");
+    for (let value_explicit_bounds__iter_index = 0; value_explicit_bounds__iter_index < value.explicit_bounds.length; value_explicit_bounds__iter_index++) {
+      const value_explicit_bounds__iter = value.explicit_bounds[value_explicit_bounds__iter_index];
+      this.writeFloat64(value_explicit_bounds__iter, "big_endian");
+    }
+    this.writeUint32(value.bucket_counts.length, "big_endian");
+    for (let value_bucket_counts__iter_index = 0; value_bucket_counts__iter_index < value.bucket_counts.length; value_bucket_counts__iter_index++) {
+      const value_bucket_counts__iter = value.bucket_counts[value_bucket_counts__iter_index];
+      this.writeUint64(value_bucket_counts__iter, "big_endian");
+    }
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a HistogramPointV2 value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: HistogramPointV2): number {
+    let size = 0;
+    size += 25; // tag (const) + descriptor_id + start_unix_nano + ts_unix_nano + flags
+    // attributes: array (kind: length_prefixed)
+    for (const item of value.attributes) {
+      const attributes_itemEncoder = new LabelPairEncoder();
+      size += attributes_itemEncoder.calculateSize(item);
+    }
+    size += 2; // length prefix (uint16)
+    // exemplars: array (kind: length_prefixed)
+    for (const item of value.exemplars) {
+      const exemplars_itemEncoder = new MetricExemplarV2Encoder();
+      size += exemplars_itemEncoder.calculateSize(item);
+    }
+    size += 37; // length prefix (uint16) + count + has_sum + sum + has_min + min + has_max + max
+    // explicit_bounds: array (kind: length_prefixed)
+    for (const item of value.explicit_bounds) {
+      size += 8;
+    }
+    size += 4; // length prefix (uint32)
+    // bucket_counts: array (kind: length_prefixed)
+    for (const item of value.bucket_counts) {
+      size += 8;
+    }
+    size += 4; // length prefix (uint32)
+    return size;
+  }
+}
+
+export class HistogramPointV2Decoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "msb_first");
+  }
+
+  decode(): HistogramPointV2Output {
+    const value: any = {};
+
+    value.tag = this.readUint8();
+    value.descriptor_id = this.readUint32("big_endian");
+    value.start_unix_nano = this.readUint64("big_endian");
+    value.ts_unix_nano = this.readUint64("big_endian");
+    value.flags = this.readUint32("big_endian");
+    value.attributes = [];
+    const attributes_length = this.readUint16("big_endian");
+    for (let i = 0; i < attributes_length; i++) {
+      let attributes__iter: any;
+      attributes__iter = {};
+      const attributes__iter_key_length = this.readUint8();
+      const attributes__iter_key_bytes = this.readBytesSlice(attributes__iter_key_length);
+      try {
+        attributes__iter.key = new TextDecoder("utf-8", { fatal: true }).decode(attributes__iter_key_bytes);
+      } catch (e) {
+        throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
+      }
+      const attributes__iter_value_length = this.readUint16("big_endian");
+      const attributes__iter_value_bytes = this.readBytesSlice(attributes__iter_value_length);
+      try {
+        attributes__iter.value = new TextDecoder("utf-8", { fatal: true }).decode(attributes__iter_value_bytes);
+      } catch (e) {
+        throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
+      }
+      value.attributes.push(attributes__iter);
+    }
+    value.exemplars = [];
+    const exemplars_length = this.readUint16("big_endian");
+    for (let i = 0; i < exemplars_length; i++) {
+      let exemplars__iter: any;
+      exemplars__iter = {};
+      exemplars__iter.ts_unix_nano = this.readUint64("big_endian");
+      exemplars__iter.number = {};
+      const discriminator = this.peekUint8();
+      if (discriminator === 1) {
+        const decoder = new IntegerValueV2Decoder(this.bytes.slice(this.byteOffset), exemplars__iter.number);
+        const decodedValue = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        exemplars__iter.number.value = { type: 'IntegerValueV2', value: decodedValue };
+      }
+      else if (discriminator === 2) {
+        const decoder = new DoubleValueV2Decoder(this.bytes.slice(this.byteOffset), exemplars__iter.number);
+        const decodedValue = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        exemplars__iter.number.value = { type: 'DoubleValueV2', value: decodedValue };
+      } else {
+        throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator: 0x${discriminator.toString(16)}`);
+      }
+      exemplars__iter.filtered_attrs = [];
+      const exemplars__iter_filtered_attrs_length = this.readUint16("big_endian");
+      for (let i = 0; i < exemplars__iter_filtered_attrs_length; i++) {
+        let exemplars__iter_filtered_attrs__iter: any;
+        exemplars__iter_filtered_attrs__iter = {};
+        const exemplars__iter_filtered_attrs__iter_key_length = this.readUint8();
+        const exemplars__iter_filtered_attrs__iter_key_bytes = this.readBytesSlice(exemplars__iter_filtered_attrs__iter_key_length);
+        try {
+          exemplars__iter_filtered_attrs__iter.key = new TextDecoder("utf-8", { fatal: true }).decode(exemplars__iter_filtered_attrs__iter_key_bytes);
+        } catch (e) {
+          throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
+        }
+        const exemplars__iter_filtered_attrs__iter_value_length = this.readUint16("big_endian");
+        const exemplars__iter_filtered_attrs__iter_value_bytes = this.readBytesSlice(exemplars__iter_filtered_attrs__iter_value_length);
+        try {
+          exemplars__iter_filtered_attrs__iter.value = new TextDecoder("utf-8", { fatal: true }).decode(exemplars__iter_filtered_attrs__iter_value_bytes);
+        } catch (e) {
+          throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
+        }
+        exemplars__iter.filtered_attrs.push(exemplars__iter_filtered_attrs__iter);
+      }
+      exemplars__iter.trace_id = [];
+      for (let i = 0; i < 16; i++) {
+        let exemplars__iter_trace_id__iter: any;
+        exemplars__iter_trace_id__iter = this.readUint8();
+        exemplars__iter.trace_id.push(exemplars__iter_trace_id__iter);
+      }
+      exemplars__iter.span_id = [];
+      for (let i = 0; i < 8; i++) {
+        let exemplars__iter_span_id__iter: any;
+        exemplars__iter_span_id__iter = this.readUint8();
+        exemplars__iter.span_id.push(exemplars__iter_span_id__iter);
+      }
+      value.exemplars.push(exemplars__iter);
+    }
+    value.count = this.readUint64("big_endian");
+    value.has_sum = this.readUint8();
+    value.sum = this.readFloat64("big_endian");
+    value.has_min = this.readUint8();
+    value.min = this.readFloat64("big_endian");
+    value.has_max = this.readUint8();
+    value.max = this.readFloat64("big_endian");
+    value.explicit_bounds = [];
+    const explicit_bounds_length = this.readUint32("big_endian");
+    for (let i = 0; i < explicit_bounds_length; i++) {
+      let explicit_bounds__iter: any;
+      explicit_bounds__iter = this.readFloat64("big_endian");
+      value.explicit_bounds.push(explicit_bounds__iter);
+    }
+    value.bucket_counts = [];
+    const bucket_counts_length = this.readUint32("big_endian");
+    for (let i = 0; i < bucket_counts_length; i++) {
+      let bucket_counts__iter: any;
+      bucket_counts__iter = this.readUint64("big_endian");
+      value.bucket_counts.push(bucket_counts__iter);
+    }
+    return value;
+  }
+}
+
+/**
+ * Exponential/native histogram with sparse positive/negative buckets, integer or float counts, optional custom bounds, and reset hint.
+ */
+export interface ExponentialHistogramPointV2Input {
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  descriptor_id: number;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  start_unix_nano: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  ts_unix_nano: bigint;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  flags: number;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint16
+   */
+  attributes: LabelPairInput[];
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint16
+   */
+  exemplars: MetricExemplarV2Input[];
+  /**
+   * Histogram count union for integer-count and float-count native histograms.
+   */
+  count: MetricCountV2Input;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  has_sum: number;
+  /**
+   * 64-bit Floating Point
+   * IEEE 754 double-precision floating point (64-bit). Provides ~15 decimal digits of precision.
+   */
+  sum: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  has_min: number;
+  /**
+   * 64-bit Floating Point
+   * IEEE 754 double-precision floating point (64-bit). Provides ~15 decimal digits of precision.
+   */
+  min: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  has_max: number;
+  /**
+   * 64-bit Floating Point
+   * IEEE 754 double-precision floating point (64-bit). Provides ~15 decimal digits of precision.
+   */
+  max: number;
+  /**
+   * 32-bit Signed Integer
+   * Fixed-width 32-bit signed integer (-2147483648 to 2147483647). Respects endianness configuration.
+   */
+  scale: number;
+  /**
+   * 64-bit Floating Point
+   * IEEE 754 double-precision floating point (64-bit). Provides ~15 decimal digits of precision.
+   */
+  zero_threshold: number;
+  /**
+   * Histogram count union for integer-count and float-count native histograms.
+   */
+  zero_count: MetricCountV2Input;
+  /**
+   * Sparse exponential histogram bucket run. Deltas are signed offsets; counts share one numeric representation.
+   */
+  positive: SparseBucketsV2Input;
+  /**
+   * Sparse exponential histogram bucket run. Deltas are signed offsets; counts share one numeric representation.
+   */
+  negative: SparseBucketsV2Input;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  custom_bounds: number[];
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  reset_hint: number;
+}
+
+/**
+ * Exponential/native histogram with sparse positive/negative buckets, integer or float counts, optional custom bounds, and reset hint.
+ */
+export interface ExponentialHistogramPointV2Output {
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  tag: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  descriptor_id: number;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  start_unix_nano: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  ts_unix_nano: bigint;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  flags: number;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint16
+   */
+  attributes: LabelPairOutput[];
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint16
+   */
+  exemplars: MetricExemplarV2Output[];
+  /**
+   * Histogram count union for integer-count and float-count native histograms.
+   */
+  count: MetricCountV2Output;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  has_sum: number;
+  /**
+   * 64-bit Floating Point
+   * IEEE 754 double-precision floating point (64-bit). Provides ~15 decimal digits of precision.
+   */
+  sum: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  has_min: number;
+  /**
+   * 64-bit Floating Point
+   * IEEE 754 double-precision floating point (64-bit). Provides ~15 decimal digits of precision.
+   */
+  min: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  has_max: number;
+  /**
+   * 64-bit Floating Point
+   * IEEE 754 double-precision floating point (64-bit). Provides ~15 decimal digits of precision.
+   */
+  max: number;
+  /**
+   * 32-bit Signed Integer
+   * Fixed-width 32-bit signed integer (-2147483648 to 2147483647). Respects endianness configuration.
+   */
+  scale: number;
+  /**
+   * 64-bit Floating Point
+   * IEEE 754 double-precision floating point (64-bit). Provides ~15 decimal digits of precision.
+   */
+  zero_threshold: number;
+  /**
+   * Histogram count union for integer-count and float-count native histograms.
+   */
+  zero_count: MetricCountV2Output;
+  /**
+   * Sparse exponential histogram bucket run. Deltas are signed offsets; counts share one numeric representation.
+   */
+  positive: SparseBucketsV2Output;
+  /**
+   * Sparse exponential histogram bucket run. Deltas are signed offsets; counts share one numeric representation.
+   */
+  negative: SparseBucketsV2Output;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  custom_bounds: number[];
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  reset_hint: number;
+}
+
+export type ExponentialHistogramPointV2 = ExponentialHistogramPointV2Output;
+
+export class ExponentialHistogramPointV2Encoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("msb_first");
+  }
+
+  encode(value: ExponentialHistogramPointV2Input): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint8(3);
+    this.writeUint32(value.descriptor_id, "big_endian");
+    this.writeUint64(value.start_unix_nano, "big_endian");
+    this.writeUint64(value.ts_unix_nano, "big_endian");
+    this.writeUint32(value.flags, "big_endian");
+    this.writeUint16(value.attributes.length, "big_endian");
+    for (let value_attributes__iter_index = 0; value_attributes__iter_index < value.attributes.length; value_attributes__iter_index++) {
+      const value_attributes__iter = value.attributes[value_attributes__iter_index];
+      const encoder_value_attributes__iter = new LabelPairEncoder();
+      const encoded_value_attributes__iter = encoder_value_attributes__iter.encode(value_attributes__iter);
+      for (const byte of encoded_value_attributes__iter) {
+        this.writeUint8(byte);
+      }
+    }
+    this.writeUint16(value.exemplars.length, "big_endian");
+    for (let value_exemplars__iter_index = 0; value_exemplars__iter_index < value.exemplars.length; value_exemplars__iter_index++) {
+      const value_exemplars__iter = value.exemplars[value_exemplars__iter_index];
+      const encoder_value_exemplars__iter = new MetricExemplarV2Encoder();
+      const encoded_value_exemplars__iter = encoder_value_exemplars__iter.encode(value_exemplars__iter);
+      for (const byte of encoded_value_exemplars__iter) {
+        this.writeUint8(byte);
+      }
+    }
+    const encoder_count = new MetricCountV2Encoder();
+    const encoded_count = encoder_count.encode(value.count);
+    for (const byte of encoded_count) {
+      this.writeUint8(byte);
+    }
+    this.writeUint8(value.has_sum);
+    this.writeFloat64(value.sum, "big_endian");
+    this.writeUint8(value.has_min);
+    this.writeFloat64(value.min, "big_endian");
+    this.writeUint8(value.has_max);
+    this.writeFloat64(value.max, "big_endian");
+    this.writeInt32(value.scale, "big_endian");
+    this.writeFloat64(value.zero_threshold, "big_endian");
+    const encoder_zero_count = new MetricCountV2Encoder();
+    const encoded_zero_count = encoder_zero_count.encode(value.zero_count);
+    for (const byte of encoded_zero_count) {
+      this.writeUint8(byte);
+    }
+    const encoder_positive = new SparseBucketsV2Encoder();
+    const encoded_positive = encoder_positive.encode(value.positive);
+    for (const byte of encoded_positive) {
+      this.writeUint8(byte);
+    }
+    const encoder_negative = new SparseBucketsV2Encoder();
+    const encoded_negative = encoder_negative.encode(value.negative);
+    for (const byte of encoded_negative) {
+      this.writeUint8(byte);
+    }
+    this.writeUint32(value.custom_bounds.length, "big_endian");
+    for (let value_custom_bounds__iter_index = 0; value_custom_bounds__iter_index < value.custom_bounds.length; value_custom_bounds__iter_index++) {
+      const value_custom_bounds__iter = value.custom_bounds[value_custom_bounds__iter_index];
+      this.writeFloat64(value_custom_bounds__iter, "big_endian");
+    }
+    this.writeUint8(value.reset_hint);
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a ExponentialHistogramPointV2 value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: ExponentialHistogramPointV2): number {
+    let size = 0;
+    size += 25; // tag (const) + descriptor_id + start_unix_nano + ts_unix_nano + flags
+    // attributes: array (kind: length_prefixed)
+    for (const item of value.attributes) {
+      const attributes_itemEncoder = new LabelPairEncoder();
+      size += attributes_itemEncoder.calculateSize(item);
+    }
+    size += 2; // length prefix (uint16)
+    // exemplars: array (kind: length_prefixed)
+    for (const item of value.exemplars) {
+      const exemplars_itemEncoder = new MetricExemplarV2Encoder();
+      size += exemplars_itemEncoder.calculateSize(item);
+    }
+    size += 2; // length prefix (uint16)
+    // count: custom type (MetricCountV2)
+    const count_encoder = new MetricCountV2Encoder();
+    size += count_encoder.calculateSize(value.count);
+    size += 39; // has_sum + sum + has_min + min + has_max + max + scale + zero_threshold
+    // zero_count: custom type (MetricCountV2)
+    const zero_count_encoder = new MetricCountV2Encoder();
+    size += zero_count_encoder.calculateSize(value.zero_count);
+    // positive: custom type (SparseBucketsV2)
+    const positive_encoder = new SparseBucketsV2Encoder();
+    size += positive_encoder.calculateSize(value.positive);
+    // negative: custom type (SparseBucketsV2)
+    const negative_encoder = new SparseBucketsV2Encoder();
+    size += negative_encoder.calculateSize(value.negative);
+    // custom_bounds: array (kind: length_prefixed)
+    for (const item of value.custom_bounds) {
+      size += 8;
+    }
+    size += 5; // length prefix (uint32) + reset_hint
+    return size;
+  }
+}
+
+export class ExponentialHistogramPointV2Decoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "msb_first");
+  }
+
+  decode(): ExponentialHistogramPointV2Output {
+    const value: any = {};
+
+    value.tag = this.readUint8();
+    value.descriptor_id = this.readUint32("big_endian");
+    value.start_unix_nano = this.readUint64("big_endian");
+    value.ts_unix_nano = this.readUint64("big_endian");
+    value.flags = this.readUint32("big_endian");
+    value.attributes = [];
+    const attributes_length = this.readUint16("big_endian");
+    for (let i = 0; i < attributes_length; i++) {
+      let attributes__iter: any;
+      attributes__iter = {};
+      const attributes__iter_key_length = this.readUint8();
+      const attributes__iter_key_bytes = this.readBytesSlice(attributes__iter_key_length);
+      try {
+        attributes__iter.key = new TextDecoder("utf-8", { fatal: true }).decode(attributes__iter_key_bytes);
+      } catch (e) {
+        throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
+      }
+      const attributes__iter_value_length = this.readUint16("big_endian");
+      const attributes__iter_value_bytes = this.readBytesSlice(attributes__iter_value_length);
+      try {
+        attributes__iter.value = new TextDecoder("utf-8", { fatal: true }).decode(attributes__iter_value_bytes);
+      } catch (e) {
+        throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
+      }
+      value.attributes.push(attributes__iter);
+    }
+    value.exemplars = [];
+    const exemplars_length = this.readUint16("big_endian");
+    for (let i = 0; i < exemplars_length; i++) {
+      let exemplars__iter: any;
+      exemplars__iter = {};
+      exemplars__iter.ts_unix_nano = this.readUint64("big_endian");
+      exemplars__iter.number = {};
+      const discriminator = this.peekUint8();
+      if (discriminator === 1) {
+        const decoder = new IntegerValueV2Decoder(this.bytes.slice(this.byteOffset), exemplars__iter.number);
+        const decodedValue = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        exemplars__iter.number.value = { type: 'IntegerValueV2', value: decodedValue };
+      }
+      else if (discriminator === 2) {
+        const decoder = new DoubleValueV2Decoder(this.bytes.slice(this.byteOffset), exemplars__iter.number);
+        const decodedValue = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        exemplars__iter.number.value = { type: 'DoubleValueV2', value: decodedValue };
+      } else {
+        throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator: 0x${discriminator.toString(16)}`);
+      }
+      exemplars__iter.filtered_attrs = [];
+      const exemplars__iter_filtered_attrs_length = this.readUint16("big_endian");
+      for (let i = 0; i < exemplars__iter_filtered_attrs_length; i++) {
+        let exemplars__iter_filtered_attrs__iter: any;
+        exemplars__iter_filtered_attrs__iter = {};
+        const exemplars__iter_filtered_attrs__iter_key_length = this.readUint8();
+        const exemplars__iter_filtered_attrs__iter_key_bytes = this.readBytesSlice(exemplars__iter_filtered_attrs__iter_key_length);
+        try {
+          exemplars__iter_filtered_attrs__iter.key = new TextDecoder("utf-8", { fatal: true }).decode(exemplars__iter_filtered_attrs__iter_key_bytes);
+        } catch (e) {
+          throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
+        }
+        const exemplars__iter_filtered_attrs__iter_value_length = this.readUint16("big_endian");
+        const exemplars__iter_filtered_attrs__iter_value_bytes = this.readBytesSlice(exemplars__iter_filtered_attrs__iter_value_length);
+        try {
+          exemplars__iter_filtered_attrs__iter.value = new TextDecoder("utf-8", { fatal: true }).decode(exemplars__iter_filtered_attrs__iter_value_bytes);
+        } catch (e) {
+          throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
+        }
+        exemplars__iter.filtered_attrs.push(exemplars__iter_filtered_attrs__iter);
+      }
+      exemplars__iter.trace_id = [];
+      for (let i = 0; i < 16; i++) {
+        let exemplars__iter_trace_id__iter: any;
+        exemplars__iter_trace_id__iter = this.readUint8();
+        exemplars__iter.trace_id.push(exemplars__iter_trace_id__iter);
+      }
+      exemplars__iter.span_id = [];
+      for (let i = 0; i < 8; i++) {
+        let exemplars__iter_span_id__iter: any;
+        exemplars__iter_span_id__iter = this.readUint8();
+        exemplars__iter.span_id.push(exemplars__iter_span_id__iter);
+      }
+      value.exemplars.push(exemplars__iter);
+    }
+    value.count = {};
+    const discriminator = this.peekUint8();
+    if (discriminator === 1) {
+      const decoder = new IntegerCountV2Decoder(this.bytes.slice(this.byteOffset), value.count);
+      const decodedValue = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.count.value = { type: 'IntegerCountV2', value: decodedValue };
+    }
+    else if (discriminator === 2) {
+      const decoder = new FloatCountV2Decoder(this.bytes.slice(this.byteOffset), value.count);
+      const decodedValue = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.count.value = { type: 'FloatCountV2', value: decodedValue };
+    } else {
+      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator: 0x${discriminator.toString(16)}`);
+    }
+    value.has_sum = this.readUint8();
+    value.sum = this.readFloat64("big_endian");
+    value.has_min = this.readUint8();
+    value.min = this.readFloat64("big_endian");
+    value.has_max = this.readUint8();
+    value.max = this.readFloat64("big_endian");
+    value.scale = this.readInt32("big_endian");
+    value.zero_threshold = this.readFloat64("big_endian");
+    value.zero_count = {};
+    const discriminator = this.peekUint8();
+    if (discriminator === 1) {
+      const decoder = new IntegerCountV2Decoder(this.bytes.slice(this.byteOffset), value.zero_count);
+      const decodedValue = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.zero_count.value = { type: 'IntegerCountV2', value: decodedValue };
+    }
+    else if (discriminator === 2) {
+      const decoder = new FloatCountV2Decoder(this.bytes.slice(this.byteOffset), value.zero_count);
+      const decodedValue = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.zero_count.value = { type: 'FloatCountV2', value: decodedValue };
+    } else {
+      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator: 0x${discriminator.toString(16)}`);
+    }
+    value.positive = {};
+    value.positive.offset = this.readInt32("big_endian");
+    value.positive.deltas = [];
+    const positive_deltas_length = this.readUint32("big_endian");
+    for (let i = 0; i < positive_deltas_length; i++) {
+      let positive_deltas__iter: any;
+      positive_deltas__iter = this.readInt32("big_endian");
+      value.positive.deltas.push(positive_deltas__iter);
+    }
+    value.positive.counts = [];
+    const positive_counts_length = this.readUint32("big_endian");
+    for (let i = 0; i < positive_counts_length; i++) {
+      let positive_counts__iter: any;
+      positive_counts__iter = {};
+      const discriminator = this.peekUint8();
+      if (discriminator === 1) {
+        const decoder = new IntegerCountV2Decoder(this.bytes.slice(this.byteOffset), positive_counts__iter);
+        const decodedValue = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        positive_counts__iter.value = { type: 'IntegerCountV2', value: decodedValue };
+      }
+      else if (discriminator === 2) {
+        const decoder = new FloatCountV2Decoder(this.bytes.slice(this.byteOffset), positive_counts__iter);
+        const decodedValue = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        positive_counts__iter.value = { type: 'FloatCountV2', value: decodedValue };
+      } else {
+        throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator: 0x${discriminator.toString(16)}`);
+      }
+      value.positive.counts.push(positive_counts__iter);
+    }
+    value.negative = {};
+    value.negative.offset = this.readInt32("big_endian");
+    value.negative.deltas = [];
+    const negative_deltas_length = this.readUint32("big_endian");
+    for (let i = 0; i < negative_deltas_length; i++) {
+      let negative_deltas__iter: any;
+      negative_deltas__iter = this.readInt32("big_endian");
+      value.negative.deltas.push(negative_deltas__iter);
+    }
+    value.negative.counts = [];
+    const negative_counts_length = this.readUint32("big_endian");
+    for (let i = 0; i < negative_counts_length; i++) {
+      let negative_counts__iter: any;
+      negative_counts__iter = {};
+      const discriminator = this.peekUint8();
+      if (discriminator === 1) {
+        const decoder = new IntegerCountV2Decoder(this.bytes.slice(this.byteOffset), negative_counts__iter);
+        const decodedValue = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        negative_counts__iter.value = { type: 'IntegerCountV2', value: decodedValue };
+      }
+      else if (discriminator === 2) {
+        const decoder = new FloatCountV2Decoder(this.bytes.slice(this.byteOffset), negative_counts__iter);
+        const decodedValue = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        negative_counts__iter.value = { type: 'FloatCountV2', value: decodedValue };
+      } else {
+        throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator: 0x${discriminator.toString(16)}`);
+      }
+      value.negative.counts.push(negative_counts__iter);
+    }
+    value.custom_bounds = [];
+    const custom_bounds_length = this.readUint32("big_endian");
+    for (let i = 0; i < custom_bounds_length; i++) {
+      let custom_bounds__iter: any;
+      custom_bounds__iter = this.readFloat64("big_endian");
+      value.custom_bounds.push(custom_bounds__iter);
+    }
+    value.reset_hint = this.readUint8();
+    return value;
+  }
+}
+
+/**
+ * Summary point with exact count, sum, and sorted quantile/value pairs.
+ */
+export interface SummaryPointV2Input {
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  descriptor_id: number;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  start_unix_nano: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  ts_unix_nano: bigint;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  flags: number;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint16
+   */
+  attributes: LabelPairInput[];
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint16
+   */
+  exemplars: MetricExemplarV2Input[];
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  count: bigint;
+  /**
+   * 64-bit Floating Point
+   * IEEE 754 double-precision floating point (64-bit). Provides ~15 decimal digits of precision.
+   */
+  sum: number;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint16
+   */
+  quantiles: QuantileValueV2Input[];
+}
+
+/**
+ * Summary point with exact count, sum, and sorted quantile/value pairs.
+ */
+export interface SummaryPointV2Output {
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  tag: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  descriptor_id: number;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  start_unix_nano: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  ts_unix_nano: bigint;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  flags: number;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint16
+   */
+  attributes: LabelPairOutput[];
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint16
+   */
+  exemplars: MetricExemplarV2Output[];
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  count: bigint;
+  /**
+   * 64-bit Floating Point
+   * IEEE 754 double-precision floating point (64-bit). Provides ~15 decimal digits of precision.
+   */
+  sum: number;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint16
+   */
+  quantiles: QuantileValueV2Output[];
+}
+
+export type SummaryPointV2 = SummaryPointV2Output;
+
+export class SummaryPointV2Encoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("msb_first");
+  }
+
+  encode(value: SummaryPointV2Input): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint8(4);
+    this.writeUint32(value.descriptor_id, "big_endian");
+    this.writeUint64(value.start_unix_nano, "big_endian");
+    this.writeUint64(value.ts_unix_nano, "big_endian");
+    this.writeUint32(value.flags, "big_endian");
+    this.writeUint16(value.attributes.length, "big_endian");
+    for (let value_attributes__iter_index = 0; value_attributes__iter_index < value.attributes.length; value_attributes__iter_index++) {
+      const value_attributes__iter = value.attributes[value_attributes__iter_index];
+      const encoder_value_attributes__iter = new LabelPairEncoder();
+      const encoded_value_attributes__iter = encoder_value_attributes__iter.encode(value_attributes__iter);
+      for (const byte of encoded_value_attributes__iter) {
+        this.writeUint8(byte);
+      }
+    }
+    this.writeUint16(value.exemplars.length, "big_endian");
+    for (let value_exemplars__iter_index = 0; value_exemplars__iter_index < value.exemplars.length; value_exemplars__iter_index++) {
+      const value_exemplars__iter = value.exemplars[value_exemplars__iter_index];
+      const encoder_value_exemplars__iter = new MetricExemplarV2Encoder();
+      const encoded_value_exemplars__iter = encoder_value_exemplars__iter.encode(value_exemplars__iter);
+      for (const byte of encoded_value_exemplars__iter) {
+        this.writeUint8(byte);
+      }
+    }
+    this.writeUint64(value.count, "big_endian");
+    this.writeFloat64(value.sum, "big_endian");
+    this.writeUint16(value.quantiles.length, "big_endian");
+    for (let value_quantiles__iter_index = 0; value_quantiles__iter_index < value.quantiles.length; value_quantiles__iter_index++) {
+      const value_quantiles__iter = value.quantiles[value_quantiles__iter_index];
+      const encoder_value_quantiles__iter = new QuantileValueV2Encoder();
+      const encoded_value_quantiles__iter = encoder_value_quantiles__iter.encode(value_quantiles__iter);
+      for (const byte of encoded_value_quantiles__iter) {
+        this.writeUint8(byte);
+      }
+    }
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a SummaryPointV2 value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: SummaryPointV2): number {
+    let size = 0;
+    size += 25; // tag (const) + descriptor_id + start_unix_nano + ts_unix_nano + flags
+    // attributes: array (kind: length_prefixed)
+    for (const item of value.attributes) {
+      const attributes_itemEncoder = new LabelPairEncoder();
+      size += attributes_itemEncoder.calculateSize(item);
+    }
+    size += 2; // length prefix (uint16)
+    // exemplars: array (kind: length_prefixed)
+    for (const item of value.exemplars) {
+      const exemplars_itemEncoder = new MetricExemplarV2Encoder();
+      size += exemplars_itemEncoder.calculateSize(item);
+    }
+    size += 18; // length prefix (uint16) + count + sum
+    // quantiles: array (kind: length_prefixed)
+    for (const item of value.quantiles) {
+      const quantiles_itemEncoder = new QuantileValueV2Encoder();
+      size += quantiles_itemEncoder.calculateSize(item);
+    }
+    size += 2; // length prefix (uint16)
+    return size;
+  }
+}
+
+export class SummaryPointV2Decoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "msb_first");
+  }
+
+  decode(): SummaryPointV2Output {
+    const value: any = {};
+
+    value.tag = this.readUint8();
+    value.descriptor_id = this.readUint32("big_endian");
+    value.start_unix_nano = this.readUint64("big_endian");
+    value.ts_unix_nano = this.readUint64("big_endian");
+    value.flags = this.readUint32("big_endian");
+    value.attributes = [];
+    const attributes_length = this.readUint16("big_endian");
+    for (let i = 0; i < attributes_length; i++) {
+      let attributes__iter: any;
+      attributes__iter = {};
+      const attributes__iter_key_length = this.readUint8();
+      const attributes__iter_key_bytes = this.readBytesSlice(attributes__iter_key_length);
+      try {
+        attributes__iter.key = new TextDecoder("utf-8", { fatal: true }).decode(attributes__iter_key_bytes);
+      } catch (e) {
+        throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
+      }
+      const attributes__iter_value_length = this.readUint16("big_endian");
+      const attributes__iter_value_bytes = this.readBytesSlice(attributes__iter_value_length);
+      try {
+        attributes__iter.value = new TextDecoder("utf-8", { fatal: true }).decode(attributes__iter_value_bytes);
+      } catch (e) {
+        throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
+      }
+      value.attributes.push(attributes__iter);
+    }
+    value.exemplars = [];
+    const exemplars_length = this.readUint16("big_endian");
+    for (let i = 0; i < exemplars_length; i++) {
+      let exemplars__iter: any;
+      exemplars__iter = {};
+      exemplars__iter.ts_unix_nano = this.readUint64("big_endian");
+      exemplars__iter.number = {};
+      const discriminator = this.peekUint8();
+      if (discriminator === 1) {
+        const decoder = new IntegerValueV2Decoder(this.bytes.slice(this.byteOffset), exemplars__iter.number);
+        const decodedValue = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        exemplars__iter.number.value = { type: 'IntegerValueV2', value: decodedValue };
+      }
+      else if (discriminator === 2) {
+        const decoder = new DoubleValueV2Decoder(this.bytes.slice(this.byteOffset), exemplars__iter.number);
+        const decodedValue = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        exemplars__iter.number.value = { type: 'DoubleValueV2', value: decodedValue };
+      } else {
+        throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator: 0x${discriminator.toString(16)}`);
+      }
+      exemplars__iter.filtered_attrs = [];
+      const exemplars__iter_filtered_attrs_length = this.readUint16("big_endian");
+      for (let i = 0; i < exemplars__iter_filtered_attrs_length; i++) {
+        let exemplars__iter_filtered_attrs__iter: any;
+        exemplars__iter_filtered_attrs__iter = {};
+        const exemplars__iter_filtered_attrs__iter_key_length = this.readUint8();
+        const exemplars__iter_filtered_attrs__iter_key_bytes = this.readBytesSlice(exemplars__iter_filtered_attrs__iter_key_length);
+        try {
+          exemplars__iter_filtered_attrs__iter.key = new TextDecoder("utf-8", { fatal: true }).decode(exemplars__iter_filtered_attrs__iter_key_bytes);
+        } catch (e) {
+          throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
+        }
+        const exemplars__iter_filtered_attrs__iter_value_length = this.readUint16("big_endian");
+        const exemplars__iter_filtered_attrs__iter_value_bytes = this.readBytesSlice(exemplars__iter_filtered_attrs__iter_value_length);
+        try {
+          exemplars__iter_filtered_attrs__iter.value = new TextDecoder("utf-8", { fatal: true }).decode(exemplars__iter_filtered_attrs__iter_value_bytes);
+        } catch (e) {
+          throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
+        }
+        exemplars__iter.filtered_attrs.push(exemplars__iter_filtered_attrs__iter);
+      }
+      exemplars__iter.trace_id = [];
+      for (let i = 0; i < 16; i++) {
+        let exemplars__iter_trace_id__iter: any;
+        exemplars__iter_trace_id__iter = this.readUint8();
+        exemplars__iter.trace_id.push(exemplars__iter_trace_id__iter);
+      }
+      exemplars__iter.span_id = [];
+      for (let i = 0; i < 8; i++) {
+        let exemplars__iter_span_id__iter: any;
+        exemplars__iter_span_id__iter = this.readUint8();
+        exemplars__iter.span_id.push(exemplars__iter_span_id__iter);
+      }
+      value.exemplars.push(exemplars__iter);
+    }
+    value.count = this.readUint64("big_endian");
+    value.sum = this.readFloat64("big_endian");
+    value.quantiles = [];
+    const quantiles_length = this.readUint16("big_endian");
+    for (let i = 0; i < quantiles_length; i++) {
+      let quantiles__iter: any;
+      quantiles__iter = {};
+      quantiles__iter.quantile = this.readFloat64("big_endian");
+      quantiles__iter.value = this.readFloat64("big_endian");
+      value.quantiles.push(quantiles__iter);
+    }
+    return value;
+  }
+}
+
+/**
+ * Lossless scalar value union.
+ */
+export interface MetricNumberV2Input {
+  /**
+   * Discriminated Union
+   * Type that can be one of several variants, chosen based on a discriminator value. Supports peek-based (read ahead) or field-based (reference earlier field) discrimination.
+   *
+   * @remarks
+   *
+   * Discriminator: peek uint8
+   * Variants: 2
+   * - IntegerValueV2 (when value === 1)
+   * - DoubleValueV2 (when value === 2)
+   */
+  value: { type: 'IntegerValueV2'; value: IntegerValueV2Input } | { type: 'DoubleValueV2'; value: DoubleValueV2Input };
+}
+
+/**
+ * Lossless scalar value union.
+ */
+export interface MetricNumberV2Output {
+  /**
+   * Discriminated Union
+   * Type that can be one of several variants, chosen based on a discriminator value. Supports peek-based (read ahead) or field-based (reference earlier field) discrimination.
+   *
+   * @remarks
+   *
+   * Discriminator: peek uint8
+   * Variants: 2
+   * - IntegerValueV2 (when value === 1)
+   * - DoubleValueV2 (when value === 2)
+   */
+  value: { type: 'IntegerValueV2'; value: IntegerValueV2Output } | { type: 'DoubleValueV2'; value: DoubleValueV2Output };
+}
+
+export type MetricNumberV2 = MetricNumberV2Output;
+
+/**
+ * Variant tags for MetricNumberV2.value
+ */
+export const enum MetricNumberV2ValueVariant {
+  IntegerValueV2 = 'IntegerValueV2',
+  DoubleValueV2 = 'DoubleValueV2',
+}
+
+export class MetricNumberV2Encoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("msb_first");
+  }
+
+  encode(value: MetricNumberV2Input): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    if (value.value.type === 'IntegerValueV2') {
+      const encoder_value = new IntegerValueV2Encoder();
+      const encoded_value = encoder_value.encode(value.value.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
+    }
+    else if (value.value.type === 'DoubleValueV2') {
+      const encoder_value = new DoubleValueV2Encoder();
+      const encoded_value = encoder_value.encode(value.value.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
+    } else {
+      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown variant type: ${(value.value as any).type}`);
+    }
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a MetricNumberV2 value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: MetricNumberV2): number {
+    let size = 0;
+    if (value.type === 'IntegerValueV2') {
+      const _enc = new IntegerValueV2Encoder();
+      size += _enc.calculateSize(value.value);
+    }
+    else if (value.type === 'DoubleValueV2') {
+      const _enc = new DoubleValueV2Encoder();
+      size += _enc.calculateSize(value.value);
+    }
+    else {
+      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown variant type for value: ${(value as any).type}`);
+    }
+    return size;
+  }
+}
+
+export class MetricNumberV2Decoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "msb_first");
+  }
+
+  decode(): MetricNumberV2Output {
+    const value: any = {};
+
+    const discriminator = this.peekUint8();
+    if (discriminator === 1) {
+      const decoder = new IntegerValueV2Decoder(this.bytes.slice(this.byteOffset), value);
+      const decodedValue = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.value = { type: 'IntegerValueV2', value: decodedValue };
+    }
+    else if (discriminator === 2) {
+      const decoder = new DoubleValueV2Decoder(this.bytes.slice(this.byteOffset), value);
+      const decodedValue = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.value = { type: 'DoubleValueV2', value: decodedValue };
+    } else {
+      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator: 0x${discriminator.toString(16)}`);
+    }
+    return value;
+  }
+}
+
+/**
+ * Histogram count union for integer-count and float-count native histograms.
+ */
+export interface MetricCountV2Input {
+  /**
+   * Discriminated Union
+   * Type that can be one of several variants, chosen based on a discriminator value. Supports peek-based (read ahead) or field-based (reference earlier field) discrimination.
+   *
+   * @remarks
+   *
+   * Discriminator: peek uint8
+   * Variants: 2
+   * - IntegerCountV2 (when value === 1)
+   * - FloatCountV2 (when value === 2)
+   */
+  value: { type: 'IntegerCountV2'; value: IntegerCountV2Input } | { type: 'FloatCountV2'; value: FloatCountV2Input };
+}
+
+/**
+ * Histogram count union for integer-count and float-count native histograms.
+ */
+export interface MetricCountV2Output {
+  /**
+   * Discriminated Union
+   * Type that can be one of several variants, chosen based on a discriminator value. Supports peek-based (read ahead) or field-based (reference earlier field) discrimination.
+   *
+   * @remarks
+   *
+   * Discriminator: peek uint8
+   * Variants: 2
+   * - IntegerCountV2 (when value === 1)
+   * - FloatCountV2 (when value === 2)
+   */
+  value: { type: 'IntegerCountV2'; value: IntegerCountV2Output } | { type: 'FloatCountV2'; value: FloatCountV2Output };
+}
+
+export type MetricCountV2 = MetricCountV2Output;
+
+/**
+ * Variant tags for MetricCountV2.value
+ */
+export const enum MetricCountV2ValueVariant {
+  IntegerCountV2 = 'IntegerCountV2',
+  FloatCountV2 = 'FloatCountV2',
+}
+
+export class MetricCountV2Encoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("msb_first");
+  }
+
+  encode(value: MetricCountV2Input): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    if (value.value.type === 'IntegerCountV2') {
+      const encoder_value = new IntegerCountV2Encoder();
+      const encoded_value = encoder_value.encode(value.value.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
+    }
+    else if (value.value.type === 'FloatCountV2') {
+      const encoder_value = new FloatCountV2Encoder();
+      const encoded_value = encoder_value.encode(value.value.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
+    } else {
+      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown variant type: ${(value.value as any).type}`);
+    }
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a MetricCountV2 value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: MetricCountV2): number {
+    let size = 0;
+    if (value.type === 'IntegerCountV2') {
+      const _enc = new IntegerCountV2Encoder();
+      size += _enc.calculateSize(value.value);
+    }
+    else if (value.type === 'FloatCountV2') {
+      const _enc = new FloatCountV2Encoder();
+      size += _enc.calculateSize(value.value);
+    }
+    else {
+      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown variant type for value: ${(value as any).type}`);
+    }
+    return size;
+  }
+}
+
+export class MetricCountV2Decoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "msb_first");
+  }
+
+  decode(): MetricCountV2Output {
+    const value: any = {};
+
+    const discriminator = this.peekUint8();
+    if (discriminator === 1) {
+      const decoder = new IntegerCountV2Decoder(this.bytes.slice(this.byteOffset), value);
+      const decodedValue = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.value = { type: 'IntegerCountV2', value: decodedValue };
+    }
+    else if (discriminator === 2) {
+      const decoder = new FloatCountV2Decoder(this.bytes.slice(this.byteOffset), value);
+      const decodedValue = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.value = { type: 'FloatCountV2', value: decodedValue };
+    } else {
+      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator: 0x${discriminator.toString(16)}`);
+    }
+    return value;
+  }
+}
+
+/**
+ * Signed 64-bit scalar.
+ */
+export interface IntegerValueV2Input {
+  /**
+   * 64-bit Signed Integer
+   * Fixed-width 64-bit signed integer (-9223372036854775808 to 9223372036854775807). Respects endianness configuration.
+   */
+  value: bigint;
+}
+
+/**
+ * Signed 64-bit scalar.
+ */
+export interface IntegerValueV2Output {
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  tag: number;
+  /**
+   * 64-bit Signed Integer
+   * Fixed-width 64-bit signed integer (-9223372036854775808 to 9223372036854775807). Respects endianness configuration.
+   */
+  value: bigint;
+}
+
+export type IntegerValueV2 = IntegerValueV2Output;
+
+export class IntegerValueV2Encoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("msb_first");
+  }
+
+  encode(value: IntegerValueV2Input): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint8(1);
+    this.writeInt64(value.value, "big_endian");
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a IntegerValueV2 value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: IntegerValueV2): number {
+    return 9; // tag (const) + value
+  }
+}
+
+export class IntegerValueV2Decoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "msb_first");
+  }
+
+  decode(): IntegerValueV2Output {
+    const value: any = {};
+
+    value.tag = this.readUint8();
+    value.value = this.readInt64("big_endian");
+    return value;
+  }
+}
+
+/**
+ * IEEE-754 scalar.
+ */
+export interface DoubleValueV2Input {
+  /**
+   * 64-bit Floating Point
+   * IEEE 754 double-precision floating point (64-bit). Provides ~15 decimal digits of precision.
+   */
+  value: number;
+}
+
+/**
+ * IEEE-754 scalar.
+ */
+export interface DoubleValueV2Output {
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  tag: number;
+  /**
+   * 64-bit Floating Point
+   * IEEE 754 double-precision floating point (64-bit). Provides ~15 decimal digits of precision.
+   */
+  value: number;
+}
+
+export type DoubleValueV2 = DoubleValueV2Output;
+
+export class DoubleValueV2Encoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("msb_first");
+  }
+
+  encode(value: DoubleValueV2Input): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint8(2);
+    this.writeFloat64(value.value, "big_endian");
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a DoubleValueV2 value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: DoubleValueV2): number {
+    return 9; // tag (const) + value
+  }
+}
+
+export class DoubleValueV2Decoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "msb_first");
+  }
+
+  decode(): DoubleValueV2Output {
+    const value: any = {};
+
+    value.tag = this.readUint8();
+    value.value = this.readFloat64("big_endian");
+    return value;
+  }
+}
+
+/**
+ * Exact non-negative count.
+ */
+export interface IntegerCountV2Input {
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  value: bigint;
+}
+
+/**
+ * Exact non-negative count.
+ */
+export interface IntegerCountV2Output {
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  tag: number;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  value: bigint;
+}
+
+export type IntegerCountV2 = IntegerCountV2Output;
+
+export class IntegerCountV2Encoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("msb_first");
+  }
+
+  encode(value: IntegerCountV2Input): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint8(1);
+    this.writeUint64(value.value, "big_endian");
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a IntegerCountV2 value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: IntegerCountV2): number {
+    return 9; // tag (const) + value
+  }
+}
+
+export class IntegerCountV2Decoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "msb_first");
+  }
+
+  decode(): IntegerCountV2Output {
+    const value: any = {};
+
+    value.tag = this.readUint8();
+    value.value = this.readUint64("big_endian");
+    return value;
+  }
+}
+
+/**
+ * Floating-point count.
+ */
+export interface FloatCountV2Input {
+  /**
+   * 64-bit Floating Point
+   * IEEE 754 double-precision floating point (64-bit). Provides ~15 decimal digits of precision.
+   */
+  value: number;
+}
+
+/**
+ * Floating-point count.
+ */
+export interface FloatCountV2Output {
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  tag: number;
+  /**
+   * 64-bit Floating Point
+   * IEEE 754 double-precision floating point (64-bit). Provides ~15 decimal digits of precision.
+   */
+  value: number;
+}
+
+export type FloatCountV2 = FloatCountV2Output;
+
+export class FloatCountV2Encoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("msb_first");
+  }
+
+  encode(value: FloatCountV2Input): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint8(2);
+    this.writeFloat64(value.value, "big_endian");
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a FloatCountV2 value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: FloatCountV2): number {
+    return 9; // tag (const) + value
+  }
+}
+
+export class FloatCountV2Decoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "msb_first");
+  }
+
+  decode(): FloatCountV2Output {
+    const value: any = {};
+
+    value.tag = this.readUint8();
+    value.value = this.readFloat64("big_endian");
+    return value;
+  }
+}
+
+/**
+ * Sparse exponential histogram bucket run. Deltas are signed offsets; counts share one numeric representation.
+ */
+export interface SparseBucketsV2Input {
+  /**
+   * 32-bit Signed Integer
+   * Fixed-width 32-bit signed integer (-2147483648 to 2147483647). Respects endianness configuration.
+   */
+  offset: number;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  deltas: number[];
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  counts: MetricCountV2Input[];
+}
+
+/**
+ * Sparse exponential histogram bucket run. Deltas are signed offsets; counts share one numeric representation.
+ */
+export interface SparseBucketsV2Output {
+  /**
+   * 32-bit Signed Integer
+   * Fixed-width 32-bit signed integer (-2147483648 to 2147483647). Respects endianness configuration.
+   */
+  offset: number;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  deltas: number[];
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  counts: MetricCountV2Output[];
+}
+
+export type SparseBucketsV2 = SparseBucketsV2Output;
+
+export class SparseBucketsV2Encoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("msb_first");
+  }
+
+  encode(value: SparseBucketsV2Input): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeInt32(value.offset, "big_endian");
+    this.writeUint32(value.deltas.length, "big_endian");
+    for (let value_deltas__iter_index = 0; value_deltas__iter_index < value.deltas.length; value_deltas__iter_index++) {
+      const value_deltas__iter = value.deltas[value_deltas__iter_index];
+      this.writeInt32(value_deltas__iter, "big_endian");
+    }
+    this.writeUint32(value.counts.length, "big_endian");
+    for (let value_counts__iter_index = 0; value_counts__iter_index < value.counts.length; value_counts__iter_index++) {
+      const value_counts__iter = value.counts[value_counts__iter_index];
+      const encoder_value_counts__iter = new MetricCountV2Encoder();
+      const encoded_value_counts__iter = encoder_value_counts__iter.encode(value_counts__iter);
+      for (const byte of encoded_value_counts__iter) {
+        this.writeUint8(byte);
+      }
+    }
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a SparseBucketsV2 value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: SparseBucketsV2): number {
+    let size = 0;
+    size += 4; // offset
+    // deltas: array (kind: length_prefixed)
+    for (const item of value.deltas) {
+      size += 4;
+    }
+    size += 4; // length prefix (uint32)
+    // counts: array (kind: length_prefixed)
+    for (const item of value.counts) {
+      const counts_itemEncoder = new MetricCountV2Encoder();
+      size += counts_itemEncoder.calculateSize(item);
+    }
+    size += 4; // length prefix (uint32)
+    return size;
+  }
+}
+
+export class SparseBucketsV2Decoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "msb_first");
+  }
+
+  decode(): SparseBucketsV2Output {
+    const value: any = {};
+
+    value.offset = this.readInt32("big_endian");
+    value.deltas = [];
+    const deltas_length = this.readUint32("big_endian");
+    for (let i = 0; i < deltas_length; i++) {
+      let deltas__iter: any;
+      deltas__iter = this.readInt32("big_endian");
+      value.deltas.push(deltas__iter);
+    }
+    value.counts = [];
+    const counts_length = this.readUint32("big_endian");
+    for (let i = 0; i < counts_length; i++) {
+      let counts__iter: any;
+      counts__iter = {};
+      const discriminator = this.peekUint8();
+      if (discriminator === 1) {
+        const decoder = new IntegerCountV2Decoder(this.bytes.slice(this.byteOffset), counts__iter);
+        const decodedValue = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        counts__iter.value = { type: 'IntegerCountV2', value: decodedValue };
+      }
+      else if (discriminator === 2) {
+        const decoder = new FloatCountV2Decoder(this.bytes.slice(this.byteOffset), counts__iter);
+        const decodedValue = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        counts__iter.value = { type: 'FloatCountV2', value: decodedValue };
+      } else {
+        throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator: 0x${discriminator.toString(16)}`);
+      }
+      value.counts.push(counts__iter);
+    }
+    return value;
+  }
+}
+
+/**
+ * One summary quantile.
+ */
+export interface QuantileValueV2Input {
+  /**
+   * 64-bit Floating Point
+   * IEEE 754 double-precision floating point (64-bit). Provides ~15 decimal digits of precision.
+   */
+  quantile: number;
+  /**
+   * 64-bit Floating Point
+   * IEEE 754 double-precision floating point (64-bit). Provides ~15 decimal digits of precision.
+   */
+  value: number;
+}
+
+/**
+ * One summary quantile.
+ */
+export interface QuantileValueV2Output {
+  /**
+   * 64-bit Floating Point
+   * IEEE 754 double-precision floating point (64-bit). Provides ~15 decimal digits of precision.
+   */
+  quantile: number;
+  /**
+   * 64-bit Floating Point
+   * IEEE 754 double-precision floating point (64-bit). Provides ~15 decimal digits of precision.
+   */
+  value: number;
+}
+
+export type QuantileValueV2 = QuantileValueV2Output;
+
+export class QuantileValueV2Encoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("msb_first");
+  }
+
+  encode(value: QuantileValueV2Input): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeFloat64(value.quantile, "big_endian");
+    this.writeFloat64(value.value, "big_endian");
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a QuantileValueV2 value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: QuantileValueV2): number {
+    return 16; // quantile + value
+  }
+}
+
+export class QuantileValueV2Decoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "msb_first");
+  }
+
+  decode(): QuantileValueV2Output {
+    const value: any = {};
+
+    value.quantile = this.readFloat64("big_endian");
+    value.value = this.readFloat64("big_endian");
+    return value;
+  }
+}
+
+/**
+ * Exemplar attached to a metric point.
+ */
+export interface MetricExemplarV2Input {
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  ts_unix_nano: bigint;
+  /**
+   * Lossless scalar value union.
+   */
+  number: MetricNumberV2Input;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint16
+   */
+  filtered_attrs: LabelPairInput[];
+  /**
+   * Bytes
+   * Raw byte array. Sugar for array of uint8 — same wire format, simpler schema definition.
+   */
+  trace_id: number[];
+  /**
+   * Bytes
+   * Raw byte array. Sugar for array of uint8 — same wire format, simpler schema definition.
+   */
+  span_id: number[];
+}
+
+/**
+ * Exemplar attached to a metric point.
+ */
+export interface MetricExemplarV2Output {
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  ts_unix_nano: bigint;
+  /**
+   * Lossless scalar value union.
+   */
+  number: MetricNumberV2Output;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint16
+   */
+  filtered_attrs: LabelPairOutput[];
+  /**
+   * Bytes
+   * Raw byte array. Sugar for array of uint8 — same wire format, simpler schema definition.
+   */
+  trace_id: number[];
+  /**
+   * Bytes
+   * Raw byte array. Sugar for array of uint8 — same wire format, simpler schema definition.
+   */
+  span_id: number[];
+}
+
+export type MetricExemplarV2 = MetricExemplarV2Output;
+
+export class MetricExemplarV2Encoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("msb_first");
+  }
+
+  encode(value: MetricExemplarV2Input): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint64(value.ts_unix_nano, "big_endian");
+    const encoder_number = new MetricNumberV2Encoder();
+    const encoded_number = encoder_number.encode(value.number);
+    for (const byte of encoded_number) {
+      this.writeUint8(byte);
+    }
+    this.writeUint16(value.filtered_attrs.length, "big_endian");
+    for (let value_filtered_attrs__iter_index = 0; value_filtered_attrs__iter_index < value.filtered_attrs.length; value_filtered_attrs__iter_index++) {
+      const value_filtered_attrs__iter = value.filtered_attrs[value_filtered_attrs__iter_index];
+      const encoder_value_filtered_attrs__iter = new LabelPairEncoder();
+      const encoded_value_filtered_attrs__iter = encoder_value_filtered_attrs__iter.encode(value_filtered_attrs__iter);
+      for (const byte of encoded_value_filtered_attrs__iter) {
+        this.writeUint8(byte);
+      }
+    }
+    // Validate fixed-length array
+    if (value.trace_id.length !== 16) {
+      throw new Error(`Array 'trace_id' must have exactly 16 elements, got ${value.trace_id.length}`);
+    }
+    for (let value_trace_id__iter_index = 0; value_trace_id__iter_index < value.trace_id.length; value_trace_id__iter_index++) {
+      const value_trace_id__iter = value.trace_id[value_trace_id__iter_index];
+      this.writeUint8(value_trace_id__iter);
+    }
+    // Validate fixed-length array
+    if (value.span_id.length !== 8) {
+      throw new Error(`Array 'span_id' must have exactly 8 elements, got ${value.span_id.length}`);
+    }
+    for (let value_span_id__iter_index = 0; value_span_id__iter_index < value.span_id.length; value_span_id__iter_index++) {
+      const value_span_id__iter = value.span_id[value_span_id__iter_index];
+      this.writeUint8(value_span_id__iter);
+    }
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a MetricExemplarV2 value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: MetricExemplarV2): number {
+    let size = 0;
+    size += 8; // ts_unix_nano
+    // number: custom type (MetricNumberV2)
+    const number_encoder = new MetricNumberV2Encoder();
+    size += number_encoder.calculateSize(value.number);
+    // filtered_attrs: array (kind: length_prefixed)
+    for (const item of value.filtered_attrs) {
+      const filtered_attrs_itemEncoder = new LabelPairEncoder();
+      size += filtered_attrs_itemEncoder.calculateSize(item);
+    }
+    size += 2; // length prefix (uint16)
+    // trace_id: bytes (kind: fixed)
+    size += value.trace_id.length;
+    // span_id: bytes (kind: fixed)
+    size += value.span_id.length;
+    return size;
+  }
+}
+
+export class MetricExemplarV2Decoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "msb_first");
+  }
+
+  decode(): MetricExemplarV2Output {
+    const value: any = {};
+
+    value.ts_unix_nano = this.readUint64("big_endian");
+    value.number = {};
+    const discriminator = this.peekUint8();
+    if (discriminator === 1) {
+      const decoder = new IntegerValueV2Decoder(this.bytes.slice(this.byteOffset), value.number);
+      const decodedValue = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.number.value = { type: 'IntegerValueV2', value: decodedValue };
+    }
+    else if (discriminator === 2) {
+      const decoder = new DoubleValueV2Decoder(this.bytes.slice(this.byteOffset), value.number);
+      const decodedValue = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.number.value = { type: 'DoubleValueV2', value: decodedValue };
+    } else {
+      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator: 0x${discriminator.toString(16)}`);
+    }
+    value.filtered_attrs = [];
+    const filtered_attrs_length = this.readUint16("big_endian");
+    for (let i = 0; i < filtered_attrs_length; i++) {
+      let filtered_attrs__iter: any;
+      filtered_attrs__iter = {};
+      const filtered_attrs__iter_key_length = this.readUint8();
+      const filtered_attrs__iter_key_bytes = this.readBytesSlice(filtered_attrs__iter_key_length);
+      try {
+        filtered_attrs__iter.key = new TextDecoder("utf-8", { fatal: true }).decode(filtered_attrs__iter_key_bytes);
+      } catch (e) {
+        throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
+      }
+      const filtered_attrs__iter_value_length = this.readUint16("big_endian");
+      const filtered_attrs__iter_value_bytes = this.readBytesSlice(filtered_attrs__iter_value_length);
+      try {
+        filtered_attrs__iter.value = new TextDecoder("utf-8", { fatal: true }).decode(filtered_attrs__iter_value_bytes);
+      } catch (e) {
+        throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
+      }
+      value.filtered_attrs.push(filtered_attrs__iter);
+    }
+    value.trace_id = [];
+    for (let i = 0; i < 16; i++) {
+      let trace_id__iter: any;
+      trace_id__iter = this.readUint8();
+      value.trace_id.push(trace_id__iter);
+    }
+    value.span_id = [];
+    for (let i = 0; i < 8; i++) {
+      let span_id__iter: any;
+      span_id__iter = this.readUint8();
+      value.span_id.push(span_id__iter);
+    }
+    return value;
+  }
+}
+

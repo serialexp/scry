@@ -84,7 +84,7 @@ use scry_query::{
 
 use crate::live_merge::{fetch_live_from_ingester, LiveDiscovery};
 use crate::memory_guard::{QueryMemoryGuard, QUERY_TOO_LARGE_MESSAGE};
-use crate::stats::QueryMetrics;
+use crate::stats::{LocalQueryDecision, QueryMetrics};
 use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OnceCell, Semaphore};
@@ -96,6 +96,12 @@ use uuid::Uuid;
 /// stored (block) half always returns regardless.
 const LIVE_FETCH_DEADLINE: Duration = Duration::from_secs(2);
 const QUERY_REQUEST_DEADLINE: Duration = Duration::from_secs(10);
+/// Implicit recent windows are snapped to this boundary. The actual bucket is
+/// capped by the configured window, so a short safety window cannot be widened
+/// by more than its own duration. The snapped bound is used for both execution
+/// and cache identity.
+const DEFAULT_WINDOW_BUCKET_NANOS: u64 = 30 * 1_000_000_000;
+const DISTRIBUTION_SMALL_QUERY_MAX_BLOCKS: usize = 1;
 const TARGETED_REPAIR_MAX_META_OBJECTS: usize = 50_000;
 const TARGETED_REPAIR_MAX_META_BYTES: u64 = 256 * 1024 * 1024;
 
@@ -516,7 +522,11 @@ impl QueryService {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
-        scry_query::apply_default_window(query, now_unix_nano, self.default_query_window_nanos)
+        self.apply_default_window_at(query, now_unix_nano)
+    }
+
+    fn apply_default_window_at(&self, query: &mut Query, now_unix_nano: u64) -> bool {
+        apply_bucketed_default_window(query, now_unix_nano, self.default_query_window_nanos)
     }
 
     /// Attach a live-ingester discovery source (D-054). Enables the merged
@@ -2172,6 +2182,9 @@ impl QueryService {
                 phases.cache_lookup += cache_started.elapsed();
                 {
                     if let Some(hit) = cached {
+                        if let Some(m) = self.metrics.as_ref() {
+                            m.record_local_decision(LocalQueryDecision::CacheHit);
+                        }
                         if let Some(g) = inflight.as_mut() {
                             g.mark_ok();
                         }
@@ -2260,6 +2273,22 @@ impl QueryService {
                     Ok((stream, physical, plan_timings)) => {
                         phases.register += plan_timings.register;
                         phases.plan += plan_timings.plan;
+                        // Phase 0 remains observation-only. Record only after a
+                        // successful final plan so repair/replan loops cannot
+                        // count one logical query more than once.
+                        if let Some(metrics) = self.metrics.as_ref() {
+                            let decision = if req.live {
+                                LocalQueryDecision::Live
+                            } else if req.sql.is_some() {
+                                LocalQueryDecision::Unsupported
+                            } else if candidate_context.len() <= DISTRIBUTION_SMALL_QUERY_MAX_BLOCKS
+                            {
+                                LocalQueryDecision::Small
+                            } else {
+                                LocalQueryDecision::EligibleShadow
+                            };
+                            metrics.record_local_decision(decision);
+                        }
                         break (stream, physical, key, candidate_context);
                     }
                     Err((code, msg)) => {
@@ -2846,6 +2875,25 @@ impl QueryService {
     }
 }
 
+fn apply_bucketed_default_window(query: &mut Query, now: u64, window: u64) -> bool {
+    if query.ts_min.is_some() || query.ts_max.is_some() || window == 0 {
+        return false;
+    }
+    // Ceil the lower bound, rather than flooring `now`, so the configured
+    // look-back remains a hard maximum. Requests in one bucket execute and key
+    // the same conservative subset of the requested recent window.
+    let bucket = DEFAULT_WINDOW_BUCKET_NANOS.min(window);
+    let exact_min = now.saturating_sub(window);
+    let remainder = exact_min % bucket;
+    let snapped_min = if remainder == 0 {
+        exact_min
+    } else {
+        exact_min.saturating_add(bucket - remainder)
+    };
+    query.ts_min = Some(snapped_min);
+    true
+}
+
 /// Stable, lowercase signal name for tracing fields. Matches the
 /// shape used by `crates/query/src/cli.rs::CliSignal::name`,
 /// so dashboards filtering on `signal="metrics"` agree at both ends.
@@ -3251,14 +3299,14 @@ mod tests {
     use scry_catalog::Catalog;
     use scry_objstore::BufPool;
     use scry_proto::{generated::LiveRecord, LabelPair};
-    use scry_query::{BloomCache, PostingsCache, QueryResultCache};
+    use scry_query::{BloomCache, PostingsCache, Query, QueryResultCache};
     use tempfile::TempDir;
     use tokio::time::Duration;
     use uuid::Uuid;
 
     use super::{
-        canonical_fleet_json, live_record_is_durable, live_record_owned_bytes, QueryService,
-        TargetedRepairLimits,
+        apply_bucketed_default_window, canonical_fleet_json, live_record_is_durable,
+        live_record_owned_bytes, QueryService, TargetedRepairLimits, DEFAULT_WINDOW_BUCKET_NANOS,
     };
 
     #[derive(Debug)]
@@ -3545,6 +3593,54 @@ mod tests {
             live_record_owned_bytes(&record),
             base + pairs + "serviceapihellozonewest".len()
         );
+    }
+
+    #[test]
+    fn default_window_is_stable_within_bucket_and_changes_at_boundary() {
+        let hour = 3_600_000_000_000;
+        let minute = DEFAULT_WINDOW_BUCKET_NANOS;
+        let mut first = Query::default();
+        let mut second = Query::default();
+        let mut next = Query::default();
+        assert!(apply_bucketed_default_window(
+            &mut first,
+            10 * hour + 1,
+            hour
+        ));
+        assert!(apply_bucketed_default_window(
+            &mut second,
+            10 * hour + minute - 1,
+            hour
+        ));
+        assert!(apply_bucketed_default_window(
+            &mut next,
+            10 * hour + minute + 1,
+            hour
+        ));
+        assert_eq!(first.ts_min, second.ts_min);
+        assert_eq!(next.ts_min, first.ts_min.map(|v| v + minute));
+        assert_eq!(first.ts_max, None);
+        assert!(first.ts_min.unwrap() >= 10 * hour + 1 - hour);
+
+        let mut short = Query::default();
+        assert!(apply_bucketed_default_window(&mut short, 101, 10));
+        assert!(short.ts_min.unwrap() >= 91);
+    }
+
+    #[test]
+    fn default_window_preserves_explicit_bounds() {
+        let mut min = Query {
+            ts_min: Some(7),
+            ..Query::default()
+        };
+        let mut max = Query {
+            ts_max: Some(9),
+            ..Query::default()
+        };
+        assert!(!apply_bucketed_default_window(&mut min, 100, 50));
+        assert!(!apply_bucketed_default_window(&mut max, 100, 50));
+        assert_eq!(min.ts_min, Some(7));
+        assert_eq!(max.ts_max, Some(9));
     }
 
     #[test]

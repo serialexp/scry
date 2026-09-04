@@ -1,7 +1,7 @@
 //! Compaction policy — which blocks to merge, into what.
 //!
 //! Size-tiered (`ARCHITECTURE.md § Compaction § Compaction policy`):
-//! blocks live at a `level`, and when a `(signal, date, level)`
+//! blocks live at a `level`, and when a `(signal, schema version, date, level)`
 //! partition accumulates at least `fanout` blocks we merge the `fanout`
 //! **smallest** of them into one block at `level + 1`. Size-tiered (vs
 //! LevelDB-style levelled) keeps write amplification low — each byte is
@@ -170,8 +170,8 @@ pub fn validate_against_catalog(
 
 /// Plan merges over the live block set. `blocks` should be the catalog's
 /// live rows ([`scry_catalog::Catalog::list_blocks`]); they are grouped
-/// by `(signal, date, level)` and any partition with `>= fanout` blocks
-/// below `max_level` yields a merge of its `fanout` smallest blocks.
+/// by `(signal, schema_version, date, level)` and any partition with `>= fanout`
+/// blocks below `max_level` yields a merge of its `fanout` smallest blocks.
 ///
 /// A partition whose merge would produce an un-encodable ancestor closure is
 /// reported in [`CompactionPlan::oversized`] instead of being planned. It used
@@ -181,7 +181,7 @@ pub fn validate_against_catalog(
 pub fn plan_merges(blocks: &[CatalogEntry], cfg: &CompactConfig) -> CompactionPlan {
     // Deterministic grouping order (BTreeMap) so a pass is reproducible
     // and tests/logs are stable.
-    let mut groups: BTreeMap<(String, String, u32), Vec<CatalogEntry>> = BTreeMap::new();
+    let mut groups: BTreeMap<(String, u32, String, u32), Vec<CatalogEntry>> = BTreeMap::new();
     for b in blocks {
         if let Some(filter) = &cfg.signal_filter {
             if &b.meta.signal != filter {
@@ -192,13 +192,18 @@ pub fn plan_merges(blocks: &[CatalogEntry], cfg: &CompactConfig) -> CompactionPl
             continue;
         }
         groups
-            .entry((b.meta.signal.clone(), b.date.clone(), b.level))
+            .entry((
+                b.meta.signal.clone(),
+                b.meta.schema_version,
+                b.date.clone(),
+                b.level,
+            ))
             .or_default()
             .push(b.clone());
     }
 
     let mut plan = CompactionPlan::default();
-    for ((signal, date, level), mut entries) in groups {
+    for ((signal, _schema_version, date, level), mut entries) in groups {
         if entries.len() < cfg.fanout {
             continue;
         }
@@ -295,6 +300,43 @@ mod tests {
         assert_eq!(p.output_level(), 1);
         let sizes: Vec<u64> = p.inputs.iter().map(|e| e.meta.byte_size).collect();
         assert_eq!(sizes, vec![10, 20], "two smallest selected");
+    }
+
+    #[test]
+    fn mixed_schema_versions_are_never_planned_together() {
+        let mut blocks = vec![
+            entry("metrics", 0, 10, 1),
+            entry("metrics", 0, 20, 2),
+            entry("metrics", 0, 30, 3),
+            entry("metrics", 0, 40, 4),
+        ];
+        blocks[2].meta.schema_version = 2;
+        blocks[3].meta.schema_version = 2;
+        let cfg = CompactConfig {
+            fanout: 2,
+            ..Default::default()
+        };
+
+        let plans = plan_merges(&blocks, &cfg).merges;
+        assert_eq!(plans.len(), 2);
+        for plan in plans {
+            let version = plan.inputs[0].meta.schema_version;
+            assert!(plan
+                .inputs
+                .iter()
+                .all(|entry| entry.meta.schema_version == version));
+        }
+    }
+
+    #[test]
+    fn mixed_versions_do_not_collectively_reach_fanout() {
+        let mut blocks = vec![entry("metrics", 0, 10, 1), entry("metrics", 0, 20, 2)];
+        blocks[1].meta.schema_version = 2;
+        let cfg = CompactConfig {
+            fanout: 2,
+            ..Default::default()
+        };
+        assert!(plan_merges(&blocks, &cfg).merges.is_empty());
     }
 
     #[test]

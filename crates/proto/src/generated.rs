@@ -304,6 +304,268 @@ impl FrameMsg {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum MetricPointV2Value {
+    ScalarPointV2(ScalarPointV2Output),
+    HistogramPointV2(HistogramPointV2Output),
+    ExponentialHistogramPointV2(ExponentialHistogramPointV2Output),
+    SummaryPointV2(SummaryPointV2Output),
+}
+
+impl MetricPointV2Value {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        match self {
+            MetricPointV2Value::ScalarPointV2(v) => {
+                encoder.write_uint8(1);
+                encoder.write_uint32(v.descriptor_id, Endianness::BigEndian);
+                encoder.write_uint64(v.start_unix_nano, Endianness::BigEndian);
+                encoder.write_uint64(v.ts_unix_nano, Endianness::BigEndian);
+                encoder.write_uint32(v.flags, Endianness::BigEndian);
+                encoder.write_uint16(v.attributes.len() as u16, Endianness::BigEndian);
+                for item in &v.attributes {
+                    item.encode_into(encoder)?;
+                }
+                encoder.write_uint16(v.exemplars.len() as u16, Endianness::BigEndian);
+                for item in &v.exemplars {
+                    item.encode_into(encoder)?;
+                }
+                v.number.encode_into(encoder)?;
+            }
+            MetricPointV2Value::HistogramPointV2(v) => {
+                encoder.write_uint8(2);
+                encoder.write_uint32(v.descriptor_id, Endianness::BigEndian);
+                encoder.write_uint64(v.start_unix_nano, Endianness::BigEndian);
+                encoder.write_uint64(v.ts_unix_nano, Endianness::BigEndian);
+                encoder.write_uint32(v.flags, Endianness::BigEndian);
+                encoder.write_uint16(v.attributes.len() as u16, Endianness::BigEndian);
+                for item in &v.attributes {
+                    item.encode_into(encoder)?;
+                }
+                encoder.write_uint16(v.exemplars.len() as u16, Endianness::BigEndian);
+                for item in &v.exemplars {
+                    item.encode_into(encoder)?;
+                }
+                encoder.write_uint64(v.count, Endianness::BigEndian);
+                encoder.write_uint8(v.has_sum);
+                encoder.write_float64(v.sum, Endianness::BigEndian);
+                encoder.write_uint8(v.has_min);
+                encoder.write_float64(v.min, Endianness::BigEndian);
+                encoder.write_uint8(v.has_max);
+                encoder.write_float64(v.max, Endianness::BigEndian);
+                encoder.write_uint32(v.explicit_bounds.len() as u32, Endianness::BigEndian);
+                for item in &v.explicit_bounds {
+                    encoder.write_float64(*item, Endianness::BigEndian);
+                }
+                encoder.write_uint32(v.bucket_counts.len() as u32, Endianness::BigEndian);
+                for item in &v.bucket_counts {
+                    encoder.write_uint64(*item, Endianness::BigEndian);
+                }
+            }
+            MetricPointV2Value::ExponentialHistogramPointV2(v) => {
+                encoder.write_uint8(3);
+                encoder.write_uint32(v.descriptor_id, Endianness::BigEndian);
+                encoder.write_uint64(v.start_unix_nano, Endianness::BigEndian);
+                encoder.write_uint64(v.ts_unix_nano, Endianness::BigEndian);
+                encoder.write_uint32(v.flags, Endianness::BigEndian);
+                encoder.write_uint16(v.attributes.len() as u16, Endianness::BigEndian);
+                for item in &v.attributes {
+                    item.encode_into(encoder)?;
+                }
+                encoder.write_uint16(v.exemplars.len() as u16, Endianness::BigEndian);
+                for item in &v.exemplars {
+                    item.encode_into(encoder)?;
+                }
+                v.count.encode_into(encoder)?;
+                encoder.write_uint8(v.has_sum);
+                encoder.write_float64(v.sum, Endianness::BigEndian);
+                encoder.write_uint8(v.has_min);
+                encoder.write_float64(v.min, Endianness::BigEndian);
+                encoder.write_uint8(v.has_max);
+                encoder.write_float64(v.max, Endianness::BigEndian);
+                encoder.write_int32(v.scale, Endianness::BigEndian);
+                encoder.write_float64(v.zero_threshold, Endianness::BigEndian);
+                v.zero_count.encode_into(encoder)?;
+                v.positive.encode_into(encoder)?;
+                v.negative.encode_into(encoder)?;
+                encoder.write_uint32(v.custom_bounds.len() as u32, Endianness::BigEndian);
+                for item in &v.custom_bounds {
+                    encoder.write_float64(*item, Endianness::BigEndian);
+                }
+                encoder.write_uint8(v.reset_hint);
+            }
+            MetricPointV2Value::SummaryPointV2(v) => {
+                encoder.write_uint8(4);
+                encoder.write_uint32(v.descriptor_id, Endianness::BigEndian);
+                encoder.write_uint64(v.start_unix_nano, Endianness::BigEndian);
+                encoder.write_uint64(v.ts_unix_nano, Endianness::BigEndian);
+                encoder.write_uint32(v.flags, Endianness::BigEndian);
+                encoder.write_uint16(v.attributes.len() as u16, Endianness::BigEndian);
+                for item in &v.attributes {
+                    item.encode_into(encoder)?;
+                }
+                encoder.write_uint16(v.exemplars.len() as u16, Endianness::BigEndian);
+                for item in &v.exemplars {
+                    item.encode_into(encoder)?;
+                }
+                encoder.write_uint64(v.count, Endianness::BigEndian);
+                encoder.write_float64(v.sum, Endianness::BigEndian);
+                encoder.write_uint16(v.quantiles.len() as u16, Endianness::BigEndian);
+                for item in &v.quantiles {
+                    item.encode_into(encoder)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            MetricPointV2Value::ScalarPointV2(_) => "ScalarPointV2",
+            MetricPointV2Value::HistogramPointV2(_) => "HistogramPointV2",
+            MetricPointV2Value::ExponentialHistogramPointV2(_) => "ExponentialHistogramPointV2",
+            MetricPointV2Value::SummaryPointV2(_) => "SummaryPointV2",
+        }
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        // Union type - try each variant in order until one succeeds
+        let start_pos = decoder.position();
+        if let Ok(v) = ScalarPointV2Output::decode_with_decoder(decoder) {
+            return Ok(MetricPointV2Value::ScalarPointV2(v));
+        }
+        decoder.seek(start_pos)?;
+        if let Ok(v) = HistogramPointV2Output::decode_with_decoder(decoder) {
+            return Ok(MetricPointV2Value::HistogramPointV2(v));
+        }
+        decoder.seek(start_pos)?;
+        if let Ok(v) = ExponentialHistogramPointV2Output::decode_with_decoder(decoder) {
+            return Ok(MetricPointV2Value::ExponentialHistogramPointV2(v));
+        }
+        decoder.seek(start_pos)?;
+        if let Ok(v) = SummaryPointV2Output::decode_with_decoder(decoder) {
+            return Ok(MetricPointV2Value::SummaryPointV2(v));
+        }
+        Err(binschema_runtime::BinSchemaError::InvalidVariant("no variant matched the input bytes".to_string()))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MetricNumberV2Value {
+    IntegerValueV2(IntegerValueV2Output),
+    DoubleValueV2(DoubleValueV2Output),
+}
+
+impl MetricNumberV2Value {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        match self {
+            MetricNumberV2Value::IntegerValueV2(v) => {
+                encoder.write_uint8(1);
+                encoder.write_int64(v.value, Endianness::BigEndian);
+            }
+            MetricNumberV2Value::DoubleValueV2(v) => {
+                encoder.write_uint8(2);
+                encoder.write_float64(v.value, Endianness::BigEndian);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            MetricNumberV2Value::IntegerValueV2(_) => "IntegerValueV2",
+            MetricNumberV2Value::DoubleValueV2(_) => "DoubleValueV2",
+        }
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        // Union type - try each variant in order until one succeeds
+        let start_pos = decoder.position();
+        if let Ok(v) = IntegerValueV2Output::decode_with_decoder(decoder) {
+            return Ok(MetricNumberV2Value::IntegerValueV2(v));
+        }
+        decoder.seek(start_pos)?;
+        if let Ok(v) = DoubleValueV2Output::decode_with_decoder(decoder) {
+            return Ok(MetricNumberV2Value::DoubleValueV2(v));
+        }
+        Err(binschema_runtime::BinSchemaError::InvalidVariant("no variant matched the input bytes".to_string()))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MetricCountV2Value {
+    IntegerCountV2(IntegerCountV2Output),
+    FloatCountV2(FloatCountV2Output),
+}
+
+impl MetricCountV2Value {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        match self {
+            MetricCountV2Value::IntegerCountV2(v) => {
+                encoder.write_uint8(1);
+                encoder.write_uint64(v.value, Endianness::BigEndian);
+            }
+            MetricCountV2Value::FloatCountV2(v) => {
+                encoder.write_uint8(2);
+                encoder.write_float64(v.value, Endianness::BigEndian);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            MetricCountV2Value::IntegerCountV2(_) => "IntegerCountV2",
+            MetricCountV2Value::FloatCountV2(_) => "FloatCountV2",
+        }
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        // Union type - try each variant in order until one succeeds
+        let start_pos = decoder.position();
+        if let Ok(v) = IntegerCountV2Output::decode_with_decoder(decoder) {
+            return Ok(MetricCountV2Value::IntegerCountV2(v));
+        }
+        decoder.seek(start_pos)?;
+        if let Ok(v) = FloatCountV2Output::decode_with_decoder(decoder) {
+            return Ok(MetricCountV2Value::FloatCountV2(v));
+        }
+        Err(binschema_runtime::BinSchemaError::InvalidVariant("no variant matched the input bytes".to_string()))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Frame {
     pub msg: FrameMsg,
 }
@@ -2886,6 +3148,1706 @@ impl DummyRecord {
             ts_unix_nano,
             key,
             value,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetricsBatchV2Input {
+    pub descriptors: Vec<MetricDescriptorV2>,
+    pub points: Vec<MetricPointV2>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetricsBatchV2Output {
+    pub magic: u32,
+    pub descriptors: Vec<MetricDescriptorV2>,
+    pub points: Vec<MetricPointV2>,
+}
+
+pub type MetricsBatchV2 = MetricsBatchV2Output;
+
+impl MetricsBatchV2Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u32_be(1397568000);
+        encoder.write_u32_be(self.descriptors.len() as u32);
+        for item in &self.descriptors {
+            item.encode_into(encoder)?;
+        }
+        encoder.write_u32_be(self.points.len() as u32);
+        for item in &self.points {
+            item.encode_into(encoder)?;
+        }
+        Ok(())
+    }
+
+}
+
+impl MetricsBatchV2Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let magic = decoder.read_u32_be()?;
+        if magic != 1397568000u32 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 1397568000, got {}", magic)));
+        }
+        let length = decoder.read_u32_be()? as usize;
+        let mut descriptors = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = MetricDescriptorV2::decode_with_decoder(decoder)?;
+            descriptors.push(item);
+        }
+        let length = decoder.read_u32_be()? as usize;
+        let mut points = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = MetricPointV2::decode_with_decoder(decoder)?;
+            points.push(item);
+        }
+        Ok(Self {
+            magic,
+            descriptors,
+            points,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        MetricsBatchV2Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        MetricsBatchV2Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<MetricsBatchV2Output> for MetricsBatchV2Input {
+    fn from(o: MetricsBatchV2Output) -> Self {
+        Self {
+            descriptors: o.descriptors,
+            points: o.points,
+        }
+    }
+}
+
+impl From<MetricsBatchV2Input> for MetricsBatchV2Output {
+    fn from(i: MetricsBatchV2Input) -> Self {
+        Self {
+            magic: 1397568000u32,
+            descriptors: i.descriptors,
+            points: i.points,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetricDescriptorV2 {
+    pub id: u32,
+    pub name: std::string::String,
+    pub description: std::string::String,
+    pub unit: std::string::String,
+    pub metric_kind: u8,
+    pub temporality: u8,
+    pub monotonic: u8,
+    pub resource_attrs: Vec<LabelPair>,
+    pub scope_name: std::string::String,
+    pub scope_version: std::string::String,
+    pub scope_attrs: Vec<LabelPair>,
+}
+
+impl MetricDescriptorV2 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u32_be(self.id);
+        encoder.write_u16_be(self.name.len() as u16);
+        let string_bytes: &[u8] = self.name.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_be(self.description.len() as u16);
+        let string_bytes: &[u8] = self.description.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_be(self.unit.len() as u16);
+        let string_bytes: &[u8] = self.unit.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_byte(self.metric_kind);
+        encoder.write_byte(self.temporality);
+        encoder.write_byte(self.monotonic);
+        encoder.write_u16_be(self.resource_attrs.len() as u16);
+        for item in &self.resource_attrs {
+            item.encode_into(encoder)?;
+        }
+        encoder.write_byte(self.scope_name.len() as u8);
+        let string_bytes: &[u8] = self.scope_name.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_byte(self.scope_version.len() as u8);
+        let string_bytes: &[u8] = self.scope_version.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_be(self.scope_attrs.len() as u16);
+        for item in &self.scope_attrs {
+            item.encode_into(encoder)?;
+        }
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let id = decoder.read_u32_be()?;
+        let length = decoder.read_u16_be()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let name = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_be()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let description = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_be()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let unit = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let metric_kind = decoder.read_byte()?;
+        let temporality = decoder.read_byte()?;
+        let monotonic = decoder.read_byte()?;
+        let length = decoder.read_u16_be()? as usize;
+        let mut resource_attrs = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = LabelPair::decode_with_decoder(decoder)?;
+            resource_attrs.push(item);
+        }
+        let length = decoder.read_byte()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let scope_name = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_byte()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let scope_version = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_be()? as usize;
+        let mut scope_attrs = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = LabelPair::decode_with_decoder(decoder)?;
+            scope_attrs.push(item);
+        }
+        Ok(Self {
+            id,
+            name,
+            description,
+            unit,
+            metric_kind,
+            temporality,
+            monotonic,
+            resource_attrs,
+            scope_name,
+            scope_version,
+            scope_attrs,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetricPointV2 {
+    pub value: MetricPointV2Value,
+}
+
+impl MetricPointV2 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.value.encode_into(encoder)?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let value = MetricPointV2Value::decode_with_decoder(decoder)?;
+        Ok(Self {
+            value,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScalarPointV2Input {
+    pub descriptor_id: u32,
+    pub start_unix_nano: u64,
+    pub ts_unix_nano: u64,
+    pub flags: u32,
+    pub attributes: Vec<LabelPair>,
+    pub exemplars: Vec<MetricExemplarV2>,
+    pub number: MetricNumberV2,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScalarPointV2Output {
+    pub tag: u8,
+    pub descriptor_id: u32,
+    pub start_unix_nano: u64,
+    pub ts_unix_nano: u64,
+    pub flags: u32,
+    pub attributes: Vec<LabelPair>,
+    pub exemplars: Vec<MetricExemplarV2>,
+    pub number: MetricNumberV2,
+}
+
+pub type ScalarPointV2 = ScalarPointV2Output;
+
+impl ScalarPointV2Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, &EncodeContext::new())?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.encode_into_with_context(encoder, &EncodeContext::new())
+    }
+
+    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, ctx)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
+
+        // Build parent context for nested struct encoding
+        let mut parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+        parent_fields.insert("descriptor_id".to_string(), FieldValue::U32(self.descriptor_id));
+        parent_fields.insert("start_unix_nano".to_string(), FieldValue::U64(self.start_unix_nano));
+        parent_fields.insert("ts_unix_nano".to_string(), FieldValue::U64(self.ts_unix_nano));
+        parent_fields.insert("flags".to_string(), FieldValue::U32(self.flags));
+        // Collect items with sub-field values for typed array 'attributes'
+        {
+            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
+            for item in &self.attributes {
+                let item_bytes = item.encode()?;
+                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
+                item_fields.insert("key".to_string(), FieldValue::String(item.key.clone()));
+                item_fields.insert("value".to_string(), FieldValue::String(item.value.clone()));
+                items_data.push(("LabelPair".to_string(), item_fields));
+            }
+            parent_fields.insert("attributes".to_string(), FieldValue::Items(items_data));
+        }
+        // Collect items with sub-field values for typed array 'exemplars'
+        {
+            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
+            for _ in &self.exemplars {
+                let item_bytes = Vec::<u8>::new(); // Items need context, skip encoding for now
+                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
+                items_data.push(("MetricExemplarV2".to_string(), item_fields));
+            }
+            parent_fields.insert("exemplars".to_string(), FieldValue::Items(items_data));
+        }
+        let child_ctx = ctx.extend_with_parent(parent_fields);
+        let _ = &child_ctx; // Used by nested struct encoding
+        encoder.write_byte(1);
+        encoder.write_u32_be(self.descriptor_id);
+        encoder.write_u64_be(self.start_unix_nano);
+        encoder.write_u64_be(self.ts_unix_nano);
+        encoder.write_u32_be(self.flags);
+        encoder.write_u16_be(self.attributes.len() as u16);
+        for item in &self.attributes {
+            item.encode_into(encoder)?;
+        }
+        encoder.write_u16_be(self.exemplars.len() as u16);
+        for item in &self.exemplars {
+            item.encode_into_with_context(encoder, &child_ctx)?;
+        }
+        // Encode nested struct number
+        self.number.encode_into(encoder)?;
+        Ok(())
+    }
+
+}
+
+impl ScalarPointV2Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let tag = decoder.read_byte()?;
+        if tag != 1u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 1, got {}", tag)));
+        }
+        let descriptor_id = decoder.read_u32_be()?;
+        let start_unix_nano = decoder.read_u64_be()?;
+        let ts_unix_nano = decoder.read_u64_be()?;
+        let flags = decoder.read_u32_be()?;
+        let length = decoder.read_u16_be()? as usize;
+        let mut attributes = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = LabelPair::decode_with_decoder(decoder)?;
+            attributes.push(item);
+        }
+        let length = decoder.read_u16_be()? as usize;
+        let mut exemplars = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = MetricExemplarV2::decode_with_decoder(decoder)?;
+            exemplars.push(item);
+        }
+        let number = MetricNumberV2::decode_with_decoder(decoder)?;
+        Ok(Self {
+            tag,
+            descriptor_id,
+            start_unix_nano,
+            ts_unix_nano,
+            flags,
+            attributes,
+            exemplars,
+            number,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        ScalarPointV2Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        ScalarPointV2Input::from(self.clone()).encode_into(encoder)
+    }
+    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
+        ScalarPointV2Input::from(self.clone()).encode_with_context(ctx)
+    }
+    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
+        ScalarPointV2Input::from(self.clone()).encode_into_with_context(encoder, ctx)
+    }
+}
+
+impl From<ScalarPointV2Output> for ScalarPointV2Input {
+    fn from(o: ScalarPointV2Output) -> Self {
+        Self {
+            descriptor_id: o.descriptor_id,
+            start_unix_nano: o.start_unix_nano,
+            ts_unix_nano: o.ts_unix_nano,
+            flags: o.flags,
+            attributes: o.attributes,
+            exemplars: o.exemplars,
+            number: o.number,
+        }
+    }
+}
+
+impl From<ScalarPointV2Input> for ScalarPointV2Output {
+    fn from(i: ScalarPointV2Input) -> Self {
+        Self {
+            tag: 1u8,
+            descriptor_id: i.descriptor_id,
+            start_unix_nano: i.start_unix_nano,
+            ts_unix_nano: i.ts_unix_nano,
+            flags: i.flags,
+            attributes: i.attributes,
+            exemplars: i.exemplars,
+            number: i.number,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistogramPointV2Input {
+    pub descriptor_id: u32,
+    pub start_unix_nano: u64,
+    pub ts_unix_nano: u64,
+    pub flags: u32,
+    pub attributes: Vec<LabelPair>,
+    pub exemplars: Vec<MetricExemplarV2>,
+    pub count: u64,
+    pub has_sum: u8,
+    pub sum: f64,
+    pub has_min: u8,
+    pub min: f64,
+    pub has_max: u8,
+    pub max: f64,
+    pub explicit_bounds: Vec<f64>,
+    pub bucket_counts: Vec<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistogramPointV2Output {
+    pub tag: u8,
+    pub descriptor_id: u32,
+    pub start_unix_nano: u64,
+    pub ts_unix_nano: u64,
+    pub flags: u32,
+    pub attributes: Vec<LabelPair>,
+    pub exemplars: Vec<MetricExemplarV2>,
+    pub count: u64,
+    pub has_sum: u8,
+    pub sum: f64,
+    pub has_min: u8,
+    pub min: f64,
+    pub has_max: u8,
+    pub max: f64,
+    pub explicit_bounds: Vec<f64>,
+    pub bucket_counts: Vec<u64>,
+}
+
+pub type HistogramPointV2 = HistogramPointV2Output;
+
+impl HistogramPointV2Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, &EncodeContext::new())?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.encode_into_with_context(encoder, &EncodeContext::new())
+    }
+
+    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, ctx)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
+
+        // Build parent context for nested struct encoding
+        let mut parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+        parent_fields.insert("descriptor_id".to_string(), FieldValue::U32(self.descriptor_id));
+        parent_fields.insert("start_unix_nano".to_string(), FieldValue::U64(self.start_unix_nano));
+        parent_fields.insert("ts_unix_nano".to_string(), FieldValue::U64(self.ts_unix_nano));
+        parent_fields.insert("flags".to_string(), FieldValue::U32(self.flags));
+        // Collect items with sub-field values for typed array 'attributes'
+        {
+            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
+            for item in &self.attributes {
+                let item_bytes = item.encode()?;
+                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
+                item_fields.insert("key".to_string(), FieldValue::String(item.key.clone()));
+                item_fields.insert("value".to_string(), FieldValue::String(item.value.clone()));
+                items_data.push(("LabelPair".to_string(), item_fields));
+            }
+            parent_fields.insert("attributes".to_string(), FieldValue::Items(items_data));
+        }
+        // Collect items with sub-field values for typed array 'exemplars'
+        {
+            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
+            for _ in &self.exemplars {
+                let item_bytes = Vec::<u8>::new(); // Items need context, skip encoding for now
+                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
+                items_data.push(("MetricExemplarV2".to_string(), item_fields));
+            }
+            parent_fields.insert("exemplars".to_string(), FieldValue::Items(items_data));
+        }
+        parent_fields.insert("count".to_string(), FieldValue::U64(self.count));
+        parent_fields.insert("has_sum".to_string(), FieldValue::U8(self.has_sum));
+        parent_fields.insert("sum".to_string(), FieldValue::F64(self.sum));
+        parent_fields.insert("has_min".to_string(), FieldValue::U8(self.has_min));
+        parent_fields.insert("min".to_string(), FieldValue::F64(self.min));
+        parent_fields.insert("has_max".to_string(), FieldValue::U8(self.has_max));
+        parent_fields.insert("max".to_string(), FieldValue::F64(self.max));
+        let child_ctx = ctx.extend_with_parent(parent_fields);
+        let _ = &child_ctx; // Used by nested struct encoding
+        encoder.write_byte(2);
+        encoder.write_u32_be(self.descriptor_id);
+        encoder.write_u64_be(self.start_unix_nano);
+        encoder.write_u64_be(self.ts_unix_nano);
+        encoder.write_u32_be(self.flags);
+        encoder.write_u16_be(self.attributes.len() as u16);
+        for item in &self.attributes {
+            item.encode_into(encoder)?;
+        }
+        encoder.write_u16_be(self.exemplars.len() as u16);
+        for item in &self.exemplars {
+            item.encode_into_with_context(encoder, &child_ctx)?;
+        }
+        encoder.write_u64_be(self.count);
+        encoder.write_byte(self.has_sum);
+        encoder.write_u64_be((self.sum).to_bits());
+        encoder.write_byte(self.has_min);
+        encoder.write_u64_be((self.min).to_bits());
+        encoder.write_byte(self.has_max);
+        encoder.write_u64_be((self.max).to_bits());
+        encoder.write_u32_be(self.explicit_bounds.len() as u32);
+        for item in &self.explicit_bounds {
+            encoder.write_u64_be((*item).to_bits());
+        }
+        encoder.write_u32_be(self.bucket_counts.len() as u32);
+        for item in &self.bucket_counts {
+            encoder.write_u64_be(*item);
+        }
+        Ok(())
+    }
+
+}
+
+impl HistogramPointV2Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let tag = decoder.read_byte()?;
+        if tag != 2u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 2, got {}", tag)));
+        }
+        let descriptor_id = decoder.read_u32_be()?;
+        let start_unix_nano = decoder.read_u64_be()?;
+        let ts_unix_nano = decoder.read_u64_be()?;
+        let flags = decoder.read_u32_be()?;
+        let length = decoder.read_u16_be()? as usize;
+        let mut attributes = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = LabelPair::decode_with_decoder(decoder)?;
+            attributes.push(item);
+        }
+        let length = decoder.read_u16_be()? as usize;
+        let mut exemplars = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = MetricExemplarV2::decode_with_decoder(decoder)?;
+            exemplars.push(item);
+        }
+        let count = decoder.read_u64_be()?;
+        let has_sum = decoder.read_byte()?;
+        let sum = f64::from_bits(decoder.read_u64_be()?);
+        let has_min = decoder.read_byte()?;
+        let min = f64::from_bits(decoder.read_u64_be()?);
+        let has_max = decoder.read_byte()?;
+        let max = f64::from_bits(decoder.read_u64_be()?);
+        let length = decoder.read_u32_be()? as usize;
+        let mut explicit_bounds = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = f64::from_bits(decoder.read_u64_be()?);
+            explicit_bounds.push(item);
+        }
+        let length = decoder.read_u32_be()? as usize;
+        let mut bucket_counts = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = decoder.read_u64_be()?;
+            bucket_counts.push(item);
+        }
+        Ok(Self {
+            tag,
+            descriptor_id,
+            start_unix_nano,
+            ts_unix_nano,
+            flags,
+            attributes,
+            exemplars,
+            count,
+            has_sum,
+            sum,
+            has_min,
+            min,
+            has_max,
+            max,
+            explicit_bounds,
+            bucket_counts,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        HistogramPointV2Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        HistogramPointV2Input::from(self.clone()).encode_into(encoder)
+    }
+    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
+        HistogramPointV2Input::from(self.clone()).encode_with_context(ctx)
+    }
+    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
+        HistogramPointV2Input::from(self.clone()).encode_into_with_context(encoder, ctx)
+    }
+}
+
+impl From<HistogramPointV2Output> for HistogramPointV2Input {
+    fn from(o: HistogramPointV2Output) -> Self {
+        Self {
+            descriptor_id: o.descriptor_id,
+            start_unix_nano: o.start_unix_nano,
+            ts_unix_nano: o.ts_unix_nano,
+            flags: o.flags,
+            attributes: o.attributes,
+            exemplars: o.exemplars,
+            count: o.count,
+            has_sum: o.has_sum,
+            sum: o.sum,
+            has_min: o.has_min,
+            min: o.min,
+            has_max: o.has_max,
+            max: o.max,
+            explicit_bounds: o.explicit_bounds,
+            bucket_counts: o.bucket_counts,
+        }
+    }
+}
+
+impl From<HistogramPointV2Input> for HistogramPointV2Output {
+    fn from(i: HistogramPointV2Input) -> Self {
+        Self {
+            tag: 2u8,
+            descriptor_id: i.descriptor_id,
+            start_unix_nano: i.start_unix_nano,
+            ts_unix_nano: i.ts_unix_nano,
+            flags: i.flags,
+            attributes: i.attributes,
+            exemplars: i.exemplars,
+            count: i.count,
+            has_sum: i.has_sum,
+            sum: i.sum,
+            has_min: i.has_min,
+            min: i.min,
+            has_max: i.has_max,
+            max: i.max,
+            explicit_bounds: i.explicit_bounds,
+            bucket_counts: i.bucket_counts,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExponentialHistogramPointV2Input {
+    pub descriptor_id: u32,
+    pub start_unix_nano: u64,
+    pub ts_unix_nano: u64,
+    pub flags: u32,
+    pub attributes: Vec<LabelPair>,
+    pub exemplars: Vec<MetricExemplarV2>,
+    pub count: MetricCountV2,
+    pub has_sum: u8,
+    pub sum: f64,
+    pub has_min: u8,
+    pub min: f64,
+    pub has_max: u8,
+    pub max: f64,
+    pub scale: i32,
+    pub zero_threshold: f64,
+    pub zero_count: MetricCountV2,
+    pub positive: SparseBucketsV2,
+    pub negative: SparseBucketsV2,
+    pub custom_bounds: Vec<f64>,
+    pub reset_hint: u8,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExponentialHistogramPointV2Output {
+    pub tag: u8,
+    pub descriptor_id: u32,
+    pub start_unix_nano: u64,
+    pub ts_unix_nano: u64,
+    pub flags: u32,
+    pub attributes: Vec<LabelPair>,
+    pub exemplars: Vec<MetricExemplarV2>,
+    pub count: MetricCountV2,
+    pub has_sum: u8,
+    pub sum: f64,
+    pub has_min: u8,
+    pub min: f64,
+    pub has_max: u8,
+    pub max: f64,
+    pub scale: i32,
+    pub zero_threshold: f64,
+    pub zero_count: MetricCountV2,
+    pub positive: SparseBucketsV2,
+    pub negative: SparseBucketsV2,
+    pub custom_bounds: Vec<f64>,
+    pub reset_hint: u8,
+}
+
+pub type ExponentialHistogramPointV2 = ExponentialHistogramPointV2Output;
+
+impl ExponentialHistogramPointV2Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, &EncodeContext::new())?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.encode_into_with_context(encoder, &EncodeContext::new())
+    }
+
+    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, ctx)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
+
+        // Build parent context for nested struct encoding
+        let mut parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+        parent_fields.insert("descriptor_id".to_string(), FieldValue::U32(self.descriptor_id));
+        parent_fields.insert("start_unix_nano".to_string(), FieldValue::U64(self.start_unix_nano));
+        parent_fields.insert("ts_unix_nano".to_string(), FieldValue::U64(self.ts_unix_nano));
+        parent_fields.insert("flags".to_string(), FieldValue::U32(self.flags));
+        // Collect items with sub-field values for typed array 'attributes'
+        {
+            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
+            for item in &self.attributes {
+                let item_bytes = item.encode()?;
+                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
+                item_fields.insert("key".to_string(), FieldValue::String(item.key.clone()));
+                item_fields.insert("value".to_string(), FieldValue::String(item.value.clone()));
+                items_data.push(("LabelPair".to_string(), item_fields));
+            }
+            parent_fields.insert("attributes".to_string(), FieldValue::Items(items_data));
+        }
+        // Collect items with sub-field values for typed array 'exemplars'
+        {
+            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
+            for _ in &self.exemplars {
+                let item_bytes = Vec::<u8>::new(); // Items need context, skip encoding for now
+                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
+                items_data.push(("MetricExemplarV2".to_string(), item_fields));
+            }
+            parent_fields.insert("exemplars".to_string(), FieldValue::Items(items_data));
+        }
+        parent_fields.insert("has_sum".to_string(), FieldValue::U8(self.has_sum));
+        parent_fields.insert("sum".to_string(), FieldValue::F64(self.sum));
+        parent_fields.insert("has_min".to_string(), FieldValue::U8(self.has_min));
+        parent_fields.insert("min".to_string(), FieldValue::F64(self.min));
+        parent_fields.insert("has_max".to_string(), FieldValue::U8(self.has_max));
+        parent_fields.insert("max".to_string(), FieldValue::F64(self.max));
+        parent_fields.insert("scale".to_string(), FieldValue::I32(self.scale));
+        parent_fields.insert("zero_threshold".to_string(), FieldValue::F64(self.zero_threshold));
+        parent_fields.insert("reset_hint".to_string(), FieldValue::U8(self.reset_hint));
+        let child_ctx = ctx.extend_with_parent(parent_fields);
+        let _ = &child_ctx; // Used by nested struct encoding
+        encoder.write_byte(3);
+        encoder.write_u32_be(self.descriptor_id);
+        encoder.write_u64_be(self.start_unix_nano);
+        encoder.write_u64_be(self.ts_unix_nano);
+        encoder.write_u32_be(self.flags);
+        encoder.write_u16_be(self.attributes.len() as u16);
+        for item in &self.attributes {
+            item.encode_into(encoder)?;
+        }
+        encoder.write_u16_be(self.exemplars.len() as u16);
+        for item in &self.exemplars {
+            item.encode_into_with_context(encoder, &child_ctx)?;
+        }
+        // Encode nested struct count
+        self.count.encode_into(encoder)?;
+        encoder.write_byte(self.has_sum);
+        encoder.write_u64_be((self.sum).to_bits());
+        encoder.write_byte(self.has_min);
+        encoder.write_u64_be((self.min).to_bits());
+        encoder.write_byte(self.has_max);
+        encoder.write_u64_be((self.max).to_bits());
+        encoder.write_u32_be(self.scale as u32);
+        encoder.write_u64_be((self.zero_threshold).to_bits());
+        // Encode nested struct zero_count
+        self.zero_count.encode_into(encoder)?;
+        // Encode nested struct positive
+        self.positive.encode_into(encoder)?;
+        // Encode nested struct negative
+        self.negative.encode_into(encoder)?;
+        encoder.write_u32_be(self.custom_bounds.len() as u32);
+        for item in &self.custom_bounds {
+            encoder.write_u64_be((*item).to_bits());
+        }
+        encoder.write_byte(self.reset_hint);
+        Ok(())
+    }
+
+}
+
+impl ExponentialHistogramPointV2Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let tag = decoder.read_byte()?;
+        if tag != 3u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 3, got {}", tag)));
+        }
+        let descriptor_id = decoder.read_u32_be()?;
+        let start_unix_nano = decoder.read_u64_be()?;
+        let ts_unix_nano = decoder.read_u64_be()?;
+        let flags = decoder.read_u32_be()?;
+        let length = decoder.read_u16_be()? as usize;
+        let mut attributes = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = LabelPair::decode_with_decoder(decoder)?;
+            attributes.push(item);
+        }
+        let length = decoder.read_u16_be()? as usize;
+        let mut exemplars = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = MetricExemplarV2::decode_with_decoder(decoder)?;
+            exemplars.push(item);
+        }
+        let count = MetricCountV2::decode_with_decoder(decoder)?;
+        let has_sum = decoder.read_byte()?;
+        let sum = f64::from_bits(decoder.read_u64_be()?);
+        let has_min = decoder.read_byte()?;
+        let min = f64::from_bits(decoder.read_u64_be()?);
+        let has_max = decoder.read_byte()?;
+        let max = f64::from_bits(decoder.read_u64_be()?);
+        let scale = decoder.read_u32_be()? as i32;
+        let zero_threshold = f64::from_bits(decoder.read_u64_be()?);
+        let zero_count = MetricCountV2::decode_with_decoder(decoder)?;
+        let positive = SparseBucketsV2::decode_with_decoder(decoder)?;
+        let negative = SparseBucketsV2::decode_with_decoder(decoder)?;
+        let length = decoder.read_u32_be()? as usize;
+        let mut custom_bounds = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = f64::from_bits(decoder.read_u64_be()?);
+            custom_bounds.push(item);
+        }
+        let reset_hint = decoder.read_byte()?;
+        Ok(Self {
+            tag,
+            descriptor_id,
+            start_unix_nano,
+            ts_unix_nano,
+            flags,
+            attributes,
+            exemplars,
+            count,
+            has_sum,
+            sum,
+            has_min,
+            min,
+            has_max,
+            max,
+            scale,
+            zero_threshold,
+            zero_count,
+            positive,
+            negative,
+            custom_bounds,
+            reset_hint,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        ExponentialHistogramPointV2Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        ExponentialHistogramPointV2Input::from(self.clone()).encode_into(encoder)
+    }
+    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
+        ExponentialHistogramPointV2Input::from(self.clone()).encode_with_context(ctx)
+    }
+    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
+        ExponentialHistogramPointV2Input::from(self.clone()).encode_into_with_context(encoder, ctx)
+    }
+}
+
+impl From<ExponentialHistogramPointV2Output> for ExponentialHistogramPointV2Input {
+    fn from(o: ExponentialHistogramPointV2Output) -> Self {
+        Self {
+            descriptor_id: o.descriptor_id,
+            start_unix_nano: o.start_unix_nano,
+            ts_unix_nano: o.ts_unix_nano,
+            flags: o.flags,
+            attributes: o.attributes,
+            exemplars: o.exemplars,
+            count: o.count,
+            has_sum: o.has_sum,
+            sum: o.sum,
+            has_min: o.has_min,
+            min: o.min,
+            has_max: o.has_max,
+            max: o.max,
+            scale: o.scale,
+            zero_threshold: o.zero_threshold,
+            zero_count: o.zero_count,
+            positive: o.positive,
+            negative: o.negative,
+            custom_bounds: o.custom_bounds,
+            reset_hint: o.reset_hint,
+        }
+    }
+}
+
+impl From<ExponentialHistogramPointV2Input> for ExponentialHistogramPointV2Output {
+    fn from(i: ExponentialHistogramPointV2Input) -> Self {
+        Self {
+            tag: 3u8,
+            descriptor_id: i.descriptor_id,
+            start_unix_nano: i.start_unix_nano,
+            ts_unix_nano: i.ts_unix_nano,
+            flags: i.flags,
+            attributes: i.attributes,
+            exemplars: i.exemplars,
+            count: i.count,
+            has_sum: i.has_sum,
+            sum: i.sum,
+            has_min: i.has_min,
+            min: i.min,
+            has_max: i.has_max,
+            max: i.max,
+            scale: i.scale,
+            zero_threshold: i.zero_threshold,
+            zero_count: i.zero_count,
+            positive: i.positive,
+            negative: i.negative,
+            custom_bounds: i.custom_bounds,
+            reset_hint: i.reset_hint,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SummaryPointV2Input {
+    pub descriptor_id: u32,
+    pub start_unix_nano: u64,
+    pub ts_unix_nano: u64,
+    pub flags: u32,
+    pub attributes: Vec<LabelPair>,
+    pub exemplars: Vec<MetricExemplarV2>,
+    pub count: u64,
+    pub sum: f64,
+    pub quantiles: Vec<QuantileValueV2>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SummaryPointV2Output {
+    pub tag: u8,
+    pub descriptor_id: u32,
+    pub start_unix_nano: u64,
+    pub ts_unix_nano: u64,
+    pub flags: u32,
+    pub attributes: Vec<LabelPair>,
+    pub exemplars: Vec<MetricExemplarV2>,
+    pub count: u64,
+    pub sum: f64,
+    pub quantiles: Vec<QuantileValueV2>,
+}
+
+pub type SummaryPointV2 = SummaryPointV2Output;
+
+impl SummaryPointV2Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, &EncodeContext::new())?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.encode_into_with_context(encoder, &EncodeContext::new())
+    }
+
+    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, ctx)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
+
+        // Build parent context for nested struct encoding
+        let mut parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+        parent_fields.insert("descriptor_id".to_string(), FieldValue::U32(self.descriptor_id));
+        parent_fields.insert("start_unix_nano".to_string(), FieldValue::U64(self.start_unix_nano));
+        parent_fields.insert("ts_unix_nano".to_string(), FieldValue::U64(self.ts_unix_nano));
+        parent_fields.insert("flags".to_string(), FieldValue::U32(self.flags));
+        // Collect items with sub-field values for typed array 'attributes'
+        {
+            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
+            for item in &self.attributes {
+                let item_bytes = item.encode()?;
+                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
+                item_fields.insert("key".to_string(), FieldValue::String(item.key.clone()));
+                item_fields.insert("value".to_string(), FieldValue::String(item.value.clone()));
+                items_data.push(("LabelPair".to_string(), item_fields));
+            }
+            parent_fields.insert("attributes".to_string(), FieldValue::Items(items_data));
+        }
+        // Collect items with sub-field values for typed array 'exemplars'
+        {
+            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
+            for _ in &self.exemplars {
+                let item_bytes = Vec::<u8>::new(); // Items need context, skip encoding for now
+                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
+                items_data.push(("MetricExemplarV2".to_string(), item_fields));
+            }
+            parent_fields.insert("exemplars".to_string(), FieldValue::Items(items_data));
+        }
+        parent_fields.insert("count".to_string(), FieldValue::U64(self.count));
+        parent_fields.insert("sum".to_string(), FieldValue::F64(self.sum));
+        // Collect items with sub-field values for typed array 'quantiles'
+        {
+            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
+            for item in &self.quantiles {
+                let item_bytes = item.encode()?;
+                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
+                item_fields.insert("quantile".to_string(), FieldValue::F64(item.quantile));
+                item_fields.insert("value".to_string(), FieldValue::F64(item.value));
+                items_data.push(("QuantileValueV2".to_string(), item_fields));
+            }
+            parent_fields.insert("quantiles".to_string(), FieldValue::Items(items_data));
+        }
+        let child_ctx = ctx.extend_with_parent(parent_fields);
+        let _ = &child_ctx; // Used by nested struct encoding
+        encoder.write_byte(4);
+        encoder.write_u32_be(self.descriptor_id);
+        encoder.write_u64_be(self.start_unix_nano);
+        encoder.write_u64_be(self.ts_unix_nano);
+        encoder.write_u32_be(self.flags);
+        encoder.write_u16_be(self.attributes.len() as u16);
+        for item in &self.attributes {
+            item.encode_into(encoder)?;
+        }
+        encoder.write_u16_be(self.exemplars.len() as u16);
+        for item in &self.exemplars {
+            item.encode_into_with_context(encoder, &child_ctx)?;
+        }
+        encoder.write_u64_be(self.count);
+        encoder.write_u64_be((self.sum).to_bits());
+        encoder.write_u16_be(self.quantiles.len() as u16);
+        for item in &self.quantiles {
+            item.encode_into(encoder)?;
+        }
+        Ok(())
+    }
+
+}
+
+impl SummaryPointV2Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let tag = decoder.read_byte()?;
+        if tag != 4u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 4, got {}", tag)));
+        }
+        let descriptor_id = decoder.read_u32_be()?;
+        let start_unix_nano = decoder.read_u64_be()?;
+        let ts_unix_nano = decoder.read_u64_be()?;
+        let flags = decoder.read_u32_be()?;
+        let length = decoder.read_u16_be()? as usize;
+        let mut attributes = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = LabelPair::decode_with_decoder(decoder)?;
+            attributes.push(item);
+        }
+        let length = decoder.read_u16_be()? as usize;
+        let mut exemplars = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = MetricExemplarV2::decode_with_decoder(decoder)?;
+            exemplars.push(item);
+        }
+        let count = decoder.read_u64_be()?;
+        let sum = f64::from_bits(decoder.read_u64_be()?);
+        let length = decoder.read_u16_be()? as usize;
+        let mut quantiles = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = QuantileValueV2::decode_with_decoder(decoder)?;
+            quantiles.push(item);
+        }
+        Ok(Self {
+            tag,
+            descriptor_id,
+            start_unix_nano,
+            ts_unix_nano,
+            flags,
+            attributes,
+            exemplars,
+            count,
+            sum,
+            quantiles,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        SummaryPointV2Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        SummaryPointV2Input::from(self.clone()).encode_into(encoder)
+    }
+    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
+        SummaryPointV2Input::from(self.clone()).encode_with_context(ctx)
+    }
+    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
+        SummaryPointV2Input::from(self.clone()).encode_into_with_context(encoder, ctx)
+    }
+}
+
+impl From<SummaryPointV2Output> for SummaryPointV2Input {
+    fn from(o: SummaryPointV2Output) -> Self {
+        Self {
+            descriptor_id: o.descriptor_id,
+            start_unix_nano: o.start_unix_nano,
+            ts_unix_nano: o.ts_unix_nano,
+            flags: o.flags,
+            attributes: o.attributes,
+            exemplars: o.exemplars,
+            count: o.count,
+            sum: o.sum,
+            quantiles: o.quantiles,
+        }
+    }
+}
+
+impl From<SummaryPointV2Input> for SummaryPointV2Output {
+    fn from(i: SummaryPointV2Input) -> Self {
+        Self {
+            tag: 4u8,
+            descriptor_id: i.descriptor_id,
+            start_unix_nano: i.start_unix_nano,
+            ts_unix_nano: i.ts_unix_nano,
+            flags: i.flags,
+            attributes: i.attributes,
+            exemplars: i.exemplars,
+            count: i.count,
+            sum: i.sum,
+            quantiles: i.quantiles,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetricNumberV2 {
+    pub value: MetricNumberV2Value,
+}
+
+impl MetricNumberV2 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.value.encode_into(encoder)?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let value = MetricNumberV2Value::decode_with_decoder(decoder)?;
+        Ok(Self {
+            value,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetricCountV2 {
+    pub value: MetricCountV2Value,
+}
+
+impl MetricCountV2 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.value.encode_into(encoder)?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let value = MetricCountV2Value::decode_with_decoder(decoder)?;
+        Ok(Self {
+            value,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct IntegerValueV2Input {
+    pub value: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct IntegerValueV2Output {
+    pub tag: u8,
+    pub value: i64,
+}
+
+pub type IntegerValueV2 = IntegerValueV2Output;
+
+impl IntegerValueV2Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(1);
+        encoder.write_u64_be(self.value as u64);
+        Ok(())
+    }
+
+}
+
+impl IntegerValueV2Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let tag = decoder.read_byte()?;
+        if tag != 1u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 1, got {}", tag)));
+        }
+        let value = decoder.read_u64_be()? as i64;
+        Ok(Self {
+            tag,
+            value,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        IntegerValueV2Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        IntegerValueV2Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<IntegerValueV2Output> for IntegerValueV2Input {
+    fn from(o: IntegerValueV2Output) -> Self {
+        Self {
+            value: o.value,
+        }
+    }
+}
+
+impl From<IntegerValueV2Input> for IntegerValueV2Output {
+    fn from(i: IntegerValueV2Input) -> Self {
+        Self {
+            tag: 1u8,
+            value: i.value,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DoubleValueV2Input {
+    pub value: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DoubleValueV2Output {
+    pub tag: u8,
+    pub value: f64,
+}
+
+pub type DoubleValueV2 = DoubleValueV2Output;
+
+impl DoubleValueV2Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(2);
+        encoder.write_u64_be((self.value).to_bits());
+        Ok(())
+    }
+
+}
+
+impl DoubleValueV2Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let tag = decoder.read_byte()?;
+        if tag != 2u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 2, got {}", tag)));
+        }
+        let value = f64::from_bits(decoder.read_u64_be()?);
+        Ok(Self {
+            tag,
+            value,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        DoubleValueV2Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        DoubleValueV2Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<DoubleValueV2Output> for DoubleValueV2Input {
+    fn from(o: DoubleValueV2Output) -> Self {
+        Self {
+            value: o.value,
+        }
+    }
+}
+
+impl From<DoubleValueV2Input> for DoubleValueV2Output {
+    fn from(i: DoubleValueV2Input) -> Self {
+        Self {
+            tag: 2u8,
+            value: i.value,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct IntegerCountV2Input {
+    pub value: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct IntegerCountV2Output {
+    pub tag: u8,
+    pub value: u64,
+}
+
+pub type IntegerCountV2 = IntegerCountV2Output;
+
+impl IntegerCountV2Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(1);
+        encoder.write_u64_be(self.value);
+        Ok(())
+    }
+
+}
+
+impl IntegerCountV2Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let tag = decoder.read_byte()?;
+        if tag != 1u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 1, got {}", tag)));
+        }
+        let value = decoder.read_u64_be()?;
+        Ok(Self {
+            tag,
+            value,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        IntegerCountV2Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        IntegerCountV2Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<IntegerCountV2Output> for IntegerCountV2Input {
+    fn from(o: IntegerCountV2Output) -> Self {
+        Self {
+            value: o.value,
+        }
+    }
+}
+
+impl From<IntegerCountV2Input> for IntegerCountV2Output {
+    fn from(i: IntegerCountV2Input) -> Self {
+        Self {
+            tag: 1u8,
+            value: i.value,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FloatCountV2Input {
+    pub value: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FloatCountV2Output {
+    pub tag: u8,
+    pub value: f64,
+}
+
+pub type FloatCountV2 = FloatCountV2Output;
+
+impl FloatCountV2Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(2);
+        encoder.write_u64_be((self.value).to_bits());
+        Ok(())
+    }
+
+}
+
+impl FloatCountV2Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let tag = decoder.read_byte()?;
+        if tag != 2u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 2, got {}", tag)));
+        }
+        let value = f64::from_bits(decoder.read_u64_be()?);
+        Ok(Self {
+            tag,
+            value,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        FloatCountV2Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        FloatCountV2Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<FloatCountV2Output> for FloatCountV2Input {
+    fn from(o: FloatCountV2Output) -> Self {
+        Self {
+            value: o.value,
+        }
+    }
+}
+
+impl From<FloatCountV2Input> for FloatCountV2Output {
+    fn from(i: FloatCountV2Input) -> Self {
+        Self {
+            tag: 2u8,
+            value: i.value,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SparseBucketsV2 {
+    pub offset: i32,
+    pub deltas: Vec<i32>,
+    pub counts: Vec<MetricCountV2>,
+}
+
+impl SparseBucketsV2 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u32_be(self.offset as u32);
+        encoder.write_u32_be(self.deltas.len() as u32);
+        for item in &self.deltas {
+            encoder.write_u32_be(*item as u32);
+        }
+        encoder.write_u32_be(self.counts.len() as u32);
+        for item in &self.counts {
+            item.encode_into(encoder)?;
+        }
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let offset = decoder.read_u32_be()? as i32;
+        let length = decoder.read_u32_be()? as usize;
+        let mut deltas = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = decoder.read_u32_be()? as i32;
+            deltas.push(item);
+        }
+        let length = decoder.read_u32_be()? as usize;
+        let mut counts = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = MetricCountV2::decode_with_decoder(decoder)?;
+            counts.push(item);
+        }
+        Ok(Self {
+            offset,
+            deltas,
+            counts,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuantileValueV2 {
+    pub quantile: f64,
+    pub value: f64,
+}
+
+impl QuantileValueV2 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u64_be((self.quantile).to_bits());
+        encoder.write_u64_be((self.value).to_bits());
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let quantile = f64::from_bits(decoder.read_u64_be()?);
+        let value = f64::from_bits(decoder.read_u64_be()?);
+        Ok(Self {
+            quantile,
+            value,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetricExemplarV2 {
+    pub ts_unix_nano: u64,
+    pub number: MetricNumberV2,
+    pub filtered_attrs: Vec<LabelPair>,
+    pub trace_id: Vec<u8>,
+    pub span_id: Vec<u8>,
+}
+
+impl MetricExemplarV2 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, &EncodeContext::new())?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.encode_into_with_context(encoder, &EncodeContext::new())
+    }
+
+    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, ctx)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
+
+        // Build parent context for nested struct encoding
+        let mut parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+        parent_fields.insert("ts_unix_nano".to_string(), FieldValue::U64(self.ts_unix_nano));
+        // Collect items with sub-field values for typed array 'filtered_attrs'
+        {
+            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
+            for item in &self.filtered_attrs {
+                let item_bytes = item.encode()?;
+                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
+                item_fields.insert("key".to_string(), FieldValue::String(item.key.clone()));
+                item_fields.insert("value".to_string(), FieldValue::String(item.value.clone()));
+                items_data.push(("LabelPair".to_string(), item_fields));
+            }
+            parent_fields.insert("filtered_attrs".to_string(), FieldValue::Items(items_data));
+        }
+        let child_ctx = ctx.extend_with_parent(parent_fields);
+        let _ = &child_ctx; // Used by nested struct encoding
+        encoder.write_u64_be(self.ts_unix_nano);
+        // Encode nested struct number
+        self.number.encode_into(encoder)?;
+        encoder.write_u16_be(self.filtered_attrs.len() as u16);
+        for item in &self.filtered_attrs {
+            item.encode_into(encoder)?;
+        }
+        for item in &self.trace_id {
+            encoder.write_byte(*item);
+        }
+        for item in &self.span_id {
+            encoder.write_byte(*item);
+        }
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let ts_unix_nano = decoder.read_u64_be()?;
+        let number = MetricNumberV2::decode_with_decoder(decoder)?;
+        let length = decoder.read_u16_be()? as usize;
+        let mut filtered_attrs = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = LabelPair::decode_with_decoder(decoder)?;
+            filtered_attrs.push(item);
+        }
+        let mut trace_id = Vec::with_capacity(16);
+        for _ in 0..16 {
+            let item = decoder.read_byte()?;
+            trace_id.push(item);
+        }
+        let mut span_id = Vec::with_capacity(8);
+        for _ in 0..8 {
+            let item = decoder.read_byte()?;
+            span_id.push(item);
+        }
+        Ok(Self {
+            ts_unix_nano,
+            number,
+            filtered_attrs,
+            trace_id,
+            span_id,
         })
     }
 }

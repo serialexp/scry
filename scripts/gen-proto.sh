@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Regenerate Rust bindings from the two scry wire-protocol schemas:
+# Regenerate Rust bindings from the three scry wire-protocol schemas:
 #   * proto/ingest.schema.json -> crates/proto/src/generated.rs
 #   * proto/query.schema.json  -> crates/proto/src/generated_query.rs
+#   * proto/query-worker.schema.json -> crates/proto/src/generated_query_worker.rs
 #
 # We commit the generated source (both `generated*.rs`) and the
 # vendored binschema runtime (crates/binschema-runtime/src/*.rs) so the
@@ -30,23 +31,29 @@ fi
 
 INGEST_SCHEMA="$ROOT/proto/ingest.schema.json"
 QUERY_SCHEMA="$ROOT/proto/query.schema.json"
+WORKER_SCHEMA="$ROOT/proto/query-worker.schema.json"
 
 TMP_INGEST="$(mktemp -d)"
 TMP_QUERY="$(mktemp -d)"
-trap 'rm -rf "$TMP_INGEST" "$TMP_QUERY"' EXIT
+TMP_WORKER="$(mktemp -d)"
+trap 'rm -rf "$TMP_INGEST" "$TMP_QUERY" "$TMP_WORKER"' EXIT
 
 echo "validating $INGEST_SCHEMA"
 node "$CLI" validate --schema "$INGEST_SCHEMA"
 echo "validating $QUERY_SCHEMA"
 node "$CLI" validate --schema "$QUERY_SCHEMA"
+echo "validating $WORKER_SCHEMA"
+node "$CLI" validate --schema "$WORKER_SCHEMA"
 
 echo "generating Rust (ingest) into $TMP_INGEST"
 node "$CLI" generate --language rust --schema "$INGEST_SCHEMA" --out "$TMP_INGEST"
 
 echo "generating Rust (query) into $TMP_QUERY"
 node "$CLI" generate --language rust --schema "$QUERY_SCHEMA" --out "$TMP_QUERY"
+echo "generating Rust (query worker) into $TMP_WORKER"
+node "$CLI" generate --language rust --schema "$WORKER_SCHEMA" --out "$TMP_WORKER"
 
-# The two runs must produce byte-identical runtime files. If they ever
+# The three runs must produce byte-identical runtime files. If they ever
 # diverge it's a bug in the generator (or a sign that the runtime has
 # acquired schema-specific knowledge); fail loudly rather than silently
 # overwriting one set with the other.
@@ -57,6 +64,7 @@ node "$CLI" generate --language rust --schema "$QUERY_SCHEMA" --out "$TMP_QUERY"
 # `lib.rs` referencing a `mod` that was never vendored.
 INGEST_RT="$TMP_INGEST/binschema_runtime/src"
 QUERY_RT="$TMP_QUERY/binschema_runtime/src"
+WORKER_RT="$TMP_WORKER/binschema_runtime/src"
 runtime_files=()
 for path in "$INGEST_RT"/*.rs; do
   runtime_files+=("$(basename "$path")")
@@ -67,7 +75,11 @@ for f in "${runtime_files[@]}"; do
     echo "error: binschema runtime ($f) present for ingest but not query — generator bug?" >&2
     exit 1
   fi
-  if ! cmp -s "$INGEST_RT/$f" "$QUERY_RT/$f"; then
+  if [[ ! -f "$WORKER_RT/$f" ]]; then
+    echo "error: binschema runtime ($f) present for ingest but not query worker" >&2
+    exit 1
+  fi
+  if ! cmp -s "$INGEST_RT/$f" "$QUERY_RT/$f" || ! cmp -s "$INGEST_RT/$f" "$WORKER_RT/$f"; then
     echo "error: binschema runtime ($f) differs between schemas — generator bug?" >&2
     diff -u "$INGEST_RT/$f" "$QUERY_RT/$f" >&2 || true
     exit 1
@@ -75,7 +87,7 @@ for f in "${runtime_files[@]}"; do
 done
 # Guard the other direction too: a file only the query run emits would
 # otherwise be silently skipped.
-for path in "$QUERY_RT"/*.rs; do
+for path in "$QUERY_RT"/*.rs "$WORKER_RT"/*.rs; do
   f="$(basename "$path")"
   if [[ ! -f "$INGEST_RT/$f" ]]; then
     echo "error: binschema runtime ($f) present for query but not ingest — generator bug?" >&2
@@ -96,6 +108,8 @@ cp "$TMP_INGEST/src/generated.rs" "$ROOT/crates/proto/src/generated.rs"
 
 echo "copying generated -> crates/proto/src/generated_query.rs"
 cp "$TMP_QUERY/src/generated.rs" "$ROOT/crates/proto/src/generated_query.rs"
+echo "copying generated -> crates/proto/src/generated_query_worker.rs"
+cp "$TMP_WORKER/src/generated.rs" "$ROOT/crates/proto/src/generated_query_worker.rs"
 
 # Format the freshly-vendored output so it lands rustfmt-clean — otherwise the
 # pre-commit hook (.githooks/pre-commit) would reject the regen commit, and the

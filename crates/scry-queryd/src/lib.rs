@@ -332,6 +332,41 @@ pub struct Args {
     #[arg(long, default_value_t = 128)]
     tail_max_connections: usize,
 
+    // ── Private distributed-query worker control plane (D-024) ────
+    /// Private query-worker control listener. Disabled by default. This port
+    /// speaks only the authenticated Phase-1 bid/reservation protocol.
+    #[arg(long)]
+    worker_listen: Option<SocketAddr>,
+
+    /// Routable address peers should dial. A wildcard listener requires this or
+    /// `$NODE_IP`; wildcard advertise addresses are rejected.
+    #[arg(long)]
+    worker_advertise_addr: Option<SocketAddr>,
+
+    /// File containing the deployment-scoped worker HMAC key (at least 32 bytes).
+    #[arg(long)]
+    worker_secret_file: Option<PathBuf>,
+
+    /// Identifier published in authenticated handshakes for the current key.
+    #[arg(long, default_value = "current")]
+    worker_key_id: String,
+
+    /// Separate non-blocking remote-fragment slot budget.
+    #[arg(long, default_value_t = 4)]
+    worker_fragment_slots: usize,
+
+    /// Weighted remote-fragment memory units (MiB).
+    #[arg(long, default_value_t = 512)]
+    worker_memory_mib: usize,
+
+    /// Reservation TTL in milliseconds.
+    #[arg(long, default_value_t = 5_000)]
+    worker_reservation_ttl_ms: u64,
+
+    /// Maximum simultaneous authenticated worker connections.
+    #[arg(long, default_value_t = 64)]
+    worker_max_connections: usize,
+
     // ── Status page (D-057) ───────────────────────────────────────
     /// Live status HTTP endpoint (the fleet dashboard, D-057). A bare
     /// `--stats-listen` binds `127.0.0.1:4098`; pass an explicit `host:port`
@@ -466,6 +501,65 @@ pub async fn run(args: Args) -> Result<()> {
     let instance_uuid = Uuid::now_v7();
     let valkey_keys = scry_valkey::Keyspace::resolve(args.valkey_namespace.as_deref())
         .context("resolving the Valkey key namespace")?;
+
+    // Bind the optional private worker port synchronously so a bad address is a
+    // startup failure rather than a warning from a detached task after readiness.
+    let worker_listener = match args.worker_listen {
+        Some(listen) => {
+            let secret_path = args
+                .worker_secret_file
+                .clone()
+                .or_else(|| std::env::var("SCRY_QUERY_WORKER_SECRET_FILE").ok().map(PathBuf::from))
+                .context("--worker-listen requires --worker-secret-file or SCRY_QUERY_WORKER_SECRET_FILE")?;
+            let mut secret = std::fs::read(&secret_path).with_context(|| {
+                format!("reading query-worker secret {}", secret_path.display())
+            })?;
+            while secret
+                .last()
+                .is_some_and(|byte| matches!(byte, b'\n' | b'\r'))
+            {
+                secret.pop();
+            }
+            let explicit_advertise = args.worker_advertise_addr.or_else(|| {
+                std::env::var("SCRY_QUERY_WORKER_ADVERTISE_ADDR")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+            });
+            let advertise = resolve_worker_advertise_addr(
+                explicit_advertise,
+                listen,
+                std::env::var("NODE_IP").ok().as_deref(),
+            )?;
+            let listener = tokio::net::TcpListener::bind(listen)
+                .await
+                .with_context(|| format!("binding private query-worker listener at {listen}"))?;
+            let authenticator = Arc::new(
+                scry_server::query_worker::WorkerAuthenticator::new(
+                    *instance_uuid.as_bytes(),
+                    valkey_keys.namespace(),
+                    scry_server::query_worker::AuthKey::new(args.worker_key_id.clone(), secret)
+                        .map_err(|error| anyhow::anyhow!("invalid query-worker key: {error}"))?,
+                    None,
+                    30_000,
+                    16_384,
+                )
+                .map_err(|error| anyhow::anyhow!("invalid query-worker auth config: {error}"))?,
+            );
+            let admission = Arc::new(
+                scry_server::query_worker::WorkerAdmission::new(
+                    args.worker_fragment_slots,
+                    args.worker_memory_mib,
+                    args.worker_reservation_ttl_ms,
+                    16_384,
+                )
+                .map_err(|error| {
+                    anyhow::anyhow!("invalid query-worker admission config: {error:?}")
+                })?,
+            );
+            Some((listener, advertise, authenticator, admission))
+        }
+        None => None,
+    };
     let valkey = match valkey_url.as_deref() {
         Some(url) => Some(
             ValkeyClient::connect(url, instance_uuid, valkey_keys.clone())
@@ -685,6 +779,15 @@ pub async fn run(args: Args) -> Result<()> {
         catalog_gauge,
         valkey.as_ref().map(|c| c.health()),
     ));
+    if let Some((_, advertise, _, admission)) = worker_listener.as_ref() {
+        query_metrics.set_worker_status(Some(scry_server::QueryWorkerStatus {
+            protocol_version: scry_server::query_worker::WORKER_PROTOCOL_VERSION,
+            execute_addr: advertise.to_string(),
+            fragment_slots_limit: args.worker_fragment_slots as u64,
+            fragment_slots_in_use: admission.active_counter(),
+            draining: false,
+        }));
+    }
 
     let service = Arc::new(
         QueryService::new(
@@ -959,6 +1062,31 @@ pub async fn run(args: Args) -> Result<()> {
         }));
     }
 
+    // ── Private query-worker listener (D-024 Phase 1) ──────────────
+    if let Some((listener, advertise, authenticator, admission)) = worker_listener {
+        let worker = Arc::new(
+            scry_server::query_worker::WorkerService::new(
+                authenticator,
+                admission,
+                postings_cache.clone(),
+                bloom_cache.clone(),
+                args.worker_max_connections,
+                Duration::from_secs(5),
+            )
+            .map_err(|error| anyhow::anyhow!("invalid query-worker service: {error}"))?,
+        );
+        let worker_shutdown = shutdown.clone();
+        info!(%advertise, "private query-worker control listener enabled");
+        bg_tasks.push(tokio::spawn(async move {
+            if let Err(error) = worker
+                .serve_with_shutdown(listener, scry_server::shutdown::wait(worker_shutdown))
+                .await
+            {
+                warn!(error = %error, "query-worker listener exited");
+            }
+        }));
+    }
+
     // ── Fleet status publication + optional HTTP page (D-057) ─────
     // A Valkey-connected queryd always publishes its snapshot. Fleet status is
     // part of the query protocol, so publication must not depend on whether the
@@ -1026,6 +1154,60 @@ pub async fn run(args: Args) -> Result<()> {
         }
     }
     serve_result
+}
+
+fn resolve_worker_advertise_addr(
+    explicit: Option<SocketAddr>,
+    listen: SocketAddr,
+    node_ip: Option<&str>,
+) -> Result<SocketAddr> {
+    let advertised = if let Some(explicit) = explicit {
+        explicit
+    } else if !listen.ip().is_unspecified() {
+        listen
+    } else {
+        let ip: std::net::IpAddr = node_ip
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .context(
+                "wildcard --worker-listen requires --worker-advertise-addr, \
+                 SCRY_QUERY_WORKER_ADVERTISE_ADDR, or NODE_IP",
+            )?
+            .parse()
+            .context("parsing NODE_IP for worker advertise address")?;
+        SocketAddr::new(ip, listen.port())
+    };
+    anyhow::ensure!(
+        !advertised.ip().is_unspecified(),
+        "query-worker advertise address must be routable, not {advertised}"
+    );
+    Ok(advertised)
+}
+
+#[cfg(test)]
+mod worker_tests {
+    use super::resolve_worker_advertise_addr;
+    use std::net::SocketAddr;
+
+    #[test]
+    fn concrete_worker_bind_advertises_itself() {
+        let listen: SocketAddr = "127.0.0.1:4200".parse().unwrap();
+        assert_eq!(
+            resolve_worker_advertise_addr(None, listen, None).unwrap(),
+            listen
+        );
+    }
+
+    #[test]
+    fn wildcard_worker_bind_uses_node_ip_and_rejects_wildcard_advertise() {
+        let listen: SocketAddr = "0.0.0.0:4200".parse().unwrap();
+        assert_eq!(
+            resolve_worker_advertise_addr(None, listen, Some("10.2.3.4")).unwrap(),
+            "10.2.3.4:4200".parse::<SocketAddr>().unwrap()
+        );
+        assert!(resolve_worker_advertise_addr(None, listen, None).is_err());
+        assert!(resolve_worker_advertise_addr(Some(listen), listen, None).is_err());
+    }
 }
 
 /// Background pub/sub convergence consumer: subscribe to every block-event

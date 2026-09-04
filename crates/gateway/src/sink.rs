@@ -22,7 +22,7 @@ use std::sync::{
 
 use scry_proto::{
     constants::{SIGNAL_BIT_LOGS, SIGNAL_BIT_METRICS, SIGNAL_BIT_PROFILES, SIGNAL_BIT_TRACES},
-    generated::{LogsBatch, MetricsBatch, ProfilesBatch, TracesBatch},
+    generated::{LogsBatch, MetricsBatch, MetricsBatchV2, ProfilesBatch, TracesBatch},
 };
 use tokio::sync::mpsc;
 use tracing::warn;
@@ -40,6 +40,7 @@ pub const ACCEPT_ALL: u8 =
 pub enum Fanout {
     Logs(Arc<LogsBatch>),
     Metrics(Arc<MetricsBatch>),
+    StructuredMetrics(Arc<MetricsBatchV2>),
     Traces(Arc<TracesBatch>),
     Profiles(Arc<ProfilesBatch>),
 }
@@ -49,7 +50,7 @@ impl Fanout {
     fn signal_bit(&self) -> u8 {
         match self {
             Fanout::Logs(_) => SIGNAL_BIT_LOGS,
-            Fanout::Metrics(_) => SIGNAL_BIT_METRICS,
+            Fanout::Metrics(_) | Fanout::StructuredMetrics(_) => SIGNAL_BIT_METRICS,
             Fanout::Traces(_) => SIGNAL_BIT_TRACES,
             Fanout::Profiles(_) => SIGNAL_BIT_PROFILES,
         }
@@ -58,7 +59,7 @@ impl Fanout {
     pub fn signal(&self) -> GatewaySignal {
         match self {
             Fanout::Logs(_) => GatewaySignal::Logs,
-            Fanout::Metrics(_) => GatewaySignal::Metrics,
+            Fanout::Metrics(_) | Fanout::StructuredMetrics(_) => GatewaySignal::Metrics,
             Fanout::Traces(_) => GatewaySignal::Traces,
             Fanout::Profiles(_) => GatewaySignal::Profiles,
         }
@@ -226,6 +227,16 @@ impl AppState {
             metrics.add_records(GatewaySignal::Metrics, batch.samples.len() as u64);
         }
         self.fan(Fanout::Metrics(Arc::new(batch)));
+    }
+
+    pub fn offer_structured_metrics(&self, batch: MetricsBatchV2) {
+        if batch.points.is_empty() {
+            return;
+        }
+        if let Some(metrics) = &self.metrics {
+            metrics.add_records(GatewaySignal::Metrics, batch.points.len() as u64);
+        }
+        self.fan(Fanout::StructuredMetrics(Arc::new(batch)));
     }
 
     pub fn offer_traces(&self, batch: TracesBatch) {

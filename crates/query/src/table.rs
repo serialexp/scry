@@ -42,7 +42,7 @@ use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::{DFSchema, Result as DfResult, ScalarValue};
 use datafusion::datasource::listing::PartitionedFile;
@@ -56,7 +56,7 @@ use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::ExecutionPlan;
-use scry_block::{block_path, BlockMeta};
+use scry_block::{block_path, BlockMeta, MetricsBlockBuilder};
 use scry_catalog::CatalogEntry;
 
 use crate::label_enrich::{expr_references_labels, labels_field, FpLabels, LabelEnrichExec};
@@ -66,11 +66,7 @@ use crate::label_enrich::{expr_references_labels, labels_field, FpLabels, LabelE
 /// Kept private to this module — callers receive `SchemaRef` via the
 /// `TableProvider::schema()` method.
 fn metrics_schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![
-        Field::new("series_fingerprint", DataType::UInt64, false),
-        Field::new("ts_unix_nano", DataType::UInt64, false),
-        Field::new("value", DataType::Float64, false),
-    ]))
+    MetricsBlockBuilder::main_schema()
 }
 
 /// The metrics *table* schema exposed to queries when the opt-in
@@ -169,6 +165,14 @@ impl MetricsTable {
         ts_max: Option<u64>,
         fp_labels: Option<Arc<FpLabels>>,
     ) -> DfResult<Self> {
+        for block in &blocks {
+            if !matches!(block.entry.meta.schema_version, 1 | 2) {
+                return Err(datafusion::common::DataFusionError::Plan(format!(
+                    "unsupported metrics block schema version {} for block {}",
+                    block.entry.meta.schema_version, block.entry.meta.uuid
+                )));
+            }
+        }
         Ok(Self {
             // The *table* schema: physical columns, plus the synthesised
             // `labels` column when the label join is on. The parquet scans

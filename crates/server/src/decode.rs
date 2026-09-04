@@ -30,9 +30,24 @@ pub fn dummy(payload: &[u8], builder: &mut DummyBlockBuilder) -> Result<usize> {
 /// series count here. The handler's connection-summary counter does
 /// the same thing.
 pub fn metrics(payload: &[u8], builder: &mut MetricsBlockBuilder) -> Result<usize> {
-    streaming::decode_metrics_batch_into(payload, builder)
-        .map(|(_series, samples)| samples)
-        .map_err(|e| anyhow::anyhow!("MetricsBatch: {e}"))
+    let is_v2 = payload
+        .get(..4)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u32::from_be_bytes)
+        == Some(scry_proto::constants::METRICS_BATCH_V2_MAGIC);
+    if is_v2 {
+        scry_proto::streaming_v2::decode_metrics_batch_v2_into(
+            payload,
+            scry_proto::streaming_v2::DecodeLimits::default(),
+            builder,
+        )
+        .map(|(_descriptors, points)| points as usize)
+        .map_err(|e| anyhow::anyhow!("MetricsBatchV2: {e}"))
+    } else {
+        streaming::decode_metrics_batch_into(payload, builder)
+            .map(|(_series, samples)| samples)
+            .map_err(|e| anyhow::anyhow!("MetricsBatch: {e}"))
+    }
 }
 
 /// Adapter for `decode_logs_batch_into`, wired to

@@ -107,6 +107,7 @@ async fn metrics_block_roundtrip() {
 
     // Sidecar invariants.
     assert_eq!(meta.signal, "metrics");
+    assert_eq!(meta.schema_version, 2);
     assert_eq!(meta.writer_id, writer);
     assert_eq!(meta.row_count, 5);
     assert_eq!(meta.ts_min_unix_nano, 50);
@@ -162,6 +163,9 @@ async fn metrics_block_roundtrip() {
     assert_eq!(main_batch.schema().field(0).name(), "series_fingerprint");
     assert_eq!(main_batch.schema().field(1).name(), "ts_unix_nano");
     assert_eq!(main_batch.schema().field(2).name(), "value");
+    assert_eq!(main_batch.schema().field(7).name(), "descriptor");
+    assert_eq!(main_batch.schema().field(8).name(), "point");
+    assert_eq!(main_batch.num_columns(), 9);
 
     let fps = main_batch
         .column(0)

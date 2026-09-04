@@ -541,14 +541,17 @@ async fn handle(
         }
     };
 
-    if hello.protocol_version != PROTOCOL_VERSION_V0 {
+    if !matches!(
+        hello.protocol_version,
+        PROTOCOL_VERSION_V0 | scry_proto::constants::PROTOCOL_VERSION_V2
+    ) {
         let _ = write_frame(
             &mut wr,
             &build::error(
                 ERR_PROTOCOL_VERSION,
                 &format!(
-                    "server supports v{:#06x}; agent asked for v{:#06x}",
-                    PROTOCOL_VERSION_V0, hello.protocol_version
+                    "server supports ingest v1 and v2; agent asked for v{:#06x}",
+                    hello.protocol_version
                 ),
             ),
         )
@@ -571,14 +574,20 @@ async fn handle(
     write_frame(
         &mut wr,
         &build::hello_ack(build::HelloAckArgs {
-            protocol_version: PROTOCOL_VERSION_V0,
+            protocol_version: hello.protocol_version,
             writer_id: &config.writer_id,
             session_id,
-            capabilities: if remote_status.is_some() {
+            capabilities: (if remote_status.is_some() {
                 scry_proto::constants::CAP_AGENT_STATUS
             } else {
                 0
-            },
+            }) | (if hello.protocol_version
+                == scry_proto::constants::PROTOCOL_VERSION_V2
+            {
+                scry_proto::constants::CAP_STRUCTURED_METRICS_V2
+            } else {
+                0
+            }),
             suggested_batch_bytes: DEFAULT_SUGGESTED_BATCH_BYTES,
             max_batch_bytes: DEFAULT_MAX_BATCH_BYTES,
             max_inflight_batches: DEFAULT_MAX_INFLIGHT_BATCHES,
@@ -798,7 +807,16 @@ async fn handle(
                             // byte-identical to the untapped path. There is no
                             // live-ring equivalent here: D-054's merged query
                             // is logs-only.
-                            let decoded = if tail.subscriber_count() > 0 {
+                            let is_structured = decompressed
+                                .get(..4)
+                                .and_then(|bytes| bytes.try_into().ok())
+                                .map(u32::from_be_bytes)
+                                == Some(scry_proto::constants::METRICS_BATCH_V2_MAGIC);
+                            let decoded = if is_structured {
+                                // Structured metric tail frames are capability-gated follow-up;
+                                // storage remains authoritative and must never be scalarized.
+                                decode_fn(&decompressed, scratch)
+                            } else if tail.subscriber_count() > 0 {
                                 let mut tap = TappingMetricsAppender::new(
                                     scratch,
                                     tail.as_ref(),
@@ -832,32 +850,63 @@ async fn handle(
                                 }
                             }
                         } else {
-                            // No metrics pipeline: validate + count
-                            // samples (series are dictionary entries,
-                            // not records — same accounting as the
-                            // pipeline path). Live tail still works here —
-                            // a storage-less ingester can serve `scry tail`.
-                            let mut counter = CountMetricsAppender::default();
-                            let decoded = if tail.subscriber_count() > 0 {
-                                let mut tap = TappingMetricsAppender::new(
-                                    &mut counter,
-                                    tail.as_ref(),
-                                    Signal::Metrics as u8,
-                                )
-                                .await;
-                                scry_proto::streaming::decode_metrics_batch_into(
+                            // No metrics pipeline: validate + count records.
+                            let is_structured = decompressed
+                                .get(..4)
+                                .and_then(|bytes| bytes.try_into().ok())
+                                .map(u32::from_be_bytes)
+                                == Some(scry_proto::constants::METRICS_BATCH_V2_MAGIC);
+                            if is_structured {
+                                struct CountV2(u64);
+                                impl scry_proto::streaming_v2::MetricsV2Appender for CountV2 {
+                                    fn descriptor(
+                                        &mut self,
+                                        _: &scry_proto::generated::MetricDescriptorV2,
+                                    ) -> std::result::Result<(), String>
+                                    {
+                                        Ok(())
+                                    }
+                                    fn point(
+                                        &mut self,
+                                        _: &scry_proto::generated::MetricPointV2,
+                                    ) -> std::result::Result<(), String>
+                                    {
+                                        self.0 += 1;
+                                        Ok(())
+                                    }
+                                }
+                                let mut counter = CountV2(0);
+                                scry_proto::streaming_v2::decode_metrics_batch_v2_into(
                                     &decompressed,
-                                    &mut tap,
+                                    scry_proto::streaming_v2::DecodeLimits::default(),
+                                    &mut counter,
                                 )
+                                .map(|_| counter.0)
+                                .map_err(|e| anyhow::anyhow!("MetricsBatchV2: {e}"))
                             } else {
-                                scry_proto::streaming::decode_metrics_batch_into(
-                                    &decompressed,
-                                    &mut counter,
-                                )
-                            };
-                            decoded
-                                .map(|(_series, samples)| samples as u64)
-                                .map_err(|e| anyhow::anyhow!("MetricsBatch: {e}"))
+                                // Scalar live tail remains available for legacy points.
+                                let mut counter = CountMetricsAppender::default();
+                                let decoded = if tail.subscriber_count() > 0 {
+                                    let mut tap = TappingMetricsAppender::new(
+                                        &mut counter,
+                                        tail.as_ref(),
+                                        Signal::Metrics as u8,
+                                    )
+                                    .await;
+                                    scry_proto::streaming::decode_metrics_batch_into(
+                                        &decompressed,
+                                        &mut tap,
+                                    )
+                                } else {
+                                    scry_proto::streaming::decode_metrics_batch_into(
+                                        &decompressed,
+                                        &mut counter,
+                                    )
+                                };
+                                decoded
+                                    .map(|(_series, samples)| samples as u64)
+                                    .map_err(|e| anyhow::anyhow!("MetricsBatch: {e}"))
+                            }
                         }
                     }
                     Signal::Logs => {

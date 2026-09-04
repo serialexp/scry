@@ -327,6 +327,18 @@ impl PostingsCache {
         })
     }
 
+    /// Return whether `uuid` is currently retained as a fully loaded index.
+    ///
+    /// This is an exact, non-fetching inspection: it never changes LRU order,
+    /// waits for an in-flight fill, or performs I/O. Loading, failed, and
+    /// oversized entries are not resident.
+    pub fn resident(&self, uuid: Uuid) -> bool {
+        let state = self.state.lock().expect("cache mutex poisoned");
+        state.map.get(&uuid).is_some_and(|slot| {
+            slot.weight.load(Ordering::Acquire) != 0 && slot.cell.get().is_some()
+        })
+    }
+
     /// Take a snapshot for telemetry. The cumulative counters use
     /// `Relaxed` because they're for reporting, not correctness.
     pub fn stats(&self) -> PostingsCacheStats {
@@ -648,8 +660,10 @@ mod tests {
     async fn cold_then_warm() {
         let cache = PostingsCache::with_budget_bytes(64 * 1024);
         let uuid = Uuid::new_v4();
+        assert!(!cache.resident(uuid));
         let idx = synthetic_index("__name__", "foo", &[10, 20]);
         install(&cache, uuid, idx.clone()).await;
+        assert!(cache.resident(uuid));
         install(&cache, uuid, idx.clone()).await;
         install(&cache, uuid, idx.clone()).await;
         let s = cache.stats();

@@ -10,55 +10,39 @@
 use axum::{
     body::Bytes,
     extract::State,
-    http::{header, StatusCode},
-    response::{IntoResponse, Response},
+    http::{HeaderMap, StatusCode},
+    response::Response,
 };
-use opentelemetry_proto::tonic::{
-    collector::trace::v1::{ExportTraceServiceRequest, ExportTraceServiceResponse},
-    common::v1::{any_value, AnyValue, KeyValue},
+use opentelemetry_proto::tonic::collector::trace::v1::{
+    ExportTraceServiceRequest, ExportTraceServiceResponse,
 };
-use prost::Message;
-use scry_proto::{
-    generated::{ResourceEntry, ScopeEntry, Span, SpanEvent, SpanLink, TracesBatch},
-    LabelPair,
+use scry_proto::generated::{ResourceEntry, ScopeEntry, Span, SpanEvent, SpanLink, TracesBatch};
+
+use crate::{
+    otlp_common::{decode_request, encode_response, kv_to_labels},
+    sink::AppState,
 };
 
-use crate::sink::AppState;
-
-/// Handle one OTLP/HTTP protobuf trace export.
+/// Handle one OTLP/HTTP trace export (protobuf or JSON, optionally gzip-compressed).
 pub async fn handle(
     State(state): State<AppState>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, (StatusCode, String)> {
-    let req = ExportTraceServiceRequest::decode(body).map_err(|e| {
-        if let Some(metrics) = state.metrics() {
-            metrics.inbound_rejected(crate::metrics::Inbound::OtlpHttp);
-        }
-        (
-            StatusCode::BAD_REQUEST,
-            format!("OTLP protobuf decode failed: {e}"),
-        )
-    })?;
-
+    let (req, encoding) =
+        decode_request::<ExportTraceServiceRequest>(&headers, body).inspect_err(|_| {
+            if let Some(metrics) = state.metrics() {
+                metrics.inbound_rejected(crate::metrics::Inbound::OtlpHttp);
+            }
+        })?;
     if let Some(metrics) = state.metrics() {
         metrics.inbound_accepted(crate::metrics::Inbound::OtlpHttp);
     }
-    // Best-effort fan-out: enqueue to every sink and return success. A slow/down
-    // downstream never fails the request (see crate::sink / D-041).
     accept(&state, req);
-
-    Ok(ok_response())
-}
-
-/// The standard empty OTLP success response (no partial-success), protobuf-encoded.
-fn ok_response() -> Response {
-    let body = ExportTraceServiceResponse::default().encode_to_vec();
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/x-protobuf")],
-        body,
-    )
-        .into_response()
+    Ok(encode_response(
+        &ExportTraceServiceResponse::default(),
+        encoding,
+    ))
 }
 
 /// Accept one decoded OTLP trace export from either HTTP or gRPC.
@@ -145,62 +129,6 @@ pub fn map_traces(req: ExportTraceServiceRequest) -> TracesBatch {
         scopes,
         spans,
     }
-}
-
-/// Map OTLP `KeyValue`s to our string→string `LabelPair`s. A missing value
-/// becomes an empty string.
-fn kv_to_labels(attrs: &[KeyValue]) -> Vec<LabelPair> {
-    attrs
-        .iter()
-        .map(|kv| LabelPair {
-            key: kv.key.clone(),
-            value: kv
-                .value
-                .as_ref()
-                .map(anyvalue_to_string)
-                .unwrap_or_default(),
-        })
-        .collect()
-}
-
-/// Flatten an OTLP `AnyValue` to a string. Scalars map directly; bytes become
-/// hex; arrays/kvlists get a compact bracketed rendering. Our label model is
-/// string→string, so non-scalar attributes are lossy by design.
-fn anyvalue_to_string(v: &AnyValue) -> String {
-    use any_value::Value;
-    match &v.value {
-        Some(Value::StringValue(s)) => s.clone(),
-        Some(Value::BoolValue(b)) => b.to_string(),
-        Some(Value::IntValue(i)) => i.to_string(),
-        Some(Value::DoubleValue(d)) => d.to_string(),
-        Some(Value::BytesValue(b)) => hex_lower(b),
-        Some(Value::ArrayValue(a)) => {
-            let parts: Vec<String> = a.values.iter().map(anyvalue_to_string).collect();
-            format!("[{}]", parts.join(","))
-        }
-        Some(Value::KvlistValue(kv)) => {
-            let parts: Vec<String> = kv
-                .values
-                .iter()
-                .map(|e| {
-                    let val = e.value.as_ref().map(anyvalue_to_string).unwrap_or_default();
-                    format!("{}={}", e.key, val)
-                })
-                .collect();
-            format!("{{{}}}", parts.join(","))
-        }
-        // `None`, plus the Profiling-signal `StringValueStrindex` (a string-table
-        // index we can't resolve here) and any future variants → empty string.
-        _ => String::new(),
-    }
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
 }
 
 /// Build a sample OTLP request with `n_spans` spans under one resource + scope.

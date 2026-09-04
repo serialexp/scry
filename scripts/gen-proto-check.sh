@@ -26,7 +26,10 @@ GEN_PATHS=(
   crates/binschema-runtime/src
   crates/proto/src/generated.rs
   crates/proto/src/generated_query.rs
-  desktop/src/proto
+  crates/proto/src/generated_query_worker.rs
+  desktop/src/proto/generated-ingest.ts
+  desktop/src/proto/generated-query.ts
+  desktop/src/proto/generated-query-worker.ts
 )
 
 echo "── regenerating all bindings to check for drift ──"

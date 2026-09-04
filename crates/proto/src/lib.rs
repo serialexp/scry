@@ -28,12 +28,18 @@ pub mod generated;
 #[rustfmt::skip]
 pub mod generated_query;
 
+#[allow(clippy::all)]
+#[rustfmt::skip]
+pub mod generated_query_worker;
+
 pub mod build;
 pub mod constants;
 pub mod fingerprint;
 pub mod framing;
+pub mod metrics_v2;
 pub mod payload;
 pub mod streaming;
+pub mod streaming_v2;
 
 pub use generated::{
     AgentStatus, AgentStatusInput, AgentStatusOutput, Batch, BatchAck, BatchAckInput,
@@ -56,4 +62,16 @@ pub use generated_query::{
     QueryStatsInput, QueryStatsOutput, ResponseSuperseded, ResponseSupersededInput,
     ResponseSupersededOutput, SchemaMsg, SchemaMsgInput, SchemaMsgOutput, StreamError,
     StreamErrorInput, StreamErrorOutput,
+};
+
+pub use generated_query_worker::{
+    QueryWorkerFrame, QueryWorkerFrameMsg, WorkerAuthenticated, WorkerAuthenticatedInput,
+    WorkerAuthenticatedOutput, WorkerBidDecline, WorkerBidDeclineInput, WorkerBidDeclineOutput,
+    WorkerBidRequest, WorkerBidRequestInput, WorkerBidRequestOutput, WorkerBidResponse,
+    WorkerBidResponseInput, WorkerBidResponseOutput, WorkerBlockLocality, WorkerBlockOffer,
+    WorkerCancel, WorkerCancelAck, WorkerCancelAckInput, WorkerCancelAckOutput, WorkerCancelInput,
+    WorkerCancelOutput, WorkerClientHello, WorkerClientHelloInput, WorkerClientHelloOutput,
+    WorkerError, WorkerErrorInput, WorkerErrorOutput, WorkerRelease, WorkerReleaseAck,
+    WorkerReleaseAckInput, WorkerReleaseAckOutput, WorkerReleaseInput, WorkerReleaseOutput,
+    WorkerServerHello, WorkerServerHelloInput, WorkerServerHelloOutput,
 };

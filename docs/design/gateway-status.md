@@ -2,7 +2,7 @@
 
 Status: complete
 Owner: Bart
-Last updated: 2026-08-30
+Last updated: 2026-09-03
 
 ## Implementation status
 
@@ -36,7 +36,7 @@ This document defines gateway status as a first-class Fleet role and pins counte
 - Show gateway instances beside agents, ingesters, and queriers in Fleet.
 - Provide the same status locally when Valkey is absent or Fleet is unavailable.
 - Separate inbound acceptance, per-sink queue admission, and final downstream disposition.
-- Break inbound work down by protocol and transport: OTLP/HTTP, OTLP/gRPC, Prometheus remote-write/HTTP, Pyroscope/HTTP, and native wire.
+- Break inbound work down by protocol and transport: OTLP/HTTP, OTLP/gRPC, Loki/HTTP, Prometheus remote-write/HTTP, legacy Pyroscope/HTTP, Pyroscope Push/HTTP, and native wire.
 - Keep all labels bounded and all common-path increments allocation-free.
 - Preserve D-041's independent, best-effort, ACK-on-enqueue fan-out semantics.
 

@@ -52,8 +52,10 @@ of it. That's `scry`.
     forward only the streams that match, dropping the rest before they
     hit the wire (D-043);
   - the **gateway** (`scry gateway`) — a **fan-out hub**. It terminates
-    *foreign push protocols* (**OTLP/HTTP traces**, **legacy Pyroscope
-    `/ingest`**, **Prometheus remote-write**) over HTTP and, opt-in, the
+    *foreign push protocols*: **OTLP traces/logs/structured metrics** over HTTP
+    (protobuf or JSON, optional gzip) and gRPC, **Loki push** (JSON or
+    raw-Snappy protobuf), **legacy and Push v1 Pyroscope**, and **Prometheus
+    remote-write**; plus, opt-in, the
     **native binschema wire** (so the agent can point at it too) — then
     forwards every accepted record, best-effort, to *all* configured
     downstream sinks at once: any of the scry ingest server, **Grafana
@@ -122,9 +124,10 @@ in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); decisions in
   substring query skip whole blocks that can't contain the term (one-sided
   error — false positives cost a scan, never a missed match; the exact
   `contains` predicate is the backstop). ~1–3% storage overhead. See D-035.
-- **The gateway** is a **fan-out hub**: it terminates OTLP/HTTP traces,
-  legacy Pyroscope `/ingest`, and Prometheus remote-write over HTTP (plus
-  the native binschema wire, opt-in), then forwards every accepted record
+- **The gateway** is a **fan-out hub**: it terminates OTLP traces/logs/scalar
+  metrics over HTTP and gRPC, Loki JSON/protobuf push, legacy and Push v1
+  Pyroscope, and Prometheus remote-write (plus the native binschema wire,
+  opt-in), then forwards every accepted record
   best-effort to *all* configured downstream sinks — any of the scry
   server, Grafana Loki, OpenSearch (logs only), and/or **Mimir**
   (metrics only, remote-write — D-044). Every sink is opt-in (no scry
@@ -139,8 +142,8 @@ in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); decisions in
   so cluster-side drift can't silently break ingest. For Amazon OpenSearch
   Service / Serverless, `--opensearch-aws-sigv4` signs every request with
   AWS SigV4 (creds + region from the default AWS chain — never argv).
-  `scripts/smoke-gateway.sh` drives the three HTTP protocols end to end
-  against a Garage-backed server.
+  `scripts/smoke-gateway.sh` drives every receiver and encoding end to end
+  against a Garage-backed server and queries exact rows for all four signals.
 - **`scry agent`** is a per-node collector (Alloy replacement): it tails
   Kubernetes pod logs and **scrapes Prometheus `/metrics` endpoints**,
   shipping both over one native-wire connection. Scrape targets come from
@@ -194,7 +197,7 @@ crates/
   cluster/             multi-instance convergence + lease-guarded maintenance (scry-cluster, D-038/D-039)
   client/              reusable native-wire client, shared by agent + gateway (scry-client)
   agent/               per-node agent: tails CRI logs + scrapes Prometheus /metrics, ships over the wire; library behind `scry agent` (scry-agent)
-  gateway/             fan-out hub: native wire + OTLP/Pyroscope/remote-write in → scry + Loki + OpenSearch + Mimir out; library behind `scry gateway` (scry-gateway)
+  gateway/             fan-out hub: native wire + OTLP/Loki/Pyroscope/remote-write in → scry + Loki + OpenSearch + Mimir out; library behind `scry gateway` (scry-gateway)
   noise-spewer/        TCP client; emits random metrics/logs/traces/profiles
   scry-ingestd/        library behind the `scry ingest` server daemon (wraps scry-server; --mode full runs maintenance)
   scry/                the single multicall binary; clap subcommands wrap every operator role above
@@ -204,7 +207,7 @@ deploy/k8s/            Kubernetes manifests: ingest server (StatefulSet+PVC), qu
 Dockerfile             one image, one `scry` binary, many roles: `scry ingest` + `scry query` + `scry agent` + `scry gateway` + `scry list` (`scry web` is home-machine only)
 scripts/gen-proto.sh        regenerate Rust bindings from proto/*.schema.json
 scripts/smoke.sh            end-to-end ingest→store→query exit criterion (metrics/logs; MULTI=1 → two-instance)
-scripts/smoke-gateway.sh    end-to-end push-gateway smoke (OTLP + Pyroscope + remote-write)
+scripts/smoke-gateway.sh    all gateway receivers → store → query, exact rows for all signals
 scripts/smoke-agent-metrics.sh  scry agent Prometheus scrape → store → query smoke
 scripts/smoke-agent-config.sh   scry agent TOML pipeline (logs json + metric label_map) smoke
 scripts/smoke-webui.sh      scry web browser surface (auth + multi-target relay)
@@ -373,11 +376,11 @@ rotating ServiceAccount token is followed. It needs a new ClusterRole rule
 To accept foreign push protocols, run the gateway alongside the server:
 
 ```bash
-# Terminates OTLP/Pyroscope/remote-write on :4318, forwards to the server:
+# Terminates OTLP/Loki/Pyroscope/remote-write on :4318, forwards to the server:
 ./target/release/scry gateway --listen 0.0.0.0:4318 --upstream 127.0.0.1:4000
 
-# Add the standard OTLP/gRPC listener (for Caddy and other gRPC exporters).
-# HTTP protobuf and gRPC feed the same mapping + best-effort fan-out path:
+# Add OTLP/gRPC for traces, logs, and structured metrics. OTLP/HTTP also accepts
+# protobuf or JSON, with optional gzip, on /v1/{traces,logs,metrics}:
 ./target/release/scry gateway \
   --listen 0.0.0.0:4318 --listen-otlp-grpc 0.0.0.0:4317 \
   --upstream 127.0.0.1:4000
@@ -712,7 +715,7 @@ that closed that gap (see D-034). Order updated accordingly.
 | **v0.2**  | ✅     | Metrics ingest + query: per-block postings sidecar, ingest-side WAL+pipeline, DataFusion-backed CLI querier with row-group pruning, postings cache. |
 | **v0.3**  | ✅     | Query daemon (`scry query`): binschema-framed remote query path (see D-031), shared between CLI and future tools. Streaming Arrow IPC batches with mid-stream resource errors. |
 | **v0.4**  | ✅     | Logs as the second real signal: stream-label postings (same shape as metrics), per-entry attributes as a `Map<Utf8,Utf8>` column, CLI `--signal logs`, signal byte on the query wire. Body-substring search deferred to its own tantivy phase. |
-| **gateway** | ✅   | Push-protocol front-end (`scry gateway`): OTLP/HTTP traces, legacy Pyroscope `/ingest`, Prometheus remote-write → native wire. Traces + profiles storage paths land end to end. |
+| **gateway** | ✅   | Fan-out push front-end (`scry gateway`): OTLP traces/logs/structured metrics over HTTP+gRPC, Loki JSON/protobuf, legacy+Push v1 Pyroscope, Prometheus remote-write, and native wire. All four signals land and query end to end. |
 | **v0.5**  | ✅     | Traces query: `--trace-id` by-id lookup (sorted-column pruning) + promoted resource-column matchers (`service.name`, …) + `SELECT *` round-trip. Predicate pushdown, no postings. |
 | **v0.6**  | ✅     | Profiles query: retrieval by time + label, raw pprof blob streamed back loss-free. Flamegraph aggregation deferred (Grafana renders pre-aggregated data — backend work for when a UI consumes it). |
 | **v0.7**  | ✅     | Full-text log search: first-class `--grep` / `body_contains` substring search accelerated by a per-block byte-trigram **bloom skip sidecar** (built inline at seal; one-sided error, exact `contains` backstop). ~1–3% storage overhead, skips whole blocks that can't match. See D-035. (PromQL demoted — own UI removes the Grafana-compat driver.) |

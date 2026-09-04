@@ -16,20 +16,24 @@
 use std::collections::BTreeMap;
 
 use scry_proto::generated::LogsBatch;
-use serde::{ser::SerializeSeq, Serialize, Serializer};
+use serde::{
+    de::{self, SeqAccess, Visitor},
+    ser::SerializeSeq,
+    Deserialize, Deserializer, Serialize, Serializer,
+};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::sink::Fanout;
 
 /// A Loki push request: `{"streams":[…]}`.
-#[derive(Debug, Serialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct LokiPushRequest {
     pub streams: Vec<LokiStream>,
 }
 
 /// One Loki stream: a label set + its entries.
-#[derive(Debug, Serialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct LokiStream {
     pub stream: BTreeMap<String, String>,
     pub values: Vec<LokiValue>,
@@ -42,6 +46,36 @@ pub struct LokiValue {
     pub ts_unix_nano: String,
     pub line: String,
     pub metadata: BTreeMap<String, String>,
+}
+
+impl<'de> Deserialize<'de> for LokiValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct LokiValueVisitor;
+        impl<'de> Visitor<'de> for LokiValueVisitor {
+            type Value = LokiValue;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a Loki [timestamp, line, optional metadata] tuple")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let ts_unix_nano = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(0, &self))?;
+                let line = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(1, &self))?;
+                let metadata = seq.next_element()?.unwrap_or_default();
+                if seq.next_element::<de::IgnoredAny>()?.is_some() {
+                    return Err(de::Error::invalid_length(4, &self));
+                }
+                Ok(LokiValue {
+                    ts_unix_nano,
+                    line,
+                    metadata,
+                })
+            }
+        }
+        deserializer.deserialize_seq(LokiValueVisitor)
+    }
 }
 
 impl Serialize for LokiValue {

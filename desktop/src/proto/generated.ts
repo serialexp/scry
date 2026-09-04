@@ -785,7 +785,7 @@ export class MatcherDecoder extends SeekableBitStreamDecoder {
 }
 
 /**
- * Client → server. Metadata request for label DISCOVERABILITY, not data: 'what label names can I match on for this signal in this time window?' Answered from the per-instance label cache (a materialized view over the authoritative postings sidecars, warmed lazily; see D-050), unioned across the candidate blocks that overlap [ts_min, ts_max]. The time bounds use the same `*_present: uint8` companion convention as QueryRequest (0 = absent → unbounded on that side). The server replies with exactly one LabelNamesResponse and closes, or a StreamError (QUERY_ERR_BAD_REQUEST if `signal` is 0 / unimplemented).
+ * Client → server. Metadata request for label DISCOVERABILITY, not data: 'what label names can I match on?' Queryd answers from its process-wide bounded suggestion view (D-069): it warms candidate blocks overlapping [ts_min, ts_max], merges what it learns with labels retained from other ranges, and may therefore return useful suggestions outside the requested window. The one-shot local CLI retains exact range semantics. Time bounds use the same `*_present: uint8` convention as QueryRequest. The server replies with exactly one LabelNamesResponse and closes, or a StreamError.
  */
 export interface LabelNamesRequestInput {
   /**
@@ -821,7 +821,7 @@ export interface LabelNamesRequestInput {
 }
 
 /**
- * Client → server. Metadata request for label DISCOVERABILITY, not data: 'what label names can I match on for this signal in this time window?' Answered from the per-instance label cache (a materialized view over the authoritative postings sidecars, warmed lazily; see D-050), unioned across the candidate blocks that overlap [ts_min, ts_max]. The time bounds use the same `*_present: uint8` companion convention as QueryRequest (0 = absent → unbounded on that side). The server replies with exactly one LabelNamesResponse and closes, or a StreamError (QUERY_ERR_BAD_REQUEST if `signal` is 0 / unimplemented).
+ * Client → server. Metadata request for label DISCOVERABILITY, not data: 'what label names can I match on?' Queryd answers from its process-wide bounded suggestion view (D-069): it warms candidate blocks overlapping [ts_min, ts_max], merges what it learns with labels retained from other ranges, and may therefore return useful suggestions outside the requested window. The one-shot local CLI retains exact range semantics. Time bounds use the same `*_present: uint8` convention as QueryRequest. The server replies with exactly one LabelNamesResponse and closes, or a StreamError.
  */
 export interface LabelNamesRequestOutput {
   /**
@@ -914,7 +914,7 @@ export class LabelNamesRequestDecoder extends SeekableBitStreamDecoder {
 }
 
 /**
- * Client → server. Metadata request: 'what values does label `label_name` take for this signal in this time window?' Same cache/union semantics and time-bound convention as LabelNamesRequest. The server replies with exactly one LabelValuesResponse and closes, or a StreamError.
+ * Client → server. Metadata suggestion request: 'what known values does label `label_name` take?' Queryd uses the same process-wide, range-expanding semantics as LabelNamesRequest and returns a bounded deterministic set (ordinary labels 1,000 by default; metrics `__name__` 10,000). Suggestions may come from another previously warmed range. The server replies with exactly one LabelValuesResponse and closes, or a StreamError.
  */
 export interface LabelValuesRequestInput {
   /**
@@ -956,7 +956,7 @@ export interface LabelValuesRequestInput {
 }
 
 /**
- * Client → server. Metadata request: 'what values does label `label_name` take for this signal in this time window?' Same cache/union semantics and time-bound convention as LabelNamesRequest. The server replies with exactly one LabelValuesResponse and closes, or a StreamError.
+ * Client → server. Metadata suggestion request: 'what known values does label `label_name` take?' Queryd uses the same process-wide, range-expanding semantics as LabelNamesRequest and returns a bounded deterministic set (ordinary labels 1,000 by default; metrics `__name__` 10,000). Suggestions may come from another previously warmed range. The server replies with exactly one LabelValuesResponse and closes, or a StreamError.
  */
 export interface LabelValuesRequestOutput {
   /**

@@ -7,7 +7,7 @@ use std::{
 
 use serde_json::{json, Value};
 
-pub const PROTOCOLS: usize = 5;
+pub const PROTOCOLS: usize = 7;
 pub const SIGNALS: usize = 4;
 pub const SINKS: usize = 4;
 
@@ -17,7 +17,9 @@ pub enum Inbound {
     OtlpHttp,
     OtlpGrpc,
     PromRemoteWriteHttp,
+    LokiHttp,
     PyroscopeHttp,
+    PyroscopePushHttp,
     NativeWire,
 }
 impl Inbound {
@@ -25,7 +27,9 @@ impl Inbound {
         Self::OtlpHttp,
         Self::OtlpGrpc,
         Self::PromRemoteWriteHttp,
+        Self::LokiHttp,
         Self::PyroscopeHttp,
+        Self::PyroscopePushHttp,
         Self::NativeWire,
     ];
     pub fn name(self) -> &'static str {
@@ -33,7 +37,9 @@ impl Inbound {
             Self::OtlpHttp => "otlp_http",
             Self::OtlpGrpc => "otlp_grpc",
             Self::PromRemoteWriteHttp => "prom_remote_write_http",
+            Self::LokiHttp => "loki_http",
             Self::PyroscopeHttp => "pyroscope_http",
+            Self::PyroscopePushHttp => "pyroscope_push_http",
             Self::NativeWire => "native_wire",
         }
     }
@@ -290,6 +296,8 @@ mod tests {
         let metrics = GatewayMetrics::default();
         metrics.inbound_accepted(Inbound::OtlpGrpc);
         metrics.inbound_rejected(Inbound::OtlpGrpc);
+        metrics.inbound_accepted(Inbound::LokiHttp);
+        metrics.inbound_accepted(Inbound::PyroscopePushHttp);
         metrics.add_records(GatewaySignal::Traces, 7);
         metrics.enqueued(SinkKind::Scry, GatewaySignal::Traces);
         metrics.dropped_full(SinkKind::Scry, GatewaySignal::Traces);
@@ -303,6 +311,8 @@ mod tests {
         }]);
         assert_eq!(snapshot["inbound"]["otlp_grpc"]["accepted"], 1);
         assert_eq!(snapshot["inbound"]["otlp_grpc"]["rejected"], 1);
+        assert_eq!(snapshot["inbound"]["loki_http"]["accepted"], 1);
+        assert_eq!(snapshot["inbound"]["pyroscope_push_http"]["accepted"], 1);
         assert_eq!(snapshot["records"]["traces"], 7);
         assert_eq!(snapshot["sinks"]["scry"]["queue_depth"], 2);
         assert_eq!(

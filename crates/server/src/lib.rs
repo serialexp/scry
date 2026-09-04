@@ -34,11 +34,13 @@
 
 pub mod catalog_gauge;
 pub mod decode;
+pub mod distributed_scheduler;
 pub mod live_merge;
 pub mod live_ring;
 pub mod memory_guard;
 mod pipeline;
 pub mod query_service;
+pub mod query_worker;
 mod server;
 pub mod shutdown;
 pub mod stats;
@@ -58,6 +60,7 @@ pub use server::{
 };
 pub use stats::{
     serve_status, CompactionPassStats, CompactionResourceStats, FleetSource, LocalStatus,
-    QueryMetrics, RetentionPassStats, ServerMetrics, StatusSnapshot, UploadStats,
+    QueryMetrics, QueryWorkerStatus, RetentionPassStats, ServerMetrics, StatusSnapshot,
+    UploadStats,
 };
 pub use tail::{SubId, SubscriptionRegistry, TailItem, TappingLogsAppender};

@@ -12,7 +12,10 @@
 use anyhow::{bail, Context, Result};
 use scry_proto::{
     build,
-    constants::{ACK_ACCEPTED, CAP_AGENT_STATUS, GOODBYE_NORMAL, PROTOCOL_VERSION_V0},
+    constants::{
+        ACK_ACCEPTED, CAP_AGENT_STATUS, CAP_STRUCTURED_METRICS_V2, GOODBYE_NORMAL,
+        PROTOCOL_VERSION_V2,
+    },
     framing::{read_frame, write_frame},
     generated::FrameMsg,
     Frame, LabelPair,
@@ -37,6 +40,8 @@ struct ConnectParams {
     hostname: String,
     signals: u8,
     resource_attrs: Vec<LabelPair>,
+    protocol_version: u16,
+    capabilities: u32,
 }
 
 /// The per-connection pieces replaced wholesale on every (re)connect.
@@ -79,12 +84,67 @@ impl Client {
         signals: u8,
         resource_attrs: Vec<LabelPair>,
     ) -> Result<Self> {
+        Self::connect_v1(addr, agent_id, hostname, signals, resource_attrs).await
+    }
+
+    /// Connect using the structured-metrics ingest protocol. Aggregate-bearing
+    /// producers must use this explicitly so legacy deployments keep working.
+    pub async fn connect_v2(
+        addr: &str,
+        agent_id: [u8; 16],
+        hostname: &str,
+        signals: u8,
+        resource_attrs: Vec<LabelPair>,
+    ) -> Result<Self> {
+        Self::connect_with_protocol(
+            addr,
+            agent_id,
+            hostname,
+            signals,
+            resource_attrs,
+            PROTOCOL_VERSION_V2,
+            CAP_STRUCTURED_METRICS_V2,
+        )
+        .await
+    }
+
+    /// Connect using the legacy scalar-only ingest protocol.
+    pub async fn connect_v1(
+        addr: &str,
+        agent_id: [u8; 16],
+        hostname: &str,
+        signals: u8,
+        resource_attrs: Vec<LabelPair>,
+    ) -> Result<Self> {
+        Self::connect_with_protocol(
+            addr,
+            agent_id,
+            hostname,
+            signals,
+            resource_attrs,
+            scry_proto::constants::PROTOCOL_VERSION_V0,
+            0,
+        )
+        .await
+    }
+
+    async fn connect_with_protocol(
+        addr: &str,
+        agent_id: [u8; 16],
+        hostname: &str,
+        signals: u8,
+        resource_attrs: Vec<LabelPair>,
+        protocol_version: u16,
+        capabilities: u32,
+    ) -> Result<Self> {
         let params = ConnectParams {
             addr: addr.to_string(),
             agent_id,
             hostname: hostname.to_string(),
             signals,
             resource_attrs,
+            protocol_version,
+            capabilities,
         };
         let est = Self::handshake(&params).await?;
         Ok(Self {
@@ -116,12 +176,12 @@ impl Client {
         write_frame(
             &mut wr,
             &build::hello(build::HelloArgs {
-                protocol_version: PROTOCOL_VERSION_V0,
+                protocol_version: params.protocol_version,
                 agent_id: params.agent_id,
                 agent_version: env!("CARGO_PKG_VERSION"),
                 hostname: &params.hostname,
                 signals: params.signals,
-                capabilities: 0,
+                capabilities: params.capabilities,
                 resource_attrs: params.resource_attrs.clone(),
             }),
         )
@@ -190,6 +250,10 @@ impl Client {
 
     pub fn supports_agent_status(&self) -> bool {
         self.capabilities & CAP_AGENT_STATUS != 0
+    }
+
+    pub fn supports_structured_metrics(&self) -> bool {
+        self.capabilities & CAP_STRUCTURED_METRICS_V2 != 0
     }
 
     /// Send one best-effort agent status report when the server negotiated support.

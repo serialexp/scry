@@ -113,9 +113,16 @@ work is tracked below.
       unbounded default DataFusion runtimes.
 
 ### Gateway, replay, and tail
-- [ ] Add explicit compressed/decompressed request limits and global/per-route
-      concurrency admission to gateway HTTP/gRPC. In particular, remote-write
-      `decompress_vec` currently has no decoded-size ceiling.
+- [x] Represent OTLP Histogram, ExponentialHistogram, and Summary data without
+      loss. Ingest protocol and metrics-block schema v2 preserve exact numbers,
+      temporality/start time, buckets, quantiles, descriptors, flags, reset hints,
+      and exemplars; Prometheus remote-write v1/v2 native histograms map to the
+      same canonical representation.
+- [ ] Add alpha OTLP Profiles (`v1development`) only with a complete structured
+      OTLP-to-pprof conversion; Pyroscope Push v1 is the stable profile ingress.
+- [ ] Add global/per-route concurrency admission to gateway HTTP/gRPC. Request
+      bodies and gzip/Snappy expansion now have a 32 MiB ceiling; concurrency
+      still needs an aggregate retained-byte/admission budget.
 - [ ] Make gateway sink queues byte-weighted, not only item-count bounded, and
       stream/chunk Loki/OpenSearch/native destination encoders instead of building
       complete payloads per slow sink worker.
@@ -197,14 +204,9 @@ work is tracked below.
       only stacks form-above-results; a manual collapse would be better.
 
 ## Query result cache (pre-existing, found 2026-08-28)
-- [ ] The D-059 default-query-window clamp defeats the result cache for any
-      query with no explicit `--from`/`--until`. `apply_default_window`
-      (`crates/server/src/query_service.rs:609`) rewrites `req.query.ts_min` to
-      `now - window` *before* `data_query_cache_key` (`:2468`) folds `ts_min`
-      into the key, so two identical unbounded queries a few hundred ms apart
-      hash differently and always miss. Introduced by f83bdbb; the
-      `scripts/smoke.sh` cache leg (added earlier, bdec69f) fails on it —
-      `cache verdicts: miss miss, expected miss hit` — with matching row counts,
-      i.e. results stay correct, only the cache never hits. Possible fixes:
-      snap the defaulted `ts_min` to a coarse bucket, or key on the *explicit*
-      request bounds (pre-clamp) plus the candidate set.
+- [x] The D-059 default-query-window clamp defeated the result cache for queries
+      without explicit bounds by putting the exact current nanosecond into the
+      key. The effective lower bound is now snapped to a 30-second bucket
+      (capped by unusually short configured windows) before both candidate
+      selection and cache-key construction, so execution and identity remain
+      identical while repeated dashboard requests can hit.

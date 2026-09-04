@@ -4,12 +4,10 @@
     "description": "Agent to server wire protocol for shipping metrics, logs, traces, and profiles to a scry ingest server. Long-lived TCP stream, length-framed messages, batch payloads compressed independently. Designed to be the only thing agents speak: the server's HTTP query surface is separate.",
     "version": "0.1.0"
   },
-
   "config": {
     "endianness": "big_endian",
     "bit_order": "msb_first"
   },
-
   "types": {
     "Frame": {
       "description": "Top-level discriminated union of all messages. Peek-discriminated on the message-type byte; each variant struct begins with a const-tagged uint8 that matches the discriminator.",
@@ -17,365 +15,1649 @@
         {
           "name": "msg",
           "type": "discriminated_union",
-          "discriminator": { "peek": "uint8" },
+          "discriminator": {
+            "peek": "uint8"
+          },
           "variants": [
-            { "type": "Hello",       "when": "value === 0x01" },
-            { "type": "HelloAck",    "when": "value === 0x02" },
-            { "type": "Batch",       "when": "value === 0x10" },
-            { "type": "BatchAck",    "when": "value === 0x11" },
-            { "type": "FlowControl", "when": "value === 0x20" },
-            { "type": "AgentStatus",  "when": "value === 0x21" },
-            { "type": "Ping",        "when": "value === 0x30" },
-            { "type": "Pong",        "when": "value === 0x31" },
-            { "type": "Goodbye",     "when": "value === 0x40" },
-            { "type": "Subscribe",   "when": "value === 0x50" },
-            { "type": "TailRecord",  "when": "value === 0x51" },
-            { "type": "LiveQuery",   "when": "value === 0x52" },
-            { "type": "LiveBatch",   "when": "value === 0x53" },
-            { "type": "TailSample",  "when": "value === 0x54" },
-            { "type": "Error",       "when": "value === 0xF0" }
+            {
+              "type": "Hello",
+              "when": "value === 0x01"
+            },
+            {
+              "type": "HelloAck",
+              "when": "value === 0x02"
+            },
+            {
+              "type": "Batch",
+              "when": "value === 0x10"
+            },
+            {
+              "type": "BatchAck",
+              "when": "value === 0x11"
+            },
+            {
+              "type": "FlowControl",
+              "when": "value === 0x20"
+            },
+            {
+              "type": "AgentStatus",
+              "when": "value === 0x21"
+            },
+            {
+              "type": "Ping",
+              "when": "value === 0x30"
+            },
+            {
+              "type": "Pong",
+              "when": "value === 0x31"
+            },
+            {
+              "type": "Goodbye",
+              "when": "value === 0x40"
+            },
+            {
+              "type": "Subscribe",
+              "when": "value === 0x50"
+            },
+            {
+              "type": "TailRecord",
+              "when": "value === 0x51"
+            },
+            {
+              "type": "LiveQuery",
+              "when": "value === 0x52"
+            },
+            {
+              "type": "LiveBatch",
+              "when": "value === 0x53"
+            },
+            {
+              "type": "TailSample",
+              "when": "value === 0x54"
+            },
+            {
+              "type": "Error",
+              "when": "value === 0xF0"
+            }
           ]
         }
       ]
     },
-
     "Hello": {
       "description": "First message from agent. Identifies agent, advertises capabilities, and lists the signals it intends to send. Sent exactly once at connection open.",
       "sequence": [
-        { "name": "tag", "type": "uint8", "const": 1 },
-        { "name": "protocol_version", "type": "uint16" },
-        { "name": "agent_id", "type": "bytes", "kind": "fixed", "length": 16 },
-        { "name": "agent_version", "type": "string", "kind": "length_prefixed", "length_type": "uint8", "encoding": "ascii" },
-        { "name": "hostname", "type": "string", "kind": "length_prefixed", "length_type": "uint8", "encoding": "utf8" },
-        { "name": "signals", "type": "uint8" },
-        { "name": "capabilities", "type": "uint32" },
-        { "name": "resource_attrs", "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "LabelPair" } }
+        {
+          "name": "tag",
+          "type": "uint8",
+          "const": 1
+        },
+        {
+          "name": "protocol_version",
+          "type": "uint16"
+        },
+        {
+          "name": "agent_id",
+          "type": "bytes",
+          "kind": "fixed",
+          "length": 16
+        },
+        {
+          "name": "agent_version",
+          "type": "string",
+          "kind": "length_prefixed",
+          "length_type": "uint8",
+          "encoding": "ascii"
+        },
+        {
+          "name": "hostname",
+          "type": "string",
+          "kind": "length_prefixed",
+          "length_type": "uint8",
+          "encoding": "utf8"
+        },
+        {
+          "name": "signals",
+          "type": "uint8"
+        },
+        {
+          "name": "capabilities",
+          "type": "uint32"
+        },
+        {
+          "name": "resource_attrs",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint16",
+          "items": {
+            "type": "LabelPair"
+          }
+        }
       ]
     },
-
     "HelloAck": {
       "description": "Server's response to Hello. Confirms protocol version, returns the server's writer_id and a session_id valid for the lifetime of this connection.",
       "sequence": [
-        { "name": "tag", "type": "uint8", "const": 2 },
-        { "name": "protocol_version", "type": "uint16" },
-        { "name": "writer_id", "type": "string", "kind": "length_prefixed", "length_type": "uint8", "encoding": "ascii" },
-        { "name": "session_id", "type": "uint64" },
-        { "name": "capabilities", "type": "uint32" },
-        { "name": "suggested_batch_bytes", "type": "uint32" },
-        { "name": "max_batch_bytes", "type": "uint32" },
-        { "name": "max_inflight_batches", "type": "uint16" }
+        {
+          "name": "tag",
+          "type": "uint8",
+          "const": 2
+        },
+        {
+          "name": "protocol_version",
+          "type": "uint16"
+        },
+        {
+          "name": "writer_id",
+          "type": "string",
+          "kind": "length_prefixed",
+          "length_type": "uint8",
+          "encoding": "ascii"
+        },
+        {
+          "name": "session_id",
+          "type": "uint64"
+        },
+        {
+          "name": "capabilities",
+          "type": "uint32"
+        },
+        {
+          "name": "suggested_batch_bytes",
+          "type": "uint32"
+        },
+        {
+          "name": "max_batch_bytes",
+          "type": "uint32"
+        },
+        {
+          "name": "max_inflight_batches",
+          "type": "uint16"
+        }
       ]
     },
-
     "Batch": {
       "description": "A compressed, signal-specific batch of records. The payload, after decompression, is a SignalBatch variant.",
       "sequence": [
-        { "name": "tag", "type": "uint8", "const": 16 },
-        { "name": "session_id", "type": "uint64" },
-        { "name": "batch_id", "type": "uint64" },
-        { "name": "signal", "type": "uint8" },
-        { "name": "ts_min_unix_nano", "type": "uint64" },
-        { "name": "ts_max_unix_nano", "type": "uint64" },
-        { "name": "record_count", "type": "uint32" },
-        { "name": "compression", "type": "uint8" },
-        { "name": "uncompressed_size", "type": "uint32" },
-        { "name": "payload", "type": "bytes", "kind": "length_prefixed", "length_type": "uint32" }
+        {
+          "name": "tag",
+          "type": "uint8",
+          "const": 16
+        },
+        {
+          "name": "session_id",
+          "type": "uint64"
+        },
+        {
+          "name": "batch_id",
+          "type": "uint64"
+        },
+        {
+          "name": "signal",
+          "type": "uint8"
+        },
+        {
+          "name": "ts_min_unix_nano",
+          "type": "uint64"
+        },
+        {
+          "name": "ts_max_unix_nano",
+          "type": "uint64"
+        },
+        {
+          "name": "record_count",
+          "type": "uint32"
+        },
+        {
+          "name": "compression",
+          "type": "uint8"
+        },
+        {
+          "name": "uncompressed_size",
+          "type": "uint32"
+        },
+        {
+          "name": "payload",
+          "type": "bytes",
+          "kind": "length_prefixed",
+          "length_type": "uint32"
+        }
       ]
     },
-
     "BatchAck": {
       "description": "Server's response per Batch. Either accepted (durable in WAL), throttled (slow down before retrying), or rejected (do not retry).",
       "sequence": [
-        { "name": "tag", "type": "uint8", "const": 17 },
-        { "name": "session_id", "type": "uint64" },
-        { "name": "batch_id", "type": "uint64" },
-        { "name": "status", "type": "uint8" },
-        { "name": "retry_after_ms", "type": "uint32" },
-        { "name": "reason_code", "type": "uint16" },
-        { "name": "message", "type": "string", "kind": "length_prefixed", "length_type": "uint16", "encoding": "utf8" }
+        {
+          "name": "tag",
+          "type": "uint8",
+          "const": 17
+        },
+        {
+          "name": "session_id",
+          "type": "uint64"
+        },
+        {
+          "name": "batch_id",
+          "type": "uint64"
+        },
+        {
+          "name": "status",
+          "type": "uint8"
+        },
+        {
+          "name": "retry_after_ms",
+          "type": "uint32"
+        },
+        {
+          "name": "reason_code",
+          "type": "uint16"
+        },
+        {
+          "name": "message",
+          "type": "string",
+          "kind": "length_prefixed",
+          "length_type": "uint16",
+          "encoding": "utf8"
+        }
       ]
     },
-
     "FlowControl": {
       "description": "Asynchronous server-to-agent rate hint, per signal.",
       "sequence": [
-        { "name": "tag", "type": "uint8", "const": 32 },
-        { "name": "session_id", "type": "uint64" },
-        { "name": "signal", "type": "uint8" },
-        { "name": "max_bytes_per_sec", "type": "uint32" },
-        { "name": "max_batches_inflight", "type": "uint16" },
-        { "name": "valid_for_ms", "type": "uint32" }
+        {
+          "name": "tag",
+          "type": "uint8",
+          "const": 32
+        },
+        {
+          "name": "session_id",
+          "type": "uint64"
+        },
+        {
+          "name": "signal",
+          "type": "uint8"
+        },
+        {
+          "name": "max_bytes_per_sec",
+          "type": "uint32"
+        },
+        {
+          "name": "max_batches_inflight",
+          "type": "uint16"
+        },
+        {
+          "name": "valid_for_ms",
+          "type": "uint32"
+        }
       ]
     },
-
     "AgentStatus": {
       "description": "Best-effort agent-to-ingester operational status. Sent only when HelloAck advertises CAP_AGENT_STATUS. The server validates the live session, canonicalizes the JSON StatusSnapshot against Hello identity, and relays it to the fleet registry without acknowledging it.",
       "sequence": [
-        { "name": "tag", "type": "uint8", "const": 33 },
-        { "name": "session_id", "type": "uint64" },
-        { "name": "sequence", "type": "uint64" },
-        { "name": "snapshot_json", "type": "string", "kind": "length_prefixed", "length_type": "uint32", "encoding": "utf8" }
+        {
+          "name": "tag",
+          "type": "uint8",
+          "const": 33
+        },
+        {
+          "name": "session_id",
+          "type": "uint64"
+        },
+        {
+          "name": "sequence",
+          "type": "uint64"
+        },
+        {
+          "name": "snapshot_json",
+          "type": "string",
+          "kind": "length_prefixed",
+          "length_type": "uint32",
+          "encoding": "utf8"
+        }
       ]
     },
-
     "Ping": {
       "description": "Keepalive request. Either side may send.",
       "sequence": [
-        { "name": "tag", "type": "uint8", "const": 48 },
-        { "name": "nonce", "type": "uint64" }
+        {
+          "name": "tag",
+          "type": "uint8",
+          "const": 48
+        },
+        {
+          "name": "nonce",
+          "type": "uint64"
+        }
       ]
     },
-
     "Pong": {
       "description": "Keepalive response. Echoes the Ping nonce.",
       "sequence": [
-        { "name": "tag", "type": "uint8", "const": 49 },
-        { "name": "nonce", "type": "uint64" }
+        {
+          "name": "tag",
+          "type": "uint8",
+          "const": 49
+        },
+        {
+          "name": "nonce",
+          "type": "uint64"
+        }
       ]
     },
-
     "Goodbye": {
       "description": "Graceful close request. Either side may send.",
       "sequence": [
-        { "name": "tag", "type": "uint8", "const": 64 },
-        { "name": "reason_code", "type": "uint16" },
-        { "name": "message", "type": "string", "kind": "length_prefixed", "length_type": "uint16", "encoding": "utf8" }
+        {
+          "name": "tag",
+          "type": "uint8",
+          "const": 64
+        },
+        {
+          "name": "reason_code",
+          "type": "uint16"
+        },
+        {
+          "name": "message",
+          "type": "string",
+          "kind": "length_prefixed",
+          "length_type": "uint16",
+          "encoding": "utf8"
+        }
       ]
     },
-
     "Error": {
       "description": "Protocol-level error. Receiving an Error closes the connection.",
       "sequence": [
-        { "name": "tag", "type": "uint8", "const": 240 },
-        { "name": "code", "type": "uint16" },
-        { "name": "message", "type": "string", "kind": "length_prefixed", "length_type": "uint16", "encoding": "utf8" }
+        {
+          "name": "tag",
+          "type": "uint8",
+          "const": 240
+        },
+        {
+          "name": "code",
+          "type": "uint16"
+        },
+        {
+          "name": "message",
+          "type": "string",
+          "kind": "length_prefixed",
+          "length_type": "uint16",
+          "encoding": "utf8"
+        }
       ]
     },
-
     "Subscribe": {
-      "description": "Live-tail subscription request (scry tail, D-050). After the Hello handshake a tail client sends this to switch the connection into server-push mode: the server sprays matching records back down the same connection until the client closes it. The reply frame depends on `signal`: Logs (2) yields TailRecord, Metrics (1) yields TailSample (D-065). Best-effort — records may be dropped under load; there is no ack and no durability.",
+      "description": "Live-tail subscription request (scry tail, D-050). After the Hello handshake a tail client sends this to switch the connection into server-push mode: the server sprays matching records back down the same connection until the client closes it. The reply frame depends on `signal`: Logs (2) yields TailRecord, Metrics (1) yields TailSample (D-065). Best-effort \u2014 records may be dropped under load; there is no ack and no durability.",
       "sequence": [
-        { "name": "tag", "type": "uint8", "const": 80 },
-        { "name": "signal", "type": "uint8" },
-        { "name": "matchers", "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "MatcherSpec" } }
+        {
+          "name": "tag",
+          "type": "uint8",
+          "const": 80
+        },
+        {
+          "name": "signal",
+          "type": "uint8"
+        },
+        {
+          "name": "matchers",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint16",
+          "items": {
+            "type": "MatcherSpec"
+          }
+        }
       ]
     },
-
     "MatcherSpec": {
       "description": "One Prometheus-style label matcher spec string (key=value | key!=value | key=~regex | key!~regex), parsed server-side by scry-match. ANDed with the others in a Subscribe.",
       "sequence": [
-        { "name": "spec", "type": "string", "kind": "length_prefixed", "length_type": "uint16", "encoding": "utf8" }
+        {
+          "name": "spec",
+          "type": "string",
+          "kind": "length_prefixed",
+          "length_type": "uint16",
+          "encoding": "utf8"
+        }
       ]
     },
-
     "TailRecord": {
       "description": "Server-to-client push of one LOG record matching a live-tail Subscribe (signal = Logs): the stream labels, entry timestamp/severity/body, and per-entry attributes. Metrics use the sibling TailSample frame instead of widening this one, so a logs tail carries no bytes it does not use. Fire-and-forget; the client never acks.",
       "sequence": [
-        { "name": "tag", "type": "uint8", "const": 81 },
-        { "name": "signal", "type": "uint8" },
-        { "name": "ts_unix_nano", "type": "uint64" },
-        { "name": "severity", "type": "uint8" },
-        { "name": "labels", "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "LabelPair" } },
-        { "name": "body", "type": "string", "kind": "length_prefixed", "length_type": "uint32", "encoding": "utf8" },
-        { "name": "attributes", "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "LabelPair" } }
+        {
+          "name": "tag",
+          "type": "uint8",
+          "const": 81
+        },
+        {
+          "name": "signal",
+          "type": "uint8"
+        },
+        {
+          "name": "ts_unix_nano",
+          "type": "uint64"
+        },
+        {
+          "name": "severity",
+          "type": "uint8"
+        },
+        {
+          "name": "labels",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint16",
+          "items": {
+            "type": "LabelPair"
+          }
+        },
+        {
+          "name": "body",
+          "type": "string",
+          "kind": "length_prefixed",
+          "length_type": "uint32",
+          "encoding": "utf8"
+        },
+        {
+          "name": "attributes",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint16",
+          "items": {
+            "type": "LabelPair"
+          }
+        }
       ]
     },
-
     "TailSample": {
-      "description": "Server-to-client push of one METRIC sample matching a live-tail Subscribe (signal = Metrics, D-065) — the TailRecord sibling for a signal whose record is a float, not a body. `series_fingerprint` is the server's own xxh3-64 over the sorted labels, carried so a client can line a live line up with a stored series (the UI chart groups on exactly this column) without re-deriving it. `metric_type` mirrors SeriesDictEntry.metric_type. `labels` repeats per sample, as it does per TailRecord: a tail is bounded by its drop-on-full channel, not by its encoding. Fire-and-forget; the client never acks.",
+      "description": "Server-to-client push of one METRIC sample matching a live-tail Subscribe (signal = Metrics, D-065) \u2014 the TailRecord sibling for a signal whose record is a float, not a body. `series_fingerprint` is the server's own xxh3-64 over the sorted labels, carried so a client can line a live line up with a stored series (the UI chart groups on exactly this column) without re-deriving it. `metric_type` mirrors SeriesDictEntry.metric_type. `labels` repeats per sample, as it does per TailRecord: a tail is bounded by its drop-on-full channel, not by its encoding. Fire-and-forget; the client never acks.",
       "sequence": [
-        { "name": "tag", "type": "uint8", "const": 84 },
-        { "name": "signal", "type": "uint8" },
-        { "name": "ts_unix_nano", "type": "uint64" },
-        { "name": "metric_type", "type": "uint8" },
-        { "name": "series_fingerprint", "type": "uint64" },
-        { "name": "value", "type": "float64" },
-        { "name": "labels", "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "LabelPair" } }
+        {
+          "name": "tag",
+          "type": "uint8",
+          "const": 84
+        },
+        {
+          "name": "signal",
+          "type": "uint8"
+        },
+        {
+          "name": "ts_unix_nano",
+          "type": "uint64"
+        },
+        {
+          "name": "metric_type",
+          "type": "uint8"
+        },
+        {
+          "name": "series_fingerprint",
+          "type": "uint64"
+        },
+        {
+          "name": "value",
+          "type": "float64"
+        },
+        {
+          "name": "labels",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint16",
+          "items": {
+            "type": "LabelPair"
+          }
+        }
       ]
     },
-
     "LiveQuery": {
       "description": "Merged-query live snapshot request (D-054). The query daemon sends this to each discovered ingester on its ingest port after the Hello handshake: 'return your retained recent records for `signal` matching these predicates.' The ingester replies with exactly one LiveBatch, then the connection is done. Logs only in v1. ts_min_unix_nano = 0 means no lower bound; ts_max_unix_nano = 0 means no upper bound; body_contains empty means no substring filter. matchers are ANDed (scry-match).",
       "sequence": [
-        { "name": "tag", "type": "uint8", "const": 82 },
-        { "name": "signal", "type": "uint8" },
-        { "name": "matchers", "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "MatcherSpec" } },
-        { "name": "ts_min_unix_nano", "type": "uint64" },
-        { "name": "ts_max_unix_nano", "type": "uint64" },
-        { "name": "body_contains", "type": "string", "kind": "length_prefixed", "length_type": "uint32", "encoding": "utf8" }
+        {
+          "name": "tag",
+          "type": "uint8",
+          "const": 82
+        },
+        {
+          "name": "signal",
+          "type": "uint8"
+        },
+        {
+          "name": "matchers",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint16",
+          "items": {
+            "type": "MatcherSpec"
+          }
+        },
+        {
+          "name": "ts_min_unix_nano",
+          "type": "uint64"
+        },
+        {
+          "name": "ts_max_unix_nano",
+          "type": "uint64"
+        },
+        {
+          "name": "body_contains",
+          "type": "string",
+          "kind": "length_prefixed",
+          "length_type": "uint32",
+          "encoding": "utf8"
+        }
       ]
     },
-
     "LiveBatch": {
       "description": "An ingester's reply to a LiveQuery (D-054): its retained recent records matching the request, each tagged with the WAL (shard, segment) the merged query dedups against. `writer_uuid` identifies this ingester's WAL instance (combined with signal + each record's shard). Exactly one LiveBatch is sent per LiveQuery, then the connection closes.",
       "sequence": [
-        { "name": "tag", "type": "uint8", "const": 83 },
-        { "name": "writer_uuid", "type": "bytes", "kind": "fixed", "length": 16 },
-        { "name": "records", "type": "array", "kind": "length_prefixed", "length_type": "uint32", "items": { "type": "LiveRecord" } }
+        {
+          "name": "tag",
+          "type": "uint8",
+          "const": 83
+        },
+        {
+          "name": "writer_uuid",
+          "type": "bytes",
+          "kind": "fixed",
+          "length": 16
+        },
+        {
+          "name": "records",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint32",
+          "items": {
+            "type": "LiveRecord"
+          }
+        }
       ]
     },
-
     "LiveRecord": {
       "description": "One retained log record in a LiveBatch. `wal_shard`/`wal_seg` are the dedup tag: the merged query keeps this record iff `wal_seg > H(writer_uuid, signal, wal_shard)`, the catalog's durable per-WAL-instance segment high-water. Everything else mirrors a stored logs row (ts/severity/labels/body/attributes).",
       "sequence": [
-        { "name": "wal_shard", "type": "uint32" },
-        { "name": "wal_seg", "type": "uint64" },
-        { "name": "ts_unix_nano", "type": "uint64" },
-        { "name": "severity", "type": "uint8" },
-        { "name": "labels", "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "LabelPair" } },
-        { "name": "body", "type": "string", "kind": "length_prefixed", "length_type": "uint32", "encoding": "utf8" },
-        { "name": "attributes", "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "LabelPair" } }
+        {
+          "name": "wal_shard",
+          "type": "uint32"
+        },
+        {
+          "name": "wal_seg",
+          "type": "uint64"
+        },
+        {
+          "name": "ts_unix_nano",
+          "type": "uint64"
+        },
+        {
+          "name": "severity",
+          "type": "uint8"
+        },
+        {
+          "name": "labels",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint16",
+          "items": {
+            "type": "LabelPair"
+          }
+        },
+        {
+          "name": "body",
+          "type": "string",
+          "kind": "length_prefixed",
+          "length_type": "uint32",
+          "encoding": "utf8"
+        },
+        {
+          "name": "attributes",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint16",
+          "items": {
+            "type": "LabelPair"
+          }
+        }
       ]
     },
-
     "LabelPair": {
       "description": "A key-value label, used by every signal. UTF-8 throughout.",
       "sequence": [
-        { "name": "key",   "type": "string", "kind": "length_prefixed", "length_type": "uint8",  "encoding": "utf8" },
-        { "name": "value", "type": "string", "kind": "length_prefixed", "length_type": "uint16", "encoding": "utf8" }
+        {
+          "name": "key",
+          "type": "string",
+          "kind": "length_prefixed",
+          "length_type": "uint8",
+          "encoding": "utf8"
+        },
+        {
+          "name": "value",
+          "type": "string",
+          "kind": "length_prefixed",
+          "length_type": "uint16",
+          "encoding": "utf8"
+        }
       ]
     },
-
     "MetricsBatch": {
       "description": "Body of a metrics Batch after decompression. Series dictionary plus samples that reference fingerprints.",
       "sequence": [
-        { "name": "series",  "type": "array", "kind": "length_prefixed", "length_type": "uint32", "items": { "type": "SeriesDictEntry" } },
-        { "name": "samples", "type": "array", "kind": "length_prefixed", "length_type": "uint32", "items": { "type": "MetricSample" } }
+        {
+          "name": "series",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint32",
+          "items": {
+            "type": "SeriesDictEntry"
+          }
+        },
+        {
+          "name": "samples",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint32",
+          "items": {
+            "type": "MetricSample"
+          }
+        }
       ]
     },
-
     "SeriesDictEntry": {
       "description": "Declares a series (set of labels) and its xxh3-64 fingerprint. The agent computes the fingerprint; the server validates it on receipt.",
       "sequence": [
-        { "name": "fingerprint", "type": "uint64" },
-        { "name": "metric_type", "type": "uint8" },
-        { "name": "labels", "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "LabelPair" } }
+        {
+          "name": "fingerprint",
+          "type": "uint64"
+        },
+        {
+          "name": "metric_type",
+          "type": "uint8"
+        },
+        {
+          "name": "labels",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint16",
+          "items": {
+            "type": "LabelPair"
+          }
+        }
       ]
     },
-
     "MetricSample": {
       "description": "One scalar observation. Histograms and summaries are exploded into multiple samples before serialisation.",
       "sequence": [
-        { "name": "fingerprint",  "type": "uint64" },
-        { "name": "ts_unix_nano", "type": "uint64" },
-        { "name": "value",        "type": "float64" }
+        {
+          "name": "fingerprint",
+          "type": "uint64"
+        },
+        {
+          "name": "ts_unix_nano",
+          "type": "uint64"
+        },
+        {
+          "name": "value",
+          "type": "float64"
+        }
       ]
     },
-
     "LogsBatch": {
       "description": "Body of a logs Batch after decompression. Records are pre-grouped by label set at the agent.",
       "sequence": [
-        { "name": "streams", "type": "array", "kind": "length_prefixed", "length_type": "uint32", "items": { "type": "LogStream" } }
+        {
+          "name": "streams",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint32",
+          "items": {
+            "type": "LogStream"
+          }
+        }
       ]
     },
-
     "LogStream": {
       "description": "A run of log entries sharing the same labels. Fingerprint follows the same xxh3-64 convention as metrics.",
       "sequence": [
-        { "name": "fingerprint", "type": "uint64" },
-        { "name": "labels",      "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "LabelPair" } },
-        { "name": "entries",     "type": "array", "kind": "length_prefixed", "length_type": "uint32", "items": { "type": "LogEntry" } }
+        {
+          "name": "fingerprint",
+          "type": "uint64"
+        },
+        {
+          "name": "labels",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint16",
+          "items": {
+            "type": "LabelPair"
+          }
+        },
+        {
+          "name": "entries",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint32",
+          "items": {
+            "type": "LogEntry"
+          }
+        }
       ]
     },
-
     "LogEntry": {
       "description": "One log line plus per-entry attributes that aren't part of the stream's stable label set.",
       "sequence": [
-        { "name": "ts_unix_nano", "type": "uint64" },
-        { "name": "severity",     "type": "uint8" },
-        { "name": "body",         "type": "string", "kind": "length_prefixed", "length_type": "uint32", "encoding": "utf8" },
-        { "name": "attributes",   "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "LabelPair" } }
+        {
+          "name": "ts_unix_nano",
+          "type": "uint64"
+        },
+        {
+          "name": "severity",
+          "type": "uint8"
+        },
+        {
+          "name": "body",
+          "type": "string",
+          "kind": "length_prefixed",
+          "length_type": "uint32",
+          "encoding": "utf8"
+        },
+        {
+          "name": "attributes",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint16",
+          "items": {
+            "type": "LabelPair"
+          }
+        }
       ]
     },
-
     "TracesBatch": {
       "description": "Body of a traces Batch after decompression. OTel-aligned with per-batch resource/scope dictionaries.",
       "sequence": [
-        { "name": "resources", "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "ResourceEntry" } },
-        { "name": "scopes",    "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "ScopeEntry" } },
-        { "name": "spans",     "type": "array", "kind": "length_prefixed", "length_type": "uint32", "items": { "type": "Span" } }
+        {
+          "name": "resources",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint16",
+          "items": {
+            "type": "ResourceEntry"
+          }
+        },
+        {
+          "name": "scopes",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint16",
+          "items": {
+            "type": "ScopeEntry"
+          }
+        },
+        {
+          "name": "spans",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint32",
+          "items": {
+            "type": "Span"
+          }
+        }
       ]
     },
-
     "ResourceEntry": {
       "sequence": [
-        { "name": "labels", "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "LabelPair" } }
+        {
+          "name": "labels",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint16",
+          "items": {
+            "type": "LabelPair"
+          }
+        }
       ]
     },
-
     "ScopeEntry": {
       "sequence": [
-        { "name": "name",    "type": "string", "kind": "length_prefixed", "length_type": "uint8", "encoding": "utf8" },
-        { "name": "version", "type": "string", "kind": "length_prefixed", "length_type": "uint8", "encoding": "ascii" }
+        {
+          "name": "name",
+          "type": "string",
+          "kind": "length_prefixed",
+          "length_type": "uint8",
+          "encoding": "utf8"
+        },
+        {
+          "name": "version",
+          "type": "string",
+          "kind": "length_prefixed",
+          "length_type": "uint8",
+          "encoding": "ascii"
+        }
       ]
     },
-
     "Span": {
       "description": "One span. References resource and scope dictionaries by index.",
       "sequence": [
-        { "name": "resource_idx", "type": "uint16" },
-        { "name": "scope_idx",    "type": "uint16" },
-        { "name": "trace_id",     "type": "bytes", "kind": "fixed", "length": 16 },
-        { "name": "span_id",      "type": "bytes", "kind": "fixed", "length": 8 },
-        { "name": "parent_span_id", "type": "optional", "value_type": { "type": "bytes", "kind": "fixed", "length": 8 } },
-        { "name": "name",            "type": "string", "kind": "length_prefixed", "length_type": "uint16", "encoding": "utf8" },
-        { "name": "kind",            "type": "uint8" },
-        { "name": "start_unix_nano", "type": "uint64" },
-        { "name": "end_unix_nano",   "type": "uint64" },
-        { "name": "status_code",     "type": "uint8" },
-        { "name": "status_message",  "type": "string", "kind": "length_prefixed", "length_type": "uint16", "encoding": "utf8" },
-        { "name": "attributes",      "type": "array",  "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "LabelPair" } },
-        { "name": "events",          "type": "array",  "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "SpanEvent" } },
-        { "name": "links",           "type": "array",  "kind": "length_prefixed", "length_type": "uint8",  "items": { "type": "SpanLink" } }
+        {
+          "name": "resource_idx",
+          "type": "uint16"
+        },
+        {
+          "name": "scope_idx",
+          "type": "uint16"
+        },
+        {
+          "name": "trace_id",
+          "type": "bytes",
+          "kind": "fixed",
+          "length": 16
+        },
+        {
+          "name": "span_id",
+          "type": "bytes",
+          "kind": "fixed",
+          "length": 8
+        },
+        {
+          "name": "parent_span_id",
+          "type": "optional",
+          "value_type": {
+            "type": "bytes",
+            "kind": "fixed",
+            "length": 8
+          }
+        },
+        {
+          "name": "name",
+          "type": "string",
+          "kind": "length_prefixed",
+          "length_type": "uint16",
+          "encoding": "utf8"
+        },
+        {
+          "name": "kind",
+          "type": "uint8"
+        },
+        {
+          "name": "start_unix_nano",
+          "type": "uint64"
+        },
+        {
+          "name": "end_unix_nano",
+          "type": "uint64"
+        },
+        {
+          "name": "status_code",
+          "type": "uint8"
+        },
+        {
+          "name": "status_message",
+          "type": "string",
+          "kind": "length_prefixed",
+          "length_type": "uint16",
+          "encoding": "utf8"
+        },
+        {
+          "name": "attributes",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint16",
+          "items": {
+            "type": "LabelPair"
+          }
+        },
+        {
+          "name": "events",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint16",
+          "items": {
+            "type": "SpanEvent"
+          }
+        },
+        {
+          "name": "links",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint8",
+          "items": {
+            "type": "SpanLink"
+          }
+        }
       ]
     },
-
     "SpanEvent": {
       "sequence": [
-        { "name": "ts_unix_nano", "type": "uint64" },
-        { "name": "name",         "type": "string", "kind": "length_prefixed", "length_type": "uint16", "encoding": "utf8" },
-        { "name": "attributes",   "type": "array",  "kind": "length_prefixed", "length_type": "uint8",  "items": { "type": "LabelPair" } }
+        {
+          "name": "ts_unix_nano",
+          "type": "uint64"
+        },
+        {
+          "name": "name",
+          "type": "string",
+          "kind": "length_prefixed",
+          "length_type": "uint16",
+          "encoding": "utf8"
+        },
+        {
+          "name": "attributes",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint8",
+          "items": {
+            "type": "LabelPair"
+          }
+        }
       ]
     },
-
     "SpanLink": {
       "sequence": [
-        { "name": "trace_id",   "type": "bytes", "kind": "fixed", "length": 16 },
-        { "name": "span_id",    "type": "bytes", "kind": "fixed", "length": 8 },
-        { "name": "attributes", "type": "array", "kind": "length_prefixed", "length_type": "uint8", "items": { "type": "LabelPair" } }
+        {
+          "name": "trace_id",
+          "type": "bytes",
+          "kind": "fixed",
+          "length": 16
+        },
+        {
+          "name": "span_id",
+          "type": "bytes",
+          "kind": "fixed",
+          "length": 8
+        },
+        {
+          "name": "attributes",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint8",
+          "items": {
+            "type": "LabelPair"
+          }
+        }
       ]
     },
-
     "ProfilesBatch": {
       "description": "Body of a profiles Batch after decompression. v0.1 stores opaque pprof_gz blobs; the structured schema lands in v0.4.",
       "sequence": [
-        { "name": "samples", "type": "array", "kind": "length_prefixed", "length_type": "uint32", "items": { "type": "ProfileBlob" } }
+        {
+          "name": "samples",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint32",
+          "items": {
+            "type": "ProfileBlob"
+          }
+        }
       ]
     },
-
     "ProfileBlob": {
       "sequence": [
-        { "name": "ts_unix_nano",  "type": "uint64" },
-        { "name": "duration_nano", "type": "uint64" },
-        { "name": "labels",        "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "LabelPair" } },
-        { "name": "format",        "type": "uint8" },
-        { "name": "data",          "type": "bytes", "kind": "length_prefixed", "length_type": "uint32" }
+        {
+          "name": "ts_unix_nano",
+          "type": "uint64"
+        },
+        {
+          "name": "duration_nano",
+          "type": "uint64"
+        },
+        {
+          "name": "labels",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint16",
+          "items": {
+            "type": "LabelPair"
+          }
+        },
+        {
+          "name": "format",
+          "type": "uint8"
+        },
+        {
+          "name": "data",
+          "type": "bytes",
+          "kind": "length_prefixed",
+          "length_type": "uint32"
+        }
       ]
     },
-
     "DummyBatch": {
       "description": "Body of a Batch whose signal is Dummy (0xFF). v0.1-only placeholder used to exercise the storage pipeline before any real signal lands. Goes away when the first real signal arrives.",
       "sequence": [
-        { "name": "records", "type": "array", "kind": "length_prefixed", "length_type": "uint32", "items": { "type": "DummyRecord" } }
+        {
+          "name": "records",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint32",
+          "items": {
+            "type": "DummyRecord"
+          }
+        }
       ]
     },
-
     "DummyRecord": {
       "description": "v0.1-only record type. A timestamp, an arbitrary key, and an opaque value. The storage layer treats this as the single record shape until real signals come online.",
       "sequence": [
-        { "name": "ts_unix_nano", "type": "uint64" },
-        { "name": "key",          "type": "string", "kind": "length_prefixed", "length_type": "uint16", "encoding": "utf8" },
-        { "name": "value",        "type": "bytes",  "kind": "length_prefixed", "length_type": "uint32" }
+        {
+          "name": "ts_unix_nano",
+          "type": "uint64"
+        },
+        {
+          "name": "key",
+          "type": "string",
+          "kind": "length_prefixed",
+          "length_type": "uint16",
+          "encoding": "utf8"
+        },
+        {
+          "name": "value",
+          "type": "bytes",
+          "kind": "length_prefixed",
+          "length_type": "uint32"
+        }
+      ]
+    },
+    "MetricsBatchV2": {
+      "description": "Protocol-v2 canonical structured metrics payload. Unlike MetricsBatch v1, structured values are never exploded into synthetic scalar series. A fixed magic prefix makes WAL replay and defensive decoders distinguish it from positional v1 payloads.",
+      "sequence": [
+        {
+          "name": "magic",
+          "type": "uint32",
+          "const": 1397568000
+        },
+        {
+          "name": "descriptors",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint32",
+          "items": {
+            "type": "MetricDescriptorV2"
+          }
+        },
+        {
+          "name": "points",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint32",
+          "items": {
+            "type": "MetricPointV2"
+          }
+        }
+      ]
+    },
+    "MetricDescriptorV2": {
+      "description": "Batch-local metric identity and common OpenTelemetry/Prometheus metadata.",
+      "sequence": [
+        {
+          "name": "id",
+          "type": "uint32"
+        },
+        {
+          "name": "name",
+          "type": "string",
+          "kind": "length_prefixed",
+          "length_type": "uint16",
+          "encoding": "utf8"
+        },
+        {
+          "name": "description",
+          "type": "string",
+          "kind": "length_prefixed",
+          "length_type": "uint16",
+          "encoding": "utf8"
+        },
+        {
+          "name": "unit",
+          "type": "string",
+          "kind": "length_prefixed",
+          "length_type": "uint16",
+          "encoding": "utf8"
+        },
+        {
+          "name": "metric_kind",
+          "type": "uint8"
+        },
+        {
+          "name": "temporality",
+          "type": "uint8"
+        },
+        {
+          "name": "monotonic",
+          "type": "uint8"
+        },
+        {
+          "name": "resource_attrs",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint16",
+          "items": {
+            "type": "LabelPair"
+          }
+        },
+        {
+          "name": "scope_name",
+          "type": "string",
+          "kind": "length_prefixed",
+          "length_type": "uint8",
+          "encoding": "utf8"
+        },
+        {
+          "name": "scope_version",
+          "type": "string",
+          "kind": "length_prefixed",
+          "length_type": "uint8",
+          "encoding": "utf8"
+        },
+        {
+          "name": "scope_attrs",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint16",
+          "items": {
+            "type": "LabelPair"
+          }
+        }
+      ]
+    },
+    "MetricPointV2": {
+      "description": "A tagged canonical metric point. Tag 1 scalar, 2 explicit histogram, 3 exponential/native histogram, 4 summary.",
+      "sequence": [
+        {
+          "name": "value",
+          "type": "discriminated_union",
+          "discriminator": {
+            "peek": "uint8"
+          },
+          "variants": [
+            {
+              "type": "ScalarPointV2",
+              "when": "value === 1"
+            },
+            {
+              "type": "HistogramPointV2",
+              "when": "value === 2"
+            },
+            {
+              "type": "ExponentialHistogramPointV2",
+              "when": "value === 3"
+            },
+            {
+              "type": "SummaryPointV2",
+              "when": "value === 4"
+            }
+          ]
+        }
+      ]
+    },
+    "ScalarPointV2": {
+      "description": "An exact signed integer or IEEE-754 double point.",
+      "sequence": [
+        {
+          "name": "tag",
+          "type": "uint8",
+          "const": 1
+        },
+        {
+          "name": "descriptor_id",
+          "type": "uint32"
+        },
+        {
+          "name": "start_unix_nano",
+          "type": "uint64"
+        },
+        {
+          "name": "ts_unix_nano",
+          "type": "uint64"
+        },
+        {
+          "name": "flags",
+          "type": "uint32"
+        },
+        {
+          "name": "attributes",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint16",
+          "items": {
+            "type": "LabelPair"
+          }
+        },
+        {
+          "name": "exemplars",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint16",
+          "items": {
+            "type": "MetricExemplarV2"
+          }
+        },
+        {
+          "name": "number",
+          "type": "MetricNumberV2"
+        }
+      ]
+    },
+    "HistogramPointV2": {
+      "description": "Explicit-bound histogram; bucket_counts length must equal explicit_bounds length + 1.",
+      "sequence": [
+        {
+          "name": "tag",
+          "type": "uint8",
+          "const": 2
+        },
+        {
+          "name": "descriptor_id",
+          "type": "uint32"
+        },
+        {
+          "name": "start_unix_nano",
+          "type": "uint64"
+        },
+        {
+          "name": "ts_unix_nano",
+          "type": "uint64"
+        },
+        {
+          "name": "flags",
+          "type": "uint32"
+        },
+        {
+          "name": "attributes",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint16",
+          "items": {
+            "type": "LabelPair"
+          }
+        },
+        {
+          "name": "exemplars",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint16",
+          "items": {
+            "type": "MetricExemplarV2"
+          }
+        },
+        {
+          "name": "count",
+          "type": "uint64"
+        },
+        {
+          "name": "has_sum",
+          "type": "uint8"
+        },
+        {
+          "name": "sum",
+          "type": "float64"
+        },
+        {
+          "name": "has_min",
+          "type": "uint8"
+        },
+        {
+          "name": "min",
+          "type": "float64"
+        },
+        {
+          "name": "has_max",
+          "type": "uint8"
+        },
+        {
+          "name": "max",
+          "type": "float64"
+        },
+        {
+          "name": "explicit_bounds",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint32",
+          "items": {
+            "type": "float64"
+          }
+        },
+        {
+          "name": "bucket_counts",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint32",
+          "items": {
+            "type": "uint64"
+          }
+        }
+      ]
+    },
+    "ExponentialHistogramPointV2": {
+      "description": "Exponential/native histogram with sparse positive/negative buckets, integer or float counts, optional custom bounds, and reset hint.",
+      "sequence": [
+        {
+          "name": "tag",
+          "type": "uint8",
+          "const": 3
+        },
+        {
+          "name": "descriptor_id",
+          "type": "uint32"
+        },
+        {
+          "name": "start_unix_nano",
+          "type": "uint64"
+        },
+        {
+          "name": "ts_unix_nano",
+          "type": "uint64"
+        },
+        {
+          "name": "flags",
+          "type": "uint32"
+        },
+        {
+          "name": "attributes",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint16",
+          "items": {
+            "type": "LabelPair"
+          }
+        },
+        {
+          "name": "exemplars",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint16",
+          "items": {
+            "type": "MetricExemplarV2"
+          }
+        },
+        {
+          "name": "count",
+          "type": "MetricCountV2"
+        },
+        {
+          "name": "has_sum",
+          "type": "uint8"
+        },
+        {
+          "name": "sum",
+          "type": "float64"
+        },
+        {
+          "name": "has_min",
+          "type": "uint8"
+        },
+        {
+          "name": "min",
+          "type": "float64"
+        },
+        {
+          "name": "has_max",
+          "type": "uint8"
+        },
+        {
+          "name": "max",
+          "type": "float64"
+        },
+        {
+          "name": "scale",
+          "type": "int32"
+        },
+        {
+          "name": "zero_threshold",
+          "type": "float64"
+        },
+        {
+          "name": "zero_count",
+          "type": "MetricCountV2"
+        },
+        {
+          "name": "positive",
+          "type": "SparseBucketsV2"
+        },
+        {
+          "name": "negative",
+          "type": "SparseBucketsV2"
+        },
+        {
+          "name": "custom_bounds",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint32",
+          "items": {
+            "type": "float64"
+          }
+        },
+        {
+          "name": "reset_hint",
+          "type": "uint8"
+        }
+      ]
+    },
+    "SummaryPointV2": {
+      "description": "Summary point with exact count, sum, and sorted quantile/value pairs.",
+      "sequence": [
+        {
+          "name": "tag",
+          "type": "uint8",
+          "const": 4
+        },
+        {
+          "name": "descriptor_id",
+          "type": "uint32"
+        },
+        {
+          "name": "start_unix_nano",
+          "type": "uint64"
+        },
+        {
+          "name": "ts_unix_nano",
+          "type": "uint64"
+        },
+        {
+          "name": "flags",
+          "type": "uint32"
+        },
+        {
+          "name": "attributes",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint16",
+          "items": {
+            "type": "LabelPair"
+          }
+        },
+        {
+          "name": "exemplars",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint16",
+          "items": {
+            "type": "MetricExemplarV2"
+          }
+        },
+        {
+          "name": "count",
+          "type": "uint64"
+        },
+        {
+          "name": "sum",
+          "type": "float64"
+        },
+        {
+          "name": "quantiles",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint16",
+          "items": {
+            "type": "QuantileValueV2"
+          }
+        }
+      ]
+    },
+    "MetricNumberV2": {
+      "description": "Lossless scalar value union.",
+      "sequence": [
+        {
+          "name": "value",
+          "type": "discriminated_union",
+          "discriminator": {
+            "peek": "uint8"
+          },
+          "variants": [
+            {
+              "type": "IntegerValueV2",
+              "when": "value === 1"
+            },
+            {
+              "type": "DoubleValueV2",
+              "when": "value === 2"
+            }
+          ]
+        }
+      ]
+    },
+    "MetricCountV2": {
+      "description": "Histogram count union for integer-count and float-count native histograms.",
+      "sequence": [
+        {
+          "name": "value",
+          "type": "discriminated_union",
+          "discriminator": {
+            "peek": "uint8"
+          },
+          "variants": [
+            {
+              "type": "IntegerCountV2",
+              "when": "value === 1"
+            },
+            {
+              "type": "FloatCountV2",
+              "when": "value === 2"
+            }
+          ]
+        }
+      ]
+    },
+    "IntegerValueV2": {
+      "description": "Signed 64-bit scalar.",
+      "sequence": [
+        {
+          "name": "tag",
+          "type": "uint8",
+          "const": 1
+        },
+        {
+          "name": "value",
+          "type": "int64"
+        }
+      ]
+    },
+    "DoubleValueV2": {
+      "description": "IEEE-754 scalar.",
+      "sequence": [
+        {
+          "name": "tag",
+          "type": "uint8",
+          "const": 2
+        },
+        {
+          "name": "value",
+          "type": "float64"
+        }
+      ]
+    },
+    "IntegerCountV2": {
+      "description": "Exact non-negative count.",
+      "sequence": [
+        {
+          "name": "tag",
+          "type": "uint8",
+          "const": 1
+        },
+        {
+          "name": "value",
+          "type": "uint64"
+        }
+      ]
+    },
+    "FloatCountV2": {
+      "description": "Floating-point count.",
+      "sequence": [
+        {
+          "name": "tag",
+          "type": "uint8",
+          "const": 2
+        },
+        {
+          "name": "value",
+          "type": "float64"
+        }
+      ]
+    },
+    "SparseBucketsV2": {
+      "description": "Sparse exponential histogram bucket run. Deltas are signed offsets; counts share one numeric representation.",
+      "sequence": [
+        {
+          "name": "offset",
+          "type": "int32"
+        },
+        {
+          "name": "deltas",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint32",
+          "items": {
+            "type": "int32"
+          }
+        },
+        {
+          "name": "counts",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint32",
+          "items": {
+            "type": "MetricCountV2"
+          }
+        }
+      ]
+    },
+    "QuantileValueV2": {
+      "description": "One summary quantile.",
+      "sequence": [
+        {
+          "name": "quantile",
+          "type": "float64"
+        },
+        {
+          "name": "value",
+          "type": "float64"
+        }
+      ]
+    },
+    "MetricExemplarV2": {
+      "description": "Exemplar attached to a metric point.",
+      "sequence": [
+        {
+          "name": "ts_unix_nano",
+          "type": "uint64"
+        },
+        {
+          "name": "number",
+          "type": "MetricNumberV2"
+        },
+        {
+          "name": "filtered_attrs",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint16",
+          "items": {
+            "type": "LabelPair"
+          }
+        },
+        {
+          "name": "trace_id",
+          "type": "bytes",
+          "kind": "fixed",
+          "length": 16
+        },
+        {
+          "name": "span_id",
+          "type": "bytes",
+          "kind": "fixed",
+          "length": 8
+        }
       ]
     }
   }

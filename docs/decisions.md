@@ -3792,3 +3792,30 @@ untouched, and retry with bounded backoff or defer it. It must not crash the
 maintenance loop, mark the partition successful, or be reported as data or
 protocol corruption. See `docs/design/capacity-presets.md` for profile
 qualification and operator-facing controls.
+
+## D-071: The gateway terminates practical Grafana-stack push protocols into existing typed batches
+
+**Context.** The fan-out gateway carried every native scry signal, but its foreign
+receivers covered only OTLP traces, Prometheus remote-write, and legacy
+Pyroscope `/ingest`. Loki clients, OTLP log/metric exporters, and modern
+Pyroscope/Alloy writers still needed another collector in front of scry.
+
+**Decision.** Add Loki JSON + raw-Snappy protobuf push, stable OTLP logs and
+metrics over HTTP and gRPC, JSON/gzip parity for OTLP traces, and the unary
+Pyroscope Push v1 endpoint. These are edge adapters only: each request becomes
+an existing `LogsBatch`, `MetricsBatch`, `TracesBatch`, or `ProfilesBatch` and
+then follows D-041's compatible-sink fan-out unchanged.
+
+OTLP/HTTP accepts protobuf and JSON with bounded optional gzip decompression.
+OTLP logs preserve resource/scope identity and carry correlation fields as
+entry metadata. OTLP Gauge and cumulative Sum points map to native scalar
+series; aggregate metric types and delta sums are counted in an OTLP
+partial-success response rather than silently discarded or given invented
+semantics. Modern Pyroscope pushes are validated as pprof, indexed from the
+profile's own timestamp/duration, and normalized to gzipped pprof storage.
+
+**Consequence.** `scry gateway` is a direct receiver for the established Loki,
+Tempo/OTLP, Prometheus, and Pyroscope push paths. Alpha `v1development` OTLP
+Profiles and native aggregate OTLP metric representation remain explicit
+follow-ups. See `docs/design/gateway-ingestion-protocols.md` for the route,
+encoding, mapping, and verification contract.

@@ -28,6 +28,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use arrow::array::{Array, ListArray, StringArray, UInt64Array};
+use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use datafusion::execution::object_store::ObjectStoreUrl;
@@ -275,6 +276,22 @@ pub async fn merge_blocks(
     admitted_non_df_bytes: u64,
 ) -> Result<Option<BlockMeta>> {
     anyhow::ensure!(!inputs.is_empty(), "merge_blocks called with no inputs");
+    let schema_version = inputs[0].meta.schema_version;
+    for entry in inputs {
+        anyhow::ensure!(
+            entry.meta.signal == signal,
+            "merge input {} has signal {:?}, expected {signal:?}",
+            entry.meta.uuid,
+            entry.meta.signal
+        );
+        anyhow::ensure!(
+            entry.meta.schema_version == schema_version,
+            "merge input {} has schema version {}, expected {}",
+            entry.meta.uuid,
+            entry.meta.schema_version,
+            schema_version
+        );
+    }
     let block_uuid = Uuid::now_v7();
     let ts_min = inputs
         .iter()
@@ -406,6 +423,20 @@ async fn merge_blocks_inner(
         .map_err(|e| anyhow::anyhow!("parse object store url: {e}"))?;
     ctx.runtime_env()
         .register_object_store(url.as_ref(), store.clone());
+
+    let mut input_schema: Option<SchemaRef> = None;
+    for entry in inputs {
+        let schema = fetch_main_schema(&store, entry).await?;
+        if let Some(expected) = &input_schema {
+            anyhow::ensure!(
+                schema.as_ref() == expected.as_ref(),
+                "merge input {} parquet schema differs from the other inputs",
+                entry.meta.uuid
+            );
+        } else {
+            input_schema = Some(schema);
+        }
+    }
 
     let paths: Vec<String> = inputs
         .iter()
@@ -857,6 +888,28 @@ async fn merge_postings_streaming(
         return Err(error);
     }
     Ok(store.head(&output_path).await?.size)
+}
+
+async fn fetch_main_schema(
+    store: &Arc<dyn ObjectStore>,
+    entry: &CatalogEntry,
+) -> Result<SchemaRef> {
+    let path = ObjPath::from(block_path(
+        &entry.meta.signal,
+        entry.meta.ts_min_unix_nano,
+        entry.meta.writer_id,
+        entry.meta.uuid,
+        "parquet",
+    ));
+    let object = store
+        .head(&path)
+        .await
+        .with_context(|| format!("HEAD input parquet {path}"))?;
+    let reader = ParquetObjectReader::new(store.clone(), path.clone()).with_file_size(object.size);
+    let builder = ParquetRecordBatchStreamBuilder::new(reader)
+        .await
+        .with_context(|| format!("open input parquet {path}"))?;
+    Ok(builder.schema().clone())
 }
 
 async fn cleanup_paths(store: &Arc<dyn ObjectStore>, paths: &[ObjPath]) {

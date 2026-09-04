@@ -9,11 +9,9 @@ write Rust/Go/TypeScript bindings by hand.
 
 | File | Protocol | Status |
 |------|----------|--------|
-| [`ingest.schema.json`](./ingest.schema.json) | Agent → server ingest stream (D-006) | v0.1 draft |
-
-Future additions (scatter-gather worker RPCs, control-plane pub/sub
-payloads, snapshot upload format) will land alongside as separate
-schemas.
+| [`ingest.schema.json`](./ingest.schema.json) | Agent → server ingest stream (D-006) | implemented |
+| [`query.schema.json`](./query.schema.json) | Client → queryd query stream (D-031) | implemented |
+| [`query-worker.schema.json`](./query-worker.schema.json) | Private queryd → queryd control plane (D-024) | Phase 1 |
 
 ## Generating code
 

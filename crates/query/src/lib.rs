@@ -66,7 +66,7 @@ use tracing::warn;
 use crate::label_enrich::{freeze_fp_labels, FpAcc};
 
 pub use bloom_cache::{
-    BloomCache, BloomCacheConfig, BloomCacheStats,
+    BloomCache, BloomCacheConfig, BloomCacheResidency, BloomCacheStats,
     DEFAULT_BUDGET_BYTES as DEFAULT_BLOOM_CACHE_BYTES,
 };
 pub use evict::EvictOnNotFound;

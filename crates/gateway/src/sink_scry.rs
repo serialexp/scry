@@ -20,7 +20,7 @@ use scry_client::Client;
 use scry_proto::{
     build,
     constants::{Signal, COMPRESSION_ZSTD},
-    generated::{LogsBatch, MetricsBatch, ProfilesBatch, TracesBatch},
+    generated::{LogsBatch, MetricsBatch, MetricsBatchV2, ProfilesBatch, TracesBatch},
     LabelPair,
 };
 use tokio::sync::mpsc;
@@ -91,6 +91,7 @@ impl ScrySink {
             ts_min,
             ts_max,
             payload,
+            requires_structured_metrics,
         } = encoded;
         let uncompressed_size = payload.len() as u32;
         let payload = zstd::encode_all(payload.as_slice(), ZSTD_LEVEL)
@@ -117,10 +118,14 @@ impl ScrySink {
         // error — the best-effort contract.
         self.reporter.attempt(gateway_signal);
         if self.client.is_none() {
-            self.client = Some(self.connect().await.map_err(|error| {
+            self.client = Some(self.connect().await.inspect_err(|_| {
                 self.reporter.attempt_failed(gateway_signal);
-                error
             })?);
+        }
+        if requires_structured_metrics
+            && !self.client.as_ref().unwrap().supports_structured_metrics()
+        {
+            anyhow::bail!("upstream does not negotiate structured metrics v2");
         }
 
         // First attempt against the live client.
@@ -165,7 +170,7 @@ impl ScrySink {
 
     /// Open a fresh session to the upstream ingest server.
     async fn connect(&self) -> anyhow::Result<Client> {
-        Client::connect(
+        Client::connect_v2(
             &self.conn.addr,
             self.conn.agent_id,
             &self.conn.hostname,
@@ -184,6 +189,7 @@ struct EncodedBatch {
     ts_min: u64,
     ts_max: u64,
     payload: Vec<u8>,
+    requires_structured_metrics: bool,
 }
 
 /// Encode a fanned-out item to its binschema payload + frame stamps. Returns
@@ -192,6 +198,7 @@ fn encode_item(item: &Fanout) -> Option<EncodedBatch> {
     match item {
         Fanout::Logs(b) => encode_logs(b),
         Fanout::Metrics(b) => encode_metrics(b),
+        Fanout::StructuredMetrics(b) => encode_structured_metrics(b),
         Fanout::Traces(b) => encode_traces(b),
         Fanout::Profiles(b) => encode_profiles(b),
     }
@@ -219,6 +226,41 @@ fn encode_logs(b: &LogsBatch) -> Option<EncodedBatch> {
         payload: b
             .encode()
             .expect("LogsBatch encode is infallible for well-formed inputs"),
+        requires_structured_metrics: false,
+    })
+}
+
+fn point_timestamp(point: &scry_proto::generated::MetricPointV2) -> u64 {
+    use scry_proto::generated::MetricPointV2Value;
+    match &point.value {
+        MetricPointV2Value::ScalarPointV2(value) => value.ts_unix_nano,
+        MetricPointV2Value::HistogramPointV2(value) => value.ts_unix_nano,
+        MetricPointV2Value::ExponentialHistogramPointV2(value) => value.ts_unix_nano,
+        MetricPointV2Value::SummaryPointV2(value) => value.ts_unix_nano,
+    }
+}
+
+fn encode_structured_metrics(b: &MetricsBatchV2) -> Option<EncodedBatch> {
+    if b.points.is_empty() {
+        return None;
+    }
+    if scry_proto::metrics_v2::validate_for_encode(b).is_err() {
+        return None;
+    }
+    let mut ts_min = u64::MAX;
+    let mut ts_max = 0;
+    for point in &b.points {
+        let timestamp = point_timestamp(point);
+        ts_min = ts_min.min(timestamp);
+        ts_max = ts_max.max(timestamp);
+    }
+    Some(EncodedBatch {
+        signal: Signal::Metrics,
+        record_count: b.points.len().try_into().ok()?,
+        ts_min,
+        ts_max,
+        payload: b.encode().ok()?,
+        requires_structured_metrics: true,
     })
 }
 
@@ -240,6 +282,7 @@ fn encode_metrics(b: &MetricsBatch) -> Option<EncodedBatch> {
         payload: b
             .encode()
             .expect("MetricsBatch encode is infallible for well-formed inputs"),
+        requires_structured_metrics: false,
     })
 }
 
@@ -261,6 +304,7 @@ fn encode_traces(b: &TracesBatch) -> Option<EncodedBatch> {
         payload: b
             .encode()
             .expect("TracesBatch encode is infallible for well-formed inputs"),
+        requires_structured_metrics: false,
     })
 }
 
@@ -282,5 +326,6 @@ fn encode_profiles(b: &ProfilesBatch) -> Option<EncodedBatch> {
         payload: b
             .encode()
             .expect("ProfilesBatch encode is infallible for well-formed inputs"),
+        requires_structured_metrics: false,
     })
 }

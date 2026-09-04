@@ -109,7 +109,11 @@ describe("fleetFields", () => {
 
   it("renders gateway inbound and per-sink forwarding stages", () => {
     const fields = new Map(fleetFields(instance("gateway", {
-      inbound: { otlp_http: { accepted: 12, rejected: 2 } },
+      inbound: {
+        otlp_http: { accepted: 12, rejected: 2 },
+        loki_http: { accepted: 3, rejected: 1 },
+        pyroscope_push_http: { accepted: 4, rejected: 0 },
+      },
       records: { traces: 44 },
       sinks: {
         scry: {
@@ -123,6 +127,8 @@ describe("fleetFields", () => {
     })));
     expect(fields.get("OTLP HTTP accepted")).toBe("12");
     expect(fields.get("OTLP HTTP rejected")).toBe("2");
+    expect(fields.get("Loki HTTP accepted")).toBe("3");
+    expect(fields.get("Pyroscope Push HTTP accepted")).toBe("4");
     expect(fields.get("traces mapped")).toBe("44");
     expect(fields.get("scry queue")).toBe("3 / 16");
     expect(fields.get("scry queue dropped")).toBe("1");

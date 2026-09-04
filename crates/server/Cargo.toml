@@ -14,8 +14,11 @@ binschema-runtime = { workspace = true }
 bytes             = { workspace = true }
 datafusion        = { workspace = true }
 futures           = { workspace = true }
+hmac              = "0.12"
 num_cpus          = { workspace = true }
 object_store      = { workspace = true }
+rand              = { workspace = true }
+sha2              = "0.10"
 scry-block        = { workspace = true }
 scry-catalog      = { workspace = true }
 scry-match        = { workspace = true }

@@ -812,6 +812,24 @@ fn histogram_quantile_ms(buckets: &[u64], quantile: f64) -> Option<u64> {
     None
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalQueryDecision {
+    CacheHit,
+    Live,
+    Unsupported,
+    Small,
+    EligibleShadow,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct QueryWorkerStatus {
+    pub protocol_version: u16,
+    pub execute_addr: String,
+    pub fragment_slots_limit: u64,
+    pub fragment_slots_in_use: Arc<AtomicU64>,
+    pub draining: bool,
+}
+
 pub struct QueryMetrics {
     started: Instant,
     instance_id: String,
@@ -847,6 +865,12 @@ pub struct QueryMetrics {
     repair_successes_total: AtomicU64,
     repair_failures_total: AtomicU64,
     repair_stability_retries_total: AtomicU64,
+    local_cache_hit_total: AtomicU64,
+    local_live_total: AtomicU64,
+    local_unsupported_total: AtomicU64,
+    local_small_total: AtomicU64,
+    eligible_shadow_total: AtomicU64,
+    worker_status: std::sync::RwLock<Option<QueryWorkerStatus>>,
     // Live-read handles into the query service's shared state.
     postings_cache: Arc<PostingsCache>,
     label_metadata: Arc<LabelMetadataCoordinator>,
@@ -910,6 +934,12 @@ impl QueryMetrics {
             repair_successes_total: AtomicU64::new(0),
             repair_failures_total: AtomicU64::new(0),
             repair_stability_retries_total: AtomicU64::new(0),
+            local_cache_hit_total: AtomicU64::new(0),
+            local_live_total: AtomicU64::new(0),
+            local_unsupported_total: AtomicU64::new(0),
+            local_small_total: AtomicU64::new(0),
+            eligible_shadow_total: AtomicU64::new(0),
+            worker_status: std::sync::RwLock::new(None),
             postings_cache,
             label_metadata,
             bloom_cache,
@@ -1026,6 +1056,25 @@ impl QueryMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record the reason a query remains local during the distribution rollout.
+    pub fn record_local_decision(&self, decision: LocalQueryDecision) {
+        let counter = match decision {
+            LocalQueryDecision::CacheHit => &self.local_cache_hit_total,
+            LocalQueryDecision::Live => &self.local_live_total,
+            LocalQueryDecision::Unsupported => &self.local_unsupported_total,
+            LocalQueryDecision::Small => &self.local_small_total,
+            LocalQueryDecision::EligibleShadow => &self.eligible_shadow_total,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn set_worker_status(&self, status: Option<QueryWorkerStatus>) {
+        *self
+            .worker_status
+            .write()
+            .expect("query worker status lock poisoned") = status;
+    }
+
     /// Cheap atomic snapshot for the periodic activity logger:
     /// `(queries_total, queries_in_flight, blocks_scanned_total)`. The logger
     /// diffs the cumulative counters between ticks to report per-interval rates.
@@ -1074,6 +1123,11 @@ impl QueryMetrics {
         let wait_nanos = self.admission_wait_nanos_total.load(Ordering::Relaxed);
         let memory_reserved = self.memory_pool.reserved();
         self.record_memory_reservation(memory_reserved);
+        let worker = self
+            .worker_status
+            .read()
+            .expect("query worker status lock poisoned")
+            .clone();
         serde_json::json!({
             "queries_total": queries,
             "queries_in_flight": self.queries_in_flight.load(Ordering::Relaxed),
@@ -1096,6 +1150,20 @@ impl QueryMetrics {
             "rows_returned_total": self.rows_returned_total.load(Ordering::Relaxed),
             "bytes_scanned_total": self.bytes_scanned_total.load(Ordering::Relaxed),
             "blocks_scanned_total": self.blocks_scanned_total.load(Ordering::Relaxed),
+            "distribution_decisions": {
+                "local_cache_hit_total": self.local_cache_hit_total.load(Ordering::Relaxed),
+                "local_live_total": self.local_live_total.load(Ordering::Relaxed),
+                "local_unsupported_total": self.local_unsupported_total.load(Ordering::Relaxed),
+                "local_small_total": self.local_small_total.load(Ordering::Relaxed),
+                "eligible_shadow_total": self.eligible_shadow_total.load(Ordering::Relaxed),
+            },
+            "worker": worker.as_ref().map(|worker| serde_json::json!({
+                "fragment_protocol_version": worker.protocol_version,
+                "execute_addr": worker.execute_addr,
+                "fragment_slots_limit": worker.fragment_slots_limit,
+                "fragment_slots_in_use": worker.fragment_slots_in_use.load(Ordering::Relaxed),
+                "draining": worker.draining,
+            })),
             "postings_cache": {
                 "hits": p.hits, "misses": p.misses, "evictions": p.evictions,
                 "entries": p.entries, "bytes_in": p.bytes_in, "budget_bytes": p.budget_bytes,
@@ -1439,6 +1507,8 @@ mod tests {
         metrics.record_repair_success();
         metrics.record_repair_failure();
         metrics.record_repair_stability_retry();
+        metrics.record_local_decision(LocalQueryDecision::CacheHit);
+        metrics.record_local_decision(LocalQueryDecision::EligibleShadow);
         let mut query = metrics.begin();
         query.mark_ok();
         drop(query);
@@ -1472,6 +1542,14 @@ mod tests {
         assert_eq!(data["admission"]["waited_total"], serde_json::json!(1));
         assert_eq!(data["admission"]["timeouts_total"], serde_json::json!(1));
         assert_eq!(data["admission"]["rejected_total"], serde_json::json!(1));
+        assert_eq!(
+            data["distribution_decisions"]["local_cache_hit_total"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            data["distribution_decisions"]["eligible_shadow_total"],
+            serde_json::json!(1)
+        );
         assert_eq!(
             data["recovery"]["response_resets_total"],
             serde_json::json!(1)

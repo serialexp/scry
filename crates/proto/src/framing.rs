@@ -12,6 +12,7 @@
 
 use crate::generated::Frame;
 use crate::generated_query::QueryFrame;
+use crate::generated_query_worker::QueryWorkerFrame;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -69,6 +70,15 @@ impl Framed for QueryFrame {
     }
 }
 
+impl Framed for QueryWorkerFrame {
+    fn encode(&self) -> binschema_runtime::Result<Vec<u8>> {
+        QueryWorkerFrame::encode(self)
+    }
+    fn decode(bytes: &[u8]) -> binschema_runtime::Result<Self> {
+        QueryWorkerFrame::decode(bytes)
+    }
+}
+
 /// Read one frame from `r`. Returns the decoded `T` on success.
 ///
 /// Returns an `Io` error with [`std::io::ErrorKind::UnexpectedEof`] on
@@ -76,11 +86,22 @@ impl Framed for QueryFrame {
 /// that want to distinguish "clean close" from "broken peer" should
 /// match on that case.
 pub async fn read_frame<T: Framed, R: AsyncRead + Unpin>(r: &mut R) -> Result<T, FrameError> {
+    read_frame_with_limit(r, MAX_FRAME_BYTES).await
+}
+
+/// Read one frame with a protocol-specific limit no larger than the global
+/// framing ceiling. Private control planes should use this rather than inherit
+/// the much larger Arrow-batch allowance.
+pub async fn read_frame_with_limit<T: Framed, R: AsyncRead + Unpin>(
+    r: &mut R,
+    maximum_bytes: usize,
+) -> Result<T, FrameError> {
+    let maximum_bytes = maximum_bytes.min(MAX_FRAME_BYTES);
     let len = r.read_u32().await? as usize;
-    if len > MAX_FRAME_BYTES {
+    if len > maximum_bytes {
         return Err(FrameError::TooLarge {
             got: len,
-            max: MAX_FRAME_BYTES,
+            max: maximum_bytes,
         });
     }
     let mut buf = vec![0u8; len];
@@ -239,6 +260,36 @@ mod tests {
             }
             other => panic!("expected TooLarge, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn worker_frame_uses_protocol_specific_framing_limit() {
+        use crate::generated_query_worker::{
+            QueryWorkerFrame, QueryWorkerFrameMsg, WorkerReleaseInput,
+        };
+
+        let frame = QueryWorkerFrame {
+            msg: QueryWorkerFrameMsg::WorkerRelease(
+                WorkerReleaseInput {
+                    coordinator_id: vec![1; 16],
+                    reservation_token: vec![2; 32],
+                }
+                .into(),
+            ),
+        };
+        let mut wire = Vec::new();
+        write_frame(&mut wire, &frame).await.unwrap();
+        let decoded: QueryWorkerFrame = read_frame_with_limit(&mut wire.as_slice(), 1024)
+            .await
+            .unwrap();
+        assert!(matches!(decoded.msg, QueryWorkerFrameMsg::WorkerRelease(_)));
+
+        let mut oversized = Vec::new();
+        oversized.extend_from_slice(&2048_u32.to_be_bytes());
+        let error = read_frame_with_limit::<QueryWorkerFrame, _>(&mut oversized.as_slice(), 1024)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, FrameError::TooLarge { max: 1024, .. }));
     }
 
     #[tokio::test]
