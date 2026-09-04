@@ -189,6 +189,18 @@ impl ObjectStore for OneShotParquetNotFound {
 const METRIC_TYPE_COUNTER: u8 = 1;
 const BUCKET: &str = "test";
 
+struct ToggleMemoryGuard(AtomicBool);
+
+#[async_trait]
+impl scry_server::QueryMemoryGuard for ToggleMemoryGuard {
+    fn check(&self) -> anyhow::Result<()> {
+        if self.0.load(Ordering::Relaxed) {
+            anyhow::bail!("test memory pressure");
+        }
+        Ok(())
+    }
+}
+
 fn test_cfg() -> BlockBuilderConfig {
     BlockBuilderConfig {
         max_rows: 1_000_000,
@@ -443,6 +455,27 @@ async fn fetch_label_values(addr: std::net::SocketAddr, signal: Signal, name: &s
     }
 }
 
+async fn fetch_fleet_error(addr: std::net::SocketAddr) -> u16 {
+    let sock = TcpStream::connect(addr).await.expect("connect");
+    let (r, w) = sock.into_split();
+    let mut r = TokioBufReader::new(r);
+    let mut w = TokioBufWriter::new(w);
+    write_frame(
+        &mut w,
+        &QueryFrame {
+            msg: QueryFrameMsg::FleetStatusRequest(scry_proto::FleetStatusRequestInput {}.into()),
+        },
+    )
+    .await
+    .expect("write fleet request");
+    w.flush().await.expect("flush");
+    let response: QueryFrame = read_frame(&mut r).await.expect("read fleet response");
+    match response.msg {
+        QueryFrameMsg::StreamError(err) => err.code,
+        other => panic!("expected fleet StreamError, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn query_round_trip() {
     // ── Plant two blocks (same shape as the query crate's e2e test) ─
@@ -518,6 +551,7 @@ async fn query_round_trip() {
     let postings_cache = Arc::new(PostingsCache::with_budget_bytes(16 * 1024 * 1024));
     let bloom_cache = Arc::new(BloomCache::with_budget_bytes(16 * 1024 * 1024));
     let memory_pool = Arc::new(GreedyMemoryPool::new(256 * 1024 * 1024));
+    let memory_guard = Arc::new(ToggleMemoryGuard(AtomicBool::new(false)));
     let runtime_env = Arc::new(
         RuntimeEnvBuilder::new()
             .with_memory_pool(memory_pool.clone())
@@ -544,7 +578,8 @@ async fn query_round_trip() {
         // These tests query with no time bounds over blocks built with fixed
         // synthetic timestamps; disable the 1h default look-back (D-059) so an
         // unbounded query still scans the whole block, as it did pre-D-059.
-        .with_default_window(0),
+        .with_default_window(0)
+        .with_memory_guard(Some(memory_guard.clone())),
     );
 
     // Pre-bind to capture the chosen port before spawning the serve
@@ -729,6 +764,9 @@ async fn query_round_trip() {
         .await
         .expect("prewarm label suggestions");
     let reads_before = service.label_metadata_stats().projected_reads;
+    // Label discovery is bounded control-plane work and must remain usable to
+    // narrow queries while the data-query memory admission gate is closed.
+    memory_guard.0.store(true, Ordering::Relaxed);
     let names = fetch_label_names(listen_addr, Signal::Metrics).await;
     assert_eq!(
         names,
@@ -750,6 +788,11 @@ async fn query_round_trip() {
     // Unknown label ⇒ empty, not an error.
     let missing = fetch_label_values(listen_addr, Signal::Metrics, "nope").await;
     assert!(missing.is_empty(), "unknown label yields no values");
+    assert_eq!(
+        fetch_fleet_error(listen_addr).await,
+        scry_proto::constants::QUERY_ERR_FLEET_UNAVAILABLE,
+        "fleet status must reach its handler despite data-query memory pressure",
+    );
     let metadata_cache_after = postings_cache.stats();
     assert_eq!(
         service.label_metadata_stats().projected_reads,

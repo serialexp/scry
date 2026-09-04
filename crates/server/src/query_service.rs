@@ -719,20 +719,11 @@ impl QueryService {
                 return Ok(());
             }
         };
-        if let Some(guard) = &self.memory_guard {
-            if let Err(e) = guard.check() {
-                warn!(%peer, error = %e, "refusing query at process memory safety threshold");
-                let _ =
-                    emit_stream_error(&mut wr, QUERY_ERR_RESOURCES, QUERY_TOO_LARGE_MESSAGE).await;
-                let _ = wr.flush().await;
-                return Ok(());
-            }
-        }
         let wire_req = match req_frame.msg {
-            QueryFrameMsg::QueryRequest(q) => q,
-            // Metadata (discoverability) requests are self-contained: one
-            // request → one response frame → close. They share the connection
-            // handshake but not the query pipeline (no Arrow stream). See D-050.
+            // Metadata and fleet-health requests are bounded control-plane work.
+            // Dispatch them before data-query admission so operators can still
+            // discover labels and diagnose the fleet while queryd is under
+            // memory pressure.
             QueryFrameMsg::LabelNamesRequest(m) => {
                 return self.handle_label_names(m, &mut wr, peer).await;
             }
@@ -742,6 +733,7 @@ impl QueryService {
             QueryFrameMsg::FleetStatusRequest(_) => {
                 return self.handle_fleet_status(&mut wr, peer).await;
             }
+            QueryFrameMsg::QueryRequest(q) => q,
             other => {
                 let name = match other {
                     QueryFrameMsg::SchemaMsg(_) => "SchemaMsg",
@@ -769,6 +761,20 @@ impl QueryService {
                 return Ok(());
             }
         };
+
+        // Only Arrow data queries are subject to the process-wide memory
+        // admission gate. Control-plane requests above have bounded responses
+        // and must remain available for diagnosis and discovery.
+        if let Some(guard) = &self.memory_guard {
+            if let Err(e) = guard.check() {
+                warn!(%peer, error = %e, "refusing query at process memory safety threshold");
+                let _ =
+                    emit_stream_error(&mut wr, QUERY_ERR_RESOURCES, QUERY_TOO_LARGE_MESSAGE).await;
+                let _ = wr.flush().await;
+                return Ok(());
+            }
+        }
+
         // Attempt resets are required for correctness once compaction can reap
         // an input immediately. Reject legacy clients before any response bytes
         // (and, in particular, before an Arrow schema makes an attempt visible).
@@ -1669,17 +1675,7 @@ impl QueryService {
             (m.ts_max_present != 0).then_some(m.ts_max),
         );
         self.apply_default_window(&mut q);
-        let collected = if let Some(guard) = &self.memory_guard {
-            tokio::select! {
-                result = self.collect_label_names(signal, &q) => result,
-                _ = guard.wait_until_exhausted() => {
-                    Err((QUERY_ERR_RESOURCES, QUERY_TOO_LARGE_MESSAGE.to_string()))
-                }
-            }
-        } else {
-            self.collect_label_names(signal, &q).await
-        };
-        let names = match collected {
+        let names = match self.collect_label_names(signal, &q).await {
             Ok(n) => n,
             Err((code, msg)) => {
                 warn!(%peer, signal = signal_name(signal), code, %msg, "label-names request failed");
@@ -1716,17 +1712,7 @@ impl QueryService {
             (m.ts_max_present != 0).then_some(m.ts_max),
         );
         self.apply_default_window(&mut q);
-        let collected = if let Some(guard) = &self.memory_guard {
-            tokio::select! {
-                result = self.collect_label_values(signal, &m.label_name, &q) => result,
-                _ = guard.wait_until_exhausted() => {
-                    Err((QUERY_ERR_RESOURCES, QUERY_TOO_LARGE_MESSAGE.to_string()))
-                }
-            }
-        } else {
-            self.collect_label_values(signal, &m.label_name, &q).await
-        };
-        let values = match collected {
+        let values = match self.collect_label_values(signal, &m.label_name, &q).await {
             Ok(v) => v,
             Err((code, msg)) => {
                 warn!(%peer, signal = signal_name(signal), code, %msg, "label-values request failed");
