@@ -118,6 +118,11 @@ work is tracked below.
       temporality/start time, buckets, quantiles, descriptors, flags, reset hints,
       and exemplars; Prometheus remote-write v1/v2 native histograms map to the
       same canonical representation.
+- [ ] Add reset-aware structured metric operators after the raw SQL/UI boundary:
+      ordered cumulative-to-delta/rate with predecessor lookback, strict explicit
+      histogram merge, exponential scale alignment, histogram quantile/fraction,
+      and PromQL range-vector/staleness semantics. Summary quantiles must remain
+      non-mergeable and exact-match only.
 - [ ] Add alpha OTLP Profiles (`v1development`) only with a complete structured
       OTLP-to-pprof conversion; Pyroscope Push v1 is the stable profile ingress.
 - [ ] Add global/per-route concurrency admission to gateway HTTP/gRPC. Request
