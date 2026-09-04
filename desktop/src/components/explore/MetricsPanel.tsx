@@ -37,8 +37,19 @@ import {
   setMetricGrouped,
   metricsChartData,
   metricsChartStatus,
+  structuredMetrics,
 } from "../../store";
 import { AGG_FNS, seriesColor, type AggFn, type MetricsChartData } from "../../metricsChart";
+import { formatExact, type StructuredMetricPoint } from "../../structuredMetrics";
+
+function pointSummary(p: StructuredMetricPoint): string {
+  switch (p.kind) {
+    case "scalar": return `value ${formatExact(p.number)}`;
+    case "histogram": return `count ${p.count} · sum ${p.sum ?? "—"} · min ${p.min ?? "—"} · max ${p.max ?? "—"}`;
+    case "exponential-histogram": return `count ${formatExact(p.count)} · sum ${p.sum ?? "—"} · min ${p.min ?? "—"} · max ${p.max ?? "—"} · scale ${p.scale} · zero ${formatExact(p.zeroCount)}`;
+    case "summary": return `count ${p.count} · sum ${p.sum}`;
+  }
+}
 
 /** Build uPlot data + line-series config from a decoded `MetricsChartData`. */
 function toPlot(mc: MetricsChartData): {
@@ -298,6 +309,34 @@ const MetricsPanel: Component = () => {
         />
         <Show when={metricsChartStatus() === "ready"}>
           <div class="metrics-hint">Drag across the chart to zoom to a range.</div>
+        </Show>
+
+        <Show when={structuredMetrics().length > 0}>
+          <div class="structured-metrics">
+            <div class="structured-metrics-title">Exact structured points · newest {structuredMetrics().length}</div>
+            <For each={[...structuredMetrics()].reverse()}>{(p) => (
+              <article class="structured-point">
+                <div class="structured-point-head">
+                  <strong>{p.descriptor.name || selectedMetric() || "metric"}</strong>
+                  <span class={`structured-kind ${p.kind}`}>{p.kind}</span>
+                  <time>{new Date(Number(p.tsUnixNano / 1_000_000n)).toLocaleString()}</time>
+                </div>
+                <div class="structured-summary">{pointSummary(p)}{p.descriptor.unit ? ` ${p.descriptor.unit}` : ""}</div>
+                <Show when={p.kind === "histogram" ? p : undefined}>{(h) => (
+                  <div class="structured-values">
+                    {h().bucketCounts.map((count, i) => `${i === 0 ? "(-∞" : `(${h().explicitBounds[i - 1]}`}, ${i < h().explicitBounds.length ? h().explicitBounds[i] : "+∞"}] = ${count}`).join(" · ")}
+                  </div>
+                )}</Show>
+                <Show when={p.kind === "exponential-histogram" ? p : undefined}>{(h) => (
+                  <div class="structured-values">positive offset {h().positive.offset}: {h().positive.counts.map(formatExact).join(", ") || "—"} · negative offset {h().negative.offset}: {h().negative.counts.map(formatExact).join(", ") || "—"} · zero threshold {h().zeroThreshold} · reset {h().resetHint}</div>
+                )}</Show>
+                <Show when={p.kind === "summary" ? p : undefined}>{(s) => (
+                  <div class="structured-values">{s().quantiles.map((q) => `p${q.quantile * 100} ${q.value}`).join(" · ") || "no quantiles"}</div>
+                )}</Show>
+                <div class="structured-labels">{p.labels.map(([k, v]) => `${k}=${v}`).join(" · ")}</div>
+              </article>
+            )}</For>
+          </div>
         </Show>
       </section>
     </Show>

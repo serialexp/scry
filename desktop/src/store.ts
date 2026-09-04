@@ -58,6 +58,12 @@ import {
   type MetricsChartData,
 } from "./metricsChart";
 import { LiveBuckets, mergeLiveIntoChart } from "./metricsLive";
+import {
+  appendStructuredCapped,
+  decodeStructuredMetricRows,
+  structuredPointFromTail,
+  type StructuredMetricPoint,
+} from "./structuredMetrics";
 
 export type { AggFn } from "./metricsChart";
 
@@ -680,6 +686,14 @@ export async function runCurrentQuery(): Promise<void> {
   // against the new filter set.
   setLabelValueCounts({});
   await runSpec(spec, "default");
+  // Decode nested structured rows independently of the scalar chart. There is
+  // intentionally no projection of histogram/summary fields into `value`.
+  if (state.signal === "Metrics") {
+    const table = resultTable();
+    setStructuredMetrics(table ? decodeStructuredMetricRows(table, STRUCTURED_METRIC_CAP) : []);
+  } else {
+    setStructuredMetrics([]);
+  }
   // For logs, refresh the volume histogram alongside the table using the same
   // matchers + range. Fire-and-forget: the graph is auxiliary, so a volume
   // failure must never fail the main query. It's cache-backed on the queryd,
@@ -733,7 +747,10 @@ const [liveStatus, setLiveStatus] = createSignal<LiveStatus>("off");
 const [liveError, setLiveError] = createSignal<string | null>(null);
 const [liveRows, setLiveRows] = createSignal<LogRow[]>([]);
 const [liveDropped, setLiveDropped] = createSignal(0);
-export { liveStatus, liveError, liveRows, liveDropped };
+/** Structured metrics are snapshots/raw points, never scalar chart buckets. */
+export const STRUCTURED_METRIC_CAP = 500;
+const [structuredMetrics, setStructuredMetrics] = createSignal<StructuredMetricPoint[]>([]);
+export { liveStatus, liveError, liveRows, liveDropped, structuredMetrics };
 
 /** Is a live subscription wanted right now? (Distinct from `liveStatus`, which
  *  reports what the connection is actually doing.) */
@@ -938,6 +955,15 @@ async function pumpLive(generation: number, signal: AbortSignal): Promise<void> 
           onSample: (s) => {
             if (generation === liveGeneration) admitLiveSample(s);
           },
+          onStructuredMetric: (raw) => {
+            if (generation !== liveGeneration) return;
+            // Raw snapshots remain bounded and separate. In particular they do
+            // not enter LiveBuckets or avg/sum/min/max SQL/chart machinery.
+            const point = structuredPointFromTail(raw);
+            setStructuredMetrics((prev) =>
+              appendStructuredCapped(prev, [point], STRUCTURED_METRIC_CAP),
+            );
+          },
         },
         signal,
       );
@@ -990,6 +1016,7 @@ export async function startLive(): Promise<void> {
   livePending = [];
   setLiveRows([]);
   setLiveDropped(0);
+  setStructuredMetrics([]);
   liveBuckets.clear();
   liveMetricsStep = 0;
   liveMetricsSeam = null;
@@ -1399,11 +1426,14 @@ export async function runMetricsChart(): Promise<void> {
   const bucket =
     `CAST(date_bin(${stepIntervalSql(stepMs)}, ` +
     `to_timestamp_nanos(ts_unix_nano)) AS BIGINT) AS bucket_ns`;
+  // The legacy scalar chart is intentionally limited to legacy scalar rows.
+  // Structured points (including structured scalars) have their own exact raw
+  // presentation and must never be coerced into cross-series aggregations.
   const sql = grouped
     ? `SELECT ${bucket}, series_fingerprint AS fp, ${reducer} AS v ` +
-      `FROM metrics GROUP BY fp, bucket_ns ORDER BY bucket_ns`
+      `FROM metrics WHERE point IS NULL GROUP BY fp, bucket_ns ORDER BY bucket_ns`
     : `SELECT ${bucket}, ${reducer} AS v ` +
-      `FROM metrics GROUP BY bucket_ns ORDER BY bucket_ns`;
+      `FROM metrics WHERE point IS NULL GROUP BY bucket_ns ORDER BY bucket_ns`;
 
   const seq = ++metricsChartSeq;
   setMetricsChartStatus("loading");

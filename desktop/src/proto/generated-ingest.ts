@@ -7879,20 +7879,20 @@ export class ExponentialHistogramPointV2Decoder extends SeekableBitStreamDecoder
     value.scale = this.readInt32("big_endian");
     value.zero_threshold = this.readFloat64("big_endian");
     value.zero_count = {};
-    const discriminator = this.peekUint8();
-    if (discriminator === 1) {
+    const zeroCountDiscriminator = this.peekUint8();
+    if (zeroCountDiscriminator === 1) {
       const decoder = new IntegerCountV2Decoder(this.bytes.slice(this.byteOffset), value.zero_count);
       const decodedValue = decoder.decode();
       this.byteOffset += decoder.byteOffset;
       value.zero_count.value = { type: 'IntegerCountV2', value: decodedValue };
     }
-    else if (discriminator === 2) {
+    else if (zeroCountDiscriminator === 2) {
       const decoder = new FloatCountV2Decoder(this.bytes.slice(this.byteOffset), value.zero_count);
       const decodedValue = decoder.decode();
       this.byteOffset += decoder.byteOffset;
       value.zero_count.value = { type: 'FloatCountV2', value: decodedValue };
     } else {
-      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator: 0x${discriminator.toString(16)}`);
+      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator: 0x${zeroCountDiscriminator.toString(16)}`);
     }
     value.positive = {};
     value.positive.offset = this.readInt32("big_endian");

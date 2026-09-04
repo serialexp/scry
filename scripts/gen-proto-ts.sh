@@ -103,4 +103,33 @@ done
 # imports (`./bit-stream.js`, …) resolve to the shared copy above.
 { printf '%s\n' "$BANNER"; cat "$TMP_INGEST/generated.ts"; } > "$OUT/generated-ingest.ts"
 
+# binschema 0.6.x reuses `const discriminator` when a generated struct contains
+# two discriminated-union fields (the exponential histogram's count and
+# zero_count). Keep the committed output executable until the upstream generator
+# scopes or uniquifies these locals.
+python3 - "$OUT/generated-ingest.ts" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+s = p.read_text()
+needle = """    value.zero_count = {};
+    const discriminator = this.peekUint8();
+    if (discriminator === 1) {
+"""
+replacement = """    value.zero_count = {};
+    const zeroCountDiscriminator = this.peekUint8();
+    if (zeroCountDiscriminator === 1) {
+"""
+s = s.replace(needle, replacement)
+s = s.replace(
+    "else if (discriminator === 2) {\n      const decoder = new FloatCountV2Decoder(this.bytes.slice(this.byteOffset), value.zero_count);",
+    "else if (zeroCountDiscriminator === 2) {\n      const decoder = new FloatCountV2Decoder(this.bytes.slice(this.byteOffset), value.zero_count);",
+)
+s = s.replace(
+    "Unknown discriminator: 0x${discriminator.toString(16)}`);\n    }\n    value.positive = {};",
+    "Unknown discriminator: 0x${zeroCountDiscriminator.toString(16)}`);\n    }\n    value.positive = {};",
+)
+p.write_text(s)
+PY
+
 echo "done. Review with: git diff desktop/src/proto"

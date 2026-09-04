@@ -85,6 +85,7 @@ describe("buildSubscribeRequest", () => {
     expect(hello.msg.value.protocol_version).toBe(PROTOCOL_VERSION_V0);
     expect(hello.msg.value.agent_version).toBe("9.9.9");
     expect(hello.msg.value.signals).toBe(SIGNAL_BIT_LOGS);
+    expect(hello.msg.value.capabilities).toBe(0x4);
     expect(hello.msg.value.agent_id).toHaveLength(16);
 
     const sub = new FrameDecoder(frames[1]!).decode() as any;

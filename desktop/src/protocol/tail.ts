@@ -28,6 +28,7 @@ import {
   type HelloAckOutput,
   type TailRecordOutput,
   type TailSampleOutput,
+  type TailMetricPointV2Output,
   // Named `Error_Output` because binschema renames a schema type that collides
   // with a JS global (`Error` → `Error_`). That rename is deliberate and now
   // consistent across declaration and reference sites, so we import the real
@@ -52,6 +53,7 @@ type TaggedFrame =
   | { type: "HelloAck"; value: HelloAckOutput }
   | { type: "TailRecord"; value: TailRecordOutput }
   | { type: "TailSample"; value: TailSampleOutput }
+  | { type: "TailMetricPointV2"; value: TailMetricPointV2Output }
   | { type: "Goodbye"; value: GoodbyeOutput }
   | { type: "Error"; value: ErrorOutput }
   | { type: string; value: unknown };
@@ -127,9 +129,10 @@ export function buildSubscribeRequest(spec: TailSpec, version: string): Uint8Arr
           agent_id: randomAgentId(),
           agent_version: version,
           hostname: "scry-ui",
-          // Announce exactly the signal we are about to subscribe to.
+          // Announce exactly the signal we are about to subscribe to. Capability
+          // bit 0x4 opts into lossless structured metric point frames (0x55).
           signals: tailSignalBit(signal),
-          capabilities: 0,
+          capabilities: 0x4,
           resource_attrs: [],
         },
       },
@@ -184,8 +187,11 @@ export interface TailCallbacks {
   onSubscribed?: () => void;
   /** Fires per pushed log record. Absent when tailing metrics. */
   onRecord?: (record: TailRecord) => void;
-  /** Fires per pushed metric sample. Absent when tailing logs. */
+  /** Fires per pushed legacy scalar metric sample. Absent when tailing logs. */
   onSample?: (sample: TailSample) => void;
+  /** Fires per capability-gated, lossless structured metric point. The raw
+   * generated output retains every uint64 as bigint. */
+  onStructuredMetric?: (point: TailMetricPointV2Output) => void;
 }
 
 /**
@@ -235,6 +241,13 @@ export async function runTail(
             break;
           }
           callbacks.onSample?.(decodeTailSample(msg.value as TailSampleOutput));
+          break;
+        case "TailMetricPointV2":
+          if (!sawHelloAck) {
+            failure = new Error("record received before the handshake completed");
+            break;
+          }
+          callbacks.onStructuredMetric?.(msg.value as TailMetricPointV2Output);
           break;
         case "Goodbye":
           // Server-initiated close; the stream ends on its own right after.

@@ -1384,6 +1384,16 @@ textarea {
   opacity: 0.8;
 }
 
+.structured-metrics { margin-top: 10px; max-height: 320px; overflow: auto; border-top: 1px solid var(--border); }
+.structured-metrics-title { position: sticky; top: 0; padding: 7px 0; color: var(--muted); background: var(--panel); font-size: 11px; z-index: 1; }
+.structured-point { padding: 7px 0; border-top: 1px solid rgb(255 255 255 / 5%); font-size: 11px; }
+.structured-point-head { display: flex; gap: 8px; align-items: baseline; }
+.structured-point-head time { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums; }
+.structured-kind { padding: 1px 5px; border-radius: 8px; color: var(--accent); background: rgb(232 163 61 / 12%); }
+.structured-summary, .structured-values { margin-top: 4px; font-family: var(--mono); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.structured-values { color: var(--muted); }
+.structured-labels { margin-top: 4px; color: var(--muted); font-size: 10px; }
+
 /* uPlot legend: compact + themed to the dark panel (matches volume). */
 .metrics-panel .u-legend {
   font-size: 10px;
