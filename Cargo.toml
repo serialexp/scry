@@ -45,7 +45,7 @@ exclude = [
 # updates this in an automatic release PR and creates the matching `vX.Y.Z` tag
 # after that PR merges. The vendored `binschema-runtime` is the one exception:
 # it tracks upstream binschema and keeps its explicitly pinned version.
-version = "0.22.0"
+version = "0.22.1"
 edition = "2021"
 # kube-rs 3.x sets the floor: its MSRV is 1.88. Everything else in the
 # workspace builds well below this; the agent's Kubernetes client is what
