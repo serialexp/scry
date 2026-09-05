@@ -1,197 +1,93 @@
 name: Release
 
-# One tag, everything built. Push a `vX.Y.Z` tag (or run manually) and this:
-#   • `prepare` creates the draft Release (once — see the job for why),
-#   • `image` builds + pushes the server container via Depot (`depot bake`),
-#   • `cli` builds the per-platform tarballs and appends them to that draft,
-#   • `publish` flips it out of draft once all of the above succeeded.
-#
-# The Release is assembled as a **draft** and published only once every job has
-# succeeded. That ordering is deliberate: `install.sh` resolves the version from
-# `/releases/latest`, which excludes drafts, so a release becomes installable at
-# exactly the moment it is complete — never while three of four tarballs are
-# still building. It also fails safe: if any leg breaks, the release stays a
-# draft rather than going public half-built.
-#
-# Both run on Depot infrastructure. The `serialexp` org is connected to Depot
-# GitHub Actions runners (used by the desktop matrix); the image build uses
-# Depot's remote BuildKit builders via the depot CLI.
-#
-# PREREQUISITES (one-time, dashboard/secrets — not doable from code):
-#   1. Image build auth — OIDC. In the Depot dashboard for the `scry` project
-#      (id in depot.json), add a trust relationship: GitHub → org `serialexp`
-#      → repo `scry`. That lets `depot bake` authenticate with no stored token.
-#      (Fallback: set a `DEPOT_TOKEN` repo/org secret and drop the id-token
-#      permission.)
-#   2. Docker Hub push — set repo/org secrets `DOCKERHUB_USERNAME` and
-#      `DOCKERHUB_TOKEN` (a Docker Hub access token with write on
-#      docker.io/serialexp/scry).
-#
-# Note: the desktop bundle's embedded version comes from
-# desktop/src-tauri/tauri.conf.json, not the git tag — bump it there when you
-# want the asset filenames to match the release tag.
-
+# Publication is driven by a merged just-release PR, not by a manually-pushed
+# tag. A `release: X.Y.Z` commit on main builds every distributable first; only
+# after all builds succeed does just-release create vX.Y.Z and the GitHub Release
+# and attach this run's artifacts. Ordinary main pushes make every publish job a
+# no-op (release-pr.yml handles those).
 on:
   push:
-    tags:
-      - 'v*'
-  workflow_dispatch:
+    branches: [main]
 
 jobs:
-  # ── Server container image (Depot remote build → Docker Hub) ───────────
+  detect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      release: ${{ steps.release.outputs.release }}
+      version: ${{ steps.release.outputs.version }}
+      tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect merged release commit
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_version=""
+          subject=$(git log -1 --format=%s)
+          if [[ "$subject" =~ ^release:\ ([0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?)$ ]]; then
+            release_version="${BASH_REMATCH[1]}"
+          elif [ "$(git rev-list --parents -n 1 HEAD | wc -w)" -ge 3 ]; then
+            while read -r parent_subject; do
+              if [[ "$parent_subject" =~ ^release:\ ([0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?)$ ]]; then
+                release_version="${BASH_REMATCH[1]}"
+                break
+              fi
+            done < <(git log -1 --format=%P | xargs -n1 git log -1 --format=%s)
+          fi
+
+          if [ -z "$release_version" ]; then
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            echo "HEAD is not a just-release commit; nothing to publish"
+            exit 0
+          fi
+
+          workspace_version=$(awk '
+            /^\[workspace\.package\]$/ { in_section=1; next }
+            in_section && /^\[/ { exit }
+            in_section && /^version[[:space:]]*=/ {
+              sub(/^[^"]*"/, ""); sub(/".*/, ""); print; exit
+            }
+          ' Cargo.toml)
+          if [ "$release_version" != "$workspace_version" ]; then
+            echo "::error::release commit version $release_version != workspace version $workspace_version"
+            exit 1
+          fi
+          echo "release=true" >> "$GITHUB_OUTPUT"
+          echo "version=$release_version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$release_version" >> "$GITHUB_OUTPUT"
+
   image:
+    needs: detect
+    if: needs.detect.outputs.release == 'true'
     runs-on: depot-ubuntu-22.04
     permissions:
       contents: read
-      id-token: write          # OIDC token for depot auth (see prereq #1)
+      id-token: write
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Depot CLI
-        uses: depot/setup-action@v1
-
+      - uses: depot/setup-action@v1
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - name: Build and push image
-        # Reads the project id from depot.json and the targets from
-        # docker-bake.hcl. TAG flows into the image tag; PUSH_LATEST also
-        # moves :latest, so a vX.Y.Z tag publishes both :<tag> and :latest.
         run: depot bake --push
         env:
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ needs.detect.outputs.tag }}
           PUSH_LATEST: "true"
 
-  # ── Desktop app bundles (Tauri, per-platform) ──────────────────────────
-  # Disabled: scry ships/tests the browser web UI now; building four unused
-  # Tauri bundles added substantial release latency. Keep the job definition
-  # in place for reference in case native packaging is revived.
-  desktop:
-    if: ${{ false }}
-    permissions:
-      contents: write          # create the GitHub Release + upload assets
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # GitHub-hosted macOS runners (Apple Silicon). NOT depot-macos-latest:
-          # the DMG bundler (bundle_dmg.sh → Finder/AppleScript + hdiutil) fails
-          # on Depot's macOS runners but works on GitHub's, same as our other
-          # Tauri apps. The image job below still uses Depot runners.
-          - platform: 'macos-latest'           # Apple Silicon (native)
-            args: '--target aarch64-apple-darwin'
-          - platform: 'macos-latest'           # Intel (cross-compiled from ARM)
-            args: '--target x86_64-apple-darwin'
-          - platform: 'depot-ubuntu-22.04'
-            args: ''
-          - platform: 'depot-windows-latest'
-            args: ''
-
-    runs-on: ${{ matrix.platform }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install bun
-        uses: oven-sh/setup-bun@v2
-
-      - name: Stamp bundle version from tag
-        # Tag builds carry the real version in the bundles/installers; manual
-        # (branch) dispatch keeps the placeholder in tauri.conf.json.
-        if: github.ref_type == 'tag'
-        shell: bash
-        working-directory: desktop
-        run: bun scripts/stamp-version.mjs "${{ github.ref_name }}"
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ startsWith(matrix.platform, 'macos') && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
-
-      - name: Cache Rust build
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: './desktop/src-tauri -> target'
-
-      - name: Install Linux dependencies (Ubuntu only)
-        if: matrix.platform == 'depot-ubuntu-22.04'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            libappindicator3-dev \
-            librsvg2-dev \
-            patchelf
-
-      - name: Install frontend dependencies
-        working-directory: desktop
-        run: bun install --frozen-lockfile
-
-      - uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          projectPath: desktop
-          tagName: ${{ github.ref_name }}
-          releaseName: 'scry ${{ github.ref_name }}'
-          releaseBody: 'scry desktop query app. Download the asset for your platform, or run the installer (see desktop/README.md).'
-          releaseDraft: true
-          prerelease: false
-          args: ${{ matrix.args }}
-
-  # ── Create the draft Release, once ────────────────────────────────────
-  # Every uploader must append to ONE release, and the only reliable way to
-  # guarantee that is to create it before anything can race.
-  #
-  # `GET /releases/tags/{tag}` returns 404 for a draft. So a get-or-create by
-  # tag never finds a draft it did not just create, and N concurrent uploaders
-  # make N drafts: v0.10.1 has three, holding 3/4/2 of its nine assets, because
-  # three desktop legs started within the same second. Splitting assets across
-  # invisible duplicates is bad on its own; it would also stall `publish`, which
-  # resolves one release by tag and counts what is attached.
-  #
-  # Staggered build times are the only reason this has not recurred since. That
-  # is luck, not design, so create the draft up front and let the matrix append.
-  prepare:
-    if: github.ref_type == 'tag'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write          # create the Release
-    steps:
-      - name: Create the draft release (idempotent)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-          TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          # `gh release view` reads the list endpoint, which DOES see drafts —
-          # unlike the by-tag endpoint softprops/tauri-action fall back on. Safe
-          # to re-run: a re-dispatched tag reuses the existing release.
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "release $TAG already exists; reusing it"
-          else
-            gh release create "$TAG" --draft --title "$TAG" --generate-notes
-            echo "created draft release $TAG"
-          fi
-
-  # ── CLI / server binary tarballs (static musl Linux + native macOS) ────
-  # Ships the headless `scry` multicall binary as per-platform tarballs, all
-  # appended to the single draft Release `prepare` created. Installed by the
-  # repo-root install.sh. Linux legs are fully-static musl builds (scry is
-  # rustls-only, no OpenSSL) via `cross`, so one binary per arch runs on any
-  # distro regardless of glibc; macOS builds natively on the Apple-Silicon
-  # runner (the x86_64 leg cross-compiles, same as the desktop matrix).
   cli:
-    # On a tag, wait for the draft to exist. On a manual dispatch `prepare` is
-    # skipped and this still runs — the tarballs go to workflow artifacts, not
-    # to a release, so there is nothing to race over.
-    needs: [prepare]
-    if: always() && (needs.prepare.result == 'success' || needs.prepare.result == 'skipped')
+    needs: detect
+    if: needs.detect.outputs.release == 'true'
     permissions:
-      contents: write          # upload assets to the Release
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -216,59 +112,32 @@ jobs:
             os: macos
             arch: aarch64
             cross: false
-
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Resolve version + guard against tag/workspace drift
-        id: version
-        shell: bash
-        run: |
-          # On a tag build, assert the tag matches [workspace.package].version
-          # (release.sh keeps them in lockstep). Manual dispatch off a branch
-          # just uses the workspace version verbatim.
-          ws_version=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
-          if [ "${{ github.ref_type }}" = "tag" ]; then
-            tag_version="${GITHUB_REF_NAME#v}"
-            if [ "$tag_version" != "$ws_version" ]; then
-              echo "::error::tag ${GITHUB_REF_NAME} != workspace version ${ws_version} (run scripts/release.sh)"
-              exit 1
-            fi
-          fi
-          echo "VERSION=${ws_version}" >> "$GITHUB_OUTPUT"
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-
-      - name: Cache Rust build
-        uses: swatinem/rust-cache@v2
+      - uses: swatinem/rust-cache@v2
         with:
           key: cli-${{ matrix.target }}
-
       - name: Install cross
         if: matrix.cross
         uses: taiki-e/install-action@v2
         with:
           tool: cross
-
-      - name: Build (cross, static musl)
+      - name: Build static Linux binary
         if: matrix.cross
         run: cross build --release -p scry --target ${{ matrix.target }} --locked
-
-      - name: Build (cargo, native)
+      - name: Build native binary
         if: ${{ !matrix.cross }}
         run: cargo build --release -p scry --target ${{ matrix.target }} --locked
-
-      - name: Package tarball + checksum
+      - name: Package tarball and checksum
         id: package
         shell: bash
         run: |
           set -euo pipefail
-          version="${{ steps.version.outputs.VERSION }}"
-          asset="scry-${version}-${{ matrix.os }}-${{ matrix.arch }}.tar.gz"
+          asset="scry-${{ needs.detect.outputs.version }}-${{ matrix.os }}-${{ matrix.arch }}.tar.gz"
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/scry" dist/
           cp README.md dist/
@@ -278,66 +147,34 @@ jobs:
           else
             shasum -a 256 "$asset" > "${asset}.sha256"
           fi
-          echo "ASSET=${asset}" >> "$GITHUB_OUTPUT"
-
-      - name: Attach to the release
-        if: github.ref_type == 'tag'
-        uses: softprops/action-gh-release@v2
-        with:
-          # Appends to the single draft `prepare` created — never creates one,
-          # so the four legs cannot split their assets across duplicates.
-          # `draft: true` keeps it a draft as softprops updates it: the release
-          # must stay invisible to `/releases/latest` (which skips drafts) until
-          # every tarball is attached, or install.sh could resolve a version
-          # whose asset for the caller's platform is still building. The
-          # `publish` job flips it once every leg is green.
-          draft: true
-          files: |
-            ${{ steps.package.outputs.ASSET }}
-            ${{ steps.package.outputs.ASSET }}.sha256
-
-      - name: Upload workflow artifact (non-tag dispatch)
-        if: github.ref_type != 'tag'
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+      - name: Upload release artifacts
         uses: actions/upload-artifact@v4
         with:
           name: cli-${{ matrix.os }}-${{ matrix.arch }}
           path: |
-            ${{ steps.package.outputs.ASSET }}
-            ${{ steps.package.outputs.ASSET }}.sha256
+            ${{ steps.package.outputs.asset }}
+            ${{ steps.package.outputs.asset }}.sha256
+          if-no-files-found: error
 
-  # ── Publish ───────────────────────────────────────────────────────────
-  # The single point where a release stops being a draft. Gated on `image` and
-  # every `cli` leg, so the release goes public only with the container image
-  # pushed and all four tarballs (plus their .sha256) attached — which is the
-  # contract install.sh depends on when it reads `/releases/latest`.
-  #
-  # `desktop` is deliberately NOT in `needs`: it is disabled (`if: false`), and
-  # a skipped job in `needs` would skip this one too, leaving every release a
-  # draft forever.
   publish:
-    if: github.ref_type == 'tag'
-    needs: [image, cli]
+    needs: [detect, image, cli]
+    if: needs.detect.outputs.release == 'true'
     runs-on: ubuntu-latest
     permissions:
-      contents: write          # flip the Release out of draft
+      contents: write
+      actions: read
     steps:
-      - name: Publish the release
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Create tag and GitHub Release
+        # No CARGO_REGISTRY_TOKEN: Scry publishes binaries and an image, not its
+        # internal workspace crates. just-release therefore skips crates.io.
+        run: npx --yes just-release@0.18.0
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-          TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          # Assert the assets are actually there before going public. A green
-          # matrix with a missing upload would otherwise publish a release that
-          # 404s for one platform — the exact failure the draft gate prevents.
-          expected=8   # 4 tarballs + 4 .sha256
-          actual=$(gh release view "$TAG" --json assets -q '.assets | length')
-          echo "release $TAG has $actual asset(s), expecting $expected"
-          if [ "$actual" -lt "$expected" ]; then
-            gh release view "$TAG" --json assets -q '.assets[].name'
-            echo "refusing to publish an incomplete release" >&2
-            exit 1
-          fi
-          gh release edit "$TAG" --draft=false
-          echo "published $TAG"
+          CI: 1
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -41,11 +41,10 @@ exclude = [
 ]
 
 [workspace.package]
-# Single source of truth for the version of every first-party crate. Bump it
-# with `scripts/release.sh <version>`, which also creates the matching `vX.Y.Z`
-# git tag — keeping crate versions and release tags in lockstep. (The vendored
-# `binschema-runtime` is the one exception: it tracks upstream binschema, not
-# scry's release cadence, so it pins its own version.)
+# Single source of truth for every first-party crate version. just-release
+# updates this in an automatic release PR and creates the matching `vX.Y.Z` tag
+# after that PR merges. The vendored `binschema-runtime` is the one exception:
+# it tracks upstream binschema and keeps its explicitly pinned version.
 version = "0.21.0"
 edition = "2021"
 # kube-rs 3.x sets the floor: its MSRV is 1.88. Everything else in the

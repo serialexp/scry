@@ -487,6 +487,19 @@ scripts/smoke-agent-config.sh     # scry agent TOML pipeline (logs json + metric
 scripts/smoke-webui.sh            # scry web browser surface (auth + multi-target relay)
 ```
 
+## Releases
+
+Releases are driven by conventional commits and `just-release`. Pushes to
+`main` automatically create or update a release PR with the calculated version,
+changelogs, lockfile, and synchronized frontend version. Merging its
+`release: X.Y.Z` commit builds the image and CLI archives, then creates the tag
+and GitHub Release automatically—do not create or push release tags manually.
+
+Repository Actions settings must allow Actions to create pull requests. The
+release workflow intentionally has no `CARGO_REGISTRY_TOKEN`: Scry publishes
+binary archives and a container image, not its internal crates. See
+`.github/workflows/release-pr.yml` and `.github/workflows/release.yml`.
+
 ## Deploy (Kubernetes)
 
 One image, `serialexp/scry:latest` (multi-arch `linux/amd64` + `linux/arm64`),

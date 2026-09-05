@@ -1,7 +1,7 @@
 name: CI
 
-# Build + lint + test on every push to main and every PR — the green-gate
-# that was missing (only the tag-triggered release workflow existed before).
+# Build + lint + test on every push to main and every PR. Release publication
+# is separately driven by a merged just-release PR.
 # Runs on Depot GitHub Actions runners, same as release.yml.
 #
 # Scope: the core cargo workspace (the desktop crate is excluded from the

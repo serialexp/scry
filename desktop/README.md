@@ -102,52 +102,40 @@ instructions on Windows.
 
 ## Releases / CI
 
-One tag builds everything. `.github/workflows/release.yml` fires on a
-`vX.Y.Z` tag (or manual dispatch) and runs two independent jobs, both on
-Depot:
+Releases are automated by pinned `just-release@0.18.0` and conventional
+commits. An ordinary push to `main` runs `.github/workflows/release-pr.yml`,
+which creates or updates a `release/YYYY-MM-DD` PR containing the calculated
+version bump, per-crate changelogs, and an aggregate root changelog used as the
+GitHub release notes. It also synchronizes `Cargo.lock`, this package's
+version, and `src-tauri/tauri.conf.json`.
 
-- **`image`** — `depot bake --push` builds the server container image on
-  Depot's remote BuildKit and pushes `docker.io/serialexp/scry:<tag>`
-  (project id + targets come from `depot.json` / `docker-bake.hcl`).
-- **`desktop`** — [`tauri-apps/tauri-action`](https://github.com/tauri-apps/tauri-action)
-  builds the app bundles across a macOS (arm + intel) / Ubuntu / Windows
-  matrix and attaches them to a **draft** GitHub Release.
+Merge that PR to publish. `.github/workflows/release.yml` recognizes the merged
+`release: X.Y.Z` commit, builds and pushes `docker.io/serialexp/scry:vX.Y.Z`
+and `latest`, builds four CLI archives, and only then asks just-release to create
+the `vX.Y.Z` tag and GitHub Release with those assets. Desktop/Tauri bundles
+remain disabled; the browser UI is embedded in the CLI/server binary.
 
-The desktop matrix runs on **[Depot](https://depot.dev) GitHub Actions
-runners** (`depot-ubuntu-22.04`, `depot-macos-latest`,
-`depot-windows-latest`). Depot's macOS runners are Apple Silicon only, so
-the Intel `.dmg` is cross-compiled from the ARM runner — both Mac
-architectures still ship. To fall back to GitHub-hosted runners, drop the
-`depot-` prefix from each `runs-on` label.
+When squash or rebase merging, preserve the exact `release: X.Y.Z` commit
+subject. A regular merge is also detected. Do not manually edit versions or
+create/push release tags.
 
 **One-time prerequisites** (dashboard/secrets — not in code):
 
-1. **Depot runners** — the `serialexp` org connected to Depot (Depot
-   GitHub App installed + runners enabled). Done.
-2. **Image build auth (OIDC)** — in the Depot dashboard for the `scry`
-   project, add a trust relationship: GitHub → org `serialexp` → repo
-   `scry`. Then `depot bake` authenticates with no stored token. Fallback:
-   a `DEPOT_TOKEN` secret (and drop `id-token: write`).
-3. **Docker Hub push** — repo/org secrets `DOCKERHUB_USERNAME` +
-   `DOCKERHUB_TOKEN` (a token with write on `docker.io/serialexp/scry`).
+1. Repository Settings → Actions → General must allow GitHub Actions to create
+   and approve pull requests.
+2. The `serialexp` org must have Depot runners enabled, and the Depot `scry`
+   project must trust this repository through GitHub OIDC.
+3. Set `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` with write access to
+   `docker.io/serialexp/scry`.
 
-To cut a release:
+`CARGO_REGISTRY_TOKEN` is intentionally absent: Scry publishes binary archives
+and a container image, not its internal workspace crates. Release PRs opened by
+the repository token do not emit a normal `pull_request` event, so the release
+workflow explicitly dispatches `ci.yml` against the finalized branch head.
 
-```bash
-git tag v0.6.0
-git push origin v0.6.0   # → image pushed; desktop draft release created
-```
-
-Review the draft's assets, then publish it. `install.sh` (release mode)
-pulls the latest *published* `v*` release, so it only sees it once
-published. The Ubuntu desktop runner `apt install`s
-`libwebkit2gtk-4.1-dev` + `librsvg2-dev` so the AppImage actually bundles
-there.
-
-> On tag builds, `scripts/stamp-version.mjs` writes the tag's version into
-> `src-tauri/tauri.conf.json` before bundling, so asset filenames and the
-> installer version track the release tag automatically (the committed
-> `0.1.0` is just a dev placeholder). Release tags must be plain
+> `scripts/stamp-version.mjs` copies the workspace Cargo version into
+> `src-tauri/tauri.conf.json` and `package.json`, so local frontend builds and
+> release PRs cannot retain a stale display version. Release tags must be plain
 > `vMAJOR.MINOR.PATCH` — a pre-release/build suffix breaks the Windows MSI
 > (WiX ProductVersion is numeric only), so the stamp step rejects it.
 

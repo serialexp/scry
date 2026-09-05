@@ -1,7 +1,7 @@
 // stamp-version.mjs — align the frontend version with the workspace Cargo version.
 //
 // Single source of truth for every first-party version is
-// `[workspace.package].version` in the root Cargo.toml (see scripts/release.sh).
+// `[workspace.package].version` in the root Cargo.toml (updated by just-release).
 // The desktop bundle, however, bakes its displayed version (`__APP_VERSION__`,
 // via desktop/vite.config.ts) from desktop/src-tauri/tauri.conf.json — and Tauri
 // packaging reads both that and desktop/package.json. Those two JSON files used
