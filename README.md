@@ -489,16 +489,16 @@ scripts/smoke-webui.sh            # scry web browser surface (auth + multi-targe
 
 ## Releases
 
-Releases are driven by conventional commits and `just-release`. Pushes to
-`main` automatically create or update a release PR with the calculated version,
-changelogs, lockfile, and synchronized frontend version. Merging its
-`release: X.Y.Z` commit builds the image and CLI archives, then creates the tag
-and GitHub Release automatically—do not create or push release tags manually.
+Releases are driven by conventional commits and `just-release`. On each push to
+`main`, `.github/workflows/release.yml` invokes just-release: ordinary commits
+create or update its release PR, while a merged `release: X.Y.Z` commit enters
+post-release mode. The latter builds and pushes the image and CLI archives first,
+then just-release creates the tag and GitHub Release automatically. Do not create
+or push release tags manually.
 
 Repository Actions settings must allow Actions to create pull requests. The
 release workflow intentionally has no `CARGO_REGISTRY_TOKEN`: Scry publishes
-binary archives and a container image, not its internal crates. See
-`.github/workflows/release-pr.yml` and `.github/workflows/release.yml`.
+binary archives and a container image, not its internal crates.
 
 ## Deploy (Kubernetes)
 

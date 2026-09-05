@@ -48,10 +48,12 @@ jobs:
         run: cargo clippy --workspace --all-targets
 
       - name: Build
-        run: cargo build --workspace --locked
+        # just-release updates workspace manifest versions but intentionally does
+        # not rewrite Cargo.lock; Cargo refreshes those local package entries here.
+        run: cargo build --workspace
 
       - name: Test
-        run: cargo test --workspace --locked
+        run: cargo test --workspace
 
   # ── Desktop app: TypeScript typecheck + frontend build ─────────────────
   desktop:

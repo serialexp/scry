@@ -41,10 +41,9 @@ exclude = [
 ]
 
 [workspace.package]
-# Single source of truth for every first-party crate version. just-release
-# updates this in an automatic release PR and creates the matching `vX.Y.Z` tag
-# after that PR merges. The vendored `binschema-runtime` is the one exception:
-# it tracks upstream binschema and keeps its explicitly pinned version.
+# Single source of truth for the Cargo workspace version. just-release updates
+# every workspace member to this version in its release PR and creates the
+# matching `vX.Y.Z` tag after that PR merges.
 version = "0.22.1"
 edition = "2021"
 # kube-rs 3.x sets the floor: its MSRV is 1.88. Everything else in the

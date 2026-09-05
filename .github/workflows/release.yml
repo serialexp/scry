@@ -1,89 +1,28 @@
 name: Release
 
-# Publication is driven by a merged just-release PR, not by a manually-pushed
-# tag. A `release: X.Y.Z` commit on main builds every distributable first; only
-# after all builds succeed does just-release create vX.Y.Z and the GitHub Release
-# and attach this run's artifacts. Ordinary main pushes make every publish job a
-# no-op (release-pr.yml handles those).
+# just-release owns both phases: ordinary main commits create/update its release
+# PR, while a merged release commit enters post-release mode and publishes. The
+# distributable builds are gated to post-release commits so publication only
+# happens after every artifact succeeds.
 on:
   push:
     branches: [main]
-  workflow_dispatch:
-    inputs:
-      release_ref:
-        description: Release commit SHA to retry after a failed or skipped publication
-        required: true
-        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
 
 jobs:
-  detect:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    outputs:
-      release: ${{ steps.release.outputs.release }}
-      version: ${{ steps.release.outputs.version }}
-      tag: ${{ steps.release.outputs.tag }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          ref: ${{ inputs.release_ref || github.sha }}
-
-      - name: Detect merged release commit
-        id: release
-        shell: bash
-        run: |
-          set -euo pipefail
-          release_version=""
-          # GitHub appends ` (#N)` to the subject of squash-merged PRs by
-          # default. Accept that suffix while keeping the release version itself
-          # strictly anchored and validated against Cargo.toml below.
-          release_subject='^release: ([0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?)( \(#[0-9]+\))?$'
-          subject=$(git log -1 --format=%s)
-          if [[ "$subject" =~ $release_subject ]]; then
-            release_version="${BASH_REMATCH[1]}"
-          elif [ "$(git rev-list --parents -n 1 HEAD | wc -w)" -ge 3 ]; then
-            while read -r parent_subject; do
-              if [[ "$parent_subject" =~ $release_subject ]]; then
-                release_version="${BASH_REMATCH[1]}"
-                break
-              fi
-            done < <(git log -1 --format=%P | xargs -n1 git log -1 --format=%s)
-          fi
-
-          if [ -z "$release_version" ]; then
-            echo "release=false" >> "$GITHUB_OUTPUT"
-            echo "HEAD is not a just-release commit; nothing to publish"
-            exit 0
-          fi
-
-          workspace_version=$(awk '
-            /^\[workspace\.package\]$/ { in_section=1; next }
-            in_section && /^\[/ { exit }
-            in_section && /^version[[:space:]]*=/ {
-              sub(/^[^"]*"/, ""); sub(/".*/, ""); print; exit
-            }
-          ' Cargo.toml)
-          if [ "$release_version" != "$workspace_version" ]; then
-            echo "::error::release commit version $release_version != workspace version $workspace_version"
-            exit 1
-          fi
-          echo "release=true" >> "$GITHUB_OUTPUT"
-          echo "version=$release_version" >> "$GITHUB_OUTPUT"
-          echo "tag=v$release_version" >> "$GITHUB_OUTPUT"
-
   image:
-    needs: detect
-    if: needs.detect.outputs.release == 'true'
+    if: >-
+      startsWith(github.event.head_commit.message, 'release:') ||
+      (startsWith(github.event.head_commit.message, 'Merge') && contains(github.event.head_commit.message, 'release/'))
     runs-on: depot-ubuntu-22.04
     permissions:
       contents: read
       id-token: write
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.release_ref || github.sha }}
       - uses: depot/setup-action@v1
       - name: Login to Docker Hub
         uses: docker/login-action@v3
@@ -91,14 +30,22 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Build and push image
-        run: depot bake --push
-        env:
-          TAG: ${{ needs.detect.outputs.tag }}
-          PUSH_LATEST: "true"
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(awk '
+            /^\[workspace\.package\]$/ { in_section=1; next }
+            in_section && /^\[/ { exit }
+            in_section && /^version[[:space:]]*=/ {
+              sub(/^[^"]*"/, ""); sub(/".*/, ""); print; exit
+            }
+          ' Cargo.toml)
+          TAG="v$version" PUSH_LATEST=true depot bake --push
 
   cli:
-    needs: detect
-    if: needs.detect.outputs.release == 'true'
+    if: >-
+      startsWith(github.event.head_commit.message, 'release:') ||
+      (startsWith(github.event.head_commit.message, 'Merge') && contains(github.event.head_commit.message, 'release/'))
     permissions:
       contents: read
     strategy:
@@ -128,8 +75,6 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.release_ref || github.sha }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -143,16 +88,23 @@ jobs:
           tool: cross
       - name: Build static Linux binary
         if: matrix.cross
-        run: cross build --release -p scry --target ${{ matrix.target }} --locked
+        run: cross build --release -p scry --target ${{ matrix.target }}
       - name: Build native binary
         if: ${{ !matrix.cross }}
-        run: cargo build --release -p scry --target ${{ matrix.target }} --locked
+        run: cargo build --release -p scry --target ${{ matrix.target }}
       - name: Package tarball and checksum
         id: package
         shell: bash
         run: |
           set -euo pipefail
-          asset="scry-${{ needs.detect.outputs.version }}-${{ matrix.os }}-${{ matrix.arch }}.tar.gz"
+          version=$(awk '
+            /^\[workspace\.package\]$/ { in_section=1; next }
+            in_section && /^\[/ { exit }
+            in_section && /^version[[:space:]]*=/ {
+              sub(/^[^"]*"/, ""); sub(/".*/, ""); print; exit
+            }
+          ' Cargo.toml)
+          asset="scry-${version}-${{ matrix.os }}-${{ matrix.arch }}.tar.gz"
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/scry" dist/
           cp README.md dist/
@@ -172,24 +124,25 @@ jobs:
             ${{ steps.package.outputs.asset }}.sha256
           if-no-files-found: error
 
-  publish:
-    needs: [detect, image, cli]
-    if: needs.detect.outputs.release == 'true'
+  release:
+    needs: [image, cli]
+    if: >-
+      always() && !cancelled() &&
+      (needs.image.result == 'success' || needs.image.result == 'skipped') &&
+      (needs.cli.result == 'success' || needs.cli.result == 'skipped')
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pull-requests: write
       actions: read
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ inputs.release_ref || github.sha }}
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Create tag and GitHub Release
-        # No CARGO_REGISTRY_TOKEN: Scry publishes binaries and an image, not its
-        # internal workspace crates. just-release therefore skips crates.io.
+      - name: Run just-release
         run: npx --yes just-release@0.18.0
         env:
           CI: 1

@@ -103,21 +103,20 @@ instructions on Windows.
 ## Releases / CI
 
 Releases are automated by pinned `just-release@0.18.0` and conventional
-commits. An ordinary push to `main` runs `.github/workflows/release-pr.yml`,
-which creates or updates a `release/YYYY-MM-DD` PR containing the calculated
-version bump, per-crate changelogs, and an aggregate root changelog used as the
-GitHub release notes. It also synchronizes `Cargo.lock`, this package's
-version, and `src-tauri/tauri.conf.json`.
+commits. An ordinary push to `main` runs `.github/workflows/release.yml`, where
+just-release creates or updates a `release/YYYY-MM-DD` PR containing its
+calculated version bump and per-package changelogs. The workflow does not amend
+or force-push the generated commit after just-release creates it.
 
-Merge that PR to publish. `.github/workflows/release.yml` recognizes the merged
+Merge that PR to publish. The same workflow recognizes the merged
 `release: X.Y.Z` commit, builds and pushes `docker.io/serialexp/scry:vX.Y.Z`
 and `latest`, builds four CLI archives, and only then asks just-release to create
 the `vX.Y.Z` tag and GitHub Release with those assets. Desktop/Tauri bundles
 remain disabled; the browser UI is embedded in the CLI/server binary.
 
-When squash or rebase merging, preserve the exact `release: X.Y.Z` commit
-subject. A regular merge is also detected. Do not manually edit versions or
-create/push release tags.
+just-release recognizes both squash/rebase release commits and regular merges
+of its release branch. Do not manually edit Cargo versions or create/push
+release tags.
 
 **One-time prerequisites** (dashboard/secrets — not in code):
 
@@ -129,13 +128,11 @@ create/push release tags.
    `docker.io/serialexp/scry`.
 
 `CARGO_REGISTRY_TOKEN` is intentionally absent: Scry publishes binary archives
-and a container image, not its internal workspace crates. Release PRs opened by
-the repository token do not emit a normal `pull_request` event, so the release
-workflow explicitly dispatches `ci.yml` against the finalized branch head.
+and a container image, not its internal workspace crates.
 
 > `scripts/stamp-version.mjs` copies the workspace Cargo version into
-> `src-tauri/tauri.conf.json` and `package.json`, so local frontend builds and
-> release PRs cannot retain a stale display version. Release tags must be plain
+> `src-tauri/tauri.conf.json` and `package.json` when desktop packaging needs to
+> be synchronized explicitly. Release tags must be plain
 > `vMAJOR.MINOR.PATCH` — a pre-release/build suffix breaks the Windows MSI
 > (WiX ProductVersion is numeric only), so the stamp step rejects it.
 
