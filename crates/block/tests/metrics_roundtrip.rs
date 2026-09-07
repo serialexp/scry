@@ -22,7 +22,7 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use scry_block::{BlockBuilder, BlockBuilderConfig, BlockMeta, MetricsBlockBuilder};
 use scry_proto::generated::{
     IntegerValueV2Input, LabelPair, MetricDescriptorV2, MetricNumberV2, MetricPointV2,
-    MetricPointV2Value, ScalarPointV2Input,
+    MetricPointV2Value, MetricsBatchV2, ScalarPointV2Input,
 };
 use scry_proto::streaming::MetricsAppender;
 use scry_proto::streaming_v2::MetricsV2Appender;
@@ -371,6 +371,61 @@ async fn metrics_structured_scalar_roundtrip() {
             .value(0),
         42
     );
+}
+
+#[test]
+fn structured_descriptor_ids_are_batch_local() {
+    fn batch(name: &str, value: i64, ts: u64) -> Vec<u8> {
+        MetricsBatchV2 {
+            magic: scry_proto::constants::METRICS_BATCH_V2_MAGIC,
+            descriptors: vec![MetricDescriptorV2 {
+                id: 1,
+                name: name.into(),
+                description: String::new(),
+                unit: "1".into(),
+                metric_kind: 2,
+                temporality: 2,
+                monotonic: 1,
+                resource_attrs: vec![],
+                scope_name: String::new(),
+                scope_version: String::new(),
+                scope_attrs: vec![],
+            }],
+            points: vec![MetricPointV2 {
+                value: MetricPointV2Value::ScalarPointV2(
+                    ScalarPointV2Input {
+                        descriptor_id: 1,
+                        start_unix_nano: 1,
+                        ts_unix_nano: ts,
+                        flags: 0,
+                        attributes: vec![],
+                        exemplars: vec![],
+                        number: MetricNumberV2 {
+                            value: scry_proto::generated::MetricNumberV2Value::IntegerValueV2(
+                                IntegerValueV2Input { value }.into(),
+                            ),
+                        },
+                    }
+                    .into(),
+                ),
+            }],
+        }
+        .encode()
+        .unwrap()
+    }
+
+    let writer = Uuid::now_v7();
+    let mut builder = MetricsBlockBuilder::new(writer, BlockBuilderConfig::default());
+    for payload in [batch("requests", 1, 100), batch("errors", 2, 200)] {
+        let (_, points) = scry_proto::streaming_v2::decode_metrics_batch_v2_into(
+            &payload,
+            scry_proto::streaming_v2::DecodeLimits::default(),
+            &mut builder,
+        )
+        .unwrap();
+        assert_eq!(points, 1);
+    }
+    assert_eq!(builder.row_count(), 2);
 }
 
 #[tokio::test]

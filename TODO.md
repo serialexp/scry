@@ -67,10 +67,10 @@ work is tracked below.
       `scripts/profile-compact-memory.sh`; unit/E2E fixtures cannot establish RSS.
 
 ### Ingest, WAL, and block building
-- [ ] Rotate/upload or spill block-sized chunks during WAL recovery. Replay
-      currently appends all surviving WAL frames into one builder per shard and
-      can materialize an arbitrarily large acknowledged backlog across up to 40
-      signal/shard builders before serving.
+- [x] Rotate/upload block-sized chunks during WAL recovery. Recovery decodes
+      each frame transactionally into scratch, uploads synchronously at the
+      normal builder thresholds, and releases the old WAL range only after the
+      complete backlog succeeds.
 - [ ] Add one global ingest memory envelope covering active builders and
       encode/upload tasks. Today 5 signals × 8 shards × 128 MiB targets can retain
       ~5 GiB before encode scratch, while upload concurrency scales with physical
@@ -78,9 +78,21 @@ work is tracked below.
 - [ ] Stop idle connections retaining peak scratch-builder capacity for all
       signals. Shrink/replace oversized scratch after merge or use a bounded
       shared pool; enforce an aggregate connection-scratch budget.
-- [ ] Reject corrupt/implausible WAL frame lengths before allocation. Replay
-      trusts a `u32` header and can attempt a nearly 4 GiB `Vec` before checking
-      truncation or CRC.
+- [x] Reject corrupt/implausible WAL frame lengths before allocation. Append and
+      replay share the outer 32 MiB protocol cap; oversized replay data fails
+      closed so its source segment is not silently released.
+- [ ] Make the live logs watermark a contiguous-durability frontier. Concurrent
+      block B can currently upload before an earlier block A (or while A fails)
+      and advance `wal_seg_max` past A, temporarily hiding A's live-ring records
+      until replay. Track completed ranges and advance only across a durable
+      prefix.
+- [ ] Revisit the ACK durability boundary. WAL append is buffered and fsyncs on
+      rotation, so ACK means process-crash buffering rather than power-loss
+      durability. Either implement group commit before ACK or document and
+      enforce the intended RPO explicitly.
+- [ ] Publish legacy metrics/log tail items only after full decode and WAL commit.
+      Their streaming taps can currently emit a valid prefix from a malformed
+      batch that is subsequently rejected and never stored.
 
 ### Query and queryd
 - [ ] Budget per-query fingerprint→label materialization outside DataFusion.

@@ -1,7 +1,7 @@
 //! End-to-end exercise for [`scry_wal::Wal`]: write, rotate, replay,
 //! cross-restart durability, mark_uploaded.
 
-use scry_wal::{SegmentId, Wal, WalConfig};
+use scry_wal::{SegmentId, Wal, WalConfig, MAX_REPLAY_FRAME_BYTES};
 use tempfile::TempDir;
 
 fn cfg(dir: &TempDir, max_bytes: u64) -> WalConfig {
@@ -145,7 +145,49 @@ async fn auto_rotates_when_segment_exceeds_cap() {
 }
 
 #[tokio::test]
-async fn replay_skips_torn_tail() {
+async fn replay_rejects_oversized_header_before_allocating() {
+    let tmp = TempDir::new().unwrap();
+    {
+        let mut w = Wal::open(cfg(&tmp, 1024 * 1024)).await.unwrap();
+        w.append(b"before-bad-header").await.unwrap();
+        w.rotate().await.unwrap();
+        w.append(b"later-segment").await.unwrap();
+        w.rotate().await.unwrap();
+    }
+    let seg0 = tmp
+        .path()
+        .join("dummy")
+        .join("wal-00000000000000000000.log");
+    let bytes = std::fs::read(&seg0).unwrap();
+    let first_frame_len = 8 + b"before-bad-header".len();
+    let mut rewritten = bytes[..first_frame_len].to_vec();
+    rewritten.extend_from_slice(&(MAX_REPLAY_FRAME_BYTES + 1).to_be_bytes());
+    rewritten.extend_from_slice(&0u32.to_be_bytes());
+    std::fs::write(&seg0, rewritten).unwrap();
+
+    let w2 = Wal::open(cfg(&tmp, 1024 * 1024)).await.unwrap();
+    let mut replay = w2.replay().unwrap();
+    assert_eq!(replay.next().unwrap().unwrap(), b"before-bad-header");
+    let error = replay.next().unwrap().unwrap_err();
+    assert!(error.to_string().contains("oversized frame"));
+    assert!(
+        seg0.exists(),
+        "corrupt source segment must remain for recovery"
+    );
+}
+
+#[tokio::test]
+async fn append_rejects_payload_above_replay_limit_without_writing() {
+    let tmp = TempDir::new().unwrap();
+    let mut w = Wal::open(cfg(&tmp, u64::MAX)).await.unwrap();
+    let before = w.current_bytes();
+    let oversized = vec![0u8; MAX_REPLAY_FRAME_BYTES as usize + 1];
+    assert!(w.append(&oversized).await.is_err());
+    assert_eq!(w.current_bytes(), before);
+}
+
+#[tokio::test]
+async fn replay_fails_closed_on_torn_tail() {
     let tmp = TempDir::new().unwrap();
     {
         let mut w = Wal::open(cfg(&tmp, 1024 * 1024)).await.unwrap();
@@ -168,10 +210,12 @@ async fn replay_skips_torn_tail() {
         f.write_all(&[0, 0, 0, 8]).unwrap(); // claims an 8-byte payload, nothing follows
     }
     let w2 = Wal::open(cfg(&tmp, 1024 * 1024)).await.unwrap();
-    let records: Vec<Vec<u8>> = w2.replay().unwrap().collect::<Result<_, _>>().unwrap();
-    assert_eq!(
-        records,
-        vec![b"good-record".to_vec()],
-        "torn-tail bytes should not fabricate a record"
+    let mut replay = w2.replay().unwrap();
+    assert_eq!(replay.next().unwrap().unwrap(), b"good-record");
+    let error = replay.next().unwrap().unwrap_err();
+    assert!(error.to_string().contains("truncated frame header"));
+    assert!(
+        seg0.exists(),
+        "torn source segment must remain for recovery"
     );
 }

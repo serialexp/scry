@@ -42,6 +42,7 @@ const SCHEMA_VERSION: u32 = 1;
 /// physical parquet column.
 pub struct ProfilesBlockBuilder {
     writer_id: Uuid,
+    block_uuid: Option<Uuid>,
     cfg: BlockBuilderConfig,
     ts: Vec<u64>,
     durations: Vec<u64>,
@@ -90,6 +91,7 @@ impl BlockBuilder for ProfilesBlockBuilder {
     fn new(writer_id: Uuid, cfg: BlockBuilderConfig) -> Self {
         Self {
             writer_id,
+            block_uuid: None,
             cfg,
             ts: Vec::with_capacity(256),
             durations: Vec::with_capacity(256),
@@ -147,6 +149,10 @@ impl BlockBuilder for ProfilesBlockBuilder {
 
     fn set_wal_shard(&mut self, shard: u32) {
         self.cfg.wal_shard = Some(shard);
+    }
+
+    fn set_block_uuid(&mut self, uuid: Uuid) {
+        self.block_uuid = Some(uuid);
     }
 
     fn finish_and_upload(
@@ -269,7 +275,7 @@ impl ProfilesBlockBuilder {
         let parquet_bytes = Bytes::from(buf);
         let byte_size = parquet_bytes.len() as u64;
 
-        let block_uuid = Uuid::now_v7();
+        let block_uuid = self.block_uuid.unwrap_or_else(Uuid::now_v7);
         let parquet_path = Path::from(block_path(
             SIGNAL,
             self.ts_min,

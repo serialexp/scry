@@ -140,6 +140,11 @@ pub trait BlockBuilder: Send + 'static {
     /// passes its own `shard_index` here at block-close. Default no-op.
     fn set_wal_shard(&mut self, _shard: u32) {}
 
+    /// Override the generated block UUID. Startup WAL recovery uses a
+    /// deterministic UUID per chunk so a crash/retry overwrites the same
+    /// objects instead of creating permanent duplicate rows.
+    fn set_block_uuid(&mut self, uuid: Uuid);
+
     /// Consume the builder, encode to parquet (+ any sidecars), upload
     /// to object storage, and return a `BlockMeta` ready for catalog
     /// insertion. Returns `Ok(None)` if the builder turned out to be

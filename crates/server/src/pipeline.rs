@@ -253,19 +253,18 @@ pub struct Pipeline<B: BlockBuilder> {
     /// destroying acked records that exist nowhere else. Each block
     /// therefore releases exactly `[block_low_seg, sealed]`.
     ///
-    /// Starts at 0 (replay merged every on-disk segment's records into the
-    /// builder, so the first successful upload legitimately owns them all)
-    /// and advances to `sealed + 1` on every `spawn_upload`.
+    /// Starts at the active segment created when the WAL opens; startup replay
+    /// uploads and releases all older segments before live ingest begins. It
+    /// advances to `sealed + 1` on every `spawn_upload`.
     block_low_seg: u64,
 }
 
 impl<B: BlockBuilder> Pipeline<B> {
-    /// Open the WAL (signal subdir = `B::SIGNAL`), replay any leftover
-    /// records into a fresh builder, and return a pipeline ready to
-    /// ingest. The replayed records are *not* re-acked to the agent
-    /// (agents will resend any in-flight batches they hadn't yet seen
-    /// an ack for, and dedup is a v0.3 concern), but they are durable
-    /// and will be uploaded in the next flush.
+    /// Open the WAL (signal subdir = `B::SIGNAL`), replay leftover records
+    /// transactionally into bounded recovery blocks, upload those blocks, and
+    /// return a pipeline ready to ingest. Replayed records are not re-acked to
+    /// the agent; acknowledged WAL data is released only after the complete
+    /// recovery succeeds.
     pub async fn open(
         wal_dir: PathBuf,
         store: Arc<dyn ObjectStore>,
@@ -296,34 +295,121 @@ impl<B: BlockBuilder> Pipeline<B> {
         decode: DecodeFn<B>,
         cfg: BlockBuilderConfig,
     ) -> Result<Self> {
+        Self::open_with_config_and_shard(wal_dir, store, catalog, writer_uuid, decode, cfg, 0).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn open_with_config_and_shard(
+        wal_dir: PathBuf,
+        store: Arc<dyn ObjectStore>,
+        catalog: Option<Arc<std::sync::Mutex<Catalog>>>,
+        writer_uuid: Uuid,
+        decode: DecodeFn<B>,
+        cfg: BlockBuilderConfig,
+        shard_index: u32,
+    ) -> Result<Self> {
         let wal = Wal::open(WalConfig::new(wal_dir, B::SIGNAL))
             .await
             .with_context(|| format!("opening {} WAL", B::SIGNAL))?;
+        let replay_high = wal.current_segment().0.checked_sub(1).map(SegmentId);
 
         let mut builder = B::new(writer_uuid, cfg);
+        let mut scratch = B::new(writer_uuid, cfg);
         let mut replayed_records = 0u64;
+        use sha2::{Digest, Sha256};
         let mut replayed_frames = 0u64;
+        let mut replayed_blocks = 0u64;
+        let mut recovery_hash = Sha256::new();
         for frame in wal.replay().context("scanning WAL for replay")? {
             let payload = frame.context("reading WAL frame")?;
-            let n = (decode)(&payload, &mut builder)
+            recovery_hash.update((payload.len() as u64).to_be_bytes());
+            recovery_hash.update(&payload);
+            // Match live ingest semantics: wire dictionaries and descriptor IDs
+            // are batch-local, and a failed decode must not leave a partial
+            // prefix in the shared recovery builder.
+            let n = (decode)(&payload, &mut scratch)
                 .with_context(|| format!("WAL replay: decode {} batch", B::SIGNAL))?;
+            builder.merge(&mut scratch);
             replayed_records += n as u64;
             replayed_frames += 1;
+
+            // Recovery used to accumulate every surviving WAL frame in one
+            // builder, bypassing the normal block thresholds and OOMing before
+            // the listener could start. Upload recovery blocks synchronously;
+            // old WAL segments are retained until every block succeeds.
+            if builder.should_close() {
+                upload_replay_block(
+                    &mut builder,
+                    writer_uuid,
+                    cfg,
+                    store.as_ref(),
+                    catalog.as_ref(),
+                    None,
+                    shard_index,
+                    recovery_block_uuid(
+                        writer_uuid,
+                        B::SIGNAL,
+                        shard_index,
+                        &recovery_hash.clone().finalize(),
+                    ),
+                )
+                .await?;
+                replayed_blocks += 1;
+            }
+        }
+        if !builder.is_empty() {
+            upload_replay_block(
+                &mut builder,
+                writer_uuid,
+                cfg,
+                store.as_ref(),
+                catalog.as_ref(),
+                replay_high,
+                shard_index,
+                recovery_block_uuid(
+                    writer_uuid,
+                    B::SIGNAL,
+                    shard_index,
+                    &recovery_hash.clone().finalize(),
+                ),
+            )
+            .await?;
+            replayed_blocks += 1;
+        }
+        if let Some(high) = replay_high {
+            let dir = wal.prepare_release(high)?;
+            Wal::release_segments(&dir, SegmentId(0), high)
+                .await
+                .context("releasing successfully replayed WAL segments")?;
+            if let Some(cat) = catalog.as_ref() {
+                if let Err(error) = cat
+                    .lock()
+                    .expect("catalog mutex poisoned")
+                    .advance_watermark(writer_uuid, B::SIGNAL, shard_index, high.0)
+                {
+                    // The durable recovery blocks and their source WAL release
+                    // already committed. A rebuildable cache failure here must
+                    // not turn into a permanent restart loop.
+                    warn!(
+                        signal = B::SIGNAL,
+                        shard = shard_index,
+                        segment = high.0,
+                        %error,
+                        "failed to cache WAL recovery watermark; later catalog convergence will repair it"
+                    );
+                }
+            }
         }
         if replayed_records > 0 {
             info!(
                 signal = B::SIGNAL,
                 replayed_records,
                 replayed_frames,
-                "WAL replay complete; records merged into next block"
+                replayed_blocks,
+                "WAL replay complete; recovery blocks uploaded"
             );
         }
-
-        // Records replayed from the WAL populate the builder before any
-        // live ingest. Stamp the block's start now so the time-based flush
-        // will seal it even if this signal then goes idle (the exact case
-        // that left 22.7M replayed-but-never-uploaded rows stuck in RAM).
-        let block_started_at = (!builder.is_empty()).then(Instant::now);
+        let next_live_segment = wal.current_segment().0;
 
         Ok(Self {
             wal: Arc::new(Mutex::new(wal)),
@@ -338,9 +424,9 @@ impl<B: BlockBuilder> Pipeline<B> {
             upload_stats: None,
             adaptive_compression: false,
             event_sink: None,
-            block_started_at,
-            shard_index: 0,
-            block_low_seg: 0,
+            block_started_at: None,
+            shard_index,
+            block_low_seg: next_live_segment,
         })
     }
 
@@ -484,33 +570,13 @@ impl<B: BlockBuilder> Pipeline<B> {
     }
 
     pub async fn ingest(&mut self, payload: &[u8]) -> Result<u64> {
-        // Order matters: WAL first, builder second. If the WAL append
-        // fails we never put the records into the in-memory builder
-        // — the agent will see the resulting BatchAck failure and
-        // retry. If decode fails partway through, the builder has
-        // absorbed a prefix of the batch's records *and* the WAL has
-        // the whole payload — on next start, replay re-applies the
-        // full batch from the WAL, so the partial absorption here
-        // is overwritten by a clean re-decode. Net effect: a decode
-        // failure just gets a retry from the agent; no duplicate or
-        // missing records.
-        self.wal
-            .lock()
-            .await
-            .append(payload)
-            .await
-            .context("WAL append")?;
-
-        let n = (self.decode)(payload, &mut self.builder)? as u64;
-        self.mark_block_started();
-
-        if self.builder.should_close() {
-            self.spawn_upload().await?;
-        }
-        // Reap any finished upload tasks so the JoinSet doesn't grow
-        // for the lifetime of the process. Non-blocking — we don't
-        // wait for in-flight work here.
-        self.reap_finished();
+        // Keep this convenience path transactionally identical to production:
+        // fully decode first, append the accepted payload to WAL, then merge.
+        // A malformed batch can neither poison replay nor leave a rejected
+        // prefix in the active builder.
+        let mut scratch = self.new_scratch();
+        let n = (self.decode)(payload, &mut scratch)? as u64;
+        self.ingest_decoded(payload, &mut scratch).await?;
         Ok(n)
     }
 
@@ -797,19 +863,19 @@ impl<B: BlockBuilder> ShardedPipeline<B> {
         let mut shards = Vec::with_capacity(n);
         for k in 0..n {
             let shard_wal = wal_dir.join(format!("shard-{k:02}"));
-            let mut pipe = Pipeline::<B>::open_with_config(
+            let mut pipe = Pipeline::<B>::open_with_config_and_shard(
                 shard_wal,
                 store.clone(),
                 catalog.clone(),
                 writer_uuid,
                 decode,
                 cfg,
+                k as u32,
             )
             .await
             .with_context(|| format!("opening {} shard {k}", B::SIGNAL))?
             .with_upload_sem(upload_sem.clone())
-            .with_adaptive_compression(adaptive_compression)
-            .with_shard_index(k as u32);
+            .with_adaptive_compression(adaptive_compression);
             if let Some(s) = upload_stats.as_ref() {
                 pipe = pipe.with_upload_stats(s.clone());
             }
@@ -843,6 +909,72 @@ impl<B: BlockBuilder> ShardedPipeline<B> {
     pub fn shards(&self) -> &[Arc<Mutex<Pipeline<B>>>] {
         &self.shards
     }
+}
+
+fn recovery_block_uuid(writer: Uuid, signal: &str, shard: u32, prefix_digest: &[u8]) -> Uuid {
+    use sha2::{Digest, Sha256};
+
+    // Stable for identical replayed content, but generation-specific even when
+    // WAL segment numbering resets after an old active file is removed.
+    let mut hash = Sha256::new();
+    hash.update(b"scry-wal-recovery-v2\0");
+    hash.update(writer.as_bytes());
+    hash.update(signal.as_bytes());
+    hash.update(shard.to_be_bytes());
+    hash.update(prefix_digest);
+    let digest = hash.finalize();
+    let mut bytes: [u8; 16] = digest[..16].try_into().expect("SHA-256 has 32 bytes");
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
+/// Persist one bounded block built during startup replay. Old WAL segments are
+/// deliberately released only after the complete replay succeeds; a later
+/// decode/upload failure therefore leaves the full source backlog available for
+/// the next restart. As with a crash between a normal block PUT and WAL release,
+/// retrying may create duplicate blocks, preferring at-least-once recovery over
+/// acknowledged data loss.
+async fn upload_replay_block<B: BlockBuilder>(
+    builder: &mut B,
+    writer_uuid: Uuid,
+    cfg: BlockBuilderConfig,
+    store: &dyn ObjectStore,
+    catalog: Option<&Arc<std::sync::Mutex<Catalog>>>,
+    replay_high: Option<SegmentId>,
+    shard_index: u32,
+    block_uuid: Uuid,
+) -> Result<()> {
+    let mut recovery = std::mem::replace(builder, B::new(writer_uuid, cfg));
+    recovery.set_block_uuid(block_uuid);
+    if let Some(high) = replay_high {
+        recovery.set_wal_seg_max(high.0);
+        recovery.set_wal_shard(shard_index);
+    }
+    let meta = recovery
+        .finish_and_upload(store)
+        .await
+        .with_context(|| format!("WAL replay: upload {} recovery block", B::SIGNAL))?
+        .ok_or_else(|| anyhow::anyhow!("WAL replay: non-empty builder produced no block"))?;
+    if let Some(cat) = catalog {
+        if let Err(error) = cat
+            .lock()
+            .expect("catalog mutex poisoned")
+            .insert_block(&meta)
+        {
+            // Match normal uploads: the bucket is authoritative and catalog
+            // convergence can recover this row. Keeping the WAL because only
+            // this rebuildable cache failed would duplicate the durable block
+            // on every restart.
+            warn!(
+                signal = B::SIGNAL,
+                block_uuid = %meta.uuid,
+                %error,
+                "catalog insert failed for WAL recovery block; bucket has the data"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// The body of an upload task: encode + PUT, then catch up the WAL and
@@ -989,14 +1121,118 @@ async fn run_upload<B: BlockBuilder>(
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use futures::stream::BoxStream;
+    use futures::{stream::BoxStream, StreamExt};
     use object_store::{
         memory::InMemory, path::Path, CopyOptions, GetOptions, GetResult, ListResult,
         MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload,
         PutResult, RenameOptions, Result as OsResult,
     };
-    use scry_block::{BlockBuilderConfig, DummyBlockBuilder};
+    use scry_block::{BlockBuilderConfig, DummyBlockBuilder, MetricsBlockBuilder};
+    use scry_proto::generated::{
+        IntegerValueV2Input, MetricDescriptorV2, MetricNumberV2, MetricPointV2, MetricPointV2Value,
+        MetricsBatchV2, ScalarPointV2Input,
+    };
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn structured_batch(name: &str, ts: u64) -> Vec<u8> {
+        MetricsBatchV2 {
+            magic: scry_proto::constants::METRICS_BATCH_V2_MAGIC,
+            descriptors: vec![MetricDescriptorV2 {
+                id: 1,
+                name: name.into(),
+                description: String::new(),
+                unit: "1".into(),
+                metric_kind: 2,
+                temporality: 0,
+                monotonic: 0,
+                resource_attrs: vec![],
+                scope_name: String::new(),
+                scope_version: String::new(),
+                scope_attrs: vec![],
+            }],
+            points: vec![MetricPointV2 {
+                value: MetricPointV2Value::ScalarPointV2(
+                    ScalarPointV2Input {
+                        descriptor_id: 1,
+                        start_unix_nano: 0,
+                        ts_unix_nano: ts,
+                        flags: 0,
+                        attributes: vec![],
+                        exemplars: vec![],
+                        number: MetricNumberV2 {
+                            value: scry_proto::generated::MetricNumberV2Value::IntegerValueV2(
+                                IntegerValueV2Input { value: 1 }.into(),
+                            ),
+                        },
+                    }
+                    .into(),
+                ),
+            }],
+        }
+        .encode()
+        .unwrap()
+    }
+
+    #[test]
+    fn recovery_ids_are_retry_stable_and_generation_specific() {
+        let writer = Uuid::now_v7();
+        let same_a = recovery_block_uuid(writer, "metrics", 2, b"same-prefix");
+        let same_b = recovery_block_uuid(writer, "metrics", 2, b"same-prefix");
+        assert_eq!(same_a, same_b);
+        assert_ne!(
+            same_a,
+            recovery_block_uuid(writer, "metrics", 2, b"different-generation")
+        );
+        assert_ne!(
+            same_a,
+            recovery_block_uuid(writer, "metrics", 3, b"same-prefix")
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_accepts_batch_local_structured_descriptor_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut wal = Wal::open(WalConfig::new(tmp.path(), "metrics"))
+            .await
+            .unwrap();
+        wal.append(&structured_batch("requests", 100))
+            .await
+            .unwrap();
+        wal.append(&structured_batch("errors", 200)).await.unwrap();
+        wal.rotate().await.unwrap();
+        drop(wal);
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let pipeline = Pipeline::<MetricsBlockBuilder>::open_with_config(
+            tmp.path().to_path_buf(),
+            store.clone(),
+            None,
+            Uuid::now_v7(),
+            crate::decode::metrics,
+            BlockBuilderConfig {
+                max_rows: 1,
+                ..BlockBuilderConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(pipeline.builder.is_empty());
+        assert_eq!(store.list(None).count().await, 6); // 2 × parquet/postings/meta
+        assert_eq!(
+            pipeline
+                .wal
+                .lock()
+                .await
+                .replay()
+                .unwrap()
+                .collect::<Result<Vec<_>>>()
+                .unwrap()
+                .len(),
+            0,
+            "source WAL is released only after every recovery block uploads"
+        );
+    }
 
     /// The adaptive-compression policy, exhaustively. When the upload pool
     /// is full we pick DENSE regardless of CPU (the bucket is the wall).

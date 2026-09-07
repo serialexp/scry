@@ -1,7 +1,8 @@
 //! Bounded callback-oriented decoder for canonical metrics v2.
 //!
-//! Descriptors and points are decoded one at a time, so a normal batch is not
-//! materialised as a second in-memory copy before being appended.
+//! Descriptors and points are decoded into one bounded batch representation,
+//! validated through borrowed slices, then appended without cloning that
+//! complete representation solely for validation.
 
 use crate::generated::{MetricDescriptorV2, MetricPointV2};
 use crate::metrics_v2::ValidationError;
@@ -38,6 +39,13 @@ pub enum DecodeError {
 }
 
 pub trait MetricsV2Appender {
+    /// Start a new wire batch. Descriptor IDs are scoped to one
+    /// `MetricsBatchV2`, so state used to resolve point references must not leak
+    /// across calls to [`decode_metrics_batch_v2_into`].
+    fn begin_batch(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
     fn descriptor(&mut self, descriptor: &MetricDescriptorV2) -> Result<(), String>;
     fn point(&mut self, point: &MetricPointV2) -> Result<(), String>;
 }
@@ -65,7 +73,8 @@ pub fn decode_metrics_batch_v2_into(
     if descriptors_len > limits.max_descriptors {
         return Err(DecodeError::ItemLimit);
     }
-    let mut descriptors = Vec::with_capacity(descriptors_len as usize);
+    let descriptor_capacity = (descriptors_len as usize).min(payload.len() / 8);
+    let mut descriptors = Vec::with_capacity(descriptor_capacity);
     for _ in 0..descriptors_len {
         descriptors.push(MetricDescriptorV2::decode_with_decoder(&mut decoder)?);
     }
@@ -73,7 +82,8 @@ pub fn decode_metrics_batch_v2_into(
     if points_len > limits.max_points {
         return Err(DecodeError::ItemLimit);
     }
-    let mut points = Vec::with_capacity(points_len as usize);
+    let point_capacity = (points_len as usize).min(payload.len() / 8);
+    let mut points = Vec::with_capacity(point_capacity);
     for _ in 0..points_len {
         points.push(MetricPointV2::decode_with_decoder(&mut decoder)?);
     }
@@ -85,11 +95,8 @@ pub fn decode_metrics_batch_v2_into(
 
     // Validate the complete batch before the first callback. An invalid point
     // must not leave a partially-mutated block builder behind.
-    crate::metrics_v2::validate(&crate::generated::MetricsBatchV2 {
-        magic: crate::constants::METRICS_BATCH_V2_MAGIC,
-        descriptors: descriptors.clone(),
-        points: points.clone(),
-    })?;
+    crate::metrics_v2::validate_parts(&descriptors, &points)?;
+    appender.begin_batch().map_err(DecodeError::Appender)?;
     for descriptor in &descriptors {
         appender
             .descriptor(descriptor)

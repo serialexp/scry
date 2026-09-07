@@ -109,6 +109,7 @@ struct OwnedLink {
 /// `Vec` of owned child rows per span).
 pub struct TracesBlockBuilder {
     writer_id: Uuid,
+    block_uuid: Option<Uuid>,
     cfg: BlockBuilderConfig,
     trace_ids: Vec<[u8; 16]>,
     span_ids: Vec<[u8; 8]>,
@@ -341,6 +342,7 @@ impl BlockBuilder for TracesBlockBuilder {
     fn new(writer_id: Uuid, cfg: BlockBuilderConfig) -> Self {
         Self {
             writer_id,
+            block_uuid: None,
             cfg,
             trace_ids: Vec::with_capacity(256),
             span_ids: Vec::with_capacity(256),
@@ -438,6 +440,10 @@ impl BlockBuilder for TracesBlockBuilder {
 
     fn set_wal_shard(&mut self, shard: u32) {
         self.cfg.wal_shard = Some(shard);
+    }
+
+    fn set_block_uuid(&mut self, uuid: Uuid) {
+        self.block_uuid = Some(uuid);
     }
 
     fn finish_and_upload(
@@ -714,7 +720,7 @@ impl TracesBlockBuilder {
         let parquet_bytes = Bytes::from(buf);
         let byte_size = parquet_bytes.len() as u64;
 
-        let block_uuid = Uuid::now_v7();
+        let block_uuid = self.block_uuid.unwrap_or_else(Uuid::now_v7);
         let parquet_path = Path::from(block_path(
             SIGNAL,
             self.ts_min,

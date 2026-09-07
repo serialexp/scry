@@ -440,6 +440,11 @@ impl<'a, A: MetricsV2Appender> TappingMetricsV2Appender<'a, A> {
 }
 
 impl<A: MetricsV2Appender> MetricsV2Appender for TappingMetricsV2Appender<'_, A> {
+    fn begin_batch(&mut self) -> Result<(), String> {
+        self.descriptors.clear();
+        self.inner.begin_batch()
+    }
+
     fn descriptor(&mut self, descriptor: &MetricDescriptorV2) -> Result<(), String> {
         self.inner.descriptor(descriptor)?;
         self.descriptors.insert(descriptor.id, descriptor.clone());

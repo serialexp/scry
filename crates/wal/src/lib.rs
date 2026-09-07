@@ -78,6 +78,11 @@ const FRAME_HEADER_SIZE: usize = 8;
 /// `ARCHITECTURE.md § The WAL` (256 MiB).
 pub const DEFAULT_MAX_SEGMENT_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Hard payload bound shared by append and replay. Native batches are capped at
+/// 16 MiB; the 32 MiB outer protocol cap leaves compatibility headroom without
+/// allowing a damaged length header to request a multi-gigabyte allocation.
+pub const MAX_REPLAY_FRAME_BYTES: u32 = 32 * 1024 * 1024;
+
 /// Identifies a WAL segment by its monotonically increasing seq.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct SegmentId(pub u64);
@@ -168,6 +173,12 @@ impl Wal {
     /// the frame is written so the per-segment cap is a soft ceiling,
     /// not a hard one.
     pub async fn append(&mut self, payload: &[u8]) -> Result<()> {
+        if payload.len() > MAX_REPLAY_FRAME_BYTES as usize {
+            anyhow::bail!(
+                "WAL payload exceeds replay limit of {} bytes",
+                MAX_REPLAY_FRAME_BYTES
+            );
+        }
         let len: u32 = payload
             .len()
             .try_into()
@@ -315,9 +326,10 @@ impl Wal {
     /// [`Wal::append`]. The active segment (created by [`Wal::open`])
     /// is empty and is skipped; everything older is replayed.
     ///
-    /// Replay stops on the first truncated or CRC-mismatched frame
-    /// inside any one segment (the rest of that segment is treated as
-    /// a torn tail) and moves on to the next segment.
+    /// Replay fails closed on a truncated, oversized, or CRC-mismatched frame.
+    /// The source segment remains on disk for explicit recovery; callers must
+    /// never release an acknowledged segment whose complete contents were not
+    /// decoded successfully.
     pub fn replay(&self) -> Result<ReplayIter> {
         use std::fs as stdfs;
         let mut seqs: Vec<u64> = Vec::new();
@@ -391,39 +403,53 @@ impl Iterator for ReplayIter {
             let f = self.cur_file.as_mut().unwrap();
 
             let mut hdr = [0u8; FRAME_HEADER_SIZE];
-            match f.read_exact(&mut hdr) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    // Clean end of segment.
+            match f.read(&mut hdr[..1]) {
+                Ok(0) => {
+                    // Exact frame boundary: clean end of this segment.
                     self.cur_file = None;
                     continue;
                 }
+                Ok(1) => {}
+                Ok(_) => unreachable!("one-byte read returned more than one byte"),
                 Err(e) => return Some(Err(anyhow::Error::from(e))),
             }
+            if let Err(e) = f.read_exact(&mut hdr[1..]) {
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    return Some(Err(anyhow::anyhow!(
+                        "WAL replay: segment {} has a truncated frame header",
+                        self.cur_seq
+                    )));
+                }
+                return Some(Err(anyhow::Error::from(e)));
+            }
             let (len, crc_expected) = decode_header(&hdr);
+            if len > MAX_REPLAY_FRAME_BYTES {
+                return Some(Err(anyhow::anyhow!(
+                    "WAL replay: segment {} declares oversized frame of {} bytes (limit {})",
+                    self.cur_seq,
+                    len,
+                    MAX_REPLAY_FRAME_BYTES
+                )));
+            }
             let mut buf = vec![0u8; len as usize];
             match f.read_exact(&mut buf) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    tracing::warn!(
-                        seq = self.cur_seq,
-                        "WAL replay: torn tail (truncated payload), skipping rest of segment"
-                    );
-                    self.cur_file = None;
-                    continue;
+                    return Some(Err(anyhow::anyhow!(
+                        "WAL replay: segment {} has a truncated frame payload",
+                        self.cur_seq
+                    )));
                 }
                 Err(e) => return Some(Err(anyhow::Error::from(e))),
             }
             let crc_actual = crc32fast::hash(&buf);
             if crc_actual != crc_expected {
-                tracing::warn!(
-                    seq = self.cur_seq,
-                    expected = crc_expected,
-                    actual = crc_actual,
-                    "WAL replay: CRC mismatch, skipping rest of segment"
-                );
-                self.cur_file = None;
-                continue;
+                return Some(Err(anyhow::anyhow!(
+                    "WAL replay: segment {} CRC mismatch (expected {}, got {})",
+                    self.cur_seq,
+                    crc_expected,
+                    crc_actual
+                )));
             }
             return Some(Ok(buf));
         }

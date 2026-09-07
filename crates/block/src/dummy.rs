@@ -52,6 +52,7 @@ const SCHEMA_VERSION: u32 = 1;
 /// conversion is a buffer-move not a per-element copy.
 pub struct DummyBlockBuilder {
     writer_id: Uuid,
+    block_uuid: Option<Uuid>,
     cfg: BlockBuilderConfig,
     ts: Vec<u64>,
     key_offsets: Vec<i32>,
@@ -90,6 +91,7 @@ impl BlockBuilder for DummyBlockBuilder {
         value_offsets.push(0);
         Self {
             writer_id,
+            block_uuid: None,
             cfg,
             ts: Vec::with_capacity(4096),
             key_offsets,
@@ -168,6 +170,10 @@ impl BlockBuilder for DummyBlockBuilder {
 
     fn set_wal_shard(&mut self, shard: u32) {
         self.cfg.wal_shard = Some(shard);
+    }
+
+    fn set_block_uuid(&mut self, uuid: Uuid) {
+        self.block_uuid = Some(uuid);
     }
 
     fn finish_and_upload(
@@ -289,7 +295,7 @@ impl DummyBlockBuilder {
         let parquet_bytes = Bytes::from(buf);
         let byte_size = parquet_bytes.len() as u64;
 
-        let block_uuid = Uuid::now_v7();
+        let block_uuid = self.block_uuid.unwrap_or_else(Uuid::now_v7);
         let parquet_path = Path::from(block_path(
             SIGNAL,
             self.ts_min,

@@ -708,6 +708,7 @@ struct OwnedSeries {
 /// In-memory metrics block under construction.
 pub struct MetricsBlockBuilder {
     writer_id: Uuid,
+    block_uuid: Option<Uuid>,
     cfg: BlockBuilderConfig,
     // Per-sample column-shaped storage (hot path).
     fingerprints: Vec<u64>,
@@ -719,7 +720,7 @@ pub struct MetricsBlockBuilder {
     // correctness).
     series_seen: HashSet<u64>,
     series_dict: Vec<OwnedSeries>,
-    descriptors: HashMap<u32, MetricDescriptorV2>,
+    descriptors: HashMap<u32, (MetricDescriptorV2, usize)>,
     v2_points: Vec<MetricRow>,
     bytes_est: u64,
     ts_min: u64,
@@ -755,6 +756,7 @@ impl BlockBuilder for MetricsBlockBuilder {
     fn new(writer_id: Uuid, cfg: BlockBuilderConfig) -> Self {
         Self {
             writer_id,
+            block_uuid: None,
             cfg,
             fingerprints: Vec::with_capacity(4096),
             ts: Vec::with_capacity(4096),
@@ -784,7 +786,10 @@ impl BlockBuilder for MetricsBlockBuilder {
         self.ts.append(&mut other.ts);
         self.values.append(&mut other.values);
         self.v2_points.append(&mut other.v2_points);
-        self.descriptors.extend(other.descriptors.drain());
+        // Descriptor IDs are batch-local lookup state. Every retained row owns
+        // its resolved descriptor, so no descriptor map belongs in the shared
+        // block builder after the scratch merge.
+        other.descriptors.clear();
 
         // Series dictionary: dedup against the *shared* builder's
         // `series_seen` so cross-batch dedup scope matches decoding
@@ -832,6 +837,10 @@ impl BlockBuilder for MetricsBlockBuilder {
         self.cfg.wal_shard = Some(shard);
     }
 
+    fn set_block_uuid(&mut self, uuid: Uuid) {
+        self.block_uuid = Some(uuid);
+    }
+
     fn finish_and_upload(
         self,
         store: &dyn ObjectStore,
@@ -868,6 +877,13 @@ impl MetricsAppender for MetricsBlockBuilder {
                 )
             })
             .collect();
+        let label_bytes = owned.iter().fold(0usize, |total, (key, value)| {
+            total
+                .saturating_add(std::mem::size_of::<(String, String)>())
+                .saturating_add(key.len())
+                .saturating_add(value.len())
+        });
+        self.bytes_est = self.bytes_est.saturating_add(label_bytes as u64);
         self.series_dict.push(OwnedSeries {
             fingerprint,
             metric_type,
@@ -890,11 +906,24 @@ impl MetricsAppender for MetricsBlockBuilder {
 }
 
 impl MetricsV2Appender for MetricsBlockBuilder {
+    fn begin_batch(&mut self) -> std::result::Result<(), String> {
+        // Descriptor IDs are references local to one MetricsBatchV2. Keep the
+        // full descriptor on every stored row; this map is only the current
+        // batch's lookup table and must be reset when IDs are reused later.
+        self.descriptors.clear();
+        Ok(())
+    }
+
     fn descriptor(&mut self, descriptor: &MetricDescriptorV2) -> std::result::Result<(), String> {
         if self.descriptors.contains_key(&descriptor.id) {
             return Err(format!("duplicate metric descriptor {}", descriptor.id));
         }
-        self.descriptors.insert(descriptor.id, descriptor.clone());
+        let encoded_len = descriptor
+            .encode()
+            .map_err(|e| format!("encode metric descriptor for sizing: {e}"))?
+            .len();
+        self.descriptors
+            .insert(descriptor.id, (descriptor.clone(), encoded_len));
         Ok(())
     }
 
@@ -916,7 +945,7 @@ impl MetricsV2Appender for MetricsBlockBuilder {
                 (p.descriptor_id, p.ts_unix_nano, &p.attributes, None)
             }
         };
-        let descriptor = self
+        let (descriptor, descriptor_bytes) = self
             .descriptors
             .get(&id)
             .ok_or_else(|| format!("unknown metric descriptor {id}"))?;
@@ -936,7 +965,17 @@ impl MetricsV2Appender for MetricsBlockBuilder {
         };
         self.ts_min = self.ts_min.min(ts);
         self.ts_max = self.ts_max.max(ts);
-        self.bytes_est += 256;
+        // The retained row owns clones of both values below. Charge their
+        // actual wire encodings rather than a flat constant: descriptors with
+        // large resource/scope attributes and histogram points otherwise let a
+        // nominal 128 MiB block grow to multiple GiB before closing.
+        let retained_bytes = descriptor_bytes.saturating_add(
+            point
+                .encode()
+                .map_err(|e| format!("encode metric point for sizing: {e}"))?
+                .len(),
+        );
+        self.bytes_est = self.bytes_est.saturating_add(retained_bytes as u64);
         self.v2_points.push(MetricRow {
             fingerprint,
             ts,
@@ -1080,7 +1119,7 @@ impl MetricsBlockBuilder {
         let postings_size = postings_bytes.len() as u64;
 
         // ── Sidecar JSON ───────────────────────────────────────────
-        let block_uuid = Uuid::now_v7();
+        let block_uuid = self.block_uuid.unwrap_or_else(Uuid::now_v7);
         let series_types: Vec<(u64, u8)> = self
             .series_dict
             .iter()

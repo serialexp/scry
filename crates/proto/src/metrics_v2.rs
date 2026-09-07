@@ -108,14 +108,24 @@ pub fn validate(batch: &MetricsBatchV2) -> Result<(), ValidationError> {
         return Err(ValidationError::BadDescriptor(0));
     }
     validate_lengths(batch)?;
-    let mut descriptors = HashMap::with_capacity(batch.descriptors.len());
-    for d in &batch.descriptors {
+    validate_parts(&batch.descriptors, &batch.points)
+}
+
+/// Validate an already-decoded batch without cloning its descriptor and point
+/// vectors. Length-prefix safety is handled while decoding; this checks the
+/// semantic descriptor/reference invariants over borrowed slices.
+pub fn validate_parts(
+    descriptor_items: &[MetricDescriptorV2],
+    points: &[MetricPointV2],
+) -> Result<(), ValidationError> {
+    let mut descriptors = HashMap::with_capacity(descriptor_items.len());
+    for d in descriptor_items {
         if descriptors.insert(d.id, d).is_some() {
             return Err(ValidationError::DuplicateDescriptor(d.id));
         }
         validate_descriptor(d)?;
     }
-    for p in &batch.points {
+    for p in points {
         validate_point(p, &descriptors)?;
     }
     Ok(())

@@ -77,6 +77,7 @@ struct OwnedStream {
 /// In-memory logs block under construction.
 pub struct LogsBlockBuilder {
     writer_id: Uuid,
+    block_uuid: Option<Uuid>,
     cfg: BlockBuilderConfig,
     // Per-entry column-shaped storage (hot path). One `Vec` per
     // physical parquet column.
@@ -159,6 +160,7 @@ impl BlockBuilder for LogsBlockBuilder {
     fn new(writer_id: Uuid, cfg: BlockBuilderConfig) -> Self {
         Self {
             writer_id,
+            block_uuid: None,
             cfg,
             fingerprints: Vec::with_capacity(4096),
             ts: Vec::with_capacity(4096),
@@ -231,6 +233,10 @@ impl BlockBuilder for LogsBlockBuilder {
 
     fn set_wal_shard(&mut self, shard: u32) {
         self.cfg.wal_shard = Some(shard);
+    }
+
+    fn set_block_uuid(&mut self, uuid: Uuid) {
+        self.block_uuid = Some(uuid);
     }
 
     fn finish_and_upload(
@@ -435,7 +441,7 @@ impl LogsBlockBuilder {
         let postings_size = postings_bytes.len() as u64;
 
         // ── Sidecar JSON ───────────────────────────────────────────
-        let block_uuid = Uuid::now_v7();
+        let block_uuid = self.block_uuid.unwrap_or_else(Uuid::now_v7);
         let all_fingerprints: Vec<u64> = self.stream_dict.iter().map(|s| s.fingerprint).collect();
         let meta = BlockMeta {
             uuid: block_uuid,
