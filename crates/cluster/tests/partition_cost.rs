@@ -20,10 +20,10 @@
 //! already has it. The cost is therefore O(blocks in the partition) GETs per
 //! merge, and it does not fall as the catalog converges.
 //!
-//! Ignored by default — needs Garage and takes minutes. Run it with:
+//! Ignored by default — needs a live S3-compatible store and takes minutes. Run it with:
 //!
 //! ```text
-//! source docker/garage/.env
+//! source docker/seaweedfs/.env
 //! cargo test -p scry-cluster --test partition_cost -- --ignored --nocapture
 //! ```
 //!
@@ -87,10 +87,10 @@ fn rate(n: usize, d: Duration) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs Garage; minutes-long measurement, not an assertion"]
+#[ignore = "needs live S3-compatible storage; minutes-long measurement, not an assertion"]
 async fn measure_compaction_partition_overhead() {
     let cfg = scry_objstore::ObjStoreConfig::from_env()
-        .expect("SCRY_OBJSTORE_* must be set (source docker/garage/.env)");
+        .expect("SCRY_OBJSTORE_* must be set (source docker/seaweedfs/.env)");
     let bucket = cfg.bucket.clone();
     let store: Arc<dyn ObjectStore> = scry_objstore::open(&cfg).await.expect("open object store");
 

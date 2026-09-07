@@ -95,6 +95,10 @@ work is tracked below.
       batch that is subsequently rejected and never stored.
 
 ### Query and queryd
+- [x] Size compaction's log body-bloom admission for its in-memory distinct-gram
+      builder rather than the compact serialized input blooms. Ordinary 2,400- and
+      24,000-row smoke merges now receive permit-relative working memory while
+      pathological cardinality still fails as a controlled resource outcome.
 - [ ] Budget per-query fingerprint→label materialization outside DataFusion.
       Intern while constructing, build only when projected, and cap/reserve
       fingerprints, label pairs, candidates, and bytes.

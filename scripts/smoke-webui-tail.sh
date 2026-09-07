@@ -36,7 +36,7 @@
 # Storage-free by design (like smoke-tail-queryd.sh): the ingester runs without
 # --storage and the query daemons point at the reachable-but-empty stub object
 # store from `lib/stub-objstore.sh`, with convergence effectively disabled. So
-# **only a dev Valkey is required** — no Garage. Point it at SCRY_VALKEY_URL
+# **only a dev Valkey is required** — no real object store. Point it at SCRY_VALKEY_URL
 # (default redis://127.0.0.1:6380, this machine's `scry-valkey-smoke`).
 #
 # Env knobs: SCRY_VALKEY_URL, IA/QQ/QT/RQ/RT/WEB ports, SPEW_RATE, BATCHES.
@@ -76,7 +76,7 @@ command -v curl >/dev/null    || fail "curl not found"
 command -v python3 >/dev/null || fail "python3 not found (needed to read the targets JSON)"
 
 # A reachable-but-empty object store, so the daemons' cold catalog seed
-# succeeds without dragging Garage into a test that stores nothing.
+# succeeds without dragging a real object store into a test that stores nothing.
 # shellcheck source=lib/stub-objstore.sh
 . "$ROOT/scripts/lib/stub-objstore.sh"
 start_stub_objstore "$S3_PORT" scry-smoke "$TMP/stub-s3.log" || fail "stub object store did not start"

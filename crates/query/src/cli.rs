@@ -14,7 +14,7 @@
 //! into pretty-printing (small result sets only). The per-block scan
 //! trailer always prints on stderr.
 //!
-//! Run (after `source docker/garage/.env`):
+//! Run (after `source docker/seaweedfs/.env`):
 //!
 //! ```bash
 //! scry get \
@@ -369,7 +369,7 @@ pub async fn run(args: Args) -> Result<()> {
     }
 
     let cfg = ObjStoreConfig::from_env()
-        .context("loading SCRY_OBJSTORE_* env (try `source docker/garage/.env`)")?;
+        .context("loading SCRY_OBJSTORE_* env (try `source docker/seaweedfs/.env`)")?;
 
     // Pool config: env defaults, overridden by any --pool-* CLI flag.
     let mut pool_cfg =

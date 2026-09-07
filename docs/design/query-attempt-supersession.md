@@ -436,7 +436,7 @@ This phase alone fixes the ten-minute compactor serialization while retaining re
 - Protocol generation drift checks for Rust and TS.
 - Frontend tests and build.
 - `cargo fmt --check`, repository clippy command, then `cargo test --workspace`.
-- Existing compaction, multi-instance, catalog snapshot, live-query, WebUI, and query smoke legs using local Garage/Valkey.
+- Existing compaction, multi-instance, catalog snapshot, live-query, WebUI, and query smoke legs using local SeaweedFS/Valkey.
 - New deterministic smoke/fault harness that forces a mid-scan compacted-input deletion and verifies reset plus exact final result.
 - A bounded local backlog experiment demonstrating compaction continues during deferred grace and sidecars decline at the expected fanout rate.
 

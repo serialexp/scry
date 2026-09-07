@@ -3819,3 +3819,35 @@ Tempo/OTLP, Prometheus, and Pyroscope push paths. Alpha `v1development` OTLP
 Profiles and native aggregate OTLP metric representation remain explicit
 follow-ups. See `docs/design/gateway-ingestion-protocols.md` for the route,
 encoding, mapping, and verification contract.
+
+## D-072: Conditional S3 writes are an explicit control-plane capability; SeaweedFS replaces Garage for local testing
+
+**Date:** 2026-09-07
+**Status:** accepted
+
+Scry's existing block data plane uses UUID-addressed immutable paths and does not
+need conditional writes. Error monitoring and future control-plane records do:
+immutable logical IDs require create-if-absent and mutable revision heads require
+ETag compare-and-swap. Depending on a Valkey lease plus an unconditional object PUT
+leaves a check-to-write race, while pretending an S3-compatible endpoint implements
+preconditions can silently overwrite state.
+
+The object-store layer therefore exposes `PutMode::Create` and
+`PutMode::Update(UpdateVersion)` helpers and a semantic capability probe. The probe
+requires a rejected duplicate create to preserve the first bytes, a stale ETag
+update to preserve current bytes, a current update to succeed, and concurrent
+create and ETag-CAS races to each have exactly one winner. Roles that need
+control-plane correctness must run this probe and fail closed; ordinary block roles
+remain usable without it.
+
+The canonical local backend changes from Garage 1.0.x to pinned SeaweedFS 4.45.
+SeaweedFS routes `If-None-Match: *` and strong ETag `If-Match` to atomic filer write
+conditions, so local and CI tests exercise the same conditional semantics required
+from AWS S3-class production storage. Historical Garage decisions and measurements
+remain true for the versions used at the time. Transitional `dev-garage-*` commands
+forward to the SeaweedFS harness for one release, but no Garage environment alias is
+created.
+
+The consequence is a narrower contract for future control-plane roles than for the
+existing data plane: "S3-compatible" alone is insufficient; the semantic probe is
+the authority. See `docs/design/conditional-object-storage.md`.

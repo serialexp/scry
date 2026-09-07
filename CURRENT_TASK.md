@@ -208,7 +208,7 @@ measurements, and the `scry-cluster` / `scry-ingestd` / `scry-queryd` /
 
 Harness: `crates/cluster/tests/partition_cost.rs`, two `#[ignore]`d measurement
 tests (they stay out of `cargo test`; 2 ignored, 0 run). Run with
-`source docker/garage/.env` then
+`source docker/seaweedfs/.env` then
 `cargo test -p scry-cluster --test partition_cost -- --ignored --nocapture`;
 `N_BLOCKS` scales the partition.
 

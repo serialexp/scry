@@ -2,7 +2,7 @@
 # scry agent metrics-scraping exit criterion — end-to-end.
 #
 # Proves the agent's Prometheus pull path lands queryable metrics in the
-# bucket, against a real scry ingest + Garage:
+# bucket, against a real scry ingest + SeaweedFS:
 #
 #   stub /metrics  →  scry agent (--scrape-target)  →  scry ingest (--storage)
 #                  →  bucket  →  scry list reconcile  →  scry get
@@ -19,7 +19,7 @@
 #   * scry get --signal metrics scans those 5 rows back (ingest→store→
 #     query is loss-free for scraped metrics).
 #
-# Self-contained except for Garage (needs docker/garage/.env) and python3.
+# Self-contained except for SeaweedFS (needs docker/seaweedfs/.env) and python3.
 # The dev bucket is emptied at the start of the run.
 
 set -euo pipefail
@@ -33,12 +33,9 @@ SMOKE_DIR="${SMOKE_DIR:-/tmp/scry-agent-metrics}"
 EXPECTED_ROWS=5   # 2 counter + 1 gauge exposed + up + scrape_duration_seconds
 
 # ── Pre-flight ──────────────────────────────────────────────────────
-if [[ ! -f docker/garage/.env ]]; then
-    echo "[agent-metrics] docker/garage/.env missing; run scripts/dev-garage-up.sh first" >&2
-    exit 2
-fi
-# shellcheck disable=SC1091
-set -a; source docker/garage/.env; set +a
+# shellcheck source=scripts/lib/dev-objstore.sh
+source "$ROOT/scripts/lib/dev-objstore.sh"
+load_dev_objstore "agent-metrics"
 
 for tool in aws sqlite3 python3; do
     command -v "$tool" >/dev/null || { echo "[agent-metrics] $tool not on PATH" >&2; exit 2; }
@@ -51,11 +48,7 @@ cargo build --release -p scry >&2
 # ── Clean slate ─────────────────────────────────────────────────────
 rm -rf "$SMOKE_DIR"; mkdir -p "$SMOKE_DIR"
 echo "[agent-metrics] emptying bucket s3://$SCRY_OBJSTORE_BUCKET/ ..."
-AWS_ACCESS_KEY_ID="$SCRY_OBJSTORE_ACCESS_KEY_ID" \
-AWS_SECRET_ACCESS_KEY="$SCRY_OBJSTORE_SECRET_ACCESS_KEY" \
-AWS_REGION="$SCRY_OBJSTORE_REGION" \
-    aws --endpoint-url "$SCRY_OBJSTORE_ENDPOINT" \
-        s3 rm "s3://$SCRY_OBJSTORE_BUCKET/" --recursive >/dev/null || true
+empty_dev_objstore_bucket "agent-metrics"
 
 # ── Stub /metrics endpoint ──────────────────────────────────────────
 cat > "$SMOKE_DIR/metrics.txt" <<'EOF'

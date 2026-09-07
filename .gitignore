@@ -1,5 +1,6 @@
 /target
 docker/garage/.env
+docker/seaweedfs/.env
 
 # Profiler output (scripts/profile-query.sh + cargo-flamegraph).
 /flamegraphs/

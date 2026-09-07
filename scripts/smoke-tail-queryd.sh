@@ -32,7 +32,7 @@
 # Storage-free by design: the ingesters run WITHOUT --storage (the logs tap
 # still fires), and the query daemons are pointed at the reachable-but-empty
 # stub object store from `lib/stub-objstore.sh` with convergence effectively
-# disabled (huge intervals), so **only a dev Valkey is required** — no Garage.
+# disabled (huge intervals), so **only a dev Valkey is required** — no real object store.
 # (The stub is not decoration: `scry query` treats a cold-boot catalog seed as
 # fatal, so the unreachable endpoint this script used to pass would now kill
 # both daemons before they bind --tail-listen.) Point it at the dev Valkey with

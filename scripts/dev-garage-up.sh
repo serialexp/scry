@@ -1,10 +1,7 @@
 #!/usr/bin/env bash
-# Bring up the local Garage S3-compatible store for development and
-# initialise its layout / bucket / credentials.
+# Transitional compatibility wrapper. SeaweedFS is now Scry's local S3 backend.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$ROOT/docker/garage"
-
-docker compose up -d
-"$ROOT/docker/garage/init.sh"
+echo "warning: dev-garage-up.sh is deprecated; use scripts/dev-seaweedfs-up.sh" >&2
+exec "$ROOT/scripts/dev-seaweedfs-up.sh" "$@"

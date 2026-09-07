@@ -26,7 +26,7 @@
 #       block sidecars (the `_catalog/` snapshot object is never mis-parsed as a
 #       block), and no daemon logs a sidecar parse failure.
 #
-# Needs Garage (docker/garage/.env — run scripts/dev-garage-up.sh) + `aws`. NO
+# Needs SeaweedFS (docker/seaweedfs/.env — run scripts/dev-seaweedfs-up.sh) + `aws`. NO
 # Valkey (single-instance; snapshot production needs no lease).
 #
 # Env knobs: IA/QQ ports, SPEW_RATE (400), BATCHES (150), MAX_AGE (3s block
@@ -57,21 +57,15 @@ fail() {
 }
 ok() { echo "  ok: $*"; }
 
-# ── Pre-flight: Garage credentials. ──────────────────────────────────
-if [ ! -f docker/garage/.env ]; then
-  fail "docker/garage/.env missing; run scripts/dev-garage-up.sh first"
-fi
-set -a; source docker/garage/.env; set +a
+# ── Pre-flight: disposable development S3 credentials. ──────────────
+# shellcheck source=scripts/lib/dev-objstore.sh
+source "$ROOT/scripts/lib/dev-objstore.sh"
+load_dev_objstore "catalog-snapshot"
 
-aws_s3() {
-  AWS_ACCESS_KEY_ID="$SCRY_OBJSTORE_ACCESS_KEY_ID" \
-  AWS_SECRET_ACCESS_KEY="$SCRY_OBJSTORE_SECRET_ACCESS_KEY" \
-  AWS_REGION="$SCRY_OBJSTORE_REGION" \
-    aws --endpoint-url "$SCRY_OBJSTORE_ENDPOINT" "$@"
-}
+aws_s3() { aws_dev_s3 "$@"; }
 
 echo "== emptying bucket s3://$SCRY_OBJSTORE_BUCKET/ =="
-aws_s3 s3 rm "s3://$SCRY_OBJSTORE_BUCKET/" --recursive >/dev/null 2>&1 || true
+empty_dev_objstore_bucket "catalog-snapshot"
 
 echo "== building release scry + noise-spewer + scry-query-probe =="
 cargo build --release -p scry -p noise-spewer -p scry-queryd >"$TMP/cargo.log" 2>&1 \

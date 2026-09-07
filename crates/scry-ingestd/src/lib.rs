@@ -10,7 +10,7 @@
 //!   scry-ingestd --listen 127.0.0.1:4000
 //!
 //! Run (storage path):
-//!   source docker/garage/.env
+//!   source docker/seaweedfs/.env
 //!   scry-ingestd --listen 127.0.0.1:4000 --storage --wal-dir ./wal
 
 mod agent_status;
@@ -77,7 +77,7 @@ pub struct Args {
     /// Enable the v0.1 storage path: Dummy batches are durably
     /// recorded in the WAL, accumulated into parquet blocks, and
     /// uploaded to object storage. Requires `--wal-dir` and the
-    /// `SCRY_OBJSTORE_*` env vars (see `docker/garage/.env`).
+    /// `SCRY_OBJSTORE_*` env vars (see `docker/seaweedfs/.env`).
     #[arg(long)]
     storage: bool,
 
@@ -498,7 +498,7 @@ pub async fn run(args: Args) -> Result<()> {
             .clone()
             .context("--storage requires --wal-dir")?;
         let cfg = ObjStoreConfig::from_env()
-            .context("loading SCRY_OBJSTORE_* env (try `source docker/garage/.env`)")?;
+            .context("loading SCRY_OBJSTORE_* env (try `source docker/seaweedfs/.env`)")?;
         let bucket = cfg.bucket.clone();
         info!(
             endpoint = %cfg.endpoint,
@@ -1257,13 +1257,14 @@ async fn run_maintenance_loop<L: LeaseProvider>(
                     compaction_progress.as_deref(),
                     compact_resources.clone(),
                 ).await {
-                    Ok(r) if r.merges > 0 || r.partition_failed > 0 || r.reap_failed > 0 || r.oversized > 0 => {
+                    Ok(r) if r.merges > 0 || r.partition_failed > 0 || r.resource_failed > 0 || r.reap_failed > 0 || r.oversized > 0 => {
                         record_compaction_metrics(metrics.as_deref(), &r, started.elapsed());
                         info!(
                         merges = r.merges, blocks_in = r.blocks_in,
                         blocks_out = r.blocks_out, reaped = r.reaped,
                         reap_failed = r.reap_failed,
                         partition_failed = r.partition_failed,
+                        resource_failed = r.resource_failed,
                         lease_held = r.lease_held,
                         lease_unavailable = r.lease_unavailable,
                         oversized = r.oversized,

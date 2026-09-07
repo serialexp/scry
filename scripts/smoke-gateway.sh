@@ -17,16 +17,16 @@ EXPECTED_TRACES=$(( (4 * REQUESTS * RECORDS) + (REQUESTS * RECORDS) ))
 EXPECTED_METRICS=$(( (4 * REQUESTS * RECORDS) + (REQUESTS * RECORDS) + (REQUESTS * SERIES * SAMPLES) ))
 EXPECTED_PROFILES=$(( REQUESTS + (2 * REQUESTS * RECORDS) ))
 
-[[ -f docker/garage/.env ]] || { echo "[gw-smoke] docker/garage/.env missing; run scripts/dev-garage-up.sh" >&2; exit 2; }
-set -a; source docker/garage/.env; set +a
+# shellcheck source=scripts/lib/dev-objstore.sh
+source "$ROOT/scripts/lib/dev-objstore.sh"
+load_dev_objstore "gw-smoke"
 for tool in aws sqlite3 curl; do command -v "$tool" >/dev/null || { echo "missing $tool" >&2; exit 2; }; done
 
 echo "[gw-smoke] building release binaries..."
 cargo build --release -p scry -p scry-gateway >&2
 rm -rf "$SMOKE_DIR"; mkdir -p "$SMOKE_DIR"
 echo "[gw-smoke] emptying dev bucket..."
-AWS_ACCESS_KEY_ID="$SCRY_OBJSTORE_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$SCRY_OBJSTORE_SECRET_ACCESS_KEY" AWS_REGION="$SCRY_OBJSTORE_REGION" \
-  aws --endpoint-url "$SCRY_OBJSTORE_ENDPOINT" s3 rm "s3://$SCRY_OBJSTORE_BUCKET/" --recursive >/dev/null || true
+empty_dev_objstore_bucket "gw-smoke"
 
 ./target/release/scry ingest --listen "$INGEST_LISTEN" --storage --wal-dir "$SMOKE_DIR/wal" --catalog "$SMOKE_DIR/online.sqlite" >"$SMOKE_DIR/ingestd.log" 2>&1 & INGEST_PID=$!
 GW_PID=""

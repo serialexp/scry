@@ -59,7 +59,7 @@
 # trace_id stats; profiles query by (type, time) block stats), so the
 # postings assertion block skips them — same as dummy.
 #
-# The dev Garage bucket (`scry-dev`) is emptied at the start of the
+# The dev SeaweedFS bucket (`scry-dev`) is emptied at the start of the
 # run so the post-condition is unambiguous. Don't point this at any
 # bucket whose contents you want to keep.
 
@@ -177,12 +177,9 @@ LISTEN="${LISTEN:-127.0.0.1:4099}"
 SMOKE_DIR="${SMOKE_DIR:-/tmp/scry-smoke}"
 
 # ── Pre-flight ──────────────────────────────────────────────────────
-if [[ ! -f docker/garage/.env ]]; then
-    echo "[smoke] docker/garage/.env missing; run scripts/dev-garage-up.sh first" >&2
-    exit 2
-fi
-# shellcheck disable=SC1091
-set -a; source docker/garage/.env; set +a
+# shellcheck source=scripts/lib/dev-objstore.sh
+source "$ROOT/scripts/lib/dev-objstore.sh"
+load_dev_objstore "smoke"
 
 if ! command -v aws >/dev/null; then
     echo "[smoke] aws CLI not on PATH — needed for bucket reset" >&2
@@ -214,11 +211,7 @@ rm -rf "$SMOKE_DIR"
 mkdir -p "$SMOKE_DIR"
 
 echo "[smoke] emptying bucket s3://$SCRY_OBJSTORE_BUCKET/ ..."
-AWS_ACCESS_KEY_ID="$SCRY_OBJSTORE_ACCESS_KEY_ID" \
-AWS_SECRET_ACCESS_KEY="$SCRY_OBJSTORE_SECRET_ACCESS_KEY" \
-AWS_REGION="$SCRY_OBJSTORE_REGION" \
-    aws --endpoint-url "$SCRY_OBJSTORE_ENDPOINT" \
-        s3 rm "s3://$SCRY_OBJSTORE_BUCKET/" --recursive >/dev/null || true
+empty_dev_objstore_bucket "smoke"
 
 # ── Run the pipeline ────────────────────────────────────────────────
 # scry ingest runs under /usr/bin/time so we can capture peak RSS +

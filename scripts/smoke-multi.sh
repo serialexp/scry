@@ -28,8 +28,8 @@
 # Single-instance correctness is unaffected: this is a separate harness; the
 # existing `scripts/smoke.sh` SIGNAL matrix still runs one daemon, no Valkey.
 #
-# Prereqs: `scripts/dev-garage-up.sh` and `scripts/dev-valkey-up.sh` (or point
-# SCRY_VALKEY_URL at any reachable Valkey/Redis). The dev Garage bucket is
+# Prereqs: `scripts/dev-seaweedfs-up.sh` and `scripts/dev-valkey-up.sh` (or point
+# SCRY_VALKEY_URL at any reachable Valkey/Redis). The dev SeaweedFS bucket is
 # emptied on every run — don't point this at a bucket you care about.
 
 set -euo pipefail
@@ -52,17 +52,15 @@ RATE="${RATE:-3000}"
 # Small blocks so each instance seals several L0 blocks → the shared
 # (logs, date, 0) partition has ≥ fanout blocks and compaction has work to do.
 BLOCK_MAX_ROWS="${BLOCK_MAX_ROWS:-12000}"
+BLOCK_MAX_AGE_SECS="${BLOCK_MAX_AGE_SECS:-2}"
 COMPACT_FANOUT="${COMPACT_FANOUT:-2}"
 
 EXPECTED_ROWS=$(( (BATCHES_A + BATCHES_B) * RECORDS_PER_BATCH ))
 
 # ── Pre-flight ──────────────────────────────────────────────────────
-if [[ ! -f docker/garage/.env ]]; then
-    echo "[multi] docker/garage/.env missing; run scripts/dev-garage-up.sh first" >&2
-    exit 2
-fi
-# shellcheck disable=SC1091
-set -a; source docker/garage/.env; set +a
+# shellcheck source=scripts/lib/dev-objstore.sh
+source "$ROOT/scripts/lib/dev-objstore.sh"
+load_dev_objstore "multi"
 
 for c in aws sqlite3; do
     command -v "$c" >/dev/null || { echo "[multi] $c CLI not on PATH" >&2; exit 2; }
@@ -78,8 +76,18 @@ if [[ -n "$VK" ]]; then
         exit 2
     fi
     # Clear any leftover lease/cursor keys from a previous run so a stale lease
-    # can't stall this run's compaction. (Bucket is truth; Valkey is ephemeral.)
-    "$VK" -u "$VALKEY_URL" flushall >/dev/null 2>&1 || true
+    # can't stall this run's compaction. FLUSHALL is safe only for the dedicated
+    # loopback development instance unless the caller explicitly opts in.
+    case "$VALKEY_URL" in
+        redis://127.0.0.1:*|redis://localhost:*|redis://\[::1\]:*) ;;
+        *)
+            if [[ "${ALLOW_NON_DEV_VALKEY_RESET:-0}" != "1" ]]; then
+                echo "[multi] refusing FLUSHALL against non-local Valkey '$VALKEY_URL'; set ALLOW_NON_DEV_VALKEY_RESET=1 explicitly" >&2
+                exit 2
+            fi
+            ;;
+    esac
+    "$VK" -u "$VALKEY_URL" flushall >/dev/null
 else
     echo "[multi] no valkey-cli/redis-cli on PATH to verify $VALKEY_URL; proceeding (connect failures will surface in daemon logs)" >&2
 fi
@@ -93,11 +101,7 @@ rm -rf "$SMOKE_DIR"
 mkdir -p "$SMOKE_DIR"
 
 echo "[multi] emptying bucket s3://$SCRY_OBJSTORE_BUCKET/ ..."
-AWS_ACCESS_KEY_ID="$SCRY_OBJSTORE_ACCESS_KEY_ID" \
-AWS_SECRET_ACCESS_KEY="$SCRY_OBJSTORE_SECRET_ACCESS_KEY" \
-AWS_REGION="$SCRY_OBJSTORE_REGION" \
-    aws --endpoint-url "$SCRY_OBJSTORE_ENDPOINT" \
-        s3 rm "s3://$SCRY_OBJSTORE_BUCKET/" --recursive >/dev/null || true
+empty_dev_objstore_bucket "multi"
 
 # ── Helpers ─────────────────────────────────────────────────────────
 PIDS=()
@@ -107,7 +111,7 @@ trap cleanup EXIT
 # Start a scry ingest; echoes its PID. Extra flags after the 4 positional.
 start_ingestd() {
     local name=$1 listen=$2 waldir=$3 catalog=$4; shift 4
-    RUST_LOG="${RUST_LOG:-info,scry_compact=debug}" \
+    NO_COLOR=1 RUST_LOG="${RUST_LOG:-info,scry_compact=debug}" \
         ./target/release/scry ingest \
             --listen "$listen" \
             --storage \
@@ -115,6 +119,7 @@ start_ingestd() {
             --catalog "$catalog" \
             --valkey-url "$VALKEY_URL" \
             --block-max-rows "$BLOCK_MAX_ROWS" \
+            --block-max-age-secs "$BLOCK_MAX_AGE_SECS" \
             "$@" \
         > "$SMOKE_DIR/$name.log" 2>&1 &
     echo $!
@@ -160,13 +165,20 @@ PIDS+=("$PB")
 wait_bind "$LISTEN_A"; wait_bind "$LISTEN_B"
 
 echo "[multi] spewing $BATCHES_A batches → A, $BATCHES_B batches → B (logs)..."
-./target/release/noise-spewer --addr "$LISTEN_A" --signals logs \
-    --rate "$RATE" --max-batches "$BATCHES_A" > "$SMOKE_DIR/spewA.log" 2>&1 &
+NO_COLOR=1 ./target/release/noise-spewer --addr "$LISTEN_A" --signals logs \
+    --rate "$RATE" --duration 10m --max-batches "$BATCHES_A" > "$SMOKE_DIR/spewA.log" 2>&1 &
 SPA=$!
-./target/release/noise-spewer --addr "$LISTEN_B" --signals logs \
-    --rate "$RATE" --max-batches "$BATCHES_B" > "$SMOKE_DIR/spewB.log" 2>&1 &
+NO_COLOR=1 ./target/release/noise-spewer --addr "$LISTEN_B" --signals logs \
+    --rate "$RATE" --duration 10m --max-batches "$BATCHES_B" > "$SMOKE_DIR/spewB.log" 2>&1 &
 SPB=$!
 wait "$SPA"; wait "$SPB"
+for spec in "A:$BATCHES_A" "B:$BATCHES_B"; do
+    name=${spec%%:*}
+    expected_batches=${spec#*:}
+    sent=$(grep -o 'batches_sent=[0-9]*' "$SMOKE_DIR/spew$name.log" | tail -1 | cut -d= -f2 || true)
+    [[ "$sent" == "$expected_batches" ]] \
+        || fail "spewer $name sent ${sent:-<unknown>} batches, expected $expected_batches"
+done
 echo "[multi] spew done; expected union rows = $EXPECTED_ROWS"
 
 # Wait for BOTH catalogs to converge to the full union (and compaction to stop
@@ -230,11 +242,20 @@ wait_bind "$LISTEN_A"; wait_bind "$LISTEN_B"
 
 echo "[multi] waiting for coordinated reaping (full-walk discover → lease → reap)..."
 reaped=0
+retention_observed=0
 for _ in $(seq 1 80); do  # up to ~40s
+    # The maintenance pass logs only after it has observed and staged/reaped work.
+    # This distinguishes a completed retention cycle from two not-yet-seeded
+    # catalogs whose initial live counts are also zero.
+    if grep -E 'retention pass' "$SMOKE_DIR/Aret.log" "$SMOKE_DIR/Bret.log" 2>/dev/null \
+        | grep -Eq '(staged|reaped)=[1-9]'; then
+        retention_observed=1
+    fi
     ra=$(live_count "$SMOKE_DIR/catAret.sqlite" logs)
     rb=$(live_count "$SMOKE_DIR/catBret.sqlite" logs)
-    # Both must have discovered (>0 at some point) then dropped to 0.
-    if [[ "$ra" == 0 && "$rb" == 0 ]]; then reaped=1; break; fi
+    if [[ "$retention_observed" == 1 && "$ra" == 0 && "$rb" == 0 ]]; then
+        reaped=1; break
+    fi
     sleep 0.5
 done
 ra=$(live_count "$SMOKE_DIR/catAret.sqlite" logs)

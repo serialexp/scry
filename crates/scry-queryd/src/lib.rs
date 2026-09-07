@@ -20,7 +20,7 @@
 //! warmup pages — across every query that follows. The first query
 //! pays the warm-up; the rest run at hot-process speed.
 //!
-//! Run (after `source docker/garage/.env`):
+//! Run (after `source docker/seaweedfs/.env`):
 //!
 //! ```bash
 //! scry query \
@@ -401,7 +401,7 @@ pub struct Args {
 /// Run the query daemon until SIGINT or SIGTERM.
 pub async fn run(args: Args) -> Result<()> {
     let cfg = ObjStoreConfig::from_env()
-        .context("loading SCRY_OBJSTORE_* env (try `source docker/garage/.env`)")?;
+        .context("loading SCRY_OBJSTORE_* env (try `source docker/seaweedfs/.env`)")?;
 
     // Pool config: env defaults, overridden by --pool-* flags.
     let mut pool_cfg =

@@ -1,30 +1,32 @@
-//! Integration test against a running Garage instance.
+//! Integration tests against a conditional-write-capable S3 endpoint.
 //!
-//! Skipped unless `SCRY_OBJSTORE_*` env vars are set. The dev harness
-//! is:
+//! Skipped unless `SCRY_OBJSTORE_*` env vars are set. The dev harness is:
 //!
 //! ```
-//! ./scripts/dev-garage-up.sh
-//! set -a; source docker/garage/.env; set +a
-//! cargo test -p scry-objstore --test garage -- --nocapture
+//! ./scripts/dev-seaweedfs-up.sh
+//! set -a; source docker/seaweedfs/.env; set +a
+//! cargo test -p scry-objstore --test s3_compat -- --nocapture
 //! ```
 //!
-//! This is deliberately not a `#[ignore]` test — Garage being up is
-//! detected at runtime. CI will pick this up once we wire a service
-//! container into the pipeline.
+//! This is deliberately not a `#[ignore]` test: absent configuration skips at
+//! runtime, while the dedicated CI service job supplies SeaweedFS.
 
 use bytes::Bytes;
 use object_store::{path::Path, ObjectStore, ObjectStoreExt};
-use scry_objstore::{open, ObjStoreConfig};
+use scry_objstore::{open, probe_conditional_writes, ObjStoreConfig};
 
 fn cfg_or_skip() -> Option<ObjStoreConfig> {
-    match ObjStoreConfig::from_env() {
-        Ok(c) => Some(c),
-        Err(e) => {
-            eprintln!("skipping: {e}");
-            None
-        }
+    const REQUIRED_ENV: &str = "SCRY_S3_COMPAT_REQUIRED";
+    let configured =
+        std::env::vars_os().any(|(key, _)| key.to_string_lossy().starts_with("SCRY_OBJSTORE_"));
+    if !configured && std::env::var_os(REQUIRED_ENV).is_none() {
+        eprintln!("skipping: SCRY_OBJSTORE_* is not configured");
+        return None;
     }
+    Some(
+        ObjStoreConfig::from_env()
+            .unwrap_or_else(|error| panic!("invalid S3 compatibility-test configuration: {error}")),
+    )
 }
 
 #[tokio::test]
@@ -72,6 +74,22 @@ async fn roundtrip_put_get_list_delete() {
     // DELETE
     store.delete(&key_a).await.expect("delete a");
     store.delete(&key_b).await.expect("delete b");
+}
+
+#[tokio::test]
+async fn conditional_create_and_update_are_atomic() {
+    let cfg = match cfg_or_skip() {
+        Some(c) => c,
+        None => return,
+    };
+    let store = open(&cfg).await.expect("open objstore");
+    let prefix = Path::from(format!(
+        "test/conditional/{}",
+        uuid_like(std::time::SystemTime::now())
+    ));
+    probe_conditional_writes(store.as_ref(), &prefix)
+        .await
+        .expect("S3 backend must enforce conditional create and ETag update");
 }
 
 // Cheap monotonic-ish suffix without pulling in uuid as a dev-dep.

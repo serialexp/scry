@@ -48,6 +48,60 @@ use crate::merge::merge_blocks;
 use crate::policy::{plan_merges, CompactConfig, OversizedPartition, PlannedMerge};
 use crate::resource::CompactResources;
 
+// A body bloom stores roughly 1.2 bytes per distinct gram at the default 1%
+// false-positive rate, while the streaming builder retains a conservatively
+// accounted 40 bytes per gram. The merge gives that builder one quarter of the
+// variable permit (two of eight sidecar shares), hence ~4 × 40 / 1.2 = 134.
+// Round up for headers, allocator slack, and MiB-granularity admission.
+const BODY_BLOOM_WORKING_SET_MULTIPLIER: u64 = 160;
+const SIDECAR_DECODE_MULTIPLIER: u64 = 3;
+
+fn estimate_non_datafusion_bytes(plan: &PlannedMerge, resources: &CompactResources) -> Result<u64> {
+    let (postings, body_blooms) = plan
+        .inputs
+        .iter()
+        .try_fold((0u64, 0u64), |(postings, body_blooms), entry| {
+            // Older sidecars may advertise an index without recording its size.
+            // Falling back to main-parquet bytes is intentionally conservative:
+            // it either reserves bounded headroom or rejects the merge before
+            // allocating, rather than treating an unknown working set as zero.
+            let postings_size = entry
+                .meta
+                .postings_size_bytes
+                .or(entry.meta.has_postings.then_some(entry.meta.byte_size))
+                .unwrap_or(0);
+            let bloom_size = entry
+                .meta
+                .body_bloom_size_bytes
+                .or(entry.meta.has_body_bloom.then_some(entry.meta.byte_size))
+                .unwrap_or(0);
+            Some((
+                postings.checked_add(postings_size)?,
+                body_blooms.checked_add(bloom_size)?,
+            ))
+        })
+        .ok_or_else(|| crate::resource::ResourceError::RequestTooLarge {
+            requested_bytes: u64::MAX,
+            budget_bytes: resources.config().non_datafusion_memory_bytes,
+        })?;
+    let fixed = resources.config().merge_fixed_bytes();
+    postings
+        .checked_mul(SIDECAR_DECODE_MULTIPLIER)
+        .and_then(|bytes| {
+            body_blooms
+                .checked_mul(BODY_BLOOM_WORKING_SET_MULTIPLIER)
+                .and_then(|bloom| bytes.checked_add(bloom))
+        })
+        .and_then(|bytes| bytes.checked_add(fixed))
+        .ok_or_else(|| {
+            crate::resource::ResourceError::RequestTooLarge {
+                requested_bytes: u64::MAX,
+                budget_bytes: resources.config().non_datafusion_memory_bytes,
+            }
+            .into()
+        })
+}
+
 /// Surface partitions the planner declined. These are operator-actionable
 /// (raise `--compact-max-level`, restore the previous `--compact-fanout`, or
 /// accept the partition as terminal), and silently never compacting would be
@@ -288,22 +342,10 @@ pub async fn compact_partition<C: CatalogHandle>(
     // DataFusion accounts for parquet input decoding and sort state in its own
     // spill-aware pool. Weighted admission covers the fixed output writer plus
     // sidecar state, estimated from sidecar sizes rather than charging the main
-    // parquet a second time. A floor covers the writer and one streamed batch;
-    // the multiplier allows for decoded maps/sets and transient Arrow arrays.
-    let sidecars = plan.inputs.iter().try_fold(0u64, |sum, entry| {
-        sum.checked_add(entry.meta.postings_size_bytes.unwrap_or(0))
-            .and_then(|v| v.checked_add(entry.meta.body_bloom_size_bytes.unwrap_or(0)))
-    });
-    let fixed = (resources.config().output_buffer_bytes as u64)
-        .saturating_add(resources.config().parquet_writer_memory_bytes as u64)
-        .saturating_add(8 * 1024 * 1024);
-    let estimated = sidecars
-        .and_then(|bytes| bytes.checked_mul(3))
-        .and_then(|bytes| bytes.checked_add(fixed))
-        .ok_or_else(|| crate::resource::ResourceError::RequestTooLarge {
-            requested_bytes: u64::MAX,
-            budget_bytes: resources.config().non_datafusion_memory_bytes,
-        })?;
+    // parquet a second time. Postings need decoded-map/Arrow headroom. A body
+    // bloom's compact bitset substantially understates the streaming builder's
+    // distinct-gram hash set, so estimate that working representation separately.
+    let estimated = estimate_non_datafusion_bytes(plan, resources)?;
     let resource_permit = resources
         .admit(estimated)
         .await
@@ -414,8 +456,58 @@ fn now_unix_nano() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::is_resource_failure;
+    use super::{estimate_non_datafusion_bytes, is_resource_failure};
+    use crate::{CompactResources, PlannedMerge, ResourceConfig};
     use datafusion::error::DataFusionError;
+    use scry_block::BlockMeta;
+    use scry_catalog::CatalogEntry;
+    use uuid::Uuid;
+
+    #[test]
+    fn unknown_present_sidecar_sizes_receive_conservative_admission() {
+        let meta = BlockMeta {
+            uuid: Uuid::now_v7(),
+            signal: "logs".into(),
+            writer_id: Uuid::now_v7(),
+            ts_min_unix_nano: 1,
+            ts_max_unix_nano: 2,
+            row_count: 10,
+            byte_size: 2 * 1024 * 1024,
+            schema_version: 1,
+            level: 0,
+            compacted_from: vec![],
+            producer_version: "test".into(),
+            label_fingerprint_bloom: None,
+            has_postings: true,
+            postings_size_bytes: None,
+            series_types: None,
+            all_fingerprints: Some(vec![1]),
+            has_body_bloom: true,
+            body_bloom_size_bytes: None,
+            wal_seg_max: None,
+            wal_shard: None,
+        };
+        let entry = CatalogEntry {
+            meta,
+            date: "1970-01-01".into(),
+            bucket: "test".into(),
+            level: 0,
+        };
+        let plan = PlannedMerge {
+            signal: "logs".into(),
+            date: "1970-01-01".into(),
+            input_level: 0,
+            inputs: vec![entry],
+        };
+        let resources =
+            CompactResources::new(ResourceConfig::from_envelope(512 * 1024 * 1024)).unwrap();
+
+        let estimated = estimate_non_datafusion_bytes(&plan, &resources).unwrap();
+        assert!(
+            estimated >= resources.config().merge_fixed_bytes() + 2 * 1024 * 1024 * 160,
+            "unknown bloom size must not be charged as zero"
+        );
+    }
 
     #[test]
     fn recognizes_context_wrapped_datafusion_resource_exhaustion() {

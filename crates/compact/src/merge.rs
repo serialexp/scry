@@ -350,10 +350,10 @@ async fn merge_blocks_inner(
     cleanup: &OutputCleanupGuard,
 ) -> Result<Option<BlockMeta>> {
     let spec = spec_for(signal)?;
-    let fixed_bytes = (resources.config().output_buffer_bytes as u64)
-        .saturating_add(resources.config().parquet_writer_memory_bytes as u64)
-        .saturating_add(8 * 1024 * 1024);
-    let budgets = SidecarBudgets::for_permit(admitted_non_df_bytes, fixed_bytes);
+    let budgets = SidecarBudgets::for_permit(
+        admitted_non_df_bytes,
+        resources.config().merge_fixed_bytes(),
+    );
 
     // Catalog entries intentionally omit sidecar-only fields. Fetch every
     // durable input meta exactly once for all signals, validate that it is the

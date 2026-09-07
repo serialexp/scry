@@ -81,13 +81,9 @@ SCRIPT_TXT="$BASE.script.txt"
 TOP_TXT="$BASE.top.txt"
 
 # ── Bucket env (load as REAL_USER would have) ───────────────────────
-ENV_FILE="${ENV_FILE:-$ROOT/docker/garage/.env}"
-if [[ -f "$ENV_FILE" ]]; then
-    set -a
-    # shellcheck disable=SC1090
-    source "$ENV_FILE"
-    set +a
-fi
+# shellcheck source=scripts/lib/dev-objstore.sh
+source "$ROOT/scripts/lib/dev-objstore.sh"
+load_dev_objstore "profile-query-deep"
 
 # ── Build as the invoking user (NOT root) ───────────────────────────
 #

@@ -57,6 +57,14 @@ impl Default for ResourceConfig {
 }
 
 impl ResourceConfig {
+    /// Fixed non-DataFusion state held by one merge: multipart output buffer,
+    /// parquet writer target, and one streamed Arrow batch plus runtime slack.
+    pub(crate) fn merge_fixed_bytes(&self) -> u64 {
+        (self.output_buffer_bytes as u64)
+            .saturating_add(self.parquet_writer_memory_bytes as u64)
+            .saturating_add(8 * MIB)
+    }
+
     /// Resolve the same mount-aware cgroup budget policy used by compactd.
     /// Invalid finite limits remain authoritative and therefore produce a
     /// sub-minimum config that validation refuses rather than an unsafe fallback.

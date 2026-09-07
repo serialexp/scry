@@ -3,7 +3,7 @@
 # smoke-tail.sh — end-to-end exercise of the `scry tail` live-tail surface (D-050).
 #
 # Pure live path, no storage: a storage-less `scry ingest` still taps the logs
-# hot path for subscribers, so this smoke needs NO Garage and NO Valkey.
+# hot path for subscribers, so this smoke needs NO real object store and NO Valkey.
 #
 #   scry ingest --listen           (no --storage: count-only logs path, still tapped)
 #     ▲ subscribe                    ▲ logs batches

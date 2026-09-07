@@ -33,7 +33,7 @@
 #       refused with QUERY_ERR_LIVE_UNAVAILABLE (code 0x0005) and streams no
 #       rows (not a silent blocks-only degrade).
 #
-# Needs Garage (docker/garage/.env — run scripts/dev-garage-up.sh) AND a dev
+# Needs SeaweedFS (docker/seaweedfs/.env — run scripts/dev-seaweedfs-up.sh) AND a dev
 # Valkey (SCRY_VALKEY_URL, default redis://127.0.0.1:6380 — this machine's
 # `scry-valkey-smoke`). Needs `aws` (bucket empty) + a TCP-capable bash.
 #
@@ -67,11 +67,10 @@ fail() {
 }
 ok() { echo "  ok: $*"; }
 
-# ── Pre-flight: Garage credentials + Valkey. ─────────────────────────
-if [ ! -f docker/garage/.env ]; then
-  fail "docker/garage/.env missing; run scripts/dev-garage-up.sh first"
-fi
-set -a; source docker/garage/.env; set +a
+# ── Pre-flight: disposable development S3 credentials + Valkey. ─────
+# shellcheck source=scripts/lib/dev-objstore.sh
+source "$ROOT/scripts/lib/dev-objstore.sh"
+load_dev_objstore "live"
 
 if command -v valkey-cli >/dev/null; then VK=valkey-cli
 elif command -v redis-cli >/dev/null; then VK=redis-cli
@@ -86,11 +85,7 @@ else
 fi
 
 echo "== emptying bucket s3://$SCRY_OBJSTORE_BUCKET/ =="
-AWS_ACCESS_KEY_ID="$SCRY_OBJSTORE_ACCESS_KEY_ID" \
-AWS_SECRET_ACCESS_KEY="$SCRY_OBJSTORE_SECRET_ACCESS_KEY" \
-AWS_REGION="$SCRY_OBJSTORE_REGION" \
-  aws --endpoint-url "$SCRY_OBJSTORE_ENDPOINT" \
-      s3 rm "s3://$SCRY_OBJSTORE_BUCKET/" --recursive >/dev/null 2>&1 || true
+empty_dev_objstore_bucket "live"
 
 echo "== building release scry + noise-spewer + scry-query-probe =="
 cargo build --release -p scry -p noise-spewer -p scry-queryd >"$TMP/cargo.log" 2>&1 \
@@ -175,7 +170,7 @@ ok "live half sees $L1 in-flight rows; only $B1 are durable yet (genuinely in-fl
 echo "== phase 2: history half + dedup (post-flush) =="
 echo "-- waiting for the block-max-age flush (${MAX_AGE}s) + upload --"
 # Poll blocks-only until it stops rising (block sealed + inserted + watermark
-# advanced). Bounded wait; MAX_AGE + upload is a few seconds on local Garage.
+# advanced). Bounded wait; MAX_AGE + upload is a few seconds on local SeaweedFS.
 B2=0
 for _ in $(seq 1 60); do
   sleep 1

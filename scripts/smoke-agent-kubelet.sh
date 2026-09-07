@@ -3,7 +3,7 @@
 #
 # Proves the agent's kubelet scrape path — HTTPS + skip-verify TLS + a
 # file-backed (rotating) ServiceAccount bearer token — lands queryable metrics
-# in the bucket, against a real scry ingest + Garage:
+# in the bucket, against a real scry ingest + SeaweedFS:
 #
 #   self-signed HTTPS stub (/metrics/cadvisor + /metrics, Bearer-gated)
 #       →  scry agent (--config, [metrics.kubelet])  →  scry ingest (--storage)
@@ -27,7 +27,7 @@
 # Pod-label SD needs the k8s pod watch this smoke omits → proven by the
 # pod_matches / build_scrape_target unit tests (same approach as D-047 feat 2).
 #
-# Self-contained except for Garage (needs docker/garage/.env), python3,
+# Self-contained except for SeaweedFS (needs docker/seaweedfs/.env), python3,
 # openssl, aws, sqlite3.
 
 set -euo pipefail
@@ -42,12 +42,9 @@ EXPECTED_ROWS=6   # (cadvisor: 1 + up + scrape_duration) + (kubelet: 1 + up + sc
 TOKEN="smoke-sa-token-$$"
 
 # ── Pre-flight ──────────────────────────────────────────────────────
-if [[ ! -f docker/garage/.env ]]; then
-    echo "[agent-kubelet] docker/garage/.env missing; run scripts/dev-garage-up.sh first" >&2
-    exit 2
-fi
-# shellcheck disable=SC1091
-set -a; source docker/garage/.env; set +a
+# shellcheck source=scripts/lib/dev-objstore.sh
+source "$ROOT/scripts/lib/dev-objstore.sh"
+load_dev_objstore "agent-kubelet"
 
 for tool in aws sqlite3 python3 openssl; do
     command -v "$tool" >/dev/null || { echo "[agent-kubelet] $tool not on PATH" >&2; exit 2; }
@@ -60,11 +57,7 @@ cargo build --release -p scry >&2
 # ── Clean slate ─────────────────────────────────────────────────────
 rm -rf "$SMOKE_DIR"; mkdir -p "$SMOKE_DIR"
 echo "[agent-kubelet] emptying bucket s3://$SCRY_OBJSTORE_BUCKET/ ..."
-AWS_ACCESS_KEY_ID="$SCRY_OBJSTORE_ACCESS_KEY_ID" \
-AWS_SECRET_ACCESS_KEY="$SCRY_OBJSTORE_SECRET_ACCESS_KEY" \
-AWS_REGION="$SCRY_OBJSTORE_REGION" \
-    aws --endpoint-url "$SCRY_OBJSTORE_ENDPOINT" \
-        s3 rm "s3://$SCRY_OBJSTORE_BUCKET/" --recursive >/dev/null || true
+empty_dev_objstore_bucket "agent-kubelet"
 
 # ── Self-signed cert + bearer-token file ────────────────────────────
 openssl req -x509 -newkey rsa:2048 -nodes \

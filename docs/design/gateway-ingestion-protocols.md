@@ -74,4 +74,4 @@ Push v1 contains raw pprof bytes and labels but no envelope timestamp. The recei
 
 ## Verification
 
-Focused tests cover format dispatch, gzip bounds, mappings, partial success, Loki label parsing and wire tags, pprof validation, and counters. `scripts/smoke-gateway.sh` sends all receiver forms through gateway → native ingest → Garage, reconciles a fresh catalog, and requires exact catalog and `scry get` row counts for metrics, logs, traces, and profiles, including postings invariants.
+Focused tests cover format dispatch, gzip bounds, mappings, partial success, Loki label parsing and wire tags, pprof validation, and counters. `scripts/smoke-gateway.sh` sends all receiver forms through gateway → native ingest → SeaweedFS, reconciles a fresh catalog, and requires exact catalog and `scry get` row counts for metrics, logs, traces, and profiles, including postings invariants.

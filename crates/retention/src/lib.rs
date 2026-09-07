@@ -134,7 +134,7 @@ pub async fn run(args: Args) -> Result<()> {
     );
 
     let obj_cfg = ObjStoreConfig::from_env()
-        .context("loading SCRY_OBJSTORE_* env (try `source docker/garage/.env`)")?;
+        .context("loading SCRY_OBJSTORE_* env (try `source docker/seaweedfs/.env`)")?;
     let bucket = obj_cfg.bucket.clone();
     let store = open_objstore(&obj_cfg).await?;
 

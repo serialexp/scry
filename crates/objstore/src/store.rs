@@ -111,7 +111,7 @@ impl PooledStore {
 
         // Multi-chunk: drain into a pool-owned Vec sized for the
         // requested range (the size is exact when the server honours
-        // the range, which S3/Garage do).
+        // the range, which S3 and SeaweedFS do).
         let mut buf = PooledBuf::checkout(&self.pool, len);
         buf.extend_from_slice(&first);
         buf.extend_from_slice(&second);

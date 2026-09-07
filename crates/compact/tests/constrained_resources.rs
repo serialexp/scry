@@ -237,6 +237,73 @@ async fn admission_deferral_does_not_abort_pass_and_next_pass_recovers() {
     assert_eq!(resources.telemetry().weighted_running_bytes, 0);
 }
 
+/// Build the same shape and cardinality as an ordinary noise-spewer logs run.
+async fn ordinary_logs_fixture(
+    rows_per_block: usize,
+) -> (
+    Arc<dyn ObjectStore>,
+    Arc<std::sync::Mutex<Catalog>>,
+    TempDir,
+) {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let writer = Uuid::now_v7();
+    let tmp = TempDir::new().unwrap();
+    let catalog = Catalog::open(&tmp.path().join("catalog.sqlite"), BUCKET).unwrap();
+    let mut random = 0x1234_5678_9abc_def0u64;
+
+    for block in 0..2 {
+        let mut builder = LogsBlockBuilder::new(writer, block_cfg());
+        let fp = block as u64 + 1;
+        builder.observe_stream(fp, vec![(b"service".to_vec(), b"api".to_vec())]);
+        for row in 0..rows_per_block {
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            let body = format!(
+                "request {:08x} processed in {}ms",
+                random as u32,
+                random % 500 + 1
+            );
+            builder.append_entry(
+                fp,
+                1_000_000 + (block * rows_per_block + row) as u64,
+                9,
+                body.into_bytes(),
+                vec![],
+            );
+        }
+        let meta = builder
+            .finish_and_upload(store.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(catalog.insert_block(&meta).unwrap());
+    }
+    (store, Arc::new(std::sync::Mutex::new(catalog)), tmp)
+}
+
+#[tokio::test]
+async fn ordinary_logs_merge_has_enough_bloom_working_memory() {
+    let (store, catalog, _tmp) = ordinary_logs_fixture(12_000).await;
+    let resources = CompactResources::new(ResourceConfig::from_envelope(512 * MIB)).unwrap();
+
+    let report = compact_once(
+        store,
+        &catalog,
+        BUCKET,
+        &compact_cfg(),
+        &block_cfg(),
+        resources.clone(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.merges, 1, "report: {report:?}");
+    assert_eq!(report.resource_failed, 0, "report: {report:?}");
+    assert_eq!(catalog.lock().unwrap().list_blocks().unwrap().len(), 1);
+    assert_eq!(resources.telemetry().weighted_running_bytes, 0);
+}
+
 /// Produce many mostly-distinct trigrams without relying on randomness.
 fn high_cardinality_body(seed: usize) -> String {
     let mut out = String::with_capacity(180_000);

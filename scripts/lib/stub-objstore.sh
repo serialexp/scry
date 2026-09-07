@@ -9,7 +9,7 @@
 # Several smoke tests exercise paths that never touch object storage — the
 # live-tail relay, the Valkey fleet status page — and used to point the daemons
 # at a deliberately unreachable endpoint (`http://127.0.0.1:1`) so they could
-# run without Garage. That stopped working when `scry query` made the cold-boot
+# run without a real S3-compatible backend. That stopped working when `scry query` made the cold-boot
 # catalog seed **fatal**: an unreachable bucket now kills the daemon before it
 # binds its listener, so the test fails during startup with no useful message.
 #
@@ -20,7 +20,7 @@
 # lets the daemon come up.
 #
 # It is NOT a general object store: it stores nothing, and any PUT is a 501. A
-# test that writes blocks wants a real Garage (`scripts/dev-garage-up.sh`).
+# test that writes blocks wants the real dev S3 backend (`scripts/dev-seaweedfs-up.sh`).
 #
 # # Usage
 #
@@ -103,7 +103,7 @@ start_stub_objstore() {
   exec 3>&- 3<&-
 
   export SCRY_OBJSTORE_ENDPOINT="http://$addr"
-  export SCRY_OBJSTORE_REGION="garage"
+  export SCRY_OBJSTORE_REGION="us-east-1"
   export SCRY_OBJSTORE_BUCKET="$bucket"
   export SCRY_OBJSTORE_ACCESS_KEY_ID="dummy"
   export SCRY_OBJSTORE_SECRET_ACCESS_KEY="dummy"

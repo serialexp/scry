@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Bring up the local Valkey instance used for scry's multi-instance
 # coordination (lease + block-event pub/sub) during development and the
-# gated integration tests. Mirrors scripts/dev-garage-up.sh.
+# gated integration tests. Mirrors scripts/dev-seaweedfs-up.sh.
 #
 # After this, point the daemons / tests at it with:
 #   export SCRY_VALKEY_URL=redis://127.0.0.1:6379

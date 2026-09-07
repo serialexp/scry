@@ -1,0 +1,17 @@
+services:
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.45
+    container_name: scry-seaweedfs
+    restart: unless-stopped
+    command: ["mini", "-dir=/data", "-s3", "-s3.port=8333"]
+    environment:
+      AWS_ACCESS_KEY_ID: scry-dev-access-key
+      AWS_SECRET_ACCESS_KEY: scry-dev-secret-key
+      S3_BUCKET: scry-dev
+    ports:
+      - "127.0.0.1:8333:8333"
+    volumes:
+      - seaweedfs-data:/data
+
+volumes:
+  seaweedfs-data:

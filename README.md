@@ -240,7 +240,7 @@ scripts/smoke-catalog-snapshot.sh  cold query bootstrap from the catalog snapsho
 scripts/smoke-status.sh     local and Valkey-aggregated Fleet status
 scripts/smoke-webui*.sh     browser auth/query and streaming tail paths
 scripts/smoke-osreplay.sh   OpenSearch replay → store → query
-scripts/dev-garage-up.sh    local single-node Garage (S3) for the smokes
+scripts/dev-seaweedfs-up.sh local single-node SeaweedFS (S3) for smokes + conditional-write tests
 scripts/dev-valkey-up.sh    local single-node Valkey for the multi-instance smoke
 ```
 
@@ -516,7 +516,7 @@ the daemon namespace convention. `--stats-listen` independently serves a local
 accept/reject counts, queue admission drops, retries, and final downstream
 outcomes rather than inferring delivery from access logs.
 
-End-to-end smoke tests (require a local Garage — `scripts/dev-garage-up.sh`):
+End-to-end smoke tests (require local SeaweedFS — `scripts/dev-seaweedfs-up.sh`):
 
 ```bash
 SIGNAL=metrics scripts/smoke.sh   # ingest → store → query round-trip, native wire
@@ -560,7 +560,10 @@ role runs. The browser UI is a separate source/home-machine deployment because
 the image does not embed frontend assets.
 
 **Prerequisite:** a dedicated S3-compatible bucket (AWS S3, Cloudflare R2,
-Hetzner Object Storage, Garage, MinIO, …). Configure its endpoint, region,
+Hetzner Object Storage, SeaweedFS, Garage, MinIO, …). Existing block storage needs
+ordinary S3 operations; future control-plane roles additionally require conditional
+create and ETag CAS and fail closed unless the semantic capability probe passes.
+Configure its endpoint, region,
 bucket, and addressing mode with `SCRY_OBJSTORE_ENDPOINT`,
 `SCRY_OBJSTORE_REGION`, `SCRY_OBJSTORE_BUCKET`, and
 `SCRY_OBJSTORE_PATH_STYLE`. For AWS, omit `SCRY_OBJSTORE_ACCESS_KEY_ID` and

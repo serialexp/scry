@@ -160,7 +160,7 @@ const CONSUMER_READY_TIMEOUT: Duration = Duration::from_secs(10);
 /// Run the compaction tool: one-shot or `--watch`, single-instance or leased.
 pub async fn run(mut args: Args) -> Result<()> {
     let obj_cfg = ObjStoreConfig::from_env()
-        .context("loading SCRY_OBJSTORE_* env (try `source docker/garage/.env`)")?;
+        .context("loading SCRY_OBJSTORE_* env (try `source docker/seaweedfs/.env`)")?;
     let bucket = obj_cfg.bucket.clone();
     let store: Arc<dyn ObjectStore> = open_objstore(&obj_cfg).await?;
     let instance_id = Uuid::now_v7();

@@ -14,7 +14,7 @@
 //! there." If the catalog row count matches the sum of writes the
 //! sink performed, the storage layer round-trips.
 //!
-//! Run (after `source docker/garage/.env`):
+//! Run (after `source docker/seaweedfs/.env`):
 //!
 //! ```bash
 //! scry list --catalog ./catalog.sqlite
@@ -64,7 +64,7 @@ pub struct Args {
 /// (`--interval`).
 pub async fn run(args: Args) -> Result<()> {
     let cfg = ObjStoreConfig::from_env()
-        .context("loading SCRY_OBJSTORE_* env (try `source docker/garage/.env`)")?;
+        .context("loading SCRY_OBJSTORE_* env (try `source docker/seaweedfs/.env`)")?;
     let bucket = cfg.bucket.clone();
 
     let catalog = Catalog::open(&args.catalog, &bucket)

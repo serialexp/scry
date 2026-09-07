@@ -5,7 +5,7 @@
 //! - **Config struct** so the rest of the codebase doesn't have to know
 //!   which env vars or which builder methods the apache crate wants.
 //! - **Factory** that returns an `Arc<dyn ObjectStore>` for an
-//!   S3-compatible backend (Garage in dev, real S3 / R2 / Hetzner in
+//!   S3-compatible backend (SeaweedFS in dev, AWS S3 / R2 / Hetzner in
 //!   production), pre-wrapped in [`PooledStore`] so per-fetch buffers
 //!   get reused across the lifetime of the process (see `pool.rs`
 //!   for the motivation: DWARF profiling showed ~30% of query wall
@@ -19,17 +19,18 @@
 //!
 //! ## Conditional PUT
 //!
-//! Real S3, R2, and minio all support `If-None-Match: *` for safe
-//! retry of block uploads. Garage 1.0.x silently overwrites — the
-//! header is accepted but not honored. v0.1 of scry doesn't depend on
-//! this: blocks are addressed by UUID v7, and a single writer never
-//! issues two PUTs to the same path. When we move to a real S3-class
-//! backend (or Garage gains support), a `put_if_absent` helper around
-//! `PutMode::Create` is the place to add it back.
+//! [`put_create`], [`put_update`], and [`probe_conditional_writes`]
+//! expose and verify the atomic conditional-write contract required by
+//! control-plane data. Backends must pass the probe before callers rely
+//! on that contract; accepting but ignoring preconditions is not enough.
 
+pub mod conditional;
 mod pool;
 mod store;
 
+pub use conditional::{
+    create_options, probe_conditional_writes, put_create, put_update, update_options,
+};
 pub use pool::{
     BufPool, BufPoolConfig, PoolStats, PooledBuf, DEFAULT_POOL_AUTOSCALE_HEADROOM,
     DEFAULT_POOL_CAPACITY, DEFAULT_POOL_MAX_CAPACITY, DEFAULT_POOL_MAX_RETAINED_BYTES,
@@ -66,7 +67,7 @@ pub struct ObjStoreConfig {
     /// Optional session token paired with explicit temporary credentials.
     pub session_token: Option<String>,
     /// Path-style (true, `endpoint/bucket/key`) vs virtual-hosted
-    /// (false, `bucket.endpoint/key`). Garage and most homelab S3s
+    /// (false, `bucket.endpoint/key`). SeaweedFS and most homelab S3s
     /// want path-style; AWS prefers virtual-hosted but accepts either.
     pub path_style: bool,
 }

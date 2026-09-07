@@ -2,7 +2,7 @@
 # scry replay-opensearch exit criterion (D-056) — end-to-end.
 #
 # Proves the OpenSearch → scry replay path lands a faithful, queryable copy of
-# the corpus, against a real scry ingest + Garage:
+# the corpus, against a real scry ingest + SeaweedFS:
 #
 #   python stub OpenSearch (PIT + search_after)  →  scry replay-opensearch
 #                  →  scry ingest (--storage)  →  bucket
@@ -22,7 +22,7 @@
 #   * --grep "log line" selects M minus the empty-body docs (bodies preserved),
 #   * the replay summary reports ts_inherited=2 and body_missing=2.
 #
-# Self-contained except for Garage (needs docker/garage/.env) and python3.
+# Self-contained except for SeaweedFS (needs docker/seaweedfs/.env) and python3.
 # The dev bucket is emptied at the start of the run.
 
 set -euo pipefail
@@ -40,12 +40,9 @@ EXPECTED_TS_INHERIT=2
 EXPECTED_BODY_MISSING=2
 
 # ── Pre-flight ──────────────────────────────────────────────────────
-if [[ ! -f docker/garage/.env ]]; then
-    echo "[osreplay] docker/garage/.env missing; run scripts/dev-garage-up.sh first" >&2
-    exit 2
-fi
-# shellcheck disable=SC1091
-set -a; source docker/garage/.env; set +a
+# shellcheck source=scripts/lib/dev-objstore.sh
+source "$ROOT/scripts/lib/dev-objstore.sh"
+load_dev_objstore "osreplay"
 
 for tool in aws sqlite3 python3; do
     command -v "$tool" >/dev/null || { echo "[osreplay] $tool not on PATH" >&2; exit 2; }
@@ -58,11 +55,7 @@ cargo build --release -p scry >&2
 # ── Clean slate ─────────────────────────────────────────────────────
 rm -rf "$SMOKE_DIR"; mkdir -p "$SMOKE_DIR"
 echo "[osreplay] emptying bucket s3://$SCRY_OBJSTORE_BUCKET/ ..."
-AWS_ACCESS_KEY_ID="$SCRY_OBJSTORE_ACCESS_KEY_ID" \
-AWS_SECRET_ACCESS_KEY="$SCRY_OBJSTORE_SECRET_ACCESS_KEY" \
-AWS_REGION="$SCRY_OBJSTORE_REGION" \
-    aws --endpoint-url "$SCRY_OBJSTORE_ENDPOINT" \
-        s3 rm "s3://$SCRY_OBJSTORE_BUCKET/" --recursive >/dev/null || true
+empty_dev_objstore_bucket "osreplay"
 
 # ── Stub OpenSearch ─────────────────────────────────────────────────
 python3 - "$STUB_PORT" "$M" > "$SMOKE_DIR/stub.log" 2>&1 <<'PY' &

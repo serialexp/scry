@@ -2,7 +2,7 @@
 # scry agent config-pipeline exit criterion — end-to-end.
 #
 # Proves the agent's TOML config-pipeline features land queryable logs +
-# metrics in the bucket, against a real scry ingest + Garage:
+# metrics in the bucket, against a real scry ingest + SeaweedFS:
 #
 #   CRI log tree ─┐
 #                  ├→ scry agent (--config agent.toml) → scry ingest (--storage)
@@ -33,7 +33,7 @@
 #   Feature 5 (json.metadata → attr) — ✅ request_id per-entry attribute.
 #   Feature 6 (metric label_map)    — ✅ container_name→container.
 #
-# Self-contained except for Garage (needs docker/garage/.env) and python3.
+# Self-contained except for SeaweedFS (needs docker/seaweedfs/.env) and python3.
 
 set -euo pipefail
 
@@ -47,12 +47,9 @@ SMOKE_DIR="${SMOKE_DIR:-/tmp/scry-agent-config}"
 EXPECTED_METRIC_ROWS=3
 
 # ── Pre-flight ──────────────────────────────────────────────────────
-if [[ ! -f docker/garage/.env ]]; then
-    echo "[agent-config] docker/garage/.env missing; run scripts/dev-garage-up.sh first" >&2
-    exit 2
-fi
-# shellcheck disable=SC1091
-set -a; source docker/garage/.env; set +a
+# shellcheck source=scripts/lib/dev-objstore.sh
+source "$ROOT/scripts/lib/dev-objstore.sh"
+load_dev_objstore "agent-config"
 
 for tool in aws sqlite3 python3; do
     command -v "$tool" >/dev/null || { echo "[agent-config] $tool not on PATH" >&2; exit 2; }
@@ -65,11 +62,7 @@ cargo build --release -p scry >&2
 # ── Clean slate ─────────────────────────────────────────────────────
 rm -rf "$SMOKE_DIR"; mkdir -p "$SMOKE_DIR"
 echo "[agent-config] emptying bucket s3://$SCRY_OBJSTORE_BUCKET/ ..."
-AWS_ACCESS_KEY_ID="$SCRY_OBJSTORE_ACCESS_KEY_ID" \
-AWS_SECRET_ACCESS_KEY="$SCRY_OBJSTORE_SECRET_ACCESS_KEY" \
-AWS_REGION="$SCRY_OBJSTORE_REGION" \
-    aws --endpoint-url "$SCRY_OBJSTORE_ENDPOINT" \
-        s3 rm "s3://$SCRY_OBJSTORE_BUCKET/" --recursive >/dev/null || true
+empty_dev_objstore_bucket "agent-config"
 
 # ── CRI log tree ────────────────────────────────────────────────────
 # Single pod: namespace=default, pod=mypod, container=app.

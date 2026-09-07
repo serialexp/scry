@@ -26,7 +26,7 @@
 # Storage-free by design: the ingester runs WITHOUT --storage (the status page
 # only needs the counters), and the query daemon is pointed at a dummy object
 # store with convergence effectively disabled (huge intervals), so **only a dev
-# Valkey is required** — no Garage. Point it at the dev Valkey with
+# Valkey is required** — no real object store. Point it at the dev Valkey with
 # SCRY_VALKEY_URL (default redis://127.0.0.1:6380 — this machine's
 # `scry-valkey-smoke`).
 #

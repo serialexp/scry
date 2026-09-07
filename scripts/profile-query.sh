@@ -35,8 +35,8 @@
 #
 #     or pass `--root` to cargo-flamegraph (requires sudo per run).
 #
-# The bucket env (SCRY_OBJSTORE_*) is loaded from docker/garage/.env
-# the same way smoke.sh does it, so the binary can reach Garage.
+# The bucket env (SCRY_OBJSTORE_*) is loaded through the shared dev-object-store
+# helper, the same way smoke.sh reaches the local SeaweedFS S3 endpoint.
 
 set -euo pipefail
 
@@ -68,15 +68,9 @@ STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT="$OUT_DIR/${STAMP}-${LABEL}.svg"
 
 # ── Bucket env ──────────────────────────────────────────────────────
-ENV_FILE="${ENV_FILE:-$ROOT/docker/garage/.env}"
-if [[ -f "$ENV_FILE" ]]; then
-    set -a
-    # shellcheck disable=SC1090
-    source "$ENV_FILE"
-    set +a
-else
-    echo "warning: $ENV_FILE not found; scry-query will fail unless SCRY_OBJSTORE_* is exported by the caller" >&2
-fi
+# shellcheck source=scripts/lib/dev-objstore.sh
+source "$ROOT/scripts/lib/dev-objstore.sh"
+load_dev_objstore "profile-query"
 
 # ── Build (separate step so build time isn't profiled) ──────────────
 echo "==> building scry (get) [profile=profiling]"

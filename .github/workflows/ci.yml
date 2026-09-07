@@ -5,10 +5,10 @@ name: CI
 # Runs on Depot GitHub Actions runners, same as release.yml.
 #
 # Scope: the core cargo workspace (the desktop crate is excluded from the
-# workspace and checked separately below). Tests are hermetic — the Valkey /
-# Garage integration tests are #[ignore]'d unless those services are present,
-# so no service containers are needed here. The MULTI/smoke end-to-end
-# (scripts/smoke.sh, needs Garage + Valkey) is intentionally NOT run here.
+# workspace and checked separately below). The ordinary Rust job is hermetic:
+# Valkey tests are gated and the S3-compat test runtime-skips without env. A
+# separate SeaweedFS job below exercises conditional S3 semantics. The MULTI/
+# smoke end-to-end (scripts/smoke.sh, needs SeaweedFS + Valkey) is not run here.
 
 on:
   push:
@@ -54,6 +54,41 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+  # ── S3 compatibility: real conditional create + ETag CAS ───────────────
+  s3-compat:
+    runs-on: depot-ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+
+      - name: Install AWS CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y awscli
+
+      - name: Start SeaweedFS
+        run: scripts/dev-seaweedfs-up.sh
+
+      - name: Test S3 compatibility contract
+        run: |
+          set -a
+          source docker/seaweedfs/.env
+          set +a
+          SCRY_S3_COMPAT_REQUIRED=1 cargo test -p scry-objstore --test s3_compat -- --nocapture
+
+      - name: Show SeaweedFS logs on failure
+        if: failure()
+        run: docker compose -f docker/seaweedfs/docker-compose.yml logs --no-color
+
+      - name: Stop SeaweedFS
+        if: always()
+        run: scripts/dev-seaweedfs-down.sh
 
   # ── Desktop app: TypeScript typecheck + frontend build ─────────────────
   desktop:

@@ -33,7 +33,7 @@
 # still fires on the count-only path), and the query daemon uses the
 # reachable-but-empty stub object store from `lib/stub-objstore.sh` with
 # convergence effectively disabled, so **only a dev Valkey is required** — no
-# Garage. Point it at one with SCRY_VALKEY_URL (default redis://127.0.0.1:6380
+# a real object store. Point it at one with SCRY_VALKEY_URL (default redis://127.0.0.1:6380
 # — the long-lived `scry-valkey-smoke` container).
 #
 # Env knobs: SCRY_VALKEY_URL, IA/QQ/QT/S3_PORT ports, SPEW_RATE, BATCHES.
