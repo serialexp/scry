@@ -44,7 +44,7 @@ exclude = [
 # Single source of truth for the Cargo workspace version. just-release updates
 # every workspace member to this version in its release PR and creates the
 # matching `vX.Y.Z` tag after that PR merges.
-version = "0.22.1"
+version = "0.22.2"
 edition = "2021"
 # kube-rs 3.x sets the floor: its MSRV is 1.88. Everything else in the
 # workspace builds well below this; the agent's Kubernetes client is what
