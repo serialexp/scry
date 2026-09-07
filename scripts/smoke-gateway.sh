@@ -57,7 +57,7 @@ for _ in $(seq 1 "$REQUESTS"); do
 done
 
 ./target/release/scry-gateway-probe promwrite "$SMOKE_DIR/promwrite.bin" "$SERIES" "$SAMPLES" >/dev/null
-for _ in $(seq 1 "$REQUESTS"); do curl -sf -o /dev/null -H 'Content-Type: application/x-protobuf' -H 'Content-Encoding: snappy' --data-binary "@$SMOKE_DIR/promwrite.bin" "$GW_URL/api/v1/write"; done
+for _ in $(seq 1 "$REQUESTS"); do curl -sf -o /dev/null -H 'Content-Type: application/x-protobuf;proto=prometheus.WriteRequest' -H 'Content-Encoding: snappy' --data-binary "@$SMOKE_DIR/promwrite.bin" "$GW_URL/api/v1/write"; done
 
 ./target/release/scry-gateway-probe pprof "$SMOKE_DIR/legacy.pprof" "$PROFILE_BYTES" >/dev/null
 for i in $(seq 1 "$REQUESTS"); do from=$((1700000000+i)); curl -sf -o /dev/null -F "profile=@$SMOKE_DIR/legacy.pprof" "$GW_URL/ingest?from=$from&until=$((from+10))&name=legacy.smoke"; done
