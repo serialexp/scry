@@ -381,33 +381,17 @@ impl WorkerClientHelloOutput {
             return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 1, got {}", tag)));
         }
         let protocol_version = decoder.read_u16_be()?;
-        let mut coordinator_id = Vec::with_capacity(16);
-        for _ in 0..16 {
-            let item = decoder.read_byte()?;
-            coordinator_id.push(item);
-        }
-        let mut expected_worker_id = Vec::with_capacity(16);
-        for _ in 0..16 {
-            let item = decoder.read_byte()?;
-            expected_worker_id.push(item);
-        }
+        let coordinator_id = decoder.read_bytes_vec(16)?;
+        let expected_worker_id = decoder.read_bytes_vec(16)?;
         let length = decoder.read_u16_be()? as usize;
         let bytes = decoder.read_bytes_vec(length)?;
         let deployment = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
         let timestamp_unix_ms = decoder.read_u64_be()?;
-        let mut nonce = Vec::with_capacity(32);
-        for _ in 0..32 {
-            let item = decoder.read_byte()?;
-            nonce.push(item);
-        }
+        let nonce = decoder.read_bytes_vec(32)?;
         let length = decoder.read_byte()? as usize;
         let bytes = decoder.read_bytes_vec(length)?;
         let key_id: std::string::String = bytes.iter().map(|&b| b as char).collect();
-        let mut mac = Vec::with_capacity(32);
-        for _ in 0..32 {
-            let item = decoder.read_byte()?;
-            mac.push(item);
-        }
+        let mac = decoder.read_bytes_vec(32)?;
         Ok(Self {
             tag,
             protocol_version,
@@ -529,30 +513,14 @@ impl WorkerServerHelloOutput {
             return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 2, got {}", tag)));
         }
         let protocol_version = decoder.read_u16_be()?;
-        let mut worker_id = Vec::with_capacity(16);
-        for _ in 0..16 {
-            let item = decoder.read_byte()?;
-            worker_id.push(item);
-        }
-        let mut coordinator_nonce = Vec::with_capacity(32);
-        for _ in 0..32 {
-            let item = decoder.read_byte()?;
-            coordinator_nonce.push(item);
-        }
-        let mut worker_nonce = Vec::with_capacity(32);
-        for _ in 0..32 {
-            let item = decoder.read_byte()?;
-            worker_nonce.push(item);
-        }
+        let worker_id = decoder.read_bytes_vec(16)?;
+        let coordinator_nonce = decoder.read_bytes_vec(32)?;
+        let worker_nonce = decoder.read_bytes_vec(32)?;
         let timestamp_unix_ms = decoder.read_u64_be()?;
         let length = decoder.read_byte()? as usize;
         let bytes = decoder.read_bytes_vec(length)?;
         let key_id: std::string::String = bytes.iter().map(|&b| b as char).collect();
-        let mut mac = Vec::with_capacity(32);
-        for _ in 0..32 {
-            let item = decoder.read_byte()?;
-            mac.push(item);
-        }
+        let mac = decoder.read_bytes_vec(32)?;
         Ok(Self {
             tag,
             protocol_version,
@@ -658,11 +626,7 @@ impl WorkerAuthenticatedOutput {
             let item = decoder.read_byte()?;
             payload.push(item);
         }
-        let mut mac = Vec::with_capacity(32);
-        for _ in 0..32 {
-            let item = decoder.read_byte()?;
-            mac.push(item);
-        }
+        let mac = decoder.read_bytes_vec(32)?;
         Ok(Self {
             tag,
             sequence,
@@ -726,11 +690,7 @@ impl WorkerBlockOffer {
     }
 
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
-        let mut uuid = Vec::with_capacity(16);
-        for _ in 0..16 {
-            let item = decoder.read_byte()?;
-            uuid.push(item);
-        }
+        let uuid = decoder.read_bytes_vec(16)?;
         let estimated_scan_bytes = decoder.read_u64_be()?;
         Ok(Self {
             uuid,
@@ -766,11 +726,7 @@ impl WorkerBlockLocality {
     }
 
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
-        let mut uuid = Vec::with_capacity(16);
-        for _ in 0..16 {
-            let item = decoder.read_byte()?;
-            uuid.push(item);
-        }
+        let uuid = decoder.read_bytes_vec(16)?;
         let locality = decoder.read_byte()?;
         Ok(Self {
             uuid,
@@ -869,17 +825,9 @@ impl WorkerBidRequestOutput {
         if tag != 16u8 {
             return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 16, got {}", tag)));
         }
-        let mut coordinator_id = Vec::with_capacity(16);
-        for _ in 0..16 {
-            let item = decoder.read_byte()?;
-            coordinator_id.push(item);
-        }
+        let coordinator_id = decoder.read_bytes_vec(16)?;
         let query_attempt = decoder.read_u32_be()?;
-        let mut offer_id = Vec::with_capacity(16);
-        for _ in 0..16 {
-            let item = decoder.read_byte()?;
-            offer_id.push(item);
-        }
+        let offer_id = decoder.read_bytes_vec(16)?;
         let deadline_unix_ms = decoder.read_u64_be()?;
         let signal = decoder.read_byte()?;
         let length = decoder.read_u16_be()? as usize;
@@ -901,11 +849,7 @@ impl WorkerBidRequestOutput {
         let operation = decoder.read_byte()?;
         let estimated_output_bytes = decoder.read_u64_be()?;
         let memory_units = decoder.read_u32_be()?;
-        let mut block_set_digest = Vec::with_capacity(32);
-        for _ in 0..32 {
-            let item = decoder.read_byte()?;
-            block_set_digest.push(item);
-        }
+        let block_set_digest = decoder.read_bytes_vec(32)?;
         Ok(Self {
             tag,
             coordinator_id,
@@ -1044,16 +988,8 @@ impl WorkerBidResponseOutput {
         if tag != 17u8 {
             return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 17, got {}", tag)));
         }
-        let mut offer_id = Vec::with_capacity(16);
-        for _ in 0..16 {
-            let item = decoder.read_byte()?;
-            offer_id.push(item);
-        }
-        let mut worker_id = Vec::with_capacity(16);
-        for _ in 0..16 {
-            let item = decoder.read_byte()?;
-            worker_id.push(item);
-        }
+        let offer_id = decoder.read_bytes_vec(16)?;
+        let worker_id = decoder.read_bytes_vec(16)?;
         let locality_generation = decoder.read_u64_be()?;
         let length = decoder.read_u16_be()? as usize;
         let mut locality = Vec::with_capacity(length);
@@ -1061,11 +997,7 @@ impl WorkerBidResponseOutput {
             let item = WorkerBlockLocality::decode_with_decoder(decoder)?;
             locality.push(item);
         }
-        let mut reservation_token = Vec::with_capacity(32);
-        for _ in 0..32 {
-            let item = decoder.read_byte()?;
-            reservation_token.push(item);
-        }
+        let reservation_token = decoder.read_bytes_vec(32)?;
         let reservation_expires_unix_ms = decoder.read_u64_be()?;
         let estimated_start_delay_ms = decoder.read_u32_be()?;
         let available_fragment_slots = decoder.read_u16_be()?;
@@ -1175,11 +1107,7 @@ impl WorkerBidDeclineOutput {
         if tag != 18u8 {
             return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 18, got {}", tag)));
         }
-        let mut offer_id = Vec::with_capacity(16);
-        for _ in 0..16 {
-            let item = decoder.read_byte()?;
-            offer_id.push(item);
-        }
+        let offer_id = decoder.read_bytes_vec(16)?;
         let reason = decoder.read_u16_be()?;
         let length = decoder.read_u16_be()? as usize;
         let bytes = decoder.read_bytes_vec(length)?;
@@ -1266,16 +1194,8 @@ impl WorkerReleaseOutput {
         if tag != 32u8 {
             return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 32, got {}", tag)));
         }
-        let mut coordinator_id = Vec::with_capacity(16);
-        for _ in 0..16 {
-            let item = decoder.read_byte()?;
-            coordinator_id.push(item);
-        }
-        let mut reservation_token = Vec::with_capacity(32);
-        for _ in 0..32 {
-            let item = decoder.read_byte()?;
-            reservation_token.push(item);
-        }
+        let coordinator_id = decoder.read_bytes_vec(16)?;
+        let reservation_token = decoder.read_bytes_vec(32)?;
         Ok(Self {
             tag,
             coordinator_id,
@@ -1353,11 +1273,7 @@ impl WorkerReleaseAckOutput {
         if tag != 33u8 {
             return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 33, got {}", tag)));
         }
-        let mut reservation_token = Vec::with_capacity(32);
-        for _ in 0..32 {
-            let item = decoder.read_byte()?;
-            reservation_token.push(item);
-        }
+        let reservation_token = decoder.read_bytes_vec(32)?;
         let released = decoder.read_byte()?;
         Ok(Self {
             tag,
@@ -1444,17 +1360,9 @@ impl WorkerCancelOutput {
         if tag != 48u8 {
             return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 48, got {}", tag)));
         }
-        let mut coordinator_id = Vec::with_capacity(16);
-        for _ in 0..16 {
-            let item = decoder.read_byte()?;
-            coordinator_id.push(item);
-        }
+        let coordinator_id = decoder.read_bytes_vec(16)?;
         let query_attempt = decoder.read_u32_be()?;
-        let mut fragment_id = Vec::with_capacity(16);
-        for _ in 0..16 {
-            let item = decoder.read_byte()?;
-            fragment_id.push(item);
-        }
+        let fragment_id = decoder.read_bytes_vec(16)?;
         let fragment_attempt = decoder.read_u32_be()?;
         Ok(Self {
             tag,
@@ -1542,11 +1450,7 @@ impl WorkerCancelAckOutput {
         if tag != 49u8 {
             return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 49, got {}", tag)));
         }
-        let mut fragment_id = Vec::with_capacity(16);
-        for _ in 0..16 {
-            let item = decoder.read_byte()?;
-            fragment_id.push(item);
-        }
+        let fragment_id = decoder.read_bytes_vec(16)?;
         let fragment_attempt = decoder.read_u32_be()?;
         let cancelled = decoder.read_byte()?;
         Ok(Self {

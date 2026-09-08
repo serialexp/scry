@@ -268,7 +268,7 @@ impl TableProvider for MetricsTable {
         // is added — `SELECT count(*)` / label-free SQL stay byte-for-byte as
         // before, and a label-less query never even builds `fp_labels`.
         let want_labels =
-            self.fp_labels.is_some() && projection.map_or(true, |p| p.contains(&labels_idx));
+            self.fp_labels.is_some() && projection.is_none_or(|p| p.contains(&labels_idx));
 
         // Physical projection pushed into the parquet scan. When labels are
         // wanted we read the full physical schema (so `series_fingerprint` is

@@ -34,6 +34,7 @@ use futures::StreamExt;
 use object_store::{path::Path as ObjPath, ObjectStore, ObjectStoreExt};
 use scry_block::BlockMeta;
 use scry_catalog::{date_dir, CatalogHandle};
+use scry_storage_layout::is_reserved_control_key;
 use uuid::Uuid;
 
 /// Outcome of a poll / walk pass.
@@ -219,8 +220,9 @@ where
     while let Some(item) = stream.next().await {
         let meta = item.context("listing bucket objects")?;
         let loc = meta.location.as_ref();
-        // `_catalog/` is reserved for catalog snapshots (D-055), not blocks.
-        if loc.starts_with("_catalog/") {
+        // Classify before suffix checks: control products may legitimately use
+        // `*.meta.json`, but they are never telemetry block sidecars.
+        if is_reserved_control_key(loc) {
             continue;
         }
         if loc.ends_with(".meta.json") {
@@ -244,8 +246,7 @@ where
     while let Some(item) = stream.next().await {
         let meta = item.context("listing bucket objects (offset)")?;
         let loc = meta.location.as_ref();
-        // `_catalog/` is reserved for catalog snapshots (D-055), not blocks.
-        if loc.starts_with("_catalog/") {
+        if is_reserved_control_key(loc) {
             continue;
         }
         if loc.ends_with(".meta.json") {

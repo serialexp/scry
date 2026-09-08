@@ -1,0 +1,9 @@
+[package]
+name        = "scry-storage-layout"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared classification and construction rules for Scry object-storage keys."
+
+[lints]
+workspace = true

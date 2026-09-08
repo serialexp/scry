@@ -447,14 +447,14 @@ async fn sink_mirrors_soft_deleted_into_the_registry() {
 /// Returns the final observed presence.
 async fn await_registry_contains(c: &ValkeyClient, uuid: Uuid, want: bool) -> bool {
     for _ in 0..50 {
-        let listed = scry_valkey::list_staged_deletions(&c).await.expect("list");
+        let listed = scry_valkey::list_staged_deletions(c).await.expect("list");
         let present = listed.iter().any(|s| s.uuid == uuid);
         if present == want {
             return present;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    scry_valkey::list_staged_deletions(&c)
+    scry_valkey::list_staged_deletions(c)
         .await
         .expect("list")
         .iter()

@@ -30,10 +30,9 @@ use crate::postings_cache::PostingsIndex;
 /// every matcher in this block.
 ///
 /// Returns:
-/// - `Ok(None)`         — at least one matcher had zero hits, so the
-///                        AND'd intersection is empty. Caller can skip
-///                        the main parquet entirely.
-/// - `Ok(Some(set))`    — non-empty intersection; pass to `scan_block`.
+/// - `Ok(None)` — at least one matcher had zero hits, so the AND'd
+///   intersection is empty. Caller can skip the main parquet entirely.
+/// - `Ok(Some(set))` — non-empty intersection; pass to `scan_block`.
 ///
 /// Special case: an empty `matchers` list returns the block's full
 /// fingerprint set, derived from `meta.all_fingerprints` (which every

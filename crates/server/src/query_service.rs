@@ -81,6 +81,7 @@ use scry_query::{
     LabelMetadataStats, PostingsCache, PostingsCacheStats, Query, QueryRequest, QueryResultCache,
     QueryResultCacheStats, METRICS_TABLE_NAME,
 };
+use scry_storage_layout::is_reserved_control_prefix;
 
 use crate::live_merge::{fetch_live_from_ingester, LiveDiscovery};
 use crate::memory_guard::{QueryMemoryGuard, QUERY_TOO_LARGE_MESSAGE};
@@ -1172,6 +1173,14 @@ impl QueryService {
                     body: r.body,
                     labels: r.labels.into_iter().map(|p| (p.key, p.value)).collect(),
                     attributes: r.attributes.into_iter().map(|p| (p.key, p.value)).collect(),
+                    observed_ts_unix_nano: None,
+                    severity_text: None,
+                    event_name: None,
+                    trace_id: None,
+                    span_id: None,
+                    trace_flags: None,
+                    raw_record_version: None,
+                    raw_record: None,
                 });
             }
             if let Some(guard) = self.memory_guard.as_ref() {
@@ -1325,6 +1334,11 @@ impl QueryService {
         partition: &RepairPartition,
     ) -> std::result::Result<Vec<ObjectMeta>, String> {
         let (signal, date) = partition;
+        if is_reserved_control_prefix(signal) {
+            return Err(format!(
+                "targeted repair refuses reserved control namespace {signal:?}"
+            ));
+        }
         let prefix = ObjPath::from(format!("{signal}/{}/", date.replace('-', "/")));
         let mut stream = self.store.list(Some(&prefix));
         let mut objects = Vec::new();
@@ -3436,6 +3450,21 @@ mod tests {
             0,
         )
         .with_targeted_repair_limits(limits)
+    }
+
+    #[tokio::test]
+    async fn targeted_repair_refuses_reserved_control_namespaces() {
+        let store = Arc::new(CountingStore::new(Duration::ZERO));
+        let service = repair_service(store.clone(), TargetedRepairLimits::default());
+
+        for signal in ["_catalog", "_scry", "_scry/errors"] {
+            let error = service
+                .list_partition_meta_objects(&(signal.to_string(), "2026-09-07".to_string()))
+                .await
+                .unwrap_err();
+            assert!(error.contains("reserved control namespace"), "{error}");
+        }
+        assert_eq!(store.lists.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

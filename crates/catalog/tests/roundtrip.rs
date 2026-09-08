@@ -549,7 +549,7 @@ async fn reconcile_walks_bucket_and_upserts_sidecars() {
         )
         .await
         .unwrap();
-    // Malformed sidecar — should bump `failed`.
+    // Malformed telemetry sidecar — should bump `failed`.
     store
         .put(
             &ObjPath::from("dummy/2025/01/01/abc/bad.meta.json"),
@@ -557,6 +557,21 @@ async fn reconcile_walks_bucket_and_upserts_sidecars() {
         )
         .await
         .unwrap();
+    // Control-plane objects can use the same suffix but must be classified
+    // before any GET or BlockMeta parse attempt.
+    for path in [
+        "_catalog/decoy.meta.json",
+        "_scry/errors/v1/projections/commit.meta.json",
+        "_scry/alerts/v1/rules/rule.meta.json",
+    ] {
+        store
+            .put(
+                &ObjPath::from(path),
+                PutPayload::from(Bytes::from_static(b"{not-block-meta")),
+            )
+            .await
+            .unwrap();
+    }
 
     let report = cat.reconcile_from_bucket(store.as_ref()).await.unwrap();
     assert_eq!(report.seen, 4, "three good + one malformed sidecar = 4");
@@ -925,7 +940,7 @@ fn live_block_stats_matches_the_scans_it_replaces() {
         vec![
             (0, 3, 30, 3 * 10 * 64),
             (1, 2, 200, 2 * 100 * 64),
-            (2, 1, 1000, 1 * 1000 * 64),
+            (2, 1, 1000, 1000 * 64),
         ],
         "levels ascending, each carrying its own blocks, rows, and bytes"
     );

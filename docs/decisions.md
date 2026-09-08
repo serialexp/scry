@@ -3851,3 +3851,37 @@ created.
 The consequence is a narrower contract for future control-plane roles than for the
 existing data plane: "S3-compatible" alone is insufficient; the semantic probe is
 the authority. See `docs/design/conditional-object-storage.md`.
+
+## D-073: Error occurrences extend logs v2; control products use `_scry/`
+
+**Date:** 2026-09-07
+**Status:** accepted
+
+Error monitoring needs lossless typed OpenTelemetry values, distinct event and
+observed timestamps, canonical top-level correlation, and immutable raw input for
+reprocessing. The current logs v1 path stringifies values and drops required fields,
+but the WAL, immutable block model, schema-versioned compaction, and query adapters
+can carry a lossless logs v2 representation. A fifth physical signal would duplicate
+all signal machinery and create ambiguous dual-write/ACK/dedup semantics for events
+that remain OpenTelemetry logs.
+
+Raw error occurrences therefore remain in the logs signal. Logs v2 stores a bounded,
+versioned canonical typed raw record alongside stable flat query columns. The
+reader-first wire contract reserves capability bit `0x0000_0008`, payload magic
+`0x534c3200` (`SL2\0`), and canonical raw-record version 1. Old logs v1 blocks
+remain readable with their missing fidelity represented honestly, and different
+block schema versions do not co-compact. Error-specific projection and admission sit
+above the shared raw logs path rather than redefining the source signal.
+
+Durable artifacts, issue projections/workflow, alert rules/state, and notification
+records live below `_scry/<subsystem>/`. `_catalog/` remains a permanent legacy
+sibling. Every telemetry reader must classify `_scry/` as control space before
+suffix matching or object GETs. That reader support ships fleet-wide in release N,
+with no `_scry/` writers enabled; writers may ship only in N+1 so rolling deployment
+and rollback cannot expose new control objects to an old block reconciler.
+
+Object storage remains authoritative for immutable control records. Local SQLite
+state is a rebuildable projection, Valkey coordinates single-winner mutable work,
+and D-072 conditional create/ETag-CAS semantics guard correctness-bearing commits.
+Subsystem-specific retention and access policies must target paths below `_scry/`;
+no bucket-wide lifecycle rule may treat the umbrella as one retention class.

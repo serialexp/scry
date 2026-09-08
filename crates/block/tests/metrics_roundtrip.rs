@@ -442,7 +442,7 @@ async fn metrics_empty_builder_uploads_nothing() {
     let mut listing = store.list(None);
     use futures::StreamExt;
     let mut count = 0;
-    while let Some(_) = listing.next().await {
+    while listing.next().await.is_some() {
         count += 1;
     }
     assert_eq!(count, 0, "no objects uploaded for empty builder");

@@ -737,9 +737,12 @@ mod tests {
 
     use crate::generated::{LabelPair, MetricSample, MetricsBatch, SeriesDictEntry};
 
+    type OwnedLabels = Vec<(Vec<u8>, Vec<u8>)>;
+    type CollectedSeries = (u64, u8, OwnedLabels);
+
     #[derive(Default, Debug, PartialEq)]
     struct MetricsCollected {
-        series: Vec<(u64, u8, Vec<(Vec<u8>, Vec<u8>)>)>,
+        series: Vec<CollectedSeries>,
         samples: Vec<(u64, u64, f64)>,
     }
 

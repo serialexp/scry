@@ -50,9 +50,10 @@
 //! [`PostingsCacheConfig::budget_bytes`] is an estimate of in-memory
 //! footprint — not a hard guarantee. We approximate per-entry size as
 //! HashMap overhead + key string heap + `Arc<Vec<u64>>` control block
-//! + Vec heap. Reality is ±30% depending on hash table load factor
-//! and allocator behaviour, but the order of magnitude is what
-//! matters for capacity planning.
+//! + Vec heap.
+//!
+//! Reality is ±30% depending on hash table load factor and allocator
+//! behaviour, but the order of magnitude is what matters for capacity planning.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};

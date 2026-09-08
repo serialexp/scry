@@ -365,3 +365,57 @@ Production accumulated ~319k block metadata sidecars because coordinated compact
    retried). So zero grace is live and has been stable for days.
 
 Do not deploy or mutate production without Bart's explicit confirmation.
+
+---
+
+# Current task — error monitoring Phase 0 foundations
+
+## Decisions
+
+Bart selected **logs v2** for lossless raw error occurrences and
+`_scry/<subsystem>/` for durable control products. D-073 records the accepted
+architecture. `_catalog/` remains a permanent legacy sibling.
+
+## Implemented in this run
+
+- Added the dependency-leaf `scry-storage-layout` crate with segment-aware
+  classification for `_catalog/`, `_scry/`, lookalikes, and untrusted prefixes.
+- Catalog reconcile and cluster full/incremental walkers classify reserved control
+  objects before `.meta.json` suffix checks, so control metadata is never fetched or
+  parsed as a telemetry block.
+- Targeted query repair refuses reserved control roots before listing.
+- Added catalog, convergence, query repair, and classifier tests with invalid
+  `_scry/**/*.meta.json` decoys; extended the catalog snapshot smoke likewise.
+- Added logs-v2's generated nonrecursive envelope and allocation-conscious,
+  two-pass canonical raw-record validator/borrowed decoder. It bounds bytes, nodes,
+  maps, containers, and depth before callbacks and retains full OTLP log semantics.
+- Added the exact reader-side logs Parquet v2 schema while leaving the active builder
+  pinned to v1. Query normalizes v1 and v2 into one stable schema, inserts typed NULL
+  fidelity for legacy/live-v1 rows, and prunes raw payloads from common projections.
+- Compaction validates claimed logs schemas, rejects mixed/unknown/mislabeled inputs,
+  and preserves opaque v2 raw bytes exactly.
+- Updated the design status/checklists and README workspace map.
+
+## Verification
+
+- `cargo test -p scry-storage-layout -p scry-catalog -p scry-cluster`
+- `cargo test -p scry-proto -p scry-block -p scry-query -p scry-server`
+- `cargo test -p scry-compact --lib --tests`
+- `cargo check --workspace`
+- `cargo fmt --all --check`
+- `bash -n` on the modified smoke and protocol generation scripts
+- deterministic protocol regeneration and generated-output byte comparison
+- `git diff --check`
+
+## Remaining work
+
+1. Deploy this reader-only namespace and logs-schema support fleet-wide in a normal
+   release before enabling `_scry/` product writers or logs-v2 ingestion. Deployment
+   is not authorized in this run.
+2. Implement the logs-v2 storage writer and safe per-schema builder rotation/WAL
+   replay. Advertise/request capability `0x0000_0008` only after rollout; current
+   agent and gateway emission must remain v1 until then.
+3. Map gateway OTLP protobuf/JSON/gzip/gRPC into canonical logs v2 without loss and
+   add end-to-end wire → WAL → block → compaction → query/extractor fidelity tests.
+4. Extend typed fidelity into live-tail only behind a separate compatible contract;
+   current best-effort live rows intentionally expose the new fields as NULL.

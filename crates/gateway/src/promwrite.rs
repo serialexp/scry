@@ -411,7 +411,7 @@ fn split_labels(labels: Vec<v1::Label>) -> Result<(String, Vec<LabelPair>), Mapp
 }
 
 fn refs_to_labels(symbols: &[String], refs: &[u32]) -> Result<Vec<v1::Label>, MappingError> {
-    if refs.len() % 2 != 0 {
+    if !refs.len().is_multiple_of(2) {
         return err("label symbol references must be name/value pairs");
     }
     refs.chunks_exact(2)
@@ -545,7 +545,7 @@ fn exemplar(
     })
 }
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len())

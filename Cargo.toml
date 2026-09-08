@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/binschema-runtime",
+    "crates/storage-layout",
     "crates/proto",
     "crates/match",
     "crates/objstore",
@@ -61,9 +62,10 @@ aws-config             = { version = "1", default-features = false, features = [
 aws-credential-types   = { version = "1", features = ["hardcoded-credentials"] }
 aws-sigv4              = { version = "1", default-features = false, features = ["sign-http"] }
 
-binschema-runtime = { path = "crates/binschema-runtime" }
-scry-proto        = { path = "crates/proto" }
-scry-match        = { path = "crates/match" }
+binschema-runtime  = { path = "crates/binschema-runtime" }
+scry-storage-layout = { path = "crates/storage-layout" }
+scry-proto         = { path = "crates/proto" }
+scry-match         = { path = "crates/match" }
 scry-duration     = { path = "crates/duration" }
 scry-objstore     = { path = "crates/objstore" }
 scry-wal          = { path = "crates/wal" }

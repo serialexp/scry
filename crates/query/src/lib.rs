@@ -44,6 +44,7 @@ pub mod cli;
 pub mod evict;
 pub mod label_enrich;
 pub mod logs;
+mod logs_normalize;
 pub mod metadata;
 mod metrics_normalize;
 pub mod metrics_sql;

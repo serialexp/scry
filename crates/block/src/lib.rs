@@ -29,7 +29,7 @@ pub use bloom::{BodyBloom, BodyBloomBuilder};
 pub use dummy::DummyBlockBuilder;
 pub use events::{BlockEvent, BlockEventSink, Envelope, NoopSink};
 pub use fence::{AlwaysValid, CompactionProgress, Fence};
-pub use logs::LogsBlockBuilder;
+pub use logs::{logs_physical_schema_v1, logs_physical_schema_v2, LogsBlockBuilder};
 pub use meta::{
     compacted_ancestor_closure, BlockMeta, MAX_COMPACTED_ANCESTORS, MAX_COMPACTED_ANCESTRY_BYTES,
 };

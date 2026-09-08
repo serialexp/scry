@@ -22,9 +22,9 @@
 #       ingester's row count N immediately, with the poll loop effectively idle.
 #   (c) INCREMENTAL DELTA — spew M more logs post-snapshot; the daemon's poll
 #       loop lifts the count to N+M (snapshot + delta, no double-count).
-#   (d) RESERVED PREFIX — a fresh reconcile over the bucket counts exactly the
-#       block sidecars (the `_catalog/` snapshot object is never mis-parsed as a
-#       block), and no daemon logs a sidecar parse failure.
+#   (d) RESERVED PREFIXES — a fresh reconcile over the bucket counts exactly the
+#       block sidecars; neither the `_catalog/` snapshot nor `_scry/` control
+#       metadata decoys are fetched or parsed as blocks.
 #
 # Needs SeaweedFS (docker/seaweedfs/.env — run scripts/dev-seaweedfs-up.sh) + `aws`. NO
 # Valkey (single-instance; snapshot production needs no lease).
@@ -206,19 +206,28 @@ done
 ok "(c) incremental delta: daemon reached N2=$N2 = snapshot ($N) + delta ($((N2 - N)))"
 
 # ════════════════════════════════════════════════════════════════════
-# Phase 4 — the reserved `_catalog/` prefix is not a block
+# Phase 4 — reserved control namespaces are not telemetry blocks
 # ════════════════════════════════════════════════════════════════════
 echo "== phase 4: reserved-prefix reconcile =="
+# Deliberately use the block commit suffix with invalid BlockMeta bytes. A
+# reader that fails to classify `_scry/` before suffix matching will report a
+# parse failure. This is reader-only rollout coverage; no product writer exists.
+printf '%s' '{not-block-meta' >"$TMP/control-decoy.meta.json"
+aws_s3 s3 cp \
+  "$TMP/control-decoy.meta.json" \
+  "s3://$SCRY_OBJSTORE_BUCKET/_scry/errors/v1/projections/control-decoy.meta.json" \
+  >/dev/null || fail "failed to upload _scry/ control metadata decoy"
 RECON_OUT="$("$SCRY" list --catalog "$CAT_C" 2>"$TMP/reconcile.err")" \
   || { cat "$TMP/reconcile.err" >&2; fail "reconcile list failed"; }
 RB="$(echo "$RECON_OUT" | sed -n 's/^# \([0-9]*\) block(s) .*/\1/p')"
 A_BLK="$(a_blocks || echo 0)"
 [ -n "$RB" ] && [ "$RB" -eq "$A_BLK" ] \
   || fail "reconcile counted $RB blocks, A has $A_BLK — the snapshot object was mis-parsed as a block"
-if grep -qi "sidecar JSON parse failed\|_catalog" "$TMP/reconcile.err" "$TMP/ingest.log" "$TMP/queryd.log"; then
-  fail "a _catalog/ object was fetched/parsed as a block sidecar (see logs)"
+if grep -qi "sidecar JSON parse failed\|_catalog.*block sidecar\|_scry.*block sidecar" \
+  "$TMP/reconcile.err" "$TMP/ingest.log" "$TMP/queryd.log"; then
+  fail "a reserved control object was fetched/parsed as a block sidecar (see logs)"
 fi
-ok "(d) reserved prefix: reconcile counts exactly $RB block(s); _catalog/ never parsed as a block"
+ok "(d) reserved prefixes: reconcile counts exactly $RB block(s); _catalog/ and _scry/ never parsed as blocks"
 
 # No panics anywhere.
 if grep -iq panicked "$TMP/ingest.log" "$TMP/queryd.log"; then

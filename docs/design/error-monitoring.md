@@ -1,14 +1,14 @@
 # Error monitoring — Architecture
 
-Status: draft, not yet implemented
+Status: accepted — reader-only Phase 0 namespace support landed; remaining phases outstanding
 Owner: Bart
 Last updated: 2026-09-07
 
 ## Implementation status
 
-Tracking the gap between this design suite and `main`. Decisions remain proposals
-until the suite-wide review is resolved and an architectural decision is appended
-to `docs/decisions.md`.
+Tracking the gap between this design suite and `main`. D-073 accepts logs v2 and
+the `_scry/<subsystem>/` namespace. Its reader-first compatibility release must be
+deployed fleet-wide before any `_scry/` product writer is enabled.
 
 ### Done
 
@@ -17,18 +17,20 @@ to `docs/decisions.md`.
 - [x] **Upstream survey.** Current OpenTelemetry exception/event conventions,
   browser capture, source-map debug IDs, and representative issue/alert behavior
   have been reviewed.
+- [x] **Architecture decisions.** D-073 selects lossless logs v2, immutable
+  object-store authority with local projections, and `_scry/<subsystem>/`.
+- [x] **Phase 0a — reader-only namespace support.** A shared classifier excludes
+  `_catalog/` and `_scry/` before block suffix checks in catalog, convergence, and
+  targeted query repair paths; no `_scry/` product writer is enabled.
+- [x] **Phase 0b — logs v2 reader contract.** The bounded canonical raw codec,
+  generated envelope, exact Parquet v2 schema, mixed-version query normalization,
+  and schema-safe compaction landed without enabling a writer.
 
 ### Outstanding
 
-- [ ] **Review — raw occurrence representation.** Confirm that a lossless typed
-  extension of logs is preferable to a fifth physical signal.
-- [ ] **Review — control-plane authority.** Confirm immutable object-store records
-  plus local projections and leased writers for mutable products.
-- [ ] **Decision record.** Append the accepted cross-cutting architecture to
-  `docs/decisions.md` after review; do not call this draft accepted beforehand.
-- [ ] **Phase 0 — foundations.** Generalize reserved prefixes, deploy their reader
-  support fleet-wide before writing new objects, preserve OTLP event fidelity and
-  correlation, define shared IDs and schemas, require `probe_conditional_writes` at
+- [ ] **Phase 0c — foundations.** Deploy reader support fleet-wide before enabling
+  writers, preserve OTLP event fidelity and correlation, define
+  shared IDs and schemas, require `probe_conditional_writes` at
   every error/control role startup, and seal compatibility.
 - [ ] **Phase 1 — artifacts and grouping.** Upload, index, symbolize, normalize,
   fingerprint, and explain issue membership.
@@ -181,11 +183,11 @@ browser front door and allowlisted proxy.
 
 ## Durable namespace and projections
 
-Before adding objects, replace literal `_catalog/` exclusions with one shared
-reserved-control-prefix classifier used by catalog reconcile, cluster poll/full
-walk, list tooling, and tests. Review should choose between sibling roots such as
-`_errors/`/`_alerts/`/`_artifacts/` and a future-proof `_scry/<subsystem>/` root.
-The focused documents use `_scry/...` illustratively, not as an accepted path.
+D-073 reserves `_scry/<subsystem>/` for control products while retaining
+`_catalog/` as a permanent legacy sibling. One shared reserved-control-prefix
+classifier is used by catalog reconcile, cluster poll/full walk, targeted query
+repair, inherited list/maintenance paths, and tests. Reader-only support must be
+deployed fleet-wide before any `_scry/` product object is written.
 
 Authoritative records are immutable and committed metadata-last:
 
@@ -282,14 +284,14 @@ status, logs, or rendered intents.
 
 ## Cross-document decisions requiring review
 
-1. **Raw representation:** extend generic logs with lossless typed recursive body/
-   attributes and structured exception context, or introduce a fifth physical
-   signal. A logs-backed v1 is preferred for ecosystem leverage, but it is not
-   accepted if it makes exception chains/frames/reprocessing lossy or awkward.
-2. **Namespace:** sibling reserved roots versus `_scry/<subsystem>/` before the
-   first new durable object ships. All existing binaries must understand the root
-   at least one rolling release before any object is written beneath it.
-3. **Object-store capability contract:** conditional create and ETag CAS are
+1. **Raw representation (resolved by D-073):** extend generic logs with a logs v2
+   typed canonical raw record plus stable flat query projection. Error-specific
+   structured context remains versioned inside the typed record rather than
+   creating a fifth physical signal.
+2. **Namespace (resolved by D-073):** use `_scry/<subsystem>/`. All existing
+   binaries must understand the root at least one rolling release before any object
+   is written beneath it.
+3. **Object-store capability contract (resolved by D-072):** conditional create and ETag CAS are
    required; define the startup probe, errors, and supported SeaweedFS/AWS matrix.
 4. **Issue transitions:** freeze the durable errors-to-alerts transition log,
    deterministic logical IDs, rebuild-without-re-emission rule, and consumer cursor.
@@ -340,6 +342,11 @@ editing.
 
 ### Review record
 
+- **2026-09-07 — D-073 resolves the foundational representation and namespace.**
+  Bart selected logs v2 and `_scry/<subsystem>/` after a code-backed comparison of
+  both feasible raw models and namespace rollout costs. Reader-only namespace
+  support lands before the first control writer; the remaining product decisions
+  below stay open.
 - **2026-09-07 — Claude and Codex whole-suite reviews.** Both reviewers read all
   eight documents against the repository. Incorporated findings include: a durable
   issue-transition stream and consumer checkpoints; projection-time occurrence
@@ -355,9 +362,9 @@ editing.
   real S3 conditional create/update semantics, and the local integration backend must
   test them. Antigravity review could not be obtained because its CLI invocation
   failed before reading the prompt; it supplied no findings.
-- **Still blocking review decisions:** raw typed-log versus fifth-signal storage;
-  durable namespace and reader rollout; workflow fold conflicts; late-symbolication
-  membership; lifetime count semantics; source-map/parser implementation; stable
+- **Still blocking review decisions after D-073:** workflow fold conflicts;
+  late-symbolication membership; lifetime count semantics; source-map/parser
+  implementation; stable
   deployment identity provisioning; single-instance exclusivity; privacy defaults;
   and initial notification policy. These remain explicit rather than silently
   selected by reviewers.

@@ -148,9 +148,9 @@ fn validate_descriptor(d: &MetricDescriptorV2) -> Result<(), ValidationError> {
     }
 }
 
-pub(crate) fn validate_point<'a>(
+pub(crate) fn validate_point(
     p: &MetricPointV2,
-    descriptors: &HashMap<u32, &'a MetricDescriptorV2>,
+    descriptors: &HashMap<u32, &MetricDescriptorV2>,
 ) -> Result<(), ValidationError> {
     let (id, start, ts, attrs, exemplars, expected) = match &p.value {
         MetricPointV2Value::ScalarPointV2(v) => {

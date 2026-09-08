@@ -12,10 +12,10 @@ is marketing.
 2. **Object storage is the source of truth.** Everything else (WAL,
    in-memory state, catalog cache) is recoverable from the bucket. If a
    process dies, you re-derive its state by listing the bucket.
-3. **Writers don't coordinate.** Multi-writer must work without a
-   distributed lock manager, a ring, or a consensus protocol.
-   Coordination happens at *compaction* time, not at write time, and
-   uses object-storage-native primitives (conditional PUT, ETags).
+3. **Writers don't coordinate on ingest.** Every writer owns its WAL and key
+   prefix. Multi-instance catalog convergence and destructive maintenance use
+   Valkey, while object storage remains the source of truth; maintenance pauses
+   rather than racing when no lease is available (D-038/D-039).
 4. **No knob without a defended reason.** Every config option must
    justify its existence in a code review. The bias is to delete.
 5. **All four signals share the storage layer.** Per-signal code lives
@@ -120,28 +120,25 @@ is marketing.
                 │  S3-compatible object storage        │
                 │  s3://bucket/<signal>/<date>/<wid>/  │
                 │       <block_uuid>.parquet           │
-                │       <block_uuid>.meta              │
+                │       <block_uuid>.meta.json         │
                 └──────────────────────────────────────┘
 ```
 
-The diagram shows the data plane. The **control plane** is a single
-Valkey instance, used for:
+The diagram shows the data plane. A Valkey instance provides the optional
+multi-instance control plane:
 
-- Agent → server discovery (live server registry + consistent
-  hashing on the agent side; see [Discovery](#discovery)).
-- Block-event pub/sub between instances for fast catalog
-  convergence (see [Block discovery](#block-discovery-valkey-pubsub-with-polling-backstop)).
-- Bucket-event pub/sub for pool changes (auto-provisioning,
-  sealing).
+- block-event pub/sub plus registries for catalog convergence, live tail, staged
+  deletions, and Fleet status;
+- leases that enforce a single winner for compaction and retention;
+- service and bucket discovery for planned or implemented distributed roles.
 
-Valkey is a **cache-invalidation hint**, not a system of record;
-object storage is always the source of truth. The same deployment namespace
-also carries ephemeral Fleet status heartbeats for ingest, query, and gateway
-roles. Those snapshots are operator telemetry only: gateway snapshots preserve
-separate inbound, queue-admission, and final-delivery counters (D-067), and are
-never a correctness input. Valkey unavailability
-gracefully degrades to polling-based discovery; no correctness is
-lost.
+Object storage remains the data source of truth; pub/sub and discovery state are
+recoverable hints backed by polling and full walks. Leases are different: they
+are a correctness requirement because merged blocks use UUIDs rather than
+content hashes. If Valkey is unavailable, reads and writes continue through the
+object-store paths, but destructive multi-instance maintenance pauses unless an
+operator explicitly enables unfenced single-owner operation (D-038/D-039). Fleet
+snapshots are telemetry only and never a correctness input.
 
 ### Deployment topologies
 
@@ -212,13 +209,15 @@ Within any bucket, the path layout is:
 ```
 <signal>/<yyyy>/<mm>/<dd>/<writer_id>/<block_uuid>.parquet
 <signal>/<yyyy>/<mm>/<dd>/<writer_id>/<block_uuid>.meta.json
-<signal>/<yyyy>/<mm>/<dd>/<writer_id>/<block_uuid>.postings.parquet  # metrics only
+<signal>/<yyyy>/<mm>/<dd>/<writer_id>/<block_uuid>.postings.parquet  # metrics and logs
+<signal>/<yyyy>/<mm>/<dd>/<writer_id>/<block_uuid>.body.bloom        # logs only
 ```
 
-The `.postings.parquet` sidecar is signal-specific — present for
-metrics, absent for logs/traces/profiles (whose query patterns don't
-benefit from an inverted index). See [Metrics](#metrics) for the
-postings design.
+Sidecars are signal-specific. Metrics and logs carry postings for label
+preselection; logs additionally carry a one-sided byte-trigram bloom that skips
+blocks unable to contain a full-text term. Traces and profiles carry neither and
+rely on Parquet predicate/statistics pruning. See [Metrics](#metrics) for the
+postings design and D-035 for the log bloom.
 
 - `signal` ∈ `{metrics, logs, traces, profiles}`. Each signal is a
   totally independent prefix; nothing crosses.
@@ -465,8 +464,11 @@ catalog, because the catalog is just a cache of what's in the bucket.
 
 #### Schema
 
-The complete catalog schema, consolidated. All tables are per
-instance; cross-instance convergence happens via Valkey events on top.
+The following is the conceptual core of the catalog, not a verbatim migration.
+The complete current DDL also includes body-bloom sizing, independent liveness,
+durable deletion/reap deadlines, compaction lineage, WAL watermarks, and label
+materialization tables. `crates/catalog/src/lib.rs` is authoritative. All tables
+are per instance; cross-instance convergence happens via Valkey events on top.
 
 ```sql
 -- All buckets known to this instance.
@@ -494,7 +496,7 @@ CREATE TABLE blocks (
   row_count           INTEGER NOT NULL,
   byte_size           INTEGER NOT NULL,    -- main parquet on-disk size
   postings_size_bytes INTEGER,             -- size of .postings.parquet, NULL if absent
-  has_postings        INTEGER NOT NULL DEFAULT 0,  -- bool; metrics-only currently
+  has_postings        INTEGER NOT NULL DEFAULT 0,  -- bool; metrics and logs
   schema_version      INTEGER NOT NULL,
   fingerprint         BLOB,                -- xxh3 label-fingerprint bloom (coarse pruning)
   superseded_by       TEXT REFERENCES blocks(uuid),  -- set during compaction grace
@@ -522,28 +524,26 @@ milestone — adding the column up front means no schema migration
 when the policy lands. Freshly-written blocks are always L0; merged
 outputs increment.
 
-`superseded_by` and `deleted_at` together implement compaction's
-grace-period semantics: a block being phased out is marked
-`superseded_by = <merged_uuid>`, removed from query planning via the
-partial index `WHERE deleted_at IS NULL`, and physically deleted from
-object storage 10 minutes later when `deleted_at` is set.
+`superseded_by`/`superseded` and `deleted_at` remove blocks from query planning
+immediately; separate durable eligibility timestamps retain the work needed to reap their
+objects after the configured grace period. `block_lineage` preserves transitive
+compaction ancestry after input rows disappear, and `wal_watermarks` records the
+history/live durability seam. See the DDL in `crates/catalog/src/lib.rs` for the
+exact current schema rather than copying it into operational code.
 
 #### Bootstrap
 
-A new instance bootstraps its catalog from, in priority order:
+On a cold `scry query` start, the daemon first tries to restore the single
+`_catalog/snapshot.sqlite` object. The snapshot is a consistent SQLite copy made
+with `VACUUM INTO`, carries `PRAGMA user_version`, and is accepted only when its
+schema version matches the running binary. Producing snapshots is a
+non-destructive, lease-free periodic task on an ingester with an online catalog;
+concurrent producers are safe because every uploaded copy is complete.
 
-1. **Catalog snapshot in object storage** (if present). A designated
-   bucket holds a periodically-updated parquet of catalog rows,
-   keyed by `(bucket, uuid)`. Snapshots are written by the instance
-   currently holding the snapshot lease, once per hour. Snapshot
-   bootstrap is O(GB read) regardless of bucket population.
-2. **Tail Valkey** from a sequence number recorded in the snapshot.
-3. **Full bucket walk** as the ultimate fallback when no snapshot
-   exists (first deployment, or all snapshots lost).
-
-Snapshots are an optimisation that becomes load-bearing past a few
-hundred thousand blocks; small deployments can skip the snapshot
-mechanism entirely and bootstrap by full walk.
+When no compatible snapshot exists, queryd completes a full bucket seed before
+opening its listener. After a restore, it can become ready immediately; the first
+background full walk runs at once to seed poll cursors and fetches sidecars only
+for UUIDs absent from the restored catalog. See D-055 and D-066.
 
 ### The WAL
 
@@ -592,14 +592,14 @@ In-memory builder per active block:
   - wall-clock age ≥ `max_block_age` (default 5 min),
   - explicit flush requested (e.g. graceful shutdown).
 - On close: serialize to parquet (zstd, level 3, row group size tuned
-  to ~1 MiB compressed), upload to object storage with
-  `If-None-Match: *` (so a retry never overwrites), write the sidecar,
-  insert a catalog row, then mark the consumed WAL segments as
-  uploaded.
+  to ~1 MiB compressed), upload the UUID-addressed data and sidecars in order
+  with `meta.json` last as the visibility commit point, insert a catalog row,
+  then mark the consumed WAL segments as uploaded. Each object PUT has a small,
+  bounded retry budget and can only rewrite identical bytes for that UUID.
 
-Block builder lifecycle is **per `(signal, day)` pair**, so a block
-never straddles a day boundary. This keeps the partition pruning trivial
-and makes retention a pure prefix-delete.
+Block builder lifecycle is **per `(signal, day)` pair**, so a block never
+straddles a day boundary. This keeps date partition pruning trivial; retention
+still selects individual catalog blocks by their exact `ts_max`.
 
 ## Ingest
 
@@ -1225,9 +1225,9 @@ that's "all of them, easily."
 ### Implementation
 
 We provide a `ParquetMetadataCache` to `parquet-rs` keyed on
-`(bucket, path, etag)`. The ETag pin is belt-and-braces — since we
-upload with `If-None-Match: *` and blocks are immutable, a stale entry
-should be impossible by construction, but matching on ETag means a
+`(bucket, path, etag)`. The ETag pin is belt-and-braces — block object paths
+are UUID-addressed and immutable, so a stale entry should be impossible by
+construction, but matching on ETag means a
 hypothetical overwrite would miss naturally rather than serve wrong
 metadata.
 
@@ -1244,50 +1244,15 @@ number of small blocks (and thus the number of objects to open and
 metadata to load on every query) while bounding the write
 amplification cost.
 
-> **Implementation status (v0.8, D-036).** The shipped subset is
-> **single-instance** and runs as a **standalone tool** (`scry compact`,
-> `--once` / `--watch`), not yet as an in-process background task (under `scry ingest`).
-> It implements the tiered levels, the size-tiered policy, and the
-> per-merge sequence below — with three deliberate simplifications:
-> (1) **no compaction lease.** There is one compactor, so the
-> per-`(signal, day)` object-store lease in [Multi-writer
-> coordination](#multi-writer-coordination) is **deferred**. The
-> immutable + content-addressed block design already makes a stale-lease
-> double-merge harmless (worst case: an orphaned merged block the next
-> pass treats as another input), so the single-instance engine is
-> forward-compatible with adding the lease later. (2) **grace defaults to
-> 0.** Because `superseded_by IS NULL` is in the query filter, queries
-> skip inputs the instant step 5 commits — there's no live-overlap window
-> for one compactor, so the grace period (still configurable via
-> `--grace`) defaults to 0; it only matters once a concurrent reader can
-> be mid-scan, i.e. the multi-instance case. (3) the merge re-sorts the
-> inputs via a **DataFusion `ORDER BY`** (streaming, spills) rather than a
-> hand-rolled k-way merge over the already-sorted inputs — correct and
-> memory-bounded; the k-way merge is a later optimisation. Retention
-> (the other half of v0.8) ships as its own standalone tool — see the
-> [Retention](#retention) status note below.
-
-> **Implementation status (v0.9, D-038/D-039).** Compaction (and
-> retention) are now **multi-instance**, running as in-process
-> background loops under `scry ingest --mode full`. Two corrections to the v0.8 note
-> above: (1) the lease is **no longer deferred** — it is a **Valkey**
-> lease (`SET NX PX` + Lua compare-and-set), not the object-store
-> `If-None-Match` lease, which **cannot** implement mutual exclusion on
-> Garage (no consensus). (2) The v0.8 claim that a stale-lease
-> double-merge is "harmless" is **wrong** and was the load-bearing reason
-> coordination is needed: blocks are addressed by random **UUID v7, not
-> by content hash**, so two winners produce two *distinct* live blocks
-> with identical rows → queries double-count, and a later merge unions
-> (not dedupes) them. Single-winner is therefore a **correctness**
-> requirement. It is upheld by the **commit-point fence** (the `meta.json`
-> PUT — which `reconcile_from_bucket` keys on — happens **last**, gated on
-> `fence.check()`, so a lost lease leaves only uncommitted bytes) plus
-> **grace=0** immediate input deletion (a stale peer's sequential re-merge
-> 404s at the input GET and aborts before committing). Convergence across
-> instances is three-tier (pub/sub → cursor poll → full walk); see
-> [Synchronisation](#synchronisation). The standalone `scry compact` /
-> `scry retention` CLIs still run **unfenced** as the single-instance
-> path. See `docs/decisions.md § D-038` and `§ D-039`.
+> **Implementation status (D-036/D-038/D-039).** Size-tiered compaction runs
+> both as a standalone single-instance command and inside `scry ingest --mode
+> full`. The merge uses a bounded, spill-aware DataFusion `ORDER BY`, rebuilds
+> signal sidecars, and publishes `meta.json` last. Embedded multi-instance work
+> requires a fenced Valkey lease per `(signal, date, level)` partition because
+> UUID-addressed outputs make duplicate committed merges a correctness error, not
+> harmless redundant work. Standalone maintenance is the explicitly
+> single-instance unfenced path. Catalogs converge through pub/sub, cursor polls,
+> and full walks.
 
 > **Implementation status (D-061).** Committed compacted sidecars now carry a
 > bounded, sorted full transitive `compacted_from` closure. The catalog applies
@@ -1347,38 +1312,39 @@ write-mostly KV workloads LevelDB targets.
    [Multi-writer coordination](#multi-writer-coordination) below).
 2. Read the K input blocks via streaming merge sorted by `ts`.
 3. Write one new block to the *current active bucket* (regardless of
-   which buckets the inputs lived in), at level `input_level + 1`.
-   Upload with `If-None-Match: *`.
+   which buckets the inputs lived in), at level `input_level + 1`. Upload
+   UUID-addressed data and sidecars first, then fence and upload `meta.json` as
+   the visibility commit point.
 4. Insert the new catalog row. Publish `block-created` on Valkey.
 5. Mark inputs `superseded_by = <new_uuid>` in the catalog.
    Publish `blocks-superseded`. **At this moment new queries skip
    the inputs.**
-6. Wait the [10-minute grace period](#compaction-deletion-10-minute-grace-period).
-7. Set `deleted_at = now()` on inputs, then `DELETE` the input
-   objects from their respective buckets.
-8. Drop the input catalog rows. Publish `blocks-deleted`. Release
-   the lease.
+6. Release the partition lease; maintenance may continue merging while the
+   durable pending reap waits for its grace deadline.
+7. When eligible, a lease-free idempotent reaper deletes each input's objects,
+   drops its catalog row, and publishes `blocks-deleted`. Failed cleanup remains
+   pending for a later pass.
 
 ### Multi-writer coordination
 
-Compaction work is partitioned by `(bucket, signal, day)`. A
-lightweight lease (a small object at
-`<bucket>/_compact_lease/<signal>/<yyyy-mm-dd>` with a TTL and an
-ETag check on takeover) ensures only one writer compacts a given
-partition at a time. The lease is acquired by conditional PUT and
-renewed by `If-Match: <etag>`.
+Compaction work is partitioned by `(signal, date, level)`. Embedded
+multi-instance maintenance acquires a Valkey lease per partition before merging;
+retention uses one global Valkey lease when staging newly expired blocks. Lease
+renewal and logical commits are fenced, and compaction uploads `meta.json` last so
+a worker that loses its lease cannot commit a visible block (D-038). Physical
+cleanup already represented by durable non-live catalog state is lease-free and
+idempotent.
 
-**Worst case:** a stale lease causes wasted work — two writers both
-produce a merged block. Both blocks are valid; the next compaction
-round picks them up as small-at-the-next-level and merges them.
-**Correctness is preserved by immutability + content addressing.**
+Single-winner execution is required for correctness: blocks have UUID identities,
+not content-addressed identities, so two committed merges of the same inputs
+would both be queried and double-count rows. Without Valkey, embedded maintenance
+pauses unless the operator explicitly asserts sole ownership with
+`--allow-unfenced-maintenance`; standalone maintenance commands are the
+single-instance path.
 
 Compaction never touches the WAL. The WAL is the
 "recent-and-not-yet-uploaded" path; compaction operates strictly on
 already-uploaded blocks.
-
-Compaction never touches the WAL. The WAL is purely the
-"recent-and-not-yet-uploaded" path.
 
 ## Synchronisation
 
@@ -1387,7 +1353,7 @@ bucket. Each instance plays four roles simultaneously: **writer**
 (owns a WAL, uploads blocks under its own `writer_id` prefix),
 **reader** (serves queries from all blocks regardless of authorship),
 **compactor** (background work, contests for partition-scoped leases),
-and **retention-runner** (background work, no coordination needed).
+and **retention-runner** (background work, contests for a global lease).
 
 The two foundational properties that make multi-instance coordination
 tractable:
@@ -1416,9 +1382,10 @@ and **periodic `ListObjects` polling** as the source-of-truth backstop:
   sidecar contents.
 - Every instance `SUBSCRIBE`s to those channels and updates its
   catalog on receipt. Propagation latency is sub-millisecond.
-- Independently, every instance polls `ListObjects` as a backstop
-  (see [Cursor-driven polling](#cursor-driven-polling) below).
-- Every 30 minutes, a full bucket walk reconciles drift end-to-end.
+- Independently, every instance polls `ListObjects` on a configurable interval
+  (5 seconds by default) as a backstop; see [Cursor-driven polling](#cursor-driven-polling).
+- A full bucket walk reconciles drift end-to-end, then sleeps for its configured
+  interval (30 minutes by default) before starting another pass.
 
 #### Cursor-driven polling
 
@@ -1447,85 +1414,66 @@ because we only scan today's and yesterday's per-writer prefixes
 
 #### Polling cadence
 
-Polling cadence adapts to Valkey health:
+The cursor poll and full-walk intervals are operator settings with defaults of 5
+seconds and 30 minutes. Polling runs whether or not Valkey is available; pub/sub
+only reduces the normal visibility delay. Full walks are scheduled from
+completion rather than at a fixed rate, so an overrun cannot turn reconciliation
+into a continuous loop. The first background walk runs immediately, which seeds
+poll cursors after snapshot restore without fetching sidecars already known to
+the catalog (D-066).
 
-- **Healthy (Valkey reachable, recent message received):** poll
-  every 60 seconds. Pure backstop; pub/sub is doing the real work.
-- **Degraded (Valkey unreachable or silent past threshold):** poll
-  every 5 seconds. Pub/sub is no longer trusted, polling is the
-  primary mechanism.
-- **On Valkey reconnect:** immediately trigger one full cursor
-  sweep across all `(signal, writer_id, date)` rows before
-  returning to the healthy cadence. Reconnect is the moment of
-  maximum unknown; that's when the sweep earns its cost.
-
-These cadences are baked-in behavior, not config knobs. If they
-prove wrong in practice we'll revisit.
-
-This is a deliberate three-tier defense: pub/sub for normal-case
-latency, short polling for "Valkey was briefly down," full walks for
-"something we don't understand happened." All three converge on the
-bucket as the source of truth — Valkey is a cache-invalidation hint,
-not a system of record.
+This is a deliberate three-tier defense: pub/sub for normal-case latency, cursor
+polling for missed events, and full walks for unknown drift. All three converge on
+the bucket as the source of truth — Valkey pub/sub is a hint, not a system of
+record.
 
 A single Valkey instance handles enormous fan-out before becoming a
 bottleneck; at our scale (1–N small N) it's a non-issue. Failure
 modes:
 
-- **Valkey down:** instances fall back to polling. Query staleness
-  rises from ~0 ms to ≤5 s. No correctness impact.
+- **Valkey down:** instances continue polling at the configured interval (5
+  seconds by default). Visibility latency rises; destructive maintenance pauses
+  without a lease. Data reads and writes remain correct.
 - **Peer disconnected from Valkey:** same as above for that peer.
 - **Network partition:** each partitioned side still serves queries
   from blocks it knows about; new writes from the *other* side become
   visible after partition heals (via polling reconciliation).
 
-### Compaction: per-partition object-storage leases
+### Maintenance: Valkey leases and fencing
 
-Compaction work is scoped per `(signal, day)` partition. Multiple
-instances run the compactor loop; for each candidate partition, the
-instance attempts to acquire a short-lived lease before starting:
+Compaction uses a logical lease key per `(signal, date, input_level)`; retention
+uses one logical lease key when staging newly expired blocks. `scry-valkey` namespaces those keys
+and implements acquisition with `SET NX PX`, compare-and-`PEXPIRE` renewal, and
+compare-and-delete release. A renewal failure invalidates the local fence before
+the server-side lease can expire.
 
-```
-PUT s3://<bucket>/_compact_lease/<signal>/<yyyy-mm-dd>
-    If-None-Match: *
-    Body: { writer_id, expires_at: now() + 5min }
-```
+The engines do not depend on Valkey directly: they receive a `Fence` and a
+`BlockEventSink`, while `scry-cluster` orchestrates work through a generic
+`LeaseProvider`. Compaction checks the fence immediately before uploading the
+commit-point `meta.json`; retention checks before staging newly expired blocks.
+Losing a lease therefore prevents a new logical transition. Reaping compaction
+inputs or retention blocks already marked non-live is durable completion work and
+does not retain or reacquire the lease. See D-038 for the full single-winner
+argument and failure behavior.
 
-- **Acquire:** `PUT If-None-Match: *`. 412 means someone else has it.
-- **Renew:** `PUT If-Match: <etag>` periodically while working.
-- **Takeover after expiry:** `GET` to check `expires_at`, then
-  `PUT If-Match: <etag>` to atomically replace.
-- **Release:** `DELETE If-Match: <etag>` on clean exit.
-
-S3 (since 2020), R2, MinIO, and Garage all support conditional writes.
-Object stores that don't are explicitly unsupported.
-
-**Correctness if the lease is buggy or contested:** two instances do
-redundant work and produce two valid merged blocks (different UUIDs,
-same input data). The next compaction round merges those two into one.
-**Correctness is preserved by immutability + content addressing;** the
-lease is purely an efficiency optimisation. We will not write
-elaborate recovery logic for double-compaction because there's
-nothing to recover.
-
-### Compaction deletion: 10-minute grace period
+### Compaction deletion: configurable grace and asynchronous reaping
 
 The compactor's output sequence:
 
-1. Upload the merged block (with `If-None-Match: *`).
-2. Insert the new catalog row in this instance and `PUBLISH` it.
-3. Mark the input blocks `superseded_by = <new_uuid>` in the catalog
-   (locally and via pub/sub). **New queries skip superseded blocks.**
-4. Wait 10 minutes.
-5. Delete the input blocks from object storage.
-6. Drop their catalog rows.
+1. Upload the merged block's data and sidecars, then fence and upload
+   `meta.json` last as its visibility commit point.
+2. Atomically apply the new block, lineage claims, supersession state, and
+   reap-eligibility timestamp in the catalog. **New queries skip superseded
+   blocks.** Publish the corresponding created/superseded events.
+3. Continue maintenance; an asynchronous reaper waits until each input's
+   configured grace deadline, then deletes its objects with bounded retries and
+   drops the catalog rows.
 
-The 10-minute grace period exists so that in-flight queries which
-already planned against the input blocks can complete their reads
-before the bytes disappear. This is fixed and not configurable. (If
-operational reality ever produces queries that take >10 min, we'll
-revisit; the architectural decision is "don't add a knob until forced
-to.")
+The grace period lets in-flight queries that already planned against input blocks
+finish before those bytes disappear. It defaults to 10 minutes with a Valkey
+lease and zero for explicitly single-instance operation, and is configurable for
+both compaction and retention. D-061's attempt-supersession protocol provides the
+recovery path when an input still disappears during an active query.
 
 During the grace period, both the old inputs and the new merged block
 exist in the bucket. The `superseded_by` flag prevents double-reads:
@@ -1533,26 +1481,25 @@ queries planned *after* the supersede event see only the merged block,
 queries planned *before* keep reading from the inputs they were
 already plumbed to.
 
-### Retention: no coordination
+### Retention coordination
 
-Retention's only operation is "delete blocks older than cutoff" — an
-idempotent prefix-delete. Multiple instances racing to retire the same
-day produce no incorrect outcome; whichever DELETE lands first wins
-and the rest get 204 No Content. Each instance manages its own
-catalog rows for the deleted prefixes (drop them on observing the
-deletion via pub/sub or polling). No leases, no leader, no
-coordination.
+Retention plans wholly expired catalog blocks by `ts_max` before lease
+acquisition, then uses one global Valkey lease to serialize and fence the
+soft-delete transition for newly expired live blocks. Already-staged blocks are
+invisible to queries and their physical deletion is lease-free, idempotent,
+durable completion work. Staged deletions are mirrored in Valkey for peers that
+missed the event or booted during the grace window (D-038/D-063).
 
-### writer_id
+### Writer identity
 
-Each instance has a stable `writer_id` that prefixes all its block
-paths. Default behavior: on first startup, generate a v4 UUID and
-persist it to `<wal_dir>/writer_id`. Operators who want
-human-readable prefixes (e.g. `ingest-eu-1`, `ingest-eu-2`) can set
-`writer_id` in the config; they're responsible for uniqueness.
+Each storage instance has a stable `writer_uuid` that prefixes all block paths.
+With a WAL directory, startup loads it from `<wal_dir>/writer_id` or generates and
+persists a UUID v7; storage-less operation uses an ephemeral UUID. This identity
+is intentionally not operator-selectable, so restarts retain prefix/cursor
+stability without allowing two writers to be configured with the same prefix.
 
-No coordination needed in either mode: UUIDs don't collide, and
-explicitly named writers are the operator's problem.
+The separate `--writer-id` string is an operator-facing server identity returned
+in `HelloAck`; it does not affect object paths or catalog writer UUIDs.
 
 ### Catalog reconciliation and crash recovery
 
@@ -1569,12 +1516,17 @@ exist." Drift sources:
 
 Defense:
 
-- **Short polling (5 s)** catches near-real-time misses.
-- **Full bucket walk (30 min)** catches everything else: add catalog
-  rows for blocks present in the bucket but not the catalog, drop
-  rows for blocks the catalog claims exist but `HEAD` says don't.
-- **On startup:** full walk before serving queries or accepting
-  writes.
+- **Cursor polling** (5-second default) catches near-real-time misses.
+- **Full bucket walks** (30-minute default, scheduled after completion) catch
+  unknown prefixes and other drift. They list committed `meta.json` keys, fetch
+  only UUIDs absent from `known_block_uuids()`, and seed cursors.
+- **On a cold queryd startup:** restore a compatible catalog snapshot when one
+  exists; otherwise complete a full seed before listening. A restored catalog
+  can become ready immediately while its first background walk seeds cursors.
+- **At query time:** a planning-time 404 evicts the stale block and permits one
+  transparent re-plan. If a block disappears after response bytes have begun,
+  queryd emits `ResponseSuperseded`; a capable client discards that provisional
+  attempt, resets its decoder state, and accepts the replacement attempt.
 
 ### Cache invalidation across instances
 
@@ -1593,22 +1545,21 @@ outlived its data.
 
 ## Retention
 
-Background task. Per signal, on a schedule:
+Background task. Per configured signal, on a schedule:
 
-1. Compute the cutoff date: `today - retention[signal]`.
-2. Delete every prefix `<bucket>/<signal>/<yyyy>/<mm>/<dd>/` where
-   `<yyyy>/<mm>/<dd>` < cutoff.
-3. Drop the corresponding catalog rows.
+1. Compute the exact nanosecond cutoff `now - ttl`.
+2. Select live catalog blocks whose newest record (`ts_max`) is strictly older
+   than the cutoff.
+3. In apply mode, soft-delete each candidate with a durable grace deadline;
+   after the deadline, remove its objects and catalog row.
 
-Because blocks never straddle a day boundary, this is a pure
-prefix-delete. No partial-block resurrection logic. No
-"open the block and find old records" scan.
+Retention never opens or rewrites Parquet. It therefore reaps only wholly expired
+blocks; partial-block rewriting at the TTL boundary remains deferred.
 
-> **Implementation status (v0.8, D-037).** Shipped as a **standalone
-> tool** (`scry retention`, `--watch` / one-shot), not yet an
-> in-process background task (under `scry ingest`), and **single-instance** (no
-> distributed lease — shared deferral with compaction). Two deliberate
-> choices on top of the sketch above: (1) **opt-in per signal, no
+> **Implementation status (D-037/D-038).** Shipped as both a standalone
+> tool (`scry retention`, `--watch` / one-shot) and an in-process loop under
+> `scry ingest --mode full`; embedded multi-instance execution uses the global
+> Valkey lease described above. Two deliberate choices are: (1) **opt-in per signal, no
 > implicit deletion.** A signal is reaped only when a TTL is configured
 > for it — a per-signal override (`--ttl-logs 30d`) or a global
 > `--ttl 30d` default. A signal with no TTL is never touched; nothing is
@@ -1622,19 +1573,12 @@ prefix-delete. No partial-block resurrection logic. No
 > compaction's delete plumbing (`delete_block_objects` →
 > `delete_blocks`, objects before rows) and the `deleted_at` soft-delete
 > gives a correct grace window (queries stop listing a block the instant
-> it's marked, before its objects go); grace defaults to 0, safe
-> single-instance. Still deferred: the multi-instance lease, time-based
-> *partial*-block rewriting (we only drop whole blocks), and
-> size/quota-based eviction (retention is purely age-based).
-
-> **Implementation status (v0.9, D-038/D-039).** Retention now runs as an
-> in-process background loop under `scry ingest --mode full`, guarded by **one
-> global Valkey retention lease** (`scry/lease/retention`) — so exactly
-> one instance reaps at a time. The reap fences before `mark_deleted` and
-> again before the object delete; a lost lease aborts with inputs intact.
-> The standalone `scry retention` CLI still runs **unfenced** as the
-> single-instance path. The multi-instance lease is no longer deferred;
-> see `docs/decisions.md § D-038`.
+> it's marked, before its objects go). Embedded staging is fenced; a lost lease
+> prevents new soft-deletes, while previously staged physical cleanup remains
+> lease-free and retryable. The standalone CLI is the unfenced single-instance
+> path. Still deferred: time-based
+> *partial*-block rewriting (we only drop whole blocks) and size/quota-based
+> eviction (retention is purely age-based).
 
 ## Scaling
 
@@ -1665,10 +1609,10 @@ deployment size with no design changes:
   prefix; `writer_id` in the path naturally distributes writes
   across partitions, giving us `N_writers × 3500 PUT/sec` headroom.
 - **WAL throughput.** Per server, no cross-server interaction.
-- **Compaction parallelism.** Partition-scoped leases let N servers
-  compact N different partitions concurrently with no coordination
-  overhead.
-- **Retention.** Idempotent DELETE; no coordination at any scale.
+- **Compaction parallelism.** Partition-scoped leases let N servers compact N
+  different partitions concurrently with only lease-control overhead.
+- **Retention.** One global lease serializes newly-expired soft-delete staging;
+  already-staged object deletions are idempotent and need no coordination.
 - **Catalog row count.** SQLite handles millions of rows trivially.
   90-day retention at 50 TB/month is ~1.2M block rows; query
   planning on indexed columns is sub-millisecond.

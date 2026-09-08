@@ -247,11 +247,19 @@ mod tests {
         // Use the trait method directly (`get_ranges`) since that's
         // what we override; `ObjectStoreExt::get_range` is the
         // delegate path and isn't what we're testing.
-        let got = store.get_ranges(&path, &[0..5]).await.unwrap();
+        let range = 0..5;
+        let got = store
+            .get_ranges(&path, std::slice::from_ref(&range))
+            .await
+            .unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].as_ref(), b"hello");
 
-        let got_full = store.get_ranges(&path, &[0..11]).await.unwrap();
+        let full_range = 0..11;
+        let got_full = store
+            .get_ranges(&path, std::slice::from_ref(&full_range))
+            .await
+            .unwrap();
         assert_eq!(got_full[0].as_ref(), b"hello world");
     }
 
@@ -267,7 +275,11 @@ mod tests {
             .unwrap();
 
         let pool_before = store.pool().free_count();
-        let _b = store.get_ranges(&Path::from("k"), &[0..6]).await.unwrap();
+        let range = 0..6;
+        let _b = store
+            .get_ranges(&Path::from("k"), std::slice::from_ref(&range))
+            .await
+            .unwrap();
         let pool_after = store.pool().free_count();
 
         assert_eq!(
@@ -290,7 +302,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(store.pool().free_count(), 0);
-        let got = store.get_ranges(&path, &[0..16]).await.unwrap();
+        let range = 0..16;
+        let got = store
+            .get_ranges(&path, std::slice::from_ref(&range))
+            .await
+            .unwrap();
         assert_eq!(got[0].as_ref(), b"abcdefghijklmnop");
         // Bytes is still alive → pool buffer is checked out.
         assert_eq!(store.pool().free_count(), 0);
@@ -315,13 +331,20 @@ mod tests {
             .unwrap();
 
         // First fetch: drains into a fresh allocation, drops back.
-        let first = store.get_ranges(&path, &[0..8]).await.unwrap();
+        let range = 0..8;
+        let first = store
+            .get_ranges(&path, std::slice::from_ref(&range))
+            .await
+            .unwrap();
         let first_ptr = first[0].as_ptr();
         drop(first);
         assert_eq!(store.pool().free_count(), 1);
 
         // Second fetch must reuse it.
-        let second = store.get_ranges(&path, &[0..8]).await.unwrap();
+        let second = store
+            .get_ranges(&path, std::slice::from_ref(&range))
+            .await
+            .unwrap();
         assert_eq!(
             second[0].as_ptr(),
             first_ptr,

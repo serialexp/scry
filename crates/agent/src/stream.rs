@@ -268,12 +268,14 @@ mod tests {
     #[test]
     fn json_labels_promoted_metadata_is_not_a_label() {
         let (_fp, base) = stream_labels(&pp(), "n", None);
-        let mut pipe = LogPipeline::default();
-        pipe.json = Some(JsonPipeline {
-            labels: vec!["level".into()],
-            metadata: vec!["request_id".into()],
-            message_field: None,
-        });
+        let pipe = LogPipeline {
+            json: Some(JsonPipeline {
+                labels: vec!["level".into()],
+                metadata: vec!["request_id".into()],
+                message_field: None,
+            }),
+            ..Default::default()
+        };
         let o = obj(r#"{"level":"warn","request_id":"r1"}"#);
         let (fp_with, labels) = enrich_labels(&base, &pipe, Some(&o));
         assert!(labels.iter().any(|l| l.key == "level" && l.value == "warn"));
@@ -285,12 +287,14 @@ mod tests {
     #[test]
     fn json_scalars_stringified_null_and_nested_skipped_for_labels() {
         let (_fp, base) = stream_labels(&pp(), "n", None);
-        let mut pipe = LogPipeline::default();
-        pipe.json = Some(JsonPipeline {
-            labels: vec!["num".into(), "flag".into(), "nul".into(), "nested".into()],
-            metadata: vec![],
-            message_field: None,
-        });
+        let pipe = LogPipeline {
+            json: Some(JsonPipeline {
+                labels: vec!["num".into(), "flag".into(), "nul".into(), "nested".into()],
+                metadata: vec![],
+                message_field: None,
+            }),
+            ..Default::default()
+        };
         let o = obj(r#"{"num":42,"flag":true,"nul":null,"nested":{"a":1}}"#);
         let (_fp, labels) = enrich_labels(&base, &pipe, Some(&o));
         assert!(labels.iter().any(|l| l.key == "num" && l.value == "42"));
@@ -301,12 +305,14 @@ mod tests {
 
     #[test]
     fn entry_metadata_and_message_field_applied() {
-        let mut pipe = LogPipeline::default();
-        pipe.json = Some(JsonPipeline {
-            labels: vec![],
-            metadata: vec!["request_id".into()],
-            message_field: Some("msg".into()),
-        });
+        let pipe = LogPipeline {
+            json: Some(JsonPipeline {
+                labels: vec![],
+                metadata: vec!["request_id".into()],
+                message_field: Some("msg".into()),
+            }),
+            ..Default::default()
+        };
         let o = obj(r#"{"msg":"hello","request_id":"r1"}"#);
         let (attrs, body) = enrich_entry("stdout", "{raw}".into(), &pipe, Some(&o));
         assert_eq!(body, "hello");
@@ -320,12 +326,14 @@ mod tests {
 
     #[test]
     fn entry_missing_message_field_keeps_body() {
-        let mut pipe = LogPipeline::default();
-        pipe.json = Some(JsonPipeline {
-            labels: vec![],
-            metadata: vec![],
-            message_field: Some("msg".into()),
-        });
+        let pipe = LogPipeline {
+            json: Some(JsonPipeline {
+                labels: vec![],
+                metadata: vec![],
+                message_field: Some("msg".into()),
+            }),
+            ..Default::default()
+        };
         let o = obj(r#"{"other":1}"#);
         let (attrs, body) = enrich_entry("stderr", "original".into(), &pipe, Some(&o));
         assert_eq!(body, "original");

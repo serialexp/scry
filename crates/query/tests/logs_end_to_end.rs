@@ -20,11 +20,19 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, StringArray, UInt64Array};
+use arrow::array::{
+    Array, ArrayRef, BinaryArray, FixedSizeBinaryBuilder, MapBuilder, StringArray, StringBuilder,
+    UInt16Array, UInt64Array, UInt8Array,
+};
+use arrow::record_batch::RecordBatch;
+use bytes::Bytes;
 use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::ExecutionPlan;
-use object_store::{memory::InMemory, ObjectStore};
-use scry_block::{BlockBuilder, BlockBuilderConfig, LogsBlockBuilder};
+use object_store::{memory::InMemory, path::Path, ObjectStore, ObjectStoreExt};
+use parquet::arrow::ArrowWriter;
+use scry_block::{
+    block_path, logs_physical_schema_v2, BlockBuilder, BlockBuilderConfig, LogsBlockBuilder,
+};
 use scry_catalog::Catalog;
 use scry_proto::streaming::LogsAppender;
 use scry_query::{
@@ -111,6 +119,36 @@ fn collect_u64(batches: &[arrow::record_batch::RecordBatch], col: &str) -> Vec<u
 
 fn total_rows(batches: &[arrow::record_batch::RecordBatch]) -> usize {
     batches.iter().map(|b| b.num_rows()).sum()
+}
+
+fn synthetic_v2_batch(fp: u64, ts: u64) -> RecordBatch {
+    let mut attrs = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+    attrs.keys().append_value("exception.type");
+    attrs.values().append_value("SyntheticError");
+    attrs.append(true).unwrap();
+    let mut trace_id = FixedSizeBinaryBuilder::with_capacity(1, 16);
+    trace_id.append_value([1_u8; 16]).unwrap();
+    let mut span_id = FixedSizeBinaryBuilder::with_capacity(1, 8);
+    span_id.append_value([2_u8; 8]).unwrap();
+    RecordBatch::try_new(
+        logs_physical_schema_v2(),
+        vec![
+            Arc::new(UInt64Array::from(vec![fp])) as ArrayRef,
+            Arc::new(UInt64Array::from(vec![ts])),
+            Arc::new(UInt8Array::from(vec![17])),
+            Arc::new(StringArray::from(vec!["v2 failure"])),
+            Arc::new(attrs.finish()),
+            Arc::new(UInt64Array::from(vec![Some(ts + 5)])),
+            Arc::new(StringArray::from(vec![Some("ERROR")])),
+            Arc::new(StringArray::from(vec![Some("exception")])),
+            Arc::new(trace_id.finish()),
+            Arc::new(span_id.finish()),
+            Arc::new(UInt8Array::from(vec![Some(1)])),
+            Arc::new(UInt16Array::from(vec![Some(1)])),
+            Arc::new(BinaryArray::from(vec![Some(b"canonical-v1".as_slice())])),
+        ],
+    )
+    .unwrap()
 }
 
 fn collect_strings(batches: &[arrow::record_batch::RecordBatch], col: &str) -> Vec<String> {
@@ -533,4 +571,105 @@ async fn logs_query_surfaces_stream_labels() {
         assert_eq!(fp, l_api);
         assert_eq!(pairs, api_expected);
     }
+}
+
+#[tokio::test]
+async fn mixed_v1_v2_blocks_normalize_and_prune_projection() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let writer = Uuid::now_v7();
+    let mut v1 = LogsBlockBuilder::new(writer, test_cfg());
+    v1.observe_stream(0x11, labels(&[("service", "legacy")]));
+    entries_for(&mut v1, 0x11, 1_000, 1, 9);
+    let v1_meta = v1.finish_and_upload(store.as_ref()).await.unwrap().unwrap();
+    assert_eq!(v1_meta.schema_version, 1);
+
+    let v2_uuid = Uuid::now_v7();
+    let v2_ts = 2_000;
+    let v2_batch = synthetic_v2_batch(0x22, v2_ts);
+    let mut bytes = Vec::new();
+    let mut writer_out = ArrowWriter::try_new(&mut bytes, v2_batch.schema(), None).unwrap();
+    writer_out.write(&v2_batch).unwrap();
+    writer_out.close().unwrap();
+    let v2_path = block_path("logs", v2_ts, writer, v2_uuid, "parquet");
+    store
+        .put(&Path::from(v2_path), Bytes::from(bytes.clone()).into())
+        .await
+        .unwrap();
+    let mut v2_meta = v1_meta.clone();
+    v2_meta.uuid = v2_uuid;
+    v2_meta.ts_min_unix_nano = v2_ts;
+    v2_meta.ts_max_unix_nano = v2_ts;
+    v2_meta.row_count = 1;
+    v2_meta.byte_size = bytes.len() as u64;
+    v2_meta.schema_version = 2;
+    v2_meta.has_postings = false;
+    v2_meta.postings_size_bytes = None;
+    v2_meta.has_body_bloom = false;
+    v2_meta.body_bloom_size_bytes = None;
+    v2_meta.all_fingerprints = Some(vec![0x22]);
+    let meta_path = block_path("logs", v2_ts, writer, v2_uuid, "meta.json");
+    store
+        .put(
+            &Path::from(meta_path),
+            Bytes::from(serde_json::to_vec_pretty(&v2_meta).unwrap()).into(),
+        )
+        .await
+        .unwrap();
+
+    let tmp = TempDir::new().unwrap();
+    let catalog = Catalog::open(&tmp.path().join("cat.sqlite"), BUCKET).unwrap();
+    assert!(catalog.insert_block(&v1_meta).unwrap());
+    assert!(catalog.insert_block(&v2_meta).unwrap());
+
+    let ctx = SessionContext::new();
+    register_logs_table(&ctx, &catalog, store, &Query::default())
+        .await
+        .unwrap();
+    let batches = ctx
+        .sql(
+            "SELECT body, observed_ts_unix_nano, event_name, raw_record \
+             FROM logs ORDER BY ts_unix_nano",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(total_rows(&batches), 2);
+    let batch = arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
+    assert_eq!(batch.num_columns(), 4);
+    let observed = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    assert!(observed.is_null(0));
+    assert_eq!(observed.value(1), v2_ts + 5);
+    let events = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert!(events.is_null(0));
+    assert_eq!(events.value(1), "exception");
+    let raw = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .unwrap();
+    assert!(raw.is_null(0));
+    assert_eq!(raw.value(1), b"canonical-v1");
+
+    // The v2-only predicate is pushed only into the v2 parquet branch. The
+    // retained inexact filter above normalization still evaluates the v1
+    // branch's typed NULL and therefore preserves SQL semantics.
+    let filtered = ctx
+        .sql("SELECT body FROM logs WHERE event_name = 'exception'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(total_rows(&filtered), 1);
+    assert_eq!(collect_strings(&filtered, "body"), vec!["v2 failure"]);
 }

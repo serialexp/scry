@@ -30,8 +30,11 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use datafusion::arrow::array::{ArrayRef, MapBuilder, StringBuilder, UInt64Builder, UInt8Builder};
-use datafusion::arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
+use datafusion::arrow::array::{
+    ArrayRef, BinaryBuilder, FixedSizeBinaryBuilder, MapBuilder, StringBuilder, UInt16Builder,
+    UInt64Builder, UInt8Builder,
+};
+use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::{DFSchema, DataFusionError, Result as DfResult, ScalarValue};
@@ -58,6 +61,7 @@ use crate::label_enrich::{
     expr_references_labels, freeze_fp_labels, labels_field, labels_map_field_names, FpAcc,
     FpLabels, LabelEnrichExec,
 };
+use crate::logs_normalize::{physical_schema as logs_physical_schema, LogsNormalizeExec};
 use crate::postings;
 use crate::postings_cache::PostingsCache;
 use crate::table::{object_store_url_for, time_overlaps};
@@ -68,40 +72,14 @@ use crate::Query;
 /// users can write `SELECT … FROM logs …` without thinking about it.
 pub const LOGS_TABLE_NAME: &str = "logs";
 
-/// The Arrow schema of a logs block's main parquet, as written by
-/// `crates/block/src/logs.rs::LogsBlockBuilder::main_schema`.
-/// Kept private to this module — callers receive `SchemaRef` via the
-/// `TableProvider::schema()` method.
+/// Stable normalized logs schema. Physical files are read with their exact
+/// version-specific schema and normalized to this v2 shape.
 fn logs_schema() -> SchemaRef {
-    // `values` nullable: matches the writer schema in
-    // `LogsBlockBuilder::main_schema` (which has to mirror Arrow
-    // `MapBuilder`'s nullable-by-default StringBuilder for its value
-    // column). The parquet file's column type and DataFusion's
-    // registered table type must agree exactly or scan time errors.
-    let entries_field = Arc::new(Field::new(
-        "entries",
-        DataType::Struct(Fields::from(vec![
-            Field::new("keys", DataType::Utf8, false),
-            Field::new("values", DataType::Utf8, true),
-        ])),
-        false,
-    ));
-    Arc::new(Schema::new(vec![
-        Field::new("stream_fingerprint", DataType::UInt64, false),
-        Field::new("ts_unix_nano", DataType::UInt64, false),
-        Field::new("severity", DataType::UInt8, false),
-        Field::new("body", DataType::Utf8, false),
-        Field::new(
-            "attributes",
-            DataType::Map(entries_field, /*keys_sorted=*/ false),
-            false,
-        ),
-    ]))
+    scry_block::logs_physical_schema_v2()
 }
 
-/// The logs *table* schema as exposed to queries: the physical parquet
-/// columns from [`logs_schema`] plus the synthesised `labels` column. The
-/// physical columns keep their indices; `labels` is appended last.
+/// The logs *table* schema as exposed to queries: 13 stable columns plus the
+/// synthesised `labels` column at index 13.
 fn logs_table_schema() -> SchemaRef {
     let mut fields: Vec<Field> = logs_schema()
         .fields()
@@ -175,6 +153,14 @@ impl LogsTable {
         body_contains: Option<String>,
         fp_labels: Arc<FpLabels>,
     ) -> DfResult<Self> {
+        for block in &blocks {
+            logs_physical_schema(block.entry.meta.schema_version).map_err(|_| {
+                DataFusionError::Plan(format!(
+                    "unsupported logs block schema version {} for block {}",
+                    block.entry.meta.schema_version, block.entry.meta.uuid
+                ))
+            })?;
+        }
         Ok(Self {
             // The *table* schema (physical columns + synthesised `labels`).
             // The parquet scans below read the physical schema only.
@@ -234,7 +220,6 @@ impl TableProvider for LogsTable {
         let physical_schema = logs_schema();
         let table_schema = self.schema();
         let labels_idx = physical_schema.fields().len();
-        let df_schema = DFSchema::try_from(physical_schema.clone())?;
 
         // Is the synthesised `labels` column actually requested? `None`
         // projection = "all columns" = yes. When it isn't, we take the
@@ -242,24 +227,43 @@ impl TableProvider for LogsTable {
         // column (< `labels_idx`), so `projection` passes straight through
         // to the parquet scan and no enrichment plan is added (keeps e.g.
         // `SELECT count(*)` and label-free SQL byte-for-byte as before).
-        let want_labels = projection.map_or(true, |p| p.contains(&labels_idx));
+        let want_labels = projection.is_none_or(|p| p.contains(&labels_idx));
 
         // Physical projection pushed into the parquet scan. When labels are
         // wanted we read the full physical schema (so `stream_fingerprint`
         // is present for the join) and let the enrich + a final projection
         // shape the output; otherwise the requested indices are already
         // physical and map 1:1.
-        let phys_projection: Option<Vec<usize>> = if want_labels {
-            None
+        // Label enrichment needs the fingerprint even when the caller did not
+        // project it. Otherwise preserve the caller's normalized projection.
+        let normalized_projection: Vec<usize> = if want_labels {
+            // LabelEnrichExec currently appends to the stable full physical
+            // schema, and needs the fingerprint. Projection pruning remains
+            // exact on the overwhelmingly common label-free path.
+            (0..labels_idx).collect()
         } else {
-            projection.cloned()
+            projection
+                .cloned()
+                .unwrap_or_else(|| (0..labels_idx).collect())
         };
 
         let make_branch = |fp_set: Option<&Arc<Vec<u64>>>,
                            file_path: String,
-                           file_size: u64|
+                           file_size: u64,
+                           schema_version: u32|
          -> DfResult<Arc<dyn ExecutionPlan>> {
-            let mut block_filters: Vec<Expr> = filters.to_vec();
+            let branch_schema = logs_physical_schema(schema_version)?;
+            let branch_df_schema = DFSchema::try_from(branch_schema.clone())?;
+            let mut block_filters: Vec<Expr> = filters
+                .iter()
+                .filter(|filter| {
+                    filter
+                        .column_refs()
+                        .iter()
+                        .all(|column| branch_schema.index_of(&column.name).is_ok())
+                })
+                .cloned()
+                .collect();
             if let Some(fp_set) = fp_set {
                 let lits: Vec<Expr> = fp_set
                     .iter()
@@ -293,22 +297,47 @@ impl TableProvider for LogsTable {
                 ));
             }
 
-            let predicate = conjunction(block_filters)
-                .map(|p| state.create_physical_expr(p, &df_schema))
+            let predicate = conjunction(block_filters.clone())
+                .map(|p| state.create_physical_expr(p, &branch_df_schema))
                 .transpose()?
                 .unwrap_or_else(|| physical_lit(true));
 
             let source = Arc::new(
-                ParquetSource::new(physical_schema.clone())
+                ParquetSource::new(branch_schema.clone())
                     .with_predicate(predicate)
                     .with_pushdown_filters(true),
             );
+            // Only request normalized columns that physically exist in this
+            // version. V1 fidelity fields are appended as typed NULL arrays.
+            let mut input_projection: Vec<usize> = normalized_projection
+                .iter()
+                .copied()
+                .filter(|idx| *idx < branch_schema.fields().len())
+                .collect();
+            // Predicate columns must remain available to ParquetSource even
+            // when absent from the user's output projection.
+            for filter in &block_filters {
+                for column in filter.column_refs() {
+                    if let Ok(idx) = branch_schema.index_of(&column.name) {
+                        if !input_projection.contains(&idx) {
+                            input_projection.push(idx);
+                        }
+                    }
+                }
+            }
+            input_projection.sort_unstable();
             let builder = FileScanConfigBuilder::new(self.object_store_url.clone(), source)
-                .with_projection_indices(phys_projection.clone())?
+                .with_projection_indices(Some(input_projection.clone()))?
                 .with_limit(limit)
                 .with_file(PartitionedFile::new(file_path, file_size));
 
-            Ok(DataSourceExec::from_data_source(builder.build()))
+            let scan = DataSourceExec::from_data_source(builder.build());
+            Ok(Arc::new(LogsNormalizeExec::new(
+                scan,
+                schema_version,
+                input_projection,
+                normalized_projection.clone(),
+            )))
         };
 
         // ── Build the physical (parquet) scan ──────────────────────
@@ -319,7 +348,7 @@ impl TableProvider for LogsTable {
             let source =
                 Arc::new(ParquetSource::new(physical_schema.clone()).with_pushdown_filters(true));
             let builder = FileScanConfigBuilder::new(self.object_store_url.clone(), source)
-                .with_projection_indices(phys_projection.clone())?
+                .with_projection_indices(Some(normalized_projection.clone()))?
                 .with_limit(limit);
             DataSourceExec::from_data_source(builder.build())
         } else {
@@ -333,7 +362,12 @@ impl TableProvider for LogsTable {
                     meta.uuid,
                     "parquet",
                 );
-                branches.push(make_branch(block.fp_set.as_ref(), path, meta.byte_size)?);
+                branches.push(make_branch(
+                    block.fp_set.as_ref(),
+                    path,
+                    meta.byte_size,
+                    meta.schema_version,
+                )?);
             }
             UnionExec::try_new(branches)?
         };
@@ -613,6 +647,16 @@ pub struct LiveLogRow {
     pub labels: Vec<(String, String)>,
     /// Per-entry attributes → the `attributes` map column.
     pub attributes: Vec<(String, String)>,
+    /// Fidelity fields unavailable on the legacy live protocol. Kept nullable
+    /// so live v1 rows union honestly with normalized stored v1/v2 rows.
+    pub observed_ts_unix_nano: Option<u64>,
+    pub severity_text: Option<String>,
+    pub event_name: Option<String>,
+    pub trace_id: Option<[u8; 16]>,
+    pub span_id: Option<[u8; 8]>,
+    pub trace_flags: Option<u8>,
+    pub raw_record_version: Option<u16>,
+    pub raw_record: Option<Vec<u8>>,
 }
 
 /// The logs *table* schema (physical logs columns + synthesised `labels`),
@@ -641,6 +685,14 @@ pub fn build_live_logs_batch(rows: &[LiveLogRow]) -> DfResult<RecordBatch> {
         StringBuilder::new(),
         StringBuilder::new(),
     );
+    let mut observed_ts = UInt64Builder::with_capacity(rows.len());
+    let mut severity_text = StringBuilder::new();
+    let mut event_name = StringBuilder::new();
+    let mut trace_id = FixedSizeBinaryBuilder::with_capacity(rows.len(), 16);
+    let mut span_id = FixedSizeBinaryBuilder::with_capacity(rows.len(), 8);
+    let mut trace_flags = UInt8Builder::with_capacity(rows.len());
+    let mut raw_record_version = UInt16Builder::with_capacity(rows.len());
+    let mut raw_record = BinaryBuilder::new();
     for r in rows {
         let pairs: Vec<scry_proto::LabelPair> = r
             .labels
@@ -659,6 +711,20 @@ pub fn build_live_logs_batch(rows: &[LiveLogRow]) -> DfResult<RecordBatch> {
             attrs.values().append_value(v);
         }
         attrs.append(true)?;
+        observed_ts.append_option(r.observed_ts_unix_nano);
+        severity_text.append_option(r.severity_text.as_deref());
+        event_name.append_option(r.event_name.as_deref());
+        match r.trace_id {
+            Some(value) => trace_id.append_value(value)?,
+            None => trace_id.append_null(),
+        }
+        match r.span_id {
+            Some(value) => span_id.append_value(value)?,
+            None => span_id.append_null(),
+        }
+        trace_flags.append_option(r.trace_flags);
+        raw_record_version.append_option(r.raw_record_version);
+        raw_record.append_option(r.raw_record.as_deref());
         for (k, v) in &r.labels {
             labels.keys().append_value(k);
             labels.values().append_value(v);
@@ -671,6 +737,14 @@ pub fn build_live_logs_batch(rows: &[LiveLogRow]) -> DfResult<RecordBatch> {
         Arc::new(sev.finish()),
         Arc::new(body.finish()),
         Arc::new(attrs.finish()),
+        Arc::new(observed_ts.finish()),
+        Arc::new(severity_text.finish()),
+        Arc::new(event_name.finish()),
+        Arc::new(trace_id.finish()),
+        Arc::new(span_id.finish()),
+        Arc::new(trace_flags.finish()),
+        Arc::new(raw_record_version.finish()),
+        Arc::new(raw_record.finish()),
         Arc::new(labels.finish()),
     ];
     RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)

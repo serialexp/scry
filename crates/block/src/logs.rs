@@ -64,6 +64,56 @@ use crate::{block_path, BlockBuilder, BlockBuilderConfig, BlockMeta, BodyBloom, 
 const SIGNAL: &str = "logs";
 const SCHEMA_VERSION: u32 = 1;
 
+fn attributes_field() -> Field {
+    let entries_field = Arc::new(Field::new(
+        "entries",
+        DataType::Struct(Fields::from(vec![
+            Field::new("keys", DataType::Utf8, false),
+            Field::new("values", DataType::Utf8, true),
+        ])),
+        false,
+    ));
+    Field::new(
+        "attributes",
+        DataType::Map(entries_field, /*keys_sorted=*/ false),
+        false,
+    )
+}
+
+/// Exact physical schema of historical logs v1 parquet files.
+pub fn logs_physical_schema_v1() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("stream_fingerprint", DataType::UInt64, false),
+        Field::new("ts_unix_nano", DataType::UInt64, false),
+        Field::new("severity", DataType::UInt8, false),
+        Field::new("body", DataType::Utf8, false),
+        attributes_field(),
+    ]))
+}
+
+/// Exact reader-side physical schema reserved for logs v2 parquet files.
+///
+/// This does not enable a v2 writer. The active [`LogsBlockBuilder`] deliberately
+/// continues to emit v1 until the corresponding wire/ingest rollout is enabled.
+pub fn logs_physical_schema_v2() -> SchemaRef {
+    let mut fields: Vec<Field> = logs_physical_schema_v1()
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect();
+    fields.extend([
+        Field::new("observed_ts_unix_nano", DataType::UInt64, true),
+        Field::new("severity_text", DataType::Utf8, true),
+        Field::new("event_name", DataType::Utf8, true),
+        Field::new("trace_id", DataType::FixedSizeBinary(16), true),
+        Field::new("span_id", DataType::FixedSizeBinary(8), true),
+        Field::new("trace_flags", DataType::UInt8, true),
+        Field::new("raw_record_version", DataType::UInt16, true),
+        Field::new("raw_record", DataType::Binary, true),
+    ]);
+    Arc::new(Schema::new(fields))
+}
+
 /// One unique stream accumulated for this block. Owned labels for
 /// the same reason as `metrics::OwnedSeries`: we dedup by
 /// fingerprint and the wire payload is dropped after decode, so the
@@ -110,36 +160,9 @@ pub struct LogsBlockBuilder {
 
 impl LogsBlockBuilder {
     pub fn main_schema() -> SchemaRef {
-        // Map<Utf8,Utf8>: the canonical Arrow Map layout used by
-        // MapBuilder<StringBuilder, StringBuilder>. Field names
-        // ("entries"/"keys"/"values") match MapBuilder's defaults
-        // so the schema and the builder agree without overrides.
-        //
-        // `values` is declared nullable to match MapBuilder's default
-        // (its inner StringBuilder accepts nulls). Our writer never
-        // actually emits a null value — `append_entry` UTF-8-coerces
-        // every attribute string — but the column type must match the
-        // builder's output type exactly or `RecordBatch::try_new`
-        // rejects the batch.
-        let entries_field = Arc::new(Field::new(
-            "entries",
-            DataType::Struct(Fields::from(vec![
-                Field::new("keys", DataType::Utf8, false),
-                Field::new("values", DataType::Utf8, true),
-            ])),
-            false,
-        ));
-        Arc::new(Schema::new(vec![
-            Field::new("stream_fingerprint", DataType::UInt64, false),
-            Field::new("ts_unix_nano", DataType::UInt64, false),
-            Field::new("severity", DataType::UInt8, false),
-            Field::new("body", DataType::Utf8, false),
-            Field::new(
-                "attributes",
-                DataType::Map(entries_field, /*keys_sorted=*/ false),
-                false,
-            ),
-        ]))
+        // Keep the active writer pinned to v1. Reader support for v2 lives in
+        // `logs_physical_schema_v2`; selecting it here would enable writing.
+        logs_physical_schema_v1()
     }
 
     pub fn postings_schema() -> SchemaRef {
@@ -540,5 +563,43 @@ impl LogsBlockBuilder {
             fps.dedup();
         }
         entries
+    }
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+
+    #[test]
+    fn schemas_are_exact_and_writer_stays_v1() {
+        let v1 = logs_physical_schema_v1();
+        let v2 = logs_physical_schema_v2();
+        assert_eq!(LogsBlockBuilder::main_schema(), v1);
+        assert_eq!(v1.fields().len(), 5);
+        assert_eq!(v2.fields().len(), 13);
+        let expected = [
+            ("stream_fingerprint", DataType::UInt64, false),
+            ("ts_unix_nano", DataType::UInt64, false),
+            ("severity", DataType::UInt8, false),
+            ("body", DataType::Utf8, false),
+            ("attributes", v1.field(4).data_type().clone(), false),
+            ("observed_ts_unix_nano", DataType::UInt64, true),
+            ("severity_text", DataType::Utf8, true),
+            ("event_name", DataType::Utf8, true),
+            ("trace_id", DataType::FixedSizeBinary(16), true),
+            ("span_id", DataType::FixedSizeBinary(8), true),
+            ("trace_flags", DataType::UInt8, true),
+            ("raw_record_version", DataType::UInt16, true),
+            ("raw_record", DataType::Binary, true),
+        ];
+        for (field, (name, ty, nullable)) in v2.fields().iter().zip(expected) {
+            assert_eq!(field.name(), name);
+            assert_eq!(field.data_type(), &ty);
+            assert_eq!(field.is_nullable(), nullable);
+        }
+        assert!(v2.fields()[..5]
+            .iter()
+            .zip(v1.fields())
+            .all(|(left, right)| left == right));
     }
 }

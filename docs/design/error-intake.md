@@ -1,13 +1,14 @@
 # Error event contract and intake — Design
 
-Status: draft, not yet implemented
+Status: partial — logs v2 reader/storage/query contract landed; writer outstanding
 Owner: Bart
 Last updated: 2026-09-07
 
 ## Implementation status
 
-This document refines [Error monitoring](error-monitoring.md). Its contracts are
-not accepted until the suite-wide review is complete.
+This document refines [Error monitoring](error-monitoring.md). D-073 accepts a
+lossless logs v2 representation; the reader-side wire/storage contract has landed,
+while gateway mapping and writer enablement remain outstanding.
 
 ### Done
 
@@ -16,13 +17,17 @@ not accepted until the suite-wide review is complete.
   conventions have been checked.
 - [x] **Current mapping survey.** Gateway HTTP/gRPC mappings and their fidelity
   gaps have been identified.
+- [x] **Decision — logs representation.** D-073 selects logs v2: bounded canonical
+  typed raw records alongside stable flat query projections.
+- [x] **Phase 0a — reader/storage/query contract.** Added the bounded canonical
+  envelope/validator, exact Parquet v2 schema, v1/v2 query normalization, nullable
+  legacy/live compatibility, and schema-safe opaque compaction. No writer is enabled.
 
 ### Outstanding
 
-- [ ] **Decision — logs representation.** Prove the generic log model can retain
-  typed values and structured exception context without requiring a fifth signal.
-- [ ] **Phase 0 — native schema fidelity.** Preserve event identity, observed
-  time, typed body/attributes, top-level correlation, and dropped counts.
+- [ ] **Phase 0b — native writer fidelity.** Map OTLP into logs v2 without loss,
+  rotate builders safely by schema generation, preserve event identity/observed time/
+  typed values/correlation/dropped counts, and capability-gate writer enablement.
 - [ ] **Phase 1 — canonical extraction.** Normalize exception logs and deprecated
   span events into one bounded occurrence contract with exact/heuristic dedup.
 - [ ] **Phase 2 — hardened browser intake.** Add public app keys, exact origin
@@ -159,10 +164,9 @@ rejected or resolved according to one documented boundary rule before hashing.
 
 Canonical serialization for identity/deduplication sorts map keys, preserves array
 order and all type tags, and length-prefixes components. JSON decoding must not
-round int64 through a JavaScript-style number. The storage choice remains the
-suite's blocking question: evolve generic logs losslessly or add a fifth signal.
-Whichever is selected, query exposes a selected flat projection without discarding
-the raw typed payload used by detail/export/reprocessing.
+round int64 through a JavaScript-style number. D-073 selects logs v2: each accepted
+record retains the bounded canonical typed payload used by detail/export/
+reprocessing alongside a selected stable flat query projection.
 
 At minimum retain top-level `event_name`, event/observed timestamps, severity
 number/text, body, attributes, trace/span IDs and flags, Resource and scope
@@ -287,6 +291,32 @@ against recursively reporting exporter failures.
 Version independently: raw typed log encoding, Scry occurrence extension,
 canonical identity serialization, scrub policy, and extracted flat projection.
 Readers reject unsupported identity-critical versions rather than guessing.
+D-073 reserves capability bit `0x0000_0008`, payload magic `0x534c3200`
+(`SL2\0`), and canonical raw-record version 1; readers land before advertisement
+or writer enablement.
+
+The stable logs v2 Parquet/query projection has these columns in contractual order:
+
+| Index | Column | Arrow type | Nullable | Logs v1 normalization |
+| ---: | --- | --- | :---: | --- |
+| 0 | `stream_fingerprint` | `UInt64` | no | existing value |
+| 1 | `ts_unix_nano` | `UInt64` | no | existing value |
+| 2 | `severity` | `UInt8` | no | existing value |
+| 3 | `body` | `Utf8` | no | existing value |
+| 4 | `attributes` | `Map<entries: Struct<keys: Utf8 non-null, values: Utf8 nullable> non-null>` | no | existing value |
+| 5 | `observed_ts_unix_nano` | `UInt64` | yes | typed NULL |
+| 6 | `severity_text` | `Utf8` | yes | typed NULL |
+| 7 | `event_name` | `Utf8` | yes | typed NULL |
+| 8 | `trace_id` | `FixedSizeBinary(16)` | yes | typed NULL |
+| 9 | `span_id` | `FixedSizeBinary(8)` | yes | typed NULL |
+| 10 | `trace_flags` | `UInt8` | yes | typed NULL |
+| 11 | `raw_record_version` | `UInt16` | yes | typed NULL |
+| 12 | `raw_record` | `Binary` | yes | typed NULL |
+
+The normalized SQL table appends synthesized `labels` at index 13 using the same
+Map layout as `attributes`. The first five v2 fields retain the exact v1 names,
+types, nullability, and order. V1 normalization clones them and appends eight typed
+NULL arrays; it never fabricates missing fidelity.
 
 The representation decision must specify the exact binschema/WAL/Parquet v2 shape,
 version-specific DataFusion adapters into one stable query schema, and compaction

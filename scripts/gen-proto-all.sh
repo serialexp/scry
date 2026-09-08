@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# One command to regenerate ALL scry wire-protocol bindings from the
-# schemas in proto/ — Rust (ingest + query) AND the TypeScript query
-# bindings — so the two never drift out of sync.
+# One command to regenerate all applicable scry wire-protocol bindings from
+# proto/: Rust for ingest, public query, and private query-worker; TypeScript
+# for ingest/live-tail and public query. The private worker protocol has no
+# browser binding.
 #
-# The root cause of a class of bugs we hit: a schema field is added, the
-# Rust bindings get regenerated (scripts/gen-proto.sh), but the TS
+# The root cause of a class of bugs we hit: a public schema field is added,
+# the Rust bindings get regenerated (scripts/gen-proto.sh), but the TS
 # bindings (scripts/gen-proto-ts.sh) are forgotten — leaving the desktop
 # / browser query client encoding a frame the daemon can't decode. This
 # wrapper runs both, so regenerating one without the other is no longer
@@ -20,10 +21,10 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-echo "── regenerating Rust bindings (ingest + query) ──"
+echo "── regenerating Rust bindings (ingest + query + query-worker) ──"
 "$ROOT/scripts/gen-proto.sh"
 
-echo "── regenerating TypeScript bindings (query) ──"
+echo "── regenerating TypeScript bindings (ingest + query) ──"
 "$ROOT/scripts/gen-proto-ts.sh"
 
 echo "── all bindings regenerated. Review with: git diff proto crates/proto crates/binschema-runtime desktop/src/proto ──"

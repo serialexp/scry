@@ -683,11 +683,7 @@ impl HelloOutput {
             return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 1, got {}", tag)));
         }
         let protocol_version = decoder.read_u16_be()?;
-        let mut agent_id = Vec::with_capacity(16);
-        for _ in 0..16 {
-            let item = decoder.read_byte()?;
-            agent_id.push(item);
-        }
+        let agent_id = decoder.read_bytes_vec(16)?;
         let length = decoder.read_byte()? as usize;
         let bytes = decoder.read_bytes_vec(length)?;
         let agent_version: std::string::String = bytes.iter().map(|&b| b as char).collect();
@@ -1992,41 +1988,11 @@ pub type TailMetricPointV2 = TailMetricPointV2Output;
 impl TailMetricPointV2Input {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
-        self.encode_into_with_context(&mut encoder, &EncodeContext::new())?;
+        self.encode_into(&mut encoder)?;
         Ok(encoder.finish())
     }
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
-        self.encode_into_with_context(encoder, &EncodeContext::new())
-    }
-
-    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
-        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
-        self.encode_into_with_context(&mut encoder, ctx)?;
-        Ok(encoder.finish())
-    }
-
-    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
-
-        // Build parent context for nested struct encoding
-        let mut parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
-        parent_fields.insert("signal".to_string(), FieldValue::U8(self.signal));
-        parent_fields.insert("series_fingerprint".to_string(), FieldValue::U64(self.series_fingerprint));
-        // Collect items with sub-field values for typed array 'labels'
-        {
-            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
-            for item in &self.labels {
-                let item_bytes = item.encode()?;
-                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
-                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
-                item_fields.insert("key".to_string(), FieldValue::String(item.key.clone()));
-                item_fields.insert("value".to_string(), FieldValue::String(item.value.clone()));
-                items_data.push(("LabelPair".to_string(), item_fields));
-            }
-            parent_fields.insert("labels".to_string(), FieldValue::Items(items_data));
-        }
-        let child_ctx = ctx.extend_with_parent(parent_fields);
-        let _ = &child_ctx; // Used by nested struct encoding
         encoder.write_byte(85);
         encoder.write_byte(self.signal);
         encoder.write_u64_be(self.series_fingerprint);
@@ -2034,9 +2000,7 @@ impl TailMetricPointV2Input {
         for item in &self.labels {
             item.encode_into(encoder)?;
         }
-        // Encode nested struct descriptor
         self.descriptor.encode_into(encoder)?;
-        // Encode nested struct point
         self.point.encode_into(encoder)?;
         Ok(())
     }
@@ -2078,12 +2042,6 @@ impl TailMetricPointV2Output {
     }
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         TailMetricPointV2Input::from(self.clone()).encode_into(encoder)
-    }
-    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
-        TailMetricPointV2Input::from(self.clone()).encode_with_context(ctx)
-    }
-    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
-        TailMetricPointV2Input::from(self.clone()).encode_into_with_context(encoder, ctx)
     }
 }
 
@@ -2271,11 +2229,7 @@ impl LiveBatchOutput {
         if tag != 83u8 {
             return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 83, got {}", tag)));
         }
-        let mut writer_uuid = Vec::with_capacity(16);
-        for _ in 0..16 {
-            let item = decoder.read_byte()?;
-            writer_uuid.push(item);
-        }
+        let writer_uuid = decoder.read_bytes_vec(16)?;
         let length = decoder.read_u32_be()? as usize;
         let mut records = Vec::with_capacity(length);
         for _ in 0..length {
@@ -2605,6 +2559,130 @@ impl LogsBatch {
         }
         Ok(Self {
             streams,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LogsBatchV2Input {
+    pub records: Vec<OpaqueLogRecordV2>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LogsBatchV2Output {
+    pub magic: u32,
+    pub raw_version: u16,
+    pub records: Vec<OpaqueLogRecordV2>,
+}
+
+pub type LogsBatchV2 = LogsBatchV2Output;
+
+impl LogsBatchV2Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u32_be(1397502464);
+        encoder.write_u16_be(1);
+        encoder.write_u32_be(self.records.len() as u32);
+        for item in &self.records {
+            item.encode_into(encoder)?;
+        }
+        Ok(())
+    }
+
+}
+
+impl LogsBatchV2Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let magic = decoder.read_u32_be()?;
+        if magic != 1397502464u32 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 1397502464, got {}", magic)));
+        }
+        let raw_version = decoder.read_u16_be()?;
+        if raw_version != 1u16 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 1, got {}", raw_version)));
+        }
+        let length = decoder.read_u32_be()? as usize;
+        let mut records = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = OpaqueLogRecordV2::decode_with_decoder(decoder)?;
+            records.push(item);
+        }
+        Ok(Self {
+            magic,
+            raw_version,
+            records,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        LogsBatchV2Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        LogsBatchV2Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<LogsBatchV2Output> for LogsBatchV2Input {
+    fn from(o: LogsBatchV2Output) -> Self {
+        Self {
+            records: o.records,
+        }
+    }
+}
+
+impl From<LogsBatchV2Input> for LogsBatchV2Output {
+    fn from(i: LogsBatchV2Input) -> Self {
+        Self {
+            magic: 1397502464u32,
+            raw_version: 1u16,
+            records: i.records,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpaqueLogRecordV2 {
+    pub value: Vec<u8>,
+}
+
+impl OpaqueLogRecordV2 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u32_be(self.value.len() as u32);
+        for item in &self.value {
+            encoder.write_byte(*item);
+        }
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let length = decoder.read_u32_be()? as usize;
+        let mut value = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = decoder.read_byte()?;
+            value.push(item);
+        }
+        Ok(Self {
+            value,
         })
     }
 }
@@ -2944,16 +3022,8 @@ impl Span {
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let resource_idx = decoder.read_u16_be()?;
         let scope_idx = decoder.read_u16_be()?;
-        let mut trace_id = Vec::with_capacity(16);
-        for _ in 0..16 {
-            let item = decoder.read_byte()?;
-            trace_id.push(item);
-        }
-        let mut span_id = Vec::with_capacity(8);
-        for _ in 0..8 {
-            let item = decoder.read_byte()?;
-            span_id.push(item);
-        }
+        let trace_id = decoder.read_bytes_vec(16)?;
+        let span_id = decoder.read_bytes_vec(8)?;
         let has_value = decoder.read_uint8()? != 0;
         let parent_span_id = if has_value {
             {
@@ -3099,16 +3169,8 @@ impl SpanLink {
     }
 
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
-        let mut trace_id = Vec::with_capacity(16);
-        for _ in 0..16 {
-            let item = decoder.read_byte()?;
-            trace_id.push(item);
-        }
-        let mut span_id = Vec::with_capacity(8);
-        for _ in 0..8 {
-            let item = decoder.read_byte()?;
-            span_id.push(item);
-        }
+        let trace_id = decoder.read_bytes_vec(16)?;
+        let span_id = decoder.read_bytes_vec(8)?;
         let length = decoder.read_byte()? as usize;
         let mut attributes = Vec::with_capacity(length);
         for _ in 0..length {
@@ -3580,54 +3642,11 @@ pub type ScalarPointV2 = ScalarPointV2Output;
 impl ScalarPointV2Input {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
-        self.encode_into_with_context(&mut encoder, &EncodeContext::new())?;
+        self.encode_into(&mut encoder)?;
         Ok(encoder.finish())
     }
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
-        self.encode_into_with_context(encoder, &EncodeContext::new())
-    }
-
-    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
-        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
-        self.encode_into_with_context(&mut encoder, ctx)?;
-        Ok(encoder.finish())
-    }
-
-    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
-
-        // Build parent context for nested struct encoding
-        let mut parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
-        parent_fields.insert("descriptor_id".to_string(), FieldValue::U32(self.descriptor_id));
-        parent_fields.insert("start_unix_nano".to_string(), FieldValue::U64(self.start_unix_nano));
-        parent_fields.insert("ts_unix_nano".to_string(), FieldValue::U64(self.ts_unix_nano));
-        parent_fields.insert("flags".to_string(), FieldValue::U32(self.flags));
-        // Collect items with sub-field values for typed array 'attributes'
-        {
-            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
-            for item in &self.attributes {
-                let item_bytes = item.encode()?;
-                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
-                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
-                item_fields.insert("key".to_string(), FieldValue::String(item.key.clone()));
-                item_fields.insert("value".to_string(), FieldValue::String(item.value.clone()));
-                items_data.push(("LabelPair".to_string(), item_fields));
-            }
-            parent_fields.insert("attributes".to_string(), FieldValue::Items(items_data));
-        }
-        // Collect items with sub-field values for typed array 'exemplars'
-        {
-            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
-            for _ in &self.exemplars {
-                let item_bytes = Vec::<u8>::new(); // Items need context, skip encoding for now
-                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
-                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
-                items_data.push(("MetricExemplarV2".to_string(), item_fields));
-            }
-            parent_fields.insert("exemplars".to_string(), FieldValue::Items(items_data));
-        }
-        let child_ctx = ctx.extend_with_parent(parent_fields);
-        let _ = &child_ctx; // Used by nested struct encoding
         encoder.write_byte(1);
         encoder.write_u32_be(self.descriptor_id);
         encoder.write_u64_be(self.start_unix_nano);
@@ -3639,9 +3658,8 @@ impl ScalarPointV2Input {
         }
         encoder.write_u16_be(self.exemplars.len() as u16);
         for item in &self.exemplars {
-            item.encode_into_with_context(encoder, &child_ctx)?;
+            item.encode_into(encoder)?;
         }
-        // Encode nested struct number
         self.number.encode_into(encoder)?;
         Ok(())
     }
@@ -3692,12 +3710,6 @@ impl ScalarPointV2Output {
     }
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         ScalarPointV2Input::from(self.clone()).encode_into(encoder)
-    }
-    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
-        ScalarPointV2Input::from(self.clone()).encode_with_context(ctx)
-    }
-    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
-        ScalarPointV2Input::from(self.clone()).encode_into_with_context(encoder, ctx)
     }
 }
 
@@ -3774,61 +3786,11 @@ pub type HistogramPointV2 = HistogramPointV2Output;
 impl HistogramPointV2Input {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
-        self.encode_into_with_context(&mut encoder, &EncodeContext::new())?;
+        self.encode_into(&mut encoder)?;
         Ok(encoder.finish())
     }
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
-        self.encode_into_with_context(encoder, &EncodeContext::new())
-    }
-
-    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
-        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
-        self.encode_into_with_context(&mut encoder, ctx)?;
-        Ok(encoder.finish())
-    }
-
-    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
-
-        // Build parent context for nested struct encoding
-        let mut parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
-        parent_fields.insert("descriptor_id".to_string(), FieldValue::U32(self.descriptor_id));
-        parent_fields.insert("start_unix_nano".to_string(), FieldValue::U64(self.start_unix_nano));
-        parent_fields.insert("ts_unix_nano".to_string(), FieldValue::U64(self.ts_unix_nano));
-        parent_fields.insert("flags".to_string(), FieldValue::U32(self.flags));
-        // Collect items with sub-field values for typed array 'attributes'
-        {
-            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
-            for item in &self.attributes {
-                let item_bytes = item.encode()?;
-                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
-                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
-                item_fields.insert("key".to_string(), FieldValue::String(item.key.clone()));
-                item_fields.insert("value".to_string(), FieldValue::String(item.value.clone()));
-                items_data.push(("LabelPair".to_string(), item_fields));
-            }
-            parent_fields.insert("attributes".to_string(), FieldValue::Items(items_data));
-        }
-        // Collect items with sub-field values for typed array 'exemplars'
-        {
-            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
-            for _ in &self.exemplars {
-                let item_bytes = Vec::<u8>::new(); // Items need context, skip encoding for now
-                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
-                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
-                items_data.push(("MetricExemplarV2".to_string(), item_fields));
-            }
-            parent_fields.insert("exemplars".to_string(), FieldValue::Items(items_data));
-        }
-        parent_fields.insert("count".to_string(), FieldValue::U64(self.count));
-        parent_fields.insert("has_sum".to_string(), FieldValue::U8(self.has_sum));
-        parent_fields.insert("sum".to_string(), FieldValue::F64(self.sum));
-        parent_fields.insert("has_min".to_string(), FieldValue::U8(self.has_min));
-        parent_fields.insert("min".to_string(), FieldValue::F64(self.min));
-        parent_fields.insert("has_max".to_string(), FieldValue::U8(self.has_max));
-        parent_fields.insert("max".to_string(), FieldValue::F64(self.max));
-        let child_ctx = ctx.extend_with_parent(parent_fields);
-        let _ = &child_ctx; // Used by nested struct encoding
         encoder.write_byte(2);
         encoder.write_u32_be(self.descriptor_id);
         encoder.write_u64_be(self.start_unix_nano);
@@ -3840,7 +3802,7 @@ impl HistogramPointV2Input {
         }
         encoder.write_u16_be(self.exemplars.len() as u16);
         for item in &self.exemplars {
-            item.encode_into_with_context(encoder, &child_ctx)?;
+            item.encode_into(encoder)?;
         }
         encoder.write_u64_be(self.count);
         encoder.write_byte(self.has_sum);
@@ -3932,12 +3894,6 @@ impl HistogramPointV2Output {
     }
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         HistogramPointV2Input::from(self.clone()).encode_into(encoder)
-    }
-    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
-        HistogramPointV2Input::from(self.clone()).encode_with_context(ctx)
-    }
-    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
-        HistogramPointV2Input::from(self.clone()).encode_into_with_context(encoder, ctx)
     }
 }
 
@@ -4040,63 +3996,11 @@ pub type ExponentialHistogramPointV2 = ExponentialHistogramPointV2Output;
 impl ExponentialHistogramPointV2Input {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
-        self.encode_into_with_context(&mut encoder, &EncodeContext::new())?;
+        self.encode_into(&mut encoder)?;
         Ok(encoder.finish())
     }
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
-        self.encode_into_with_context(encoder, &EncodeContext::new())
-    }
-
-    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
-        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
-        self.encode_into_with_context(&mut encoder, ctx)?;
-        Ok(encoder.finish())
-    }
-
-    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
-
-        // Build parent context for nested struct encoding
-        let mut parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
-        parent_fields.insert("descriptor_id".to_string(), FieldValue::U32(self.descriptor_id));
-        parent_fields.insert("start_unix_nano".to_string(), FieldValue::U64(self.start_unix_nano));
-        parent_fields.insert("ts_unix_nano".to_string(), FieldValue::U64(self.ts_unix_nano));
-        parent_fields.insert("flags".to_string(), FieldValue::U32(self.flags));
-        // Collect items with sub-field values for typed array 'attributes'
-        {
-            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
-            for item in &self.attributes {
-                let item_bytes = item.encode()?;
-                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
-                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
-                item_fields.insert("key".to_string(), FieldValue::String(item.key.clone()));
-                item_fields.insert("value".to_string(), FieldValue::String(item.value.clone()));
-                items_data.push(("LabelPair".to_string(), item_fields));
-            }
-            parent_fields.insert("attributes".to_string(), FieldValue::Items(items_data));
-        }
-        // Collect items with sub-field values for typed array 'exemplars'
-        {
-            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
-            for _ in &self.exemplars {
-                let item_bytes = Vec::<u8>::new(); // Items need context, skip encoding for now
-                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
-                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
-                items_data.push(("MetricExemplarV2".to_string(), item_fields));
-            }
-            parent_fields.insert("exemplars".to_string(), FieldValue::Items(items_data));
-        }
-        parent_fields.insert("has_sum".to_string(), FieldValue::U8(self.has_sum));
-        parent_fields.insert("sum".to_string(), FieldValue::F64(self.sum));
-        parent_fields.insert("has_min".to_string(), FieldValue::U8(self.has_min));
-        parent_fields.insert("min".to_string(), FieldValue::F64(self.min));
-        parent_fields.insert("has_max".to_string(), FieldValue::U8(self.has_max));
-        parent_fields.insert("max".to_string(), FieldValue::F64(self.max));
-        parent_fields.insert("scale".to_string(), FieldValue::I32(self.scale));
-        parent_fields.insert("zero_threshold".to_string(), FieldValue::F64(self.zero_threshold));
-        parent_fields.insert("reset_hint".to_string(), FieldValue::U8(self.reset_hint));
-        let child_ctx = ctx.extend_with_parent(parent_fields);
-        let _ = &child_ctx; // Used by nested struct encoding
         encoder.write_byte(3);
         encoder.write_u32_be(self.descriptor_id);
         encoder.write_u64_be(self.start_unix_nano);
@@ -4108,9 +4012,8 @@ impl ExponentialHistogramPointV2Input {
         }
         encoder.write_u16_be(self.exemplars.len() as u16);
         for item in &self.exemplars {
-            item.encode_into_with_context(encoder, &child_ctx)?;
+            item.encode_into(encoder)?;
         }
-        // Encode nested struct count
         self.count.encode_into(encoder)?;
         encoder.write_byte(self.has_sum);
         encoder.write_u64_be((self.sum).to_bits());
@@ -4120,11 +4023,8 @@ impl ExponentialHistogramPointV2Input {
         encoder.write_u64_be((self.max).to_bits());
         encoder.write_u32_be(self.scale as u32);
         encoder.write_u64_be((self.zero_threshold).to_bits());
-        // Encode nested struct zero_count
         self.zero_count.encode_into(encoder)?;
-        // Encode nested struct positive
         self.positive.encode_into(encoder)?;
-        // Encode nested struct negative
         self.negative.encode_into(encoder)?;
         encoder.write_u32_be(self.custom_bounds.len() as u32);
         for item in &self.custom_bounds {
@@ -4211,12 +4111,6 @@ impl ExponentialHistogramPointV2Output {
     }
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         ExponentialHistogramPointV2Input::from(self.clone()).encode_into(encoder)
-    }
-    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
-        ExponentialHistogramPointV2Input::from(self.clone()).encode_with_context(ctx)
-    }
-    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
-        ExponentialHistogramPointV2Input::from(self.clone()).encode_into_with_context(encoder, ctx)
     }
 }
 
@@ -4307,69 +4201,11 @@ pub type SummaryPointV2 = SummaryPointV2Output;
 impl SummaryPointV2Input {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
-        self.encode_into_with_context(&mut encoder, &EncodeContext::new())?;
+        self.encode_into(&mut encoder)?;
         Ok(encoder.finish())
     }
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
-        self.encode_into_with_context(encoder, &EncodeContext::new())
-    }
-
-    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
-        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
-        self.encode_into_with_context(&mut encoder, ctx)?;
-        Ok(encoder.finish())
-    }
-
-    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
-
-        // Build parent context for nested struct encoding
-        let mut parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
-        parent_fields.insert("descriptor_id".to_string(), FieldValue::U32(self.descriptor_id));
-        parent_fields.insert("start_unix_nano".to_string(), FieldValue::U64(self.start_unix_nano));
-        parent_fields.insert("ts_unix_nano".to_string(), FieldValue::U64(self.ts_unix_nano));
-        parent_fields.insert("flags".to_string(), FieldValue::U32(self.flags));
-        // Collect items with sub-field values for typed array 'attributes'
-        {
-            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
-            for item in &self.attributes {
-                let item_bytes = item.encode()?;
-                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
-                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
-                item_fields.insert("key".to_string(), FieldValue::String(item.key.clone()));
-                item_fields.insert("value".to_string(), FieldValue::String(item.value.clone()));
-                items_data.push(("LabelPair".to_string(), item_fields));
-            }
-            parent_fields.insert("attributes".to_string(), FieldValue::Items(items_data));
-        }
-        // Collect items with sub-field values for typed array 'exemplars'
-        {
-            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
-            for _ in &self.exemplars {
-                let item_bytes = Vec::<u8>::new(); // Items need context, skip encoding for now
-                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
-                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
-                items_data.push(("MetricExemplarV2".to_string(), item_fields));
-            }
-            parent_fields.insert("exemplars".to_string(), FieldValue::Items(items_data));
-        }
-        parent_fields.insert("count".to_string(), FieldValue::U64(self.count));
-        parent_fields.insert("sum".to_string(), FieldValue::F64(self.sum));
-        // Collect items with sub-field values for typed array 'quantiles'
-        {
-            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
-            for item in &self.quantiles {
-                let item_bytes = item.encode()?;
-                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
-                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
-                item_fields.insert("quantile".to_string(), FieldValue::F64(item.quantile));
-                item_fields.insert("value".to_string(), FieldValue::F64(item.value));
-                items_data.push(("QuantileValueV2".to_string(), item_fields));
-            }
-            parent_fields.insert("quantiles".to_string(), FieldValue::Items(items_data));
-        }
-        let child_ctx = ctx.extend_with_parent(parent_fields);
-        let _ = &child_ctx; // Used by nested struct encoding
         encoder.write_byte(4);
         encoder.write_u32_be(self.descriptor_id);
         encoder.write_u64_be(self.start_unix_nano);
@@ -4381,7 +4217,7 @@ impl SummaryPointV2Input {
         }
         encoder.write_u16_be(self.exemplars.len() as u16);
         for item in &self.exemplars {
-            item.encode_into_with_context(encoder, &child_ctx)?;
+            item.encode_into(encoder)?;
         }
         encoder.write_u64_be(self.count);
         encoder.write_u64_be((self.sum).to_bits());
@@ -4447,12 +4283,6 @@ impl SummaryPointV2Output {
     }
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         SummaryPointV2Input::from(self.clone()).encode_into(encoder)
-    }
-    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
-        SummaryPointV2Input::from(self.clone()).encode_with_context(ctx)
-    }
-    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
-        SummaryPointV2Input::from(self.clone()).encode_into_with_context(encoder, ctx)
     }
 }
 
@@ -4929,42 +4759,12 @@ pub struct MetricExemplarV2 {
 impl MetricExemplarV2 {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
-        self.encode_into_with_context(&mut encoder, &EncodeContext::new())?;
+        self.encode_into(&mut encoder)?;
         Ok(encoder.finish())
     }
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
-        self.encode_into_with_context(encoder, &EncodeContext::new())
-    }
-
-    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
-        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
-        self.encode_into_with_context(&mut encoder, ctx)?;
-        Ok(encoder.finish())
-    }
-
-    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
-
-        // Build parent context for nested struct encoding
-        let mut parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
-        parent_fields.insert("ts_unix_nano".to_string(), FieldValue::U64(self.ts_unix_nano));
-        // Collect items with sub-field values for typed array 'filtered_attrs'
-        {
-            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
-            for item in &self.filtered_attrs {
-                let item_bytes = item.encode()?;
-                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
-                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
-                item_fields.insert("key".to_string(), FieldValue::String(item.key.clone()));
-                item_fields.insert("value".to_string(), FieldValue::String(item.value.clone()));
-                items_data.push(("LabelPair".to_string(), item_fields));
-            }
-            parent_fields.insert("filtered_attrs".to_string(), FieldValue::Items(items_data));
-        }
-        let child_ctx = ctx.extend_with_parent(parent_fields);
-        let _ = &child_ctx; // Used by nested struct encoding
         encoder.write_u64_be(self.ts_unix_nano);
-        // Encode nested struct number
         self.number.encode_into(encoder)?;
         encoder.write_u16_be(self.filtered_attrs.len() as u16);
         for item in &self.filtered_attrs {
@@ -4993,16 +4793,8 @@ impl MetricExemplarV2 {
             let item = LabelPair::decode_with_decoder(decoder)?;
             filtered_attrs.push(item);
         }
-        let mut trace_id = Vec::with_capacity(16);
-        for _ in 0..16 {
-            let item = decoder.read_byte()?;
-            trace_id.push(item);
-        }
-        let mut span_id = Vec::with_capacity(8);
-        for _ in 0..8 {
-            let item = decoder.read_byte()?;
-            span_id.push(item);
-        }
+        let trace_id = decoder.read_bytes_vec(16)?;
+        let span_id = decoder.read_bytes_vec(8)?;
         Ok(Self {
             ts_unix_nano,
             number,

@@ -75,6 +75,7 @@ struct Line {
 /// record shapes and therefore different frames, so the channel between
 /// [`dial_subscribe`] and its consumer carries either.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum TailFrame {
     /// A log entry (`TailRecord`, signal = Logs).
     Record(scry_proto::generated::TailRecordOutput),

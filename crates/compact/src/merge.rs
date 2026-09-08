@@ -40,7 +40,8 @@ use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStream
 use parquet::arrow::AsyncArrowWriter;
 use scry_block::postings::{postings_record_batch, postings_schema, PostingsEntry};
 use scry_block::{
-    block_path, compacted_ancestor_closure, BlockBuilderConfig, BlockMeta, BodyBloomBuilder, Fence,
+    block_path, compacted_ancestor_closure, logs_physical_schema_v1, logs_physical_schema_v2,
+    BlockBuilderConfig, BlockMeta, BodyBloomBuilder, Fence,
 };
 use scry_catalog::CatalogEntry;
 use uuid::Uuid;
@@ -209,6 +210,23 @@ impl PostingsCursor {
     }
 }
 
+fn expected_logs_schema(version: u32) -> Result<SchemaRef> {
+    match version {
+        1 => Ok(logs_physical_schema_v1()),
+        2 => Ok(logs_physical_schema_v2()),
+        _ => anyhow::bail!("unsupported logs block schema version {version}"),
+    }
+}
+
+fn expected_main_schema(signal: &str, version: u32) -> Result<Option<SchemaRef>> {
+    match signal {
+        "logs" => expected_logs_schema(version).map(Some),
+        // Schema hardening for the other signals belongs with their respective
+        // version adapters. Preserve their existing identical-input check here.
+        _ => Ok(None),
+    }
+}
+
 fn spec_for(signal: &str) -> Result<SignalSpec> {
     Ok(match signal {
         "logs" => SignalSpec {
@@ -292,6 +310,10 @@ pub async fn merge_blocks(
             schema_version
         );
     }
+    // Reject unsupported versions before allocating an output identity or
+    // touching object storage. The inner check reuses this dispatch to compare
+    // each parquet footer against the metadata claim.
+    expected_main_schema(signal, schema_version)?;
     let block_uuid = Uuid::now_v7();
     let ts_min = inputs
         .iter()
@@ -381,6 +403,13 @@ async fn merge_blocks_inner(
             fetched.uuid,
             fetched.signal
         );
+        anyhow::ensure!(
+            fetched.schema_version == entry.meta.schema_version,
+            "input {} metadata schema version mismatch: catalog has {}, sidecar has {}",
+            fetched.uuid,
+            entry.meta.schema_version,
+            fetched.schema_version
+        );
         input_metas.push(fetched);
     }
     anyhow::ensure!(
@@ -424,12 +453,25 @@ async fn merge_blocks_inner(
     ctx.runtime_env()
         .register_object_store(url.as_ref(), store.clone());
 
+    // Validate the metadata version against the canonical physical schema, not
+    // merely against the other inputs. Otherwise consistently mislabeled blocks
+    // could be co-merged and publish an output whose metadata lies about its
+    // parquet shape. Do this before DataFusion creates a stream or any output is
+    // staged.
+    let expected_schema = expected_main_schema(signal, schema_version)?;
     let mut input_schema: Option<SchemaRef> = None;
     for entry in inputs {
         let schema = fetch_main_schema(&store, entry).await?;
-        if let Some(expected) = &input_schema {
+        if let Some(expected) = &expected_schema {
             anyhow::ensure!(
                 schema.as_ref() == expected.as_ref(),
+                "merge input {} parquet schema does not match {signal} schema version {schema_version}",
+                entry.meta.uuid
+            );
+        }
+        if let Some(first) = &input_schema {
+            anyhow::ensure!(
+                schema.as_ref() == first.as_ref(),
                 "merge input {} parquet schema differs from the other inputs",
                 entry.meta.uuid
             );

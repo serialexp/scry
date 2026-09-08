@@ -3789,6 +3789,197 @@ export class LogsBatchDecoder extends SeekableBitStreamDecoder {
 }
 
 /**
+ * Capability-gated logs-v2 envelope. Each record is an opaque, length-delimited canonical raw log record validated by the hand-written bounded streaming parser; keeping recursion outside binschema prevents generated recursive allocations.
+ */
+export interface LogsBatchV2Input {
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  records: OpaqueLogRecordV2Input[];
+}
+
+/**
+ * Capability-gated logs-v2 envelope. Each record is an opaque, length-delimited canonical raw log record validated by the hand-written bounded streaming parser; keeping recursion outside binschema prevents generated recursive allocations.
+ */
+export interface LogsBatchV2Output {
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  magic: number;
+  /**
+   * 16-bit Unsigned Integer
+   * Fixed-width 16-bit unsigned integer (0-65535). Respects endianness configuration (big-endian or little-endian).
+   */
+  raw_version: number;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  records: OpaqueLogRecordV2Output[];
+}
+
+export type LogsBatchV2 = LogsBatchV2Output;
+
+export class LogsBatchV2Encoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("msb_first");
+  }
+
+  encode(value: LogsBatchV2Input): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint32(1397502464, "big_endian");
+    this.writeUint16(1, "big_endian");
+    this.writeUint32(value.records.length, "big_endian");
+    for (let value_records__iter_index = 0; value_records__iter_index < value.records.length; value_records__iter_index++) {
+      const value_records__iter = value.records[value_records__iter_index];
+      const encoder_value_records__iter = new OpaqueLogRecordV2Encoder();
+      const encoded_value_records__iter = encoder_value_records__iter.encode(value_records__iter);
+      for (const byte of encoded_value_records__iter) {
+        this.writeUint8(byte);
+      }
+    }
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a LogsBatchV2 value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: LogsBatchV2): number {
+    let size = 0;
+    size += 6; // magic (const) + raw_version (const)
+    // records: array (kind: length_prefixed)
+    for (const item of value.records) {
+      const records_itemEncoder = new OpaqueLogRecordV2Encoder();
+      size += records_itemEncoder.calculateSize(item);
+    }
+    size += 4; // length prefix (uint32)
+    return size;
+  }
+}
+
+export class LogsBatchV2Decoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "msb_first");
+  }
+
+  decode(): LogsBatchV2Output {
+    const value: any = {};
+
+    value.magic = this.readUint32("big_endian");
+    value.raw_version = this.readUint16("big_endian");
+    value.records = [];
+    const records_length = this.readUint32("big_endian");
+    for (let i = 0; i < records_length; i++) {
+      let records__iter: any;
+      records__iter = {};
+      records__iter.value = [];
+      const records__iter_value_length = this.readUint32("big_endian");
+      for (let i = 0; i < records__iter_value_length; i++) {
+        let records__iter_value__iter: any;
+        records__iter_value__iter = this.readUint8();
+        records__iter.value.push(records__iter_value__iter);
+      }
+      value.records.push(records__iter);
+    }
+    return value;
+  }
+}
+
+/**
+ * One length-delimited canonical raw log record. Its recursive typed-value grammar is validated and borrowed by streaming_logs_v2.
+ */
+export interface OpaqueLogRecordV2Input {
+  /**
+   * Bytes
+   * Raw byte array. Sugar for array of uint8 — same wire format, simpler schema definition.
+   */
+  value: number[];
+}
+
+/**
+ * One length-delimited canonical raw log record. Its recursive typed-value grammar is validated and borrowed by streaming_logs_v2.
+ */
+export interface OpaqueLogRecordV2Output {
+  /**
+   * Bytes
+   * Raw byte array. Sugar for array of uint8 — same wire format, simpler schema definition.
+   */
+  value: number[];
+}
+
+export type OpaqueLogRecordV2 = OpaqueLogRecordV2Output;
+
+export class OpaqueLogRecordV2Encoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("msb_first");
+  }
+
+  encode(value: OpaqueLogRecordV2Input): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint32(value.value.length, "big_endian");
+    for (let value_value__iter_index = 0; value_value__iter_index < value.value.length; value_value__iter_index++) {
+      const value_value__iter = value.value[value_value__iter_index];
+      this.writeUint8(value_value__iter);
+    }
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a OpaqueLogRecordV2 value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: OpaqueLogRecordV2): number {
+    let size = 0;
+    // value: bytes (kind: length_prefixed)
+    size += value.value.length;
+    size += 4; // length prefix (uint32)
+    return size;
+  }
+}
+
+export class OpaqueLogRecordV2Decoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "msb_first");
+  }
+
+  decode(): OpaqueLogRecordV2Output {
+    const value: any = {};
+
+    value.value = [];
+    const value_length = this.readUint32("big_endian");
+    for (let i = 0; i < value_length; i++) {
+      let value__iter: any;
+      value__iter = this.readUint8();
+      value.value.push(value__iter);
+    }
+    return value;
+  }
+}
+
+/**
  * A run of log entries sharing the same labels. Fingerprint follows the same xxh3-64 convention as metrics.
  */
 export interface LogStreamInput {
@@ -6646,24 +6837,24 @@ export class MetricPointV2Encoder extends BitStreamEncoder {
    */
   calculateSize(value: MetricPointV2): number {
     let size = 0;
-    if (value.type === 'ScalarPointV2') {
+    if (value.value.type === 'ScalarPointV2') {
       const _enc = new ScalarPointV2Encoder();
-      size += _enc.calculateSize(value.value);
+      size += _enc.calculateSize(value.value.value);
     }
-    else if (value.type === 'HistogramPointV2') {
+    else if (value.value.type === 'HistogramPointV2') {
       const _enc = new HistogramPointV2Encoder();
-      size += _enc.calculateSize(value.value);
+      size += _enc.calculateSize(value.value.value);
     }
-    else if (value.type === 'ExponentialHistogramPointV2') {
+    else if (value.value.type === 'ExponentialHistogramPointV2') {
       const _enc = new ExponentialHistogramPointV2Encoder();
-      size += _enc.calculateSize(value.value);
+      size += _enc.calculateSize(value.value.value);
     }
-    else if (value.type === 'SummaryPointV2') {
+    else if (value.value.type === 'SummaryPointV2') {
       const _enc = new SummaryPointV2Encoder();
-      size += _enc.calculateSize(value.value);
+      size += _enc.calculateSize(value.value.value);
     }
     else {
-      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown variant type for value: ${(value as any).type}`);
+      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown variant type for value: ${(value.value as any).type}`);
     }
     return size;
   }
@@ -8373,16 +8564,16 @@ export class MetricNumberV2Encoder extends BitStreamEncoder {
    */
   calculateSize(value: MetricNumberV2): number {
     let size = 0;
-    if (value.type === 'IntegerValueV2') {
+    if (value.value.type === 'IntegerValueV2') {
       const _enc = new IntegerValueV2Encoder();
-      size += _enc.calculateSize(value.value);
+      size += _enc.calculateSize(value.value.value);
     }
-    else if (value.type === 'DoubleValueV2') {
+    else if (value.value.type === 'DoubleValueV2') {
       const _enc = new DoubleValueV2Encoder();
-      size += _enc.calculateSize(value.value);
+      size += _enc.calculateSize(value.value.value);
     }
     else {
-      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown variant type for value: ${(value as any).type}`);
+      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown variant type for value: ${(value.value as any).type}`);
     }
     return size;
   }
@@ -8498,16 +8689,16 @@ export class MetricCountV2Encoder extends BitStreamEncoder {
    */
   calculateSize(value: MetricCountV2): number {
     let size = 0;
-    if (value.type === 'IntegerCountV2') {
+    if (value.value.type === 'IntegerCountV2') {
       const _enc = new IntegerCountV2Encoder();
-      size += _enc.calculateSize(value.value);
+      size += _enc.calculateSize(value.value.value);
     }
-    else if (value.type === 'FloatCountV2') {
+    else if (value.value.type === 'FloatCountV2') {
       const _enc = new FloatCountV2Encoder();
-      size += _enc.calculateSize(value.value);
+      size += _enc.calculateSize(value.value.value);
     }
     else {
-      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown variant type for value: ${(value as any).type}`);
+      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown variant type for value: ${(value.value as any).type}`);
     }
     return size;
   }

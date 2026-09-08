@@ -4,15 +4,15 @@
 #   * proto/query.schema.json  -> crates/proto/src/generated_query.rs
 #   * proto/query-worker.schema.json -> crates/proto/src/generated_query_worker.rs
 #
-# We commit the generated source (both `generated*.rs`) and the
-# vendored binschema runtime (crates/binschema-runtime/src/*.rs) so the
+# We commit the generated source (`generated*.rs`) and the vendored
+# binschema runtime (crates/binschema-runtime/src/*.rs) so the
 # normal build does not depend on node / binschema being installed. This
 # script is the only path that should touch those files.
 #
 # The binschema generator emits a fresh copy of the runtime alongside
-# each schema's generated.rs. The runtime is schema-independent, so the
-# two runs MUST produce byte-identical runtime files; the script
-# asserts that before copying so we don't accidentally diverge.
+# each schema's generated.rs. The runtime is schema-independent, so all
+# three runs MUST produce byte-identical runtime files; the script asserts
+# that before copying so we don't accidentally diverge.
 #
 # Usage:
 #   scripts/gen-proto.sh                # uses default binschema location
@@ -117,4 +117,4 @@ cp "$TMP_WORKER/src/generated.rs" "$ROOT/crates/proto/src/generated_query_worker
 echo "rustfmt -> binschema-runtime + generated proto sources"
 ( cd "$ROOT" && cargo fmt -p binschema-runtime -p scry-proto )
 
-echo "done. Review with: git diff crates/binschema-runtime crates/proto/src/generated.rs crates/proto/src/generated_query.rs"
+echo "done. Review with: git diff crates/binschema-runtime crates/proto/src/generated.rs crates/proto/src/generated_query.rs crates/proto/src/generated_query_worker.rs"

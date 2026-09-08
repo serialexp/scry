@@ -17,7 +17,8 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use object_store::{memory::InMemory, ObjectStore, ObjectStoreExt};
+use bytes::Bytes;
+use object_store::{memory::InMemory, ObjectStore, ObjectStoreExt, PutPayload};
 use scry_block::{
     BlockBuilder, BlockBuilderConfig, BlockEvent, BlockMeta, LogsBlockBuilder, NoopSink,
 };
@@ -272,6 +273,19 @@ async fn full_walk_discovers_untracked_prefixes() {
     let writer = Uuid::now_v7();
     let b1 = build_logs_block(&store, writer, 0xA001, NOW, 30).await;
     let b2 = build_logs_block(&store, writer, 0xB001, NOW + 50, 30).await;
+    for path in [
+        "_catalog/decoy.meta.json",
+        "_scry/errors/v1/projections/commit.meta.json",
+        "_scry/alerts/v1/rules/rule.meta.json",
+    ] {
+        store
+            .put(
+                &object_store::path::Path::from(path),
+                PutPayload::from(Bytes::from_static(b"{not-block-meta")),
+            )
+            .await
+            .unwrap();
+    }
 
     // Empty catalog with no cursors at all — incremental poll would find
     // nothing (no prefixes known). A full walk discovers both.
@@ -280,6 +294,8 @@ async fn full_walk_discovers_untracked_prefixes() {
     assert_eq!(poll.inserted, 0, "no cursors ⇒ incremental poll is blind");
 
     let walk = full_walk(store.as_ref(), &catalog, BUCKET).await.unwrap();
+    assert_eq!(walk.seen, 2, "control metadata is not a block candidate");
+    assert_eq!(walk.failed, 0, "control metadata is never parsed");
     assert_eq!(walk.inserted, 2, "full walk discovers untracked blocks");
     assert!(catalog.get_block(b1.uuid).unwrap().is_some());
     assert!(catalog.get_block(b2.uuid).unwrap().is_some());

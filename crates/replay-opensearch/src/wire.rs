@@ -267,25 +267,22 @@ struct Established {
 /// Drain server frames, forwarding each `BatchAck` (with its status) to the
 /// send side.
 async fn reader_loop(mut rd: BufReader<OwnedReadHalf>, ack_tx: mpsc::Sender<RawAck>) {
-    loop {
-        match read_frame::<Frame, _>(&mut rd).await {
-            Ok(f) => match f.msg {
-                FrameMsg::BatchAck(a) => {
-                    if ack_tx
-                        .send(RawAck {
-                            batch_id: a.batch_id,
-                            status: a.status,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
+    while let Ok(f) = read_frame::<Frame, _>(&mut rd).await {
+        match f.msg {
+            FrameMsg::BatchAck(a) => {
+                if ack_tx
+                    .send(RawAck {
+                        batch_id: a.batch_id,
+                        status: a.status,
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
                 }
-                FrameMsg::Goodbye(_) | FrameMsg::Error(_) => break,
-                _ => {}
-            },
-            Err(_) => break,
+            }
+            FrameMsg::Goodbye(_) | FrameMsg::Error(_) => break,
+            _ => {}
         }
     }
 }

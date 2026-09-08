@@ -725,6 +725,41 @@
         }
       ]
     },
+    "LogsBatchV2": {
+      "description": "Capability-gated logs-v2 envelope. Each record is an opaque, length-delimited canonical raw log record validated by the hand-written bounded streaming parser; keeping recursion outside binschema prevents generated recursive allocations.",
+      "sequence": [
+        {
+          "name": "magic",
+          "type": "uint32",
+          "const": 1397502464
+        },
+        {
+          "name": "raw_version",
+          "type": "uint16",
+          "const": 1
+        },
+        {
+          "name": "records",
+          "type": "array",
+          "kind": "length_prefixed",
+          "length_type": "uint32",
+          "items": {
+            "type": "OpaqueLogRecordV2"
+          }
+        }
+      ]
+    },
+    "OpaqueLogRecordV2": {
+      "description": "One length-delimited canonical raw log record. Its recursive typed-value grammar is validated and borrowed by streaming_logs_v2.",
+      "sequence": [
+        {
+          "name": "value",
+          "type": "bytes",
+          "kind": "length_prefixed",
+          "length_type": "uint32"
+        }
+      ]
+    },
     "LogStream": {
       "description": "A run of log entries sharing the same labels. Fingerprint follows the same xxh3-64 convention as metrics.",
       "sequence": [

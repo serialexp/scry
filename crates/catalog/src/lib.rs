@@ -31,6 +31,7 @@ use futures::StreamExt;
 use object_store::{path::Path as ObjPath, ObjectStore, ObjectStoreExt};
 use rusqlite::{params, Connection, OptionalExtension};
 use scry_block::BlockMeta;
+use scry_storage_layout::is_reserved_control_key;
 use uuid::Uuid;
 
 pub mod snapshot;
@@ -1439,9 +1440,10 @@ impl Catalog {
                 }
             };
             let path_str = obj.location.as_ref();
-            // The `_catalog/` prefix is reserved for catalog snapshots (D-055),
-            // never a block sidecar — skip it before any suffix check.
-            if path_str.starts_with("_catalog/") {
+            // Control namespaces are never telemetry. Classify before checking
+            // the suffix so a control-plane `*.meta.json` is not fetched or
+            // parsed as a block sidecar.
+            if is_reserved_control_key(path_str) {
                 continue;
             }
             if !path_str.ends_with(".meta.json") {
