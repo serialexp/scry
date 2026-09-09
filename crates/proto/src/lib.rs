@@ -37,6 +37,7 @@ pub mod build;
 pub mod constants;
 pub mod fingerprint;
 pub mod framing;
+pub mod logs_v2_encoder;
 pub mod metrics_v2;
 pub mod payload;
 pub mod streaming;
@@ -73,6 +74,16 @@ pub use generated_query::{
     QueryStatsInput, QueryStatsOutput, ResponseSuperseded, ResponseSupersededInput,
     ResponseSupersededOutput, SchemaMsg, SchemaMsgInput, SchemaMsgOutput, StreamError,
     StreamErrorInput, StreamErrorOutput,
+};
+
+pub use logs_v2_encoder::{
+    encode_log_record_v2_from_source_into, encode_log_record_v2_into,
+    encode_logs_batch_v2_from_sources_into, encode_logs_batch_v2_into,
+    AnyValueAdapter as LogsV2AnyValueAdapter, AnyValueInput as LogsV2AnyValueInput,
+    BorrowedAnyValue as LogsV2BorrowedAnyValue, EncodeError as LogsV2EncodeError,
+    EncodeScratch as LogsV2EncodeScratch, KeyValueInput as LogsV2KeyValueInput, LogRecordInput,
+    ScopeInput as LogsV2ScopeInput, SourceLogRecordInput as LogsV2SourceLogRecordInput,
+    SourceScopeInput as LogsV2SourceScopeInput,
 };
 
 pub use generated_query_worker::{

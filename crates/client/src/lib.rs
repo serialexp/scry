@@ -14,7 +14,7 @@ use scry_proto::{
     build,
     constants::{
         ACK_ACCEPTED, CAP_AGENT_STATUS, CAP_LOGS_V2, CAP_STRUCTURED_METRICS_V2, GOODBYE_NORMAL,
-        PROTOCOL_VERSION_V2,
+        PROTOCOL_VERSION_V0, PROTOCOL_VERSION_V2,
     },
     framing::{read_frame, write_frame},
     generated::FrameMsg,
@@ -153,7 +153,17 @@ impl Client {
         .await
     }
 
-    async fn connect_with_protocol(
+    /// Connect with an explicit ingest protocol version and capability request.
+    ///
+    /// This is intended for producers that need more than one opt-in capability;
+    /// `capabilities` is an OR-combined bitmask of `CAP_*` constants. The exact
+    /// request is retained and sent again on every [`Client::reconnect`]. Prefer
+    /// the narrower constructors when only their documented behavior is needed.
+    ///
+    /// Structured metrics are the defining feature of protocol v2, so v2 must
+    /// request [`CAP_STRUCTURED_METRICS_V2`], and that capability cannot be
+    /// requested with the legacy protocol.
+    pub async fn connect_with_protocol(
         addr: &str,
         agent_id: [u8; 16],
         hostname: &str,
@@ -162,6 +172,18 @@ impl Client {
         protocol_version: u16,
         capabilities: u32,
     ) -> Result<Self> {
+        match protocol_version {
+            PROTOCOL_VERSION_V0 if capabilities & CAP_STRUCTURED_METRICS_V2 != 0 => {
+                bail!("CAP_STRUCTURED_METRICS_V2 requires protocol v2")
+            }
+            PROTOCOL_VERSION_V0 => {}
+            PROTOCOL_VERSION_V2 if capabilities & CAP_STRUCTURED_METRICS_V2 == 0 => {
+                bail!("protocol v2 requires CAP_STRUCTURED_METRICS_V2")
+            }
+            PROTOCOL_VERSION_V2 => {}
+            other => bail!("unsupported ingest protocol version {other:#06x}"),
+        }
+
         let params = ConnectParams {
             addr: addr.to_string(),
             agent_id,

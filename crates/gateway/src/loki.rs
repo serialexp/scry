@@ -184,7 +184,7 @@ impl LokiSink {
             let Fanout::Logs(batch) = item else {
                 continue; // mask is logs-only; ignore anything else defensively
             };
-            let req = to_push_request(&batch);
+            let req = to_push_request(&batch.projection);
             self.reporter.attempt(crate::metrics::GatewaySignal::Logs);
             if let Err(e) = self.ship(&req).await {
                 self.reporter

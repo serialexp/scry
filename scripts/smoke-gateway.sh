@@ -28,7 +28,7 @@ rm -rf "$SMOKE_DIR"; mkdir -p "$SMOKE_DIR"
 echo "[gw-smoke] emptying dev bucket..."
 empty_dev_objstore_bucket "gw-smoke"
 
-./target/release/scry ingest --listen "$INGEST_LISTEN" --storage --wal-dir "$SMOKE_DIR/wal" --catalog "$SMOKE_DIR/online.sqlite" >"$SMOKE_DIR/ingestd.log" 2>&1 & INGEST_PID=$!
+./target/release/scry ingest --listen "$INGEST_LISTEN" --storage --enable-logs-v2 --wal-dir "$SMOKE_DIR/wal" --catalog "$SMOKE_DIR/online.sqlite" >"$SMOKE_DIR/ingestd.log" 2>&1 & INGEST_PID=$!
 GW_PID=""
 cleanup() { [[ -n "$GW_PID" ]] && kill -9 "$GW_PID" 2>/dev/null || true; kill -9 "$INGEST_PID" 2>/dev/null || true; }
 trap cleanup EXIT
@@ -68,13 +68,17 @@ for _ in $(seq 1 "$REQUESTS"); do
   curl -sf -o /dev/null -H 'Content-Type: application/json' -H 'Content-Encoding: gzip' --data-binary "@$SMOKE_DIR/push.json.gz" "$GW_URL/push.v1.PusherService/Push"
 done
 
-sleep 2; kill "$GW_PID" 2>/dev/null || true; GW_PID=""; sleep 1; kill -INT "$INGEST_PID"; wait "$INGEST_PID" 2>/dev/null || true; trap - EXIT
+sleep 2; kill -INT "$GW_PID" 2>/dev/null || true; wait "$GW_PID" 2>/dev/null || true; GW_PID=""; sleep 1; kill -INT "$INGEST_PID"; wait "$INGEST_PID" 2>/dev/null || true; trap - EXIT
 ./target/release/scry list --catalog "$SMOKE_DIR/recon.sqlite" >"$SMOKE_DIR/list.txt" 2>&1
 
 rows() { sqlite3 "$SMOKE_DIR/recon.sqlite" "SELECT COALESCE(SUM(row_count),0) FROM blocks WHERE signal='$1';"; }
 blocks() { sqlite3 "$SMOKE_DIR/recon.sqlite" "SELECT COUNT(*) FROM blocks WHERE signal='$1';"; }
 postings() { sqlite3 "$SMOKE_DIR/recon.sqlite" "SELECT COUNT(*) FROM blocks WHERE signal='$1' AND has_postings=1;"; }
+log_v2_rows=$(sqlite3 "$SMOKE_DIR/recon.sqlite" "SELECT COALESCE(SUM(row_count),0) FROM blocks WHERE signal='logs' AND schema_version=2;")
+expected_otlp_logs=$((5 * REQUESTS * RECORDS))
+echo "[gw-smoke] logs-v2 rows=$log_v2_rows expected=$expected_otlp_logs"
 failed=0
+[[ "$log_v2_rows" == "$expected_otlp_logs" ]] || failed=1
 for spec in "logs:$EXPECTED_LOGS:yes" "metrics:$EXPECTED_METRICS:yes" "traces:$EXPECTED_TRACES:no" "profiles:$EXPECTED_PROFILES:no"; do
   IFS=: read -r signal expected indexed <<<"$spec"; actual=$(rows "$signal"); count=$(blocks "$signal"); sidecars=$(postings "$signal")
   echo "[gw-smoke] $signal rows=$actual expected=$expected blocks=$count postings=$sidecars"

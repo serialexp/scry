@@ -34,11 +34,41 @@ use crate::metrics::{GatewayMetrics, GatewaySignal, QueueSnapshot, SinkKind};
 pub const ACCEPT_ALL: u8 =
     SIGNAL_BIT_METRICS | SIGNAL_BIT_LOGS | SIGNAL_BIT_TRACES | SIGNAL_BIT_PROFILES;
 
+/// One canonical logs-v2 payload and the frame metadata derived while mapping it.
+/// The payload is already validated and ready for compression by the Scry sink.
+#[derive(Debug)]
+pub struct CanonicalLogsBatch {
+    pub payload: Vec<u8>,
+    pub record_count: u32,
+    pub ts_min: u64,
+    pub ts_max: u64,
+}
+
+/// A log batch's shared fan-out representation.
+///
+/// Every origin provides the v1 compatibility projection consumed by Loki and
+/// OpenSearch. Lossless OTLP intake additionally carries canonical logs-v2 bytes
+/// for Scry; native-v1 and Loki intake deliberately do not fabricate that fidelity.
+#[derive(Debug)]
+pub struct LogsFanout {
+    pub projection: LogsBatch,
+    pub canonical: Option<CanonicalLogsBatch>,
+}
+
+impl LogsFanout {
+    pub fn v1(projection: LogsBatch) -> Self {
+        Self {
+            projection,
+            canonical: None,
+        }
+    }
+}
+
 /// A decoded batch ready to fan out. `Arc` so every sink shares one copy rather
 /// than deep-cloning the payload once per destination.
 #[derive(Clone)]
 pub enum Fanout {
-    Logs(Arc<LogsBatch>),
+    Logs(Arc<LogsFanout>),
     Metrics(Arc<MetricsBatch>),
     StructuredMetrics(Arc<MetricsBatchV2>),
     Traces(Arc<TracesBatch>),
@@ -203,18 +233,27 @@ impl AppState {
     }
 
     pub fn offer_logs(&self, batch: LogsBatch) {
-        if batch.streams.is_empty() {
-            return;
-        }
-        if let Some(metrics) = &self.metrics {
-            metrics.add_records(
-                GatewaySignal::Logs,
+        self.offer_logs_fanout(LogsFanout::v1(batch));
+    }
+
+    pub fn offer_logs_fanout(&self, batch: LogsFanout) {
+        let record_count = batch
+            .canonical
+            .as_ref()
+            .map(|canonical| u64::from(canonical.record_count))
+            .unwrap_or_else(|| {
                 batch
+                    .projection
                     .streams
                     .iter()
                     .map(|stream| stream.entries.len() as u64)
-                    .sum(),
-            );
+                    .sum()
+            });
+        if record_count == 0 {
+            return;
+        }
+        if let Some(metrics) = &self.metrics {
+            metrics.add_records(GatewaySignal::Logs, record_count);
         }
         self.fan(Fanout::Logs(Arc::new(batch)));
     }

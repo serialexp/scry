@@ -1,14 +1,14 @@
 # Error event contract and intake — Design
 
-Status: partial — native logs v2 writer implemented behind explicit negotiation; gateway mapping outstanding
+Status: partial — lossless logs v2 intake landed; canonical extraction outstanding
 Owner: Bart
-Last updated: 2026-09-09
+Last updated: 2026-09-10
 
 ## Implementation status
 
 This document refines [Error monitoring](error-monitoring.md). D-073 accepts a
-lossless logs v2 representation; the reader and native writer mechanics have landed,
-while producer mapping and operator enablement remain outstanding.
+lossless logs v2 representation; reader, native writer, and gateway OTLP producer
+mechanics have landed, while operator enablement and canonical extraction remain.
 
 ### Done
 
@@ -24,14 +24,13 @@ while producer mapping and operator enablement remain outstanding.
   legacy/live compatibility, and schema-safe opaque compaction.
 - [x] **Phase 0b — native writer mechanics.** The ingest server can negotiate logs
   v2 behind explicit `--enable-logs-v2`, write exact raw records plus the stable
-  projection, and rotate live/recovery blocks before schema changes. Existing
-  producers remain pinned to v1.
+  projection, and rotate live/recovery blocks before schema changes.
+- [x] **Phase 0c — producer fidelity.** Gateway OTLP maps into bounded canonical
+  logs v2 with event/observed time, typed values, correlation, schema and dropped
+  counts, and reselects the format from each connection's negotiated capabilities.
 
 ### Outstanding
 
-- [ ] **Phase 0c — producer fidelity.** Map gateway OTLP into logs v2 without loss,
-  preserve event identity/observed time/typed values/correlation/dropped counts,
-  and re-negotiate/re-encode safely across reconnects.
 - [ ] **Phase 1 — canonical extraction.** Normalize exception logs and deprecated
   span events into one bounded occurrence contract with exact/heuristic dedup.
 - [ ] **Phase 2 — hardened browser intake.** Add public app keys, exact origin
@@ -326,6 +325,13 @@ attribute value use deterministic typed canonical text; exact types remain in
 `raw_record`. Stream identity hashes length-delimited canonical label bytes and
 rejects a repeated hash with different exact labels.
 
+Gateway canonicalization accepts at most the logs-v2 decoder's 16 MiB envelope even
+though generic OTLP transport permits 32 MiB requests. It rejects affected records
+with deterministic partial-success reasons for malformed IDs, unsupported Resource
+entities/profile dictionary references, duplicate or empty keys, and encoding bounds.
+Absent and explicitly empty OTLP bodies both normalize to canonical null; `-0.0`
+normalizes to `+0.0` and NaN payloads to the canonical NaN by design.
+
 The representation decision must specify the exact binschema/WAL/Parquet v2 shape,
 version-specific DataFusion adapters into one stable query schema, and compaction
 compatibility. Mixed-schema blocks compact only within `(signal, schema_version)`
@@ -335,9 +341,11 @@ readers concurrently; adding fields without those adapters is not “additive.�
 Rollout order is: ship all readers/adapters first; preserve new OTLP fields; add
 typed round trips; teach query/UI aliases; and extraction shadow mode; then enable
 new writers, `logs/dup`, and SDK guidance. The native writer is present behind
-mutual negotiation and visible default-off `--enable-logs-v2`; existing producers
-do not request it yet. V1 and v2 share the logs WAL by explicit product decision,
-so once v2 has been accepted an operator must not roll that WAL back to an older
+mutual negotiation and visible default-off `--enable-logs-v2`. The gateway requests
+logs v2 automatically for canonical OTLP batches and refuses to downgrade them when
+the current upstream session does not negotiate it; native-v1 and Loki inputs remain
+v1. V1 and v2 share the logs WAL by explicit product decision, so once v2 has been
+accepted an operator must not roll that WAL back to an older
 binary that cannot replay SL2 frames. Disabling new v2 acceptance does not disable
 recovery in a capable binary. Existing string-only blocks remain queryable and
 produce explicitly lower-quality occurrences without fabricated fidelity or

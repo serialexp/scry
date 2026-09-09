@@ -290,9 +290,10 @@ cargo build --release --workspace
 # Ingest server (add --storage --wal-dir … --catalog … to persist; see below):
 ./target/release/scry ingest --listen 127.0.0.1:4000
 
-# Logs v2 acceptance is an explicit, mutually negotiated opt-in. Existing agents
-# and the gateway still emit v1. Once a shared logs WAL contains v2 frames, do not
-# roll that ingester back to a binary that predates logs-v2 replay support.
+# Logs v2 acceptance is an explicit, mutually negotiated opt-in. The gateway
+# requests it for lossless OTLP logs; existing agents and non-OTLP log inputs stay
+# on v1. Once a shared logs WAL contains v2 frames, do not roll that ingester back
+# to a binary that predates logs-v2 replay support.
 ./target/release/scry ingest --listen 127.0.0.1:4000 --enable-logs-v2
 
 # Feed it synthetic load over the native wire:
@@ -507,7 +508,11 @@ Every sink is opt-in (`--upstream`, `--loki-url`, `--opensearch-url`,
 `--mimir-url`); at least one must be configured. `--listen-wire` and
 `--listen-otlp-grpc` are opt-in; with neither bound, the gateway serves only the
 foreign HTTP protocols. The scry sink connects lazily, so a down/absent scry server never
-blocks startup. Remote Write accepts v1 and v2 with their standard `proto=`
+blocks startup. OTLP logs are retained as canonical typed logs v2 when the upstream
+was started with `--enable-logs-v2`; the gateway refuses a lossy v1 downgrade for
+those batches when that capability is unavailable. This remains best-effort fan-out:
+the OTLP success response means accepted for bounded enqueue, not downstream WAL
+acceptance. Remote Write accepts v1 and v2 with their standard `proto=`
 Content-Type parameter; parameter-less v1 requests must send
 `X-Prometheus-Remote-Write-Version: 0.1.0`. Loki/OpenSearch are logs-only;
 Mimir is metrics-only and emits Remote Write 1.0 to `{url}/api/v1/push`;

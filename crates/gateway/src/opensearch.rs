@@ -347,7 +347,7 @@ impl OpenSearchSink {
                     };
                     let signal = crate::metrics::GatewaySignal::Logs;
                     self.reporter.attempt(signal);
-                    match self.handle(&batch).await {
+                    match self.handle(&batch.projection).await {
                         Ok(BulkOutcome::Delivered) => self.reporter.delivered(signal),
                         Ok(BulkOutcome::SkippedEmpty) => self.reporter.skipped_empty(signal),
                         Ok(BulkOutcome::PartialFailure) => self.reporter.partial_failure(signal),

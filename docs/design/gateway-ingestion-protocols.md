@@ -2,7 +2,7 @@
 
 Status: complete
 Owner: Bart
-Last updated: 2026-09-03
+Last updated: 2026-09-10
 
 ## Implementation status
 
@@ -10,7 +10,7 @@ Last updated: 2026-09-03
 
 - [x] **Shared OTLP HTTP transport.** Traces, logs, and metrics accept protobuf or JSON with optional bounded gzip decompression.
 - [x] **Loki receiver.** JSON and raw-Snappy protobuf pushes map into native log streams.
-- [x] **OTLP logs.** HTTP and gRPC preserve resource/scope identity, entry metadata, severity, and trace correlation.
+- [x] **OTLP logs.** HTTP and gRPC preserve the stable OTLP log model in bounded canonical logs v2 while retaining a v1 compatibility projection for foreign sinks.
 - [x] **OTLP structured metrics.** Gauge, delta/cumulative Sum, Histogram, ExponentialHistogram, and Summary points map into the native v2 model with explicit partial-success rejection accounting.
 - [x] **OTLP trace parity.** Existing trace mapping now accepts JSON and gzip as well as protobuf.
 - [x] **Modern Pyroscope receiver.** Push v1 Connect JSON/protobuf/gzip validates pprof metadata and normalizes storage to gzipped pprof.
@@ -25,7 +25,7 @@ _(nothing in this design; aggregate OTLP metric conversion and alpha OTLP Profil
 
 The gateway originally accepted OTLP traces, Prometheus remote-write, and the legacy Pyroscope multipart endpoint. Loki pushes, OTLP logs and metrics, and the current Pyroscope Push API could not be pointed at scry directly. This left the nominal Grafana-stack replacement dependent on a collector for common ingress protocols.
 
-This design completes the practical push surface without changing scry's native wire or storage schemas. Every receiver projects into an existing typed batch and therefore retains D-041's all-compatible-sinks fan-out and ACK-on-enqueue semantics.
+This design completes the practical push surface. Receivers map into a typed fan-out item and retain D-041's all-compatible-sinks fan-out and ACK-on-enqueue semantics. OTLP logs additionally carry the schema-versioned canonical logs-v2 payload selected by D-073.
 
 ## Receiver matrix
 
@@ -53,7 +53,9 @@ All HTTP request and expanded gzip/Snappy bodies are bounded to 32 MiB. Unsuppor
 
 Loki stream labels become scry stream labels and structured metadata becomes entry attributes. Protobuf label sets are parsed with quoted escape handling, and scry computes its own canonical fingerprint rather than trusting Loki's hash.
 
-OTLP resource attributes form stream identity, augmented by non-colliding `otel.scope.name` and `otel.scope.version`. Event time wins, with observed time as fallback. Severity maps numerically; severity text, valid trace/span IDs, and flags remain namespaced entry attributes. AnyValue data is stringified because the native log metadata model is string-to-string.
+OTLP logs produce two shared views. The canonical logs-v2 payload retains both schema URLs, Resource/scope/record dropped counts, exact optional scope and its attributes, both timestamps, severity number/text, event name, typed body/attributes, flags, and binary trace context. Maps are sorted by UTF-8 bytes, floats are canonicalized, and encoding is bounded to 16 MiB with per-record depth/node/container/string limits. Absent and empty bodies normalize to canonical null.
+
+The v1 compatibility projection remains available to Loki/OpenSearch: Resource attributes form stream identity, augmented by non-colliding `otel.scope.name` and `otel.scope.version`; event time wins with observed time as fallback, and typed values are stringified. The Scry sink automatically requests logs v2 and sends the canonical view only when the current session negotiated it. It drops rather than silently downgrading canonical OTLP logs when support is unavailable. Malformed IDs, unsupported profiling dictionary references or Resource entities, duplicate/empty map keys, and bound violations reject the affected records through deterministic OTLP partial success.
 
 ### Metrics
 

@@ -531,7 +531,8 @@ pub fn decode_logs_batch_v2_into(
     appender.begin_batch(count).map_err(DecodeError::Appender)?;
     let mut second = Cursor::new(payload);
     validate_header(&mut second)?;
-    debug_assert_eq!(second.u32()?, count);
+    let second_count = second.u32()?;
+    debug_assert_eq!(second_count, count);
     for _ in 0..count {
         let encoded = length_delimited_record(&mut second, limits)?;
         appender
@@ -1341,6 +1342,19 @@ mod tests {
         let mut output = String::new();
         record.body.write_canonical_text(&mut output);
         assert_eq!(output, r#"{"array":[],"bytes":hex"","map":{}}"#);
+    }
+
+    // `debug_assert_eq!` does not evaluate its arguments in optimized builds;
+    // this regression is therefore exercised by the release test run as well.
+    #[test]
+    fn second_pass_consumes_record_count() {
+        let payload = envelope(&[standard(null, empty_map)]);
+        let mut sink = Sink::default();
+        assert_eq!(
+            decode_logs_batch_v2_into(&payload, DecodeLimits::default(), &mut sink).unwrap(),
+            1
+        );
+        assert_eq!(sink.records, 1);
     }
 
     #[test]

@@ -1,4 +1,13 @@
 
+## Logs v2 follow-ups
+
+- Teach the gateway's optional native `--listen-wire` receiver to negotiate,
+  validate, and relay logs-v2 batches. Phase 0c covers foreign OTLP production;
+  native-v1 and Loki-origin logs intentionally remain v1 today.
+- Expose correlated native BatchAck acceptance/rejection to the gateway Scry sink.
+  D-041 intentionally ACKs inbound requests on bounded enqueue, but current client
+  delivery counters mean socket flush rather than downstream WAL acceptance.
+
 ## D-070 bounded memory follow-ups (review of ebffc11, blocking release)
 
 ### Compaction implementation
