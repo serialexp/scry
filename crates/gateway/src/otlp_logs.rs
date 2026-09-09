@@ -15,6 +15,7 @@ use opentelemetry_proto::tonic::{
     common::v1::{any_value::Value, AnyValue, KeyValue},
     logs::v1::LogRecord,
 };
+use prost::Message;
 use scry_proto::{
     constants::{LOGS_BATCH_V2_MAGIC, LOGS_RAW_VERSION_V1},
     encode_log_record_v2_from_source_into,
@@ -33,6 +34,10 @@ use crate::{
 };
 
 const REASON_COUNT: usize = 8;
+// Limit total canonicalization work to a small multiple of the already-bounded
+// decoded OTLP request. This prevents shared Resource/scope metadata from being
+// re-encoded once per tiny record after the 16 MiB output envelope is full.
+const ENCODE_WORK_MULTIPLIER: usize = 4;
 const REASON_NAMES: [&str; REASON_COUNT] = [
     "missing_timestamp",
     "severity_out_of_range",
@@ -290,6 +295,19 @@ fn validate_record(record: &LogRecord) -> Result<TraceContext<'_>, Reject> {
 
 pub fn map_logs(request: ExportLogsServiceRequest) -> LogsMapping {
     let limits = LogsV2DecodeLimits::default();
+    // Prost's exact encoded length is linear in the decoded request and does not
+    // allocate. Charge canonical record bytes against a saturating multiple of
+    // that input size, in addition to the hard 16 MiB output cap.
+    let encode_work_limit = request
+        .encoded_len()
+        .saturating_mul(ENCODE_WORK_MULTIPLIER)
+        .min(
+            limits
+                .max_payload_bytes
+                .saturating_mul(ENCODE_WORK_MULTIPLIER),
+        );
+    let mut encoded_work = 0usize;
+    let mut work_exhausted = false;
     let mut payload = Vec::with_capacity(4096);
     payload.extend_from_slice(&LOGS_BATCH_V2_MAGIC.to_be_bytes());
     payload.extend_from_slice(&LOGS_RAW_VERSION_V1.to_be_bytes());
@@ -338,6 +356,10 @@ pub fn map_logs(request: ExportLogsServiceRequest) -> LogsMapping {
             let mut stream_index = None;
 
             for record in scope_logs.log_records {
+                if work_exhausted {
+                    increment_reason(&mut reasons, Reject::Bounds);
+                    continue;
+                }
                 let result = resource_invalid
                     .or(scope_invalid)
                     .map_or_else(|| validate_record(&record), Err);
@@ -386,6 +408,14 @@ pub fn map_logs(request: ExportLogsServiceRequest) -> LogsMapping {
                     increment_reason(&mut reasons, classify_encode_error(error));
                     continue;
                 }
+                encoded_work = match encoded_work.checked_add(raw.len()) {
+                    Some(work) if work <= encode_work_limit => work,
+                    _ => {
+                        work_exhausted = true;
+                        increment_reason(&mut reasons, Reject::Bounds);
+                        continue;
+                    }
+                };
                 let Some(next_count) = record_count.checked_add(1) else {
                     increment_reason(&mut reasons, Reject::Bounds);
                     continue;
@@ -741,6 +771,27 @@ mod tests {
         assert_eq!(mapped.canonical.record_count, 0);
         assert_eq!(mapped.reasons[Reject::MapKey as usize], 1);
         assert_eq!(mapped.reasons[Reject::Dictionary as usize], 1);
+    }
+
+    #[test]
+    fn repeated_shared_metadata_stops_at_linear_encoding_work() {
+        let mut request = sample_request(2_000);
+        let large = "x".repeat(64 * 1024);
+        request.resource_logs[0]
+            .resource
+            .as_mut()
+            .unwrap()
+            .attributes
+            .push(kv("shared.large", Value::StringValue(large)));
+        let input_bytes = request.encoded_len();
+        let mapped = map_logs(request);
+
+        // Re-encoding the shared attribute for every record would do ~128 MiB of
+        // work. The request-relative work budget accepts only a small prefix and
+        // rejects the remainder deterministically.
+        assert!(mapped.canonical.record_count < 100);
+        assert!(mapped.reasons[Reject::Bounds as usize] > 1_900);
+        assert!(mapped.canonical.payload.len() <= input_bytes * ENCODE_WORK_MULTIPLIER);
     }
 
     #[test]

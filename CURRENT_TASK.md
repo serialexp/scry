@@ -423,8 +423,9 @@ architecture. `_catalog/` remains a permanent legacy sibling.
    The shared logs WAL deliberately does not support rollback to an older binary once
    it contains v2 frames. Current agent emission and non-OTLP gateway inputs remain v1.
 3. ~~Map gateway OTLP protobuf/JSON/gzip/gRPC into canonical logs v2 without loss.~~
-   Implemented with bounded typed canonicalization, deterministic per-record partial
-   success, combined capability negotiation, and reconnect-safe no-downgrade behavior.
+   Implemented with typed canonicalization bounded by output bytes and aggregate
+   request-relative encoding work, deterministic per-record partial success, combined
+   capability negotiation, and reconnect-safe no-downgrade behavior.
    The ingester's `--enable-logs-v2` remains the operator rollout gate; native-v1 and
    Loki inputs remain v1.
 4. Extend typed fidelity into live-tail only behind a separate compatible contract;

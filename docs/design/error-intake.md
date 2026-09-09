@@ -326,7 +326,9 @@ attribute value use deterministic typed canonical text; exact types remain in
 rejects a repeated hash with different exact labels.
 
 Gateway canonicalization accepts at most the logs-v2 decoder's 16 MiB envelope even
-though generic OTLP transport permits 32 MiB requests. It rejects affected records
+though generic OTLP transport permits 32 MiB requests. Total record-encoding work is
+also capped to a small multiple of the decoded OTLP size, preventing shared Resource/
+scope metadata from amplifying into unbounded repeated work. It rejects affected records
 with deterministic partial-success reasons for malformed IDs, unsupported Resource
 entities/profile dictionary references, duplicate or empty keys, and encoding bounds.
 Absent and explicitly empty OTLP bodies both normalize to canonical null; `-0.0`
