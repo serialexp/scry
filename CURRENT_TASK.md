@@ -389,11 +389,16 @@ architecture. `_catalog/` remains a permanent legacy sibling.
 - Added logs-v2's generated nonrecursive envelope and allocation-conscious,
   two-pass canonical raw-record validator/borrowed decoder. It bounds bytes, nodes,
   maps, containers, and depth before callbacks and retains full OTLP log semantics.
-- Added the exact reader-side logs Parquet v2 schema while leaving the active builder
-  pinned to v1. Query normalizes v1 and v2 into one stable schema, inserts typed NULL
-  fidelity for legacy/live-v1 rows, and prunes raw payloads from common projections.
+- Added the exact logs Parquet v2 schema. Query normalizes v1 and v2 into one stable
+  schema, inserts typed NULL fidelity for legacy/live-v1 rows, and prunes raw payloads
+  from common projections.
+- Implemented a schema-selecting logs builder, typed canonical search projection,
+  exact raw-byte storage, homogeneous live/recovery block rotation, and mutually
+  negotiated server acceptance behind visible default-off `--enable-logs-v2`.
 - Compaction validates claimed logs schemas, rejects mixed/unknown/mislabeled inputs,
   and preserves opaque v2 raw bytes exactly.
+- Best-effort tail and merged-live rows receive the compatible v1 projection only
+  after full decode and (when storage exists) WAL commit; typed live fields remain NULL.
 - Updated the design status/checklists and README workspace map.
 
 ## Verification
@@ -412,10 +417,12 @@ architecture. `_catalog/` remains a permanent legacy sibling.
 1. Deploy this reader-only namespace and logs-schema support fleet-wide in a normal
    release before enabling `_scry/` product writers or logs-v2 ingestion. Deployment
    is not authorized in this run.
-2. Implement the logs-v2 storage writer and safe per-schema builder rotation/WAL
-   replay. Advertise/request capability `0x0000_0008` only after rollout; current
-   agent and gateway emission must remain v1 until then.
-3. Map gateway OTLP protobuf/JSON/gzip/gRPC into canonical logs v2 without loss and
-   add end-to-end wire → WAL → block → compaction → query/extractor fidelity tests.
+2. ~~Implement the logs-v2 storage writer and safe per-schema builder rotation/WAL
+   replay.~~ Implemented behind visible, default-off `--enable-logs-v2`; mutual
+   capability negotiation gates new acceptance while recovery always understands v2.
+   The shared logs WAL deliberately does not support rollback to an older binary once
+   it contains v2 frames. Current agent and gateway emission remain v1.
+3. Map gateway OTLP protobuf/JSON/gzip/gRPC into canonical logs v2 without loss;
+   current producers remain deliberately pinned to v1.
 4. Extend typed fidelity into live-tail only behind a separate compatible contract;
    current best-effort live rows intentionally expose the new fields as NULL.

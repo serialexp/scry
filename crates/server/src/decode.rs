@@ -50,13 +50,36 @@ pub fn metrics(payload: &[u8], builder: &mut MetricsBlockBuilder) -> Result<usiz
     }
 }
 
-/// Adapter for `decode_logs_batch_into`, wired to
-/// [`LogsBlockBuilder`]. The streaming decoder returns the total
-/// entry count (streams are a dictionary, not records); the
-/// pipeline records that directly.
+/// Adapter for both logs wire formats, wired to [`LogsBlockBuilder`].
+///
+/// Format recognition deliberately lives here rather than in live-session
+/// feature gating: WAL recovery must always be able to replay a v2 frame that
+/// was accepted while the feature was enabled, even if a later process restart
+/// omits the flag. Live ingest checks mutual capability negotiation before this
+/// decoder can run.
 pub fn logs(payload: &[u8], builder: &mut LogsBlockBuilder) -> Result<usize> {
-    streaming::decode_logs_batch_into(payload, builder)
-        .map_err(|e| anyhow::anyhow!("LogsBatch: {e}"))
+    if is_logs_v2(payload) {
+        scry_proto::decode_logs_batch_v2_into(
+            payload,
+            scry_proto::LogsV2DecodeLimits::default(),
+            builder,
+        )
+        .map(|records| records as usize)
+        .map_err(|e| anyhow::anyhow!("LogsBatchV2: {e}"))
+    } else {
+        streaming::decode_logs_batch_into(payload, builder)
+            .map_err(|e| anyhow::anyhow!("LogsBatch: {e}"))
+    }
+}
+
+/// Cheap envelope discriminator. A magic-v2 payload is never allowed to fall
+/// through to the legacy decoder.
+pub fn is_logs_v2(payload: &[u8]) -> bool {
+    payload
+        .get(..4)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u32::from_be_bytes)
+        == Some(scry_proto::constants::LOGS_BATCH_V2_MAGIC)
 }
 
 /// Adapter for `decode_traces_batch_into`, wired to

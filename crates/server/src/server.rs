@@ -39,7 +39,7 @@ use tokio::{
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::live_ring::{LiveLogRecord, LiveRing, RetainingLogsAppender};
+use crate::live_ring::{LiveLogRecord, LiveRing, RetainingLogsAppender, RetainingLogsV2Appender};
 use crate::pipeline::{DecodeFn, Pipeline, ShardedPipeline};
 use crate::stats::ServerMetrics;
 use crate::tail::{
@@ -105,6 +105,16 @@ pub trait RemoteStatusRelay: Send + Sync + 'static {
 const MAX_AGENT_STATUS_JSON_BYTES: usize = 64 * 1024;
 const INGEST_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
 
+#[inline]
+fn negotiate_logs_v2(server_enabled: bool, peer_capabilities: u32) -> bool {
+    server_enabled && peer_capabilities & scry_proto::constants::CAP_LOGS_V2 != 0
+}
+
+#[inline]
+fn logs_payload_allowed(signal: Signal, payload: &[u8], logs_v2_negotiated: bool) -> bool {
+    signal != Signal::Logs || !crate::decode::is_logs_v2(payload) || logs_v2_negotiated
+}
+
 /// Static configuration for a [`Server`]. Cheap to construct, cloned
 /// into each spawned connection task.
 #[derive(Clone, Debug)]
@@ -118,6 +128,9 @@ pub struct ServerConfig {
     /// One per process; reusing it across restarts is what allows the
     /// WAL to replay into the same writer's lineage.
     pub writer_uuid: Uuid,
+    /// Advertise and accept the logs-v2 wire format when the peer also
+    /// requests `CAP_LOGS_V2`. This is independent of protocol version.
+    pub enable_logs_v2: bool,
 }
 
 /// The ingest server. Constructed with [`Server::new`], driven to
@@ -574,6 +587,11 @@ async fn handle(
         "hello"
     );
 
+    // Capabilities are negotiated independently of the envelope protocol
+    // version. Both endpoints must opt in before a magic-v2 logs payload is
+    // accepted.
+    let logs_v2_negotiated = negotiate_logs_v2(config.enable_logs_v2, hello.capabilities);
+
     write_frame(
         &mut wr,
         &build::hello_ack(build::HelloAckArgs {
@@ -588,6 +606,10 @@ async fn handle(
                 == scry_proto::constants::PROTOCOL_VERSION_V2
             {
                 scry_proto::constants::CAP_STRUCTURED_METRICS_V2
+            } else {
+                0
+            }) | (if logs_v2_negotiated {
+                scry_proto::constants::CAP_LOGS_V2
             } else {
                 0
             }) | scry_proto::constants::CAP_STRUCTURED_METRICS_TAIL,
@@ -752,6 +774,27 @@ async fn handle(
                 }
 
                 let signal = sig.unwrap();
+                let logs_v2 = signal == Signal::Logs && crate::decode::is_logs_v2(&decompressed);
+                if !logs_payload_allowed(signal, &decompressed, logs_v2_negotiated) {
+                    counters.rejected.fetch_add(1, Ordering::Relaxed);
+                    if let Some(m) = metrics.as_ref() {
+                        m.add_rejected();
+                    }
+                    write_frame(
+                        &mut wr,
+                        &build::batch_ack(
+                            session_id,
+                            b.batch_id,
+                            ACK_REJECTED,
+                            0,
+                            REJECT_BAD_SCHEMA,
+                            "logs v2 was not mutually negotiated",
+                        ),
+                    )
+                    .await?;
+                    wr.flush().await?;
+                    continue;
+                }
 
                 // Each signal that has a pipeline configured gets the
                 // WAL+block path; the rest fall back to streaming
@@ -946,7 +989,20 @@ async fn handle(
                             // scratch borrow before phase 2 re-uses it.
                             let tap_on = tail.subscriber_count() > 0;
                             let (decoded, live_records): (Result<usize>, Vec<LiveLogRecord>) =
-                                if live_ring.is_some() {
+                                if logs_v2 && (live_ring.is_some() || tap_on) {
+                                    let mut retaining = RetainingLogsV2Appender::new(scratch);
+                                    let decoded = scry_proto::decode_logs_batch_v2_into(
+                                        &decompressed,
+                                        scry_proto::LogsV2DecodeLimits::default(),
+                                        &mut retaining,
+                                    )
+                                    .map(|records| records as usize)
+                                    .map_err(|e| anyhow::anyhow!("LogsBatchV2: {e}"));
+                                    (decoded, retaining.into_records())
+                                } else if logs_v2 {
+                                    // Preserve the allocation-free storage-only path.
+                                    (decode_fn(&decompressed, scratch), Vec::new())
+                                } else if live_ring.is_some() {
                                     let mut retaining = RetainingLogsAppender::new(scratch);
                                     let d = if tap_on {
                                         let mut tap = TappingLogsAppender::new(
@@ -991,16 +1047,21 @@ async fn handle(
                                     let mut guard = pipe.lock().await;
                                     match guard.ingest_decoded(&decompressed, scratch).await {
                                         Ok(seg) => {
-                                            // Feed the live ring: stamp the batch's
-                                            // WAL shard+segment onto the collected
-                                            // records and push. Nothing collected
-                                            // when the ring is disabled.
+                                            // Publication is deliberately after the
+                                            // WAL append/merge transaction succeeds,
+                                            // and never holds the pipeline lock while
+                                            // snapshotting tail subscribers.
+                                            let shard = guard.shard_index();
+                                            drop(guard);
+                                            if logs_v2 && tap_on {
+                                                tail.publish_logs(
+                                                    Signal::Logs as u8,
+                                                    &live_records,
+                                                )
+                                                .await;
+                                            }
                                             if let Some(ring) = live_ring.as_ref() {
-                                                ring.push_stamped(
-                                                    live_records,
-                                                    guard.shard_index(),
-                                                    seg.0,
-                                                );
+                                                ring.push_stamped(live_records, shard, seg.0);
                                             }
                                             Ok(n as u64)
                                         }
@@ -1015,12 +1076,43 @@ async fn handle(
                                     Err(e)
                                 }
                             }
+                        } else if logs_v2 {
+                            // With no WAL, full decode success is the commit point.
+                            // Avoid projection allocations when neither live surface
+                            // can observe them.
+                            if live_ring.is_some() || tail.subscriber_count() > 0 {
+                                let mut counter = CountLogsV2Appender;
+                                let mut retaining = RetainingLogsV2Appender::new(&mut counter);
+                                match scry_proto::decode_logs_batch_v2_into(
+                                    &decompressed,
+                                    scry_proto::LogsV2DecodeLimits::default(),
+                                    &mut retaining,
+                                ) {
+                                    Ok(records) => {
+                                        let live_records = retaining.into_records();
+                                        tail.publish_logs(Signal::Logs as u8, &live_records).await;
+                                        if let Some(ring) = live_ring.as_ref() {
+                                            // No WAL exists in this mode, so the
+                                            // dedup tag remains the neutral (0, 0).
+                                            ring.push_stamped(live_records, 0, 0);
+                                        }
+                                        Ok(records as u64)
+                                    }
+                                    Err(e) => Err(anyhow::anyhow!("LogsBatchV2: {e}")),
+                                }
+                            } else {
+                                let mut counter = CountLogsV2Appender;
+                                scry_proto::decode_logs_batch_v2_into(
+                                    &decompressed,
+                                    scry_proto::LogsV2DecodeLimits::default(),
+                                    &mut counter,
+                                )
+                                .map(|records| records as u64)
+                                .map_err(|e| anyhow::anyhow!("LogsBatchV2: {e}"))
+                            }
                         } else {
-                            // No logs pipeline: validate + count
-                            // entries (streams are dictionary entries,
-                            // not records — same accounting as the
-                            // pipeline path). Live tail still works here —
-                            // a storage-less ingester can serve `scry tail`.
+                            // No logs pipeline: validate + count legacy entries.
+                            // V1 remains accepted even on a v2-negotiated session.
                             let mut counter = CountLogsAppender::default();
                             let decoded = if tail.subscriber_count() > 0 {
                                 let mut tap = TappingLogsAppender::new(
@@ -1538,6 +1630,19 @@ impl scry_proto::streaming::LogsAppender for CountLogsAppender {
     }
 }
 
+/// Counter-only `LogsV2Appender` for storage-less validation.
+#[derive(Default)]
+struct CountLogsV2Appender;
+
+impl scry_proto::LogsV2Appender for CountLogsV2Appender {
+    fn record(
+        &mut self,
+        _record: scry_proto::CanonicalLogRecord<'_>,
+    ) -> std::result::Result<(), String> {
+        Ok(())
+    }
+}
+
 /// Counter-only `TracesAppender` for the no-traces-pipeline case.
 /// Spans are counted; resources/scopes are dictionary entries and the
 /// per-span data is discarded — matching the configured-pipeline path's
@@ -1592,5 +1697,161 @@ fn short_msg_name(m: &FrameMsg) -> &'static str {
         FrameMsg::TailMetricPointV2(_) => "TailMetricPointV2",
         FrameMsg::LiveQuery(_) => "LiveQuery",
         FrameMsg::LiveBatch(_) => "LiveBatch",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logs_v2_handshake_requires_both_endpoints() {
+        let cap = scry_proto::constants::CAP_LOGS_V2;
+        assert!(!negotiate_logs_v2(false, 0));
+        assert!(!negotiate_logs_v2(false, cap));
+        assert!(!negotiate_logs_v2(true, 0));
+        assert!(negotiate_logs_v2(true, cap));
+    }
+
+    #[test]
+    fn logs_v2_capability_is_protocol_version_independent() {
+        let cap = scry_proto::constants::CAP_LOGS_V2;
+        for _protocol_version in [
+            scry_proto::constants::PROTOCOL_VERSION_V0,
+            scry_proto::constants::PROTOCOL_VERSION_V2,
+        ] {
+            assert!(negotiate_logs_v2(true, cap));
+        }
+    }
+
+    #[test]
+    fn magic_v2_logs_rejected_without_negotiation_and_accepted_with_it() {
+        let payload = scry_proto::constants::LOGS_BATCH_V2_MAGIC.to_be_bytes();
+        assert!(!logs_payload_allowed(Signal::Logs, &payload, false));
+        assert!(logs_payload_allowed(Signal::Logs, &payload, true));
+        assert!(logs_payload_allowed(Signal::Metrics, &payload, false));
+    }
+
+    #[test]
+    fn legacy_logs_remain_accepted_on_negotiated_session() {
+        assert!(logs_payload_allowed(Signal::Logs, &[0, 0, 0, 0], true));
+    }
+
+    async fn handshake_and_send_logs_v2(
+        server_enabled: bool,
+        peer_capabilities: u32,
+        protocol_version: u16,
+    ) -> (scry_proto::HelloAck, scry_proto::BatchAck) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let (socket, peer) = listener.accept().await.unwrap();
+            handle(
+                socket,
+                peer,
+                Arc::new(ServerConfig {
+                    listen_addr: addr.to_string(),
+                    writer_id: "test-writer".into(),
+                    writer_uuid: Uuid::now_v7(),
+                    enable_logs_v2: server_enabled,
+                }),
+                42,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                SubscriptionRegistry::new(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        write_frame(
+            &mut client,
+            &build::hello(build::HelloArgs {
+                protocol_version,
+                agent_id: [0; 16],
+                agent_version: "test",
+                hostname: "test-host",
+                signals: SIGNAL_BIT_LOGS,
+                capabilities: peer_capabilities,
+                resource_attrs: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap();
+        client.flush().await.unwrap();
+        let ack = match read_frame::<scry_proto::Frame, _>(&mut client)
+            .await
+            .unwrap()
+            .msg
+        {
+            FrameMsg::HelloAck(ack) => ack,
+            other => panic!("expected HelloAck, got {}", short_msg_name(&other)),
+        };
+
+        // A valid empty v2 envelope exercises negotiation and dispatch without
+        // depending on a particular typed record fixture.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&scry_proto::constants::LOGS_BATCH_V2_MAGIC.to_be_bytes());
+        payload.extend_from_slice(&scry_proto::constants::LOGS_RAW_VERSION.to_be_bytes());
+        payload.extend_from_slice(&0u32.to_be_bytes());
+        write_frame(
+            &mut client,
+            &build::batch(build::BatchArgs {
+                session_id: ack.session_id,
+                batch_id: 7,
+                signal: Signal::Logs as u8,
+                ts_min_unix_nano: 0,
+                ts_max_unix_nano: 0,
+                record_count: 0,
+                compression: scry_proto::constants::COMPRESSION_NONE,
+                uncompressed_size: payload.len() as u32,
+                payload,
+            }),
+        )
+        .await
+        .unwrap();
+        client.flush().await.unwrap();
+        let batch_ack = match read_frame::<scry_proto::Frame, _>(&mut client)
+            .await
+            .unwrap()
+            .msg
+        {
+            FrameMsg::BatchAck(ack) => ack,
+            other => panic!("expected BatchAck, got {}", short_msg_name(&other)),
+        };
+        drop(client);
+        server_task.await.unwrap();
+        (ack, batch_ack)
+    }
+
+    #[tokio::test]
+    async fn handshake_advertises_and_accepts_logs_v2_only_when_mutual() {
+        let cap = scry_proto::constants::CAP_LOGS_V2;
+
+        // Use protocol v1 to prove the capability does not depend on v2.
+        let (hello_ack, batch_ack) =
+            handshake_and_send_logs_v2(true, cap, PROTOCOL_VERSION_V0).await;
+        assert_ne!(hello_ack.capabilities & cap, 0);
+        assert_eq!(batch_ack.status, ACK_ACCEPTED);
+
+        for (server_enabled, peer_capabilities) in [(false, cap), (true, 0)] {
+            let (hello_ack, batch_ack) = handshake_and_send_logs_v2(
+                server_enabled,
+                peer_capabilities,
+                scry_proto::constants::PROTOCOL_VERSION_V2,
+            )
+            .await;
+            assert_eq!(hello_ack.capabilities & cap, 0);
+            assert_eq!(batch_ack.status, ACK_REJECTED);
+            assert_eq!(batch_ack.reason_code, REJECT_BAD_SCHEMA);
+            assert!(batch_ack.message.contains("not mutually negotiated"));
+        }
     }
 }

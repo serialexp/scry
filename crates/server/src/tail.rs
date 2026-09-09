@@ -202,6 +202,39 @@ impl SubscriptionRegistry {
             .cloned()
             .collect()
     }
+
+    /// Publish already-projected logs after their ingest transaction commits.
+    /// Delivery is best-effort and does not clone bodies/attributes unless at
+    /// least one subscriber's filter matches the record.
+    pub async fn publish_logs(&self, signal: u8, records: &[crate::live_ring::LiveLogRecord]) {
+        if records.is_empty() || self.subscriber_count() == 0 {
+            return;
+        }
+        let subs = self.snapshot_for(signal).await;
+        for record in records {
+            let mut item: Option<Arc<TailItem>> = None;
+            for sub in &subs {
+                if !sub.filter.keeps(&record.labels) {
+                    continue;
+                }
+                let item = item.get_or_insert_with(|| {
+                    Arc::new(TailItem {
+                        signal,
+                        ts_unix_nano: record.ts_unix_nano,
+                        labels: Arc::clone(&record.labels),
+                        payload: TailPayload::Log {
+                            severity: record.severity,
+                            body: record.body.clone(),
+                            attributes: record.attributes.clone(),
+                        },
+                    })
+                });
+                if sub.tx.try_send(Arc::clone(item)).is_err() {
+                    self.dropped.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
 }
 
 /// A [`LogsAppender`] decorator that forwards matching entries to live-tail
@@ -566,6 +599,34 @@ mod tests {
         // Idempotent.
         reg.deregister(id).await;
         assert_eq!(reg.subscriber_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn committed_projected_logs_are_published_best_effort() {
+        let reg = SubscriptionRegistry::new();
+        let signal = 0x10;
+        let filter = LabelFilter::parse(&["service=\"api\"".to_string()]).unwrap();
+        let (_id, mut rx) = reg.register(signal, filter, 8).await;
+        let records = vec![crate::live_ring::LiveLogRecord {
+            wal_shard: 1,
+            wal_seg: 2,
+            ts_unix_nano: 100,
+            severity: 9,
+            labels: Arc::new(vec![LabelPair {
+                key: "service".into(),
+                value: "api".into(),
+            }]),
+            body: "hello".into(),
+            attributes: vec![LabelPair {
+                key: "code".into(),
+                value: "42".into(),
+            }],
+        }];
+
+        reg.publish_logs(signal, &records).await;
+        let item = rx.try_recv().expect("matching projected log");
+        assert_eq!(item.ts_unix_nano, 100);
+        assert_eq!(body_of(&item), "hello");
     }
 
     #[tokio::test]

@@ -154,6 +154,324 @@ impl<'a> AnyValueRef<'a> {
     pub fn tag(self) -> u8 {
         self.encoded[0]
     }
+
+    /// Returns a typed, borrowed view of this already-validated value.
+    ///
+    /// Containers are lazy views over the canonical encoding; this does not
+    /// allocate or construct a recursive value tree.
+    pub fn value(self) -> AnyValue<'a> {
+        decode_value(self.encoded)
+    }
+
+    /// Returns an iterator over this value when it is a top-level map.
+    pub fn map_iter(self) -> Option<MapIter<'a>> {
+        match self.value() {
+            AnyValue::Map(map) => Some(map.iter()),
+            _ => None,
+        }
+    }
+
+    /// Appends deterministic canonical text to `output`.
+    ///
+    /// A string at the root is appended verbatim, which preserves the familiar
+    /// log-body projection. Strings nested in arrays or maps (and map keys) use
+    /// JSON quoting and escaping. Existing contents of `output` are retained.
+    pub fn write_canonical_text(self, output: &mut String) {
+        match self.value() {
+            AnyValue::String(value) => output.push_str(value),
+            value => write_nested_value(value, output),
+        }
+    }
+
+    /// Appends a type-injective canonical representation to `output`.
+    ///
+    /// Unlike [`write_canonical_text`](Self::write_canonical_text), root strings
+    /// are JSON-quoted too. Use this for labels and other identity-bearing
+    /// projections so `"null"` cannot collide with the canonical null value.
+    pub fn write_typed_canonical_text(self, output: &mut String) {
+        write_nested_value(self.value(), output);
+    }
+}
+
+/// A typed borrowed view into a validated canonical `AnyValue`.
+///
+/// Canonical text is `null`, `true`/`false`, signed decimal integers, and
+/// deterministic decimal doubles (`.0` is retained for integral finite
+/// doubles, with `NaN`, `Infinity`, and `-Infinity` for non-finite values).
+/// Bytes are `hex"0123abcd"`; arrays are `[value,...]`; maps are
+/// `{"key":value,...}`. Nested strings and map keys are JSON-escaped.
+#[derive(Debug, Clone, Copy)]
+pub enum AnyValue<'a> {
+    Null,
+    String(&'a str),
+    Bool(bool),
+    Int64(i64),
+    Double(f64),
+    Bytes(&'a [u8]),
+    Array(ArrayRef<'a>),
+    Map(MapRef<'a>),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ArrayRef<'a> {
+    encoded_values: &'a [u8],
+    len: u32,
+}
+
+impl<'a> ArrayRef<'a> {
+    pub fn len(self) -> u32 {
+        self.len
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    pub fn iter(self) -> ArrayIter<'a> {
+        ArrayIter {
+            remaining: self.len,
+            encoded: self.encoded_values,
+        }
+    }
+}
+
+impl<'a> IntoIterator for ArrayRef<'a> {
+    type Item = AnyValueRef<'a>;
+    type IntoIter = ArrayIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MapRef<'a> {
+    encoded_entries: &'a [u8],
+    len: u32,
+}
+
+impl<'a> MapRef<'a> {
+    pub fn len(self) -> u32 {
+        self.len
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    pub fn iter(self) -> MapIter<'a> {
+        MapIter {
+            remaining: self.len,
+            encoded: self.encoded_entries,
+        }
+    }
+}
+
+impl<'a> IntoIterator for MapRef<'a> {
+    type Item = (&'a str, AnyValueRef<'a>);
+    type IntoIter = MapIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ArrayIter<'a> {
+    remaining: u32,
+    encoded: &'a [u8],
+}
+
+impl<'a> Iterator for ArrayIter<'a> {
+    type Item = AnyValueRef<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let len = encoded_value_len(self.encoded);
+        let (value, rest) = self.encoded.split_at(len);
+        self.encoded = rest;
+        self.remaining -= 1;
+        Some(AnyValueRef { encoded: value })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.remaining as usize;
+        (len, Some(len))
+    }
+}
+
+impl ExactSizeIterator for ArrayIter<'_> {}
+impl std::iter::FusedIterator for ArrayIter<'_> {}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MapIter<'a> {
+    remaining: u32,
+    encoded: &'a [u8],
+}
+
+impl<'a> Iterator for MapIter<'a> {
+    type Item = (&'a str, AnyValueRef<'a>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let key_len = read_u32(self.encoded) as usize;
+        let key_end = 4 + key_len;
+        let key = std::str::from_utf8(&self.encoded[4..key_end])
+            .expect("AnyValueRef was UTF-8 validated");
+        let value_len = encoded_value_len(&self.encoded[key_end..]);
+        let value_end = key_end + value_len;
+        let value = AnyValueRef {
+            encoded: &self.encoded[key_end..value_end],
+        };
+        self.encoded = &self.encoded[value_end..];
+        self.remaining -= 1;
+        Some((key, value))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.remaining as usize;
+        (len, Some(len))
+    }
+}
+
+impl ExactSizeIterator for MapIter<'_> {}
+impl std::iter::FusedIterator for MapIter<'_> {}
+
+fn read_u32(input: &[u8]) -> u32 {
+    u32::from_be_bytes(input[..4].try_into().expect("validated u32"))
+}
+
+fn encoded_value_len(input: &[u8]) -> usize {
+    match input[0] {
+        ANY_NULL => 1,
+        ANY_STRING | ANY_BYTES => 5 + read_u32(&input[1..]) as usize,
+        ANY_BOOL => 2,
+        ANY_INT64 | ANY_DOUBLE => 9,
+        ANY_ARRAY => {
+            let count = read_u32(&input[1..]);
+            let mut offset = 5;
+            for _ in 0..count {
+                offset += encoded_value_len(&input[offset..]);
+            }
+            offset
+        }
+        ANY_MAP => {
+            let count = read_u32(&input[1..]);
+            let mut offset = 5;
+            for _ in 0..count {
+                let key_len = read_u32(&input[offset..]) as usize;
+                offset += 4 + key_len;
+                offset += encoded_value_len(&input[offset..]);
+            }
+            offset
+        }
+        _ => unreachable!("AnyValueRef has a validated tag"),
+    }
+}
+
+fn decode_value(input: &[u8]) -> AnyValue<'_> {
+    match input[0] {
+        ANY_NULL => AnyValue::Null,
+        ANY_STRING => {
+            let len = read_u32(&input[1..]) as usize;
+            AnyValue::String(
+                std::str::from_utf8(&input[5..5 + len]).expect("AnyValueRef was UTF-8 validated"),
+            )
+        }
+        ANY_BOOL => AnyValue::Bool(input[1] != 0),
+        ANY_INT64 => AnyValue::Int64(i64::from_be_bytes(input[1..9].try_into().unwrap())),
+        ANY_DOUBLE => AnyValue::Double(f64::from_bits(u64::from_be_bytes(
+            input[1..9].try_into().unwrap(),
+        ))),
+        ANY_BYTES => {
+            let len = read_u32(&input[1..]) as usize;
+            AnyValue::Bytes(&input[5..5 + len])
+        }
+        ANY_ARRAY => AnyValue::Array(ArrayRef {
+            len: read_u32(&input[1..]),
+            encoded_values: &input[5..],
+        }),
+        ANY_MAP => AnyValue::Map(MapRef {
+            len: read_u32(&input[1..]),
+            encoded_entries: &input[5..],
+        }),
+        _ => unreachable!("AnyValueRef has a validated tag"),
+    }
+}
+
+fn write_json_string(value: &str, output: &mut String) {
+    output.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => output.push_str("\\\""),
+            '\\' => output.push_str("\\\\"),
+            '\u{08}' => output.push_str("\\b"),
+            '\u{0c}' => output.push_str("\\f"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            '\u{00}'..='\u{1f}' => {
+                use std::fmt::Write;
+                write!(output, "\\u{:04x}", character as u32).unwrap();
+            }
+            _ => output.push(character),
+        }
+    }
+    output.push('"');
+}
+
+fn write_nested_value(value: AnyValue<'_>, output: &mut String) {
+    use std::fmt::Write;
+
+    match value {
+        AnyValue::Null => output.push_str("null"),
+        AnyValue::String(value) => write_json_string(value, output),
+        AnyValue::Bool(value) => output.push_str(if value { "true" } else { "false" }),
+        AnyValue::Int64(value) => write!(output, "{value}").unwrap(),
+        AnyValue::Double(value) if value.is_nan() => output.push_str("NaN"),
+        AnyValue::Double(value) if value == f64::INFINITY => output.push_str("Infinity"),
+        AnyValue::Double(value) if value == f64::NEG_INFINITY => output.push_str("-Infinity"),
+        AnyValue::Double(value) => {
+            let start = output.len();
+            write!(output, "{value}").unwrap();
+            if !output[start..].contains(['.', 'e', 'E']) {
+                output.push_str(".0");
+            }
+        }
+        AnyValue::Bytes(value) => {
+            output.push_str("hex\"");
+            for byte in value {
+                write!(output, "{byte:02x}").unwrap();
+            }
+            output.push('"');
+        }
+        AnyValue::Array(values) => {
+            output.push('[');
+            for (index, value) in values.iter().enumerate() {
+                if index != 0 {
+                    output.push(',');
+                }
+                write_nested_value(value.value(), output);
+            }
+            output.push(']');
+        }
+        AnyValue::Map(values) => {
+            output.push('{');
+            for (index, (key, value)) in values.iter().enumerate() {
+                if index != 0 {
+                    output.push(',');
+                }
+                write_json_string(key, output);
+                output.push(':');
+                write_nested_value(value.value(), output);
+            }
+            output.push('}');
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -880,6 +1198,149 @@ mod tests {
             decode_logs_batch_v2_into(&payload, DecodeLimits::default(), &mut Sink::default()),
             Err(DecodeError::TrailingBytes)
         );
+    }
+
+    fn any_string(out: &mut Vec<u8>, value: &str) {
+        out.push(ANY_STRING);
+        string(out, value.as_bytes());
+    }
+
+    fn map_entry(out: &mut Vec<u8>, key: &str, value: impl FnOnce(&mut Vec<u8>)) {
+        string(out, key.as_bytes());
+        value(out);
+    }
+
+    #[test]
+    fn borrowed_typed_values_and_top_level_map_iteration() {
+        let raw = standard(null, |out| {
+            out.push(ANY_MAP);
+            out.extend_from_slice(&3u32.to_be_bytes());
+            map_entry(out, "a", |out| {
+                out.push(ANY_INT64);
+                out.extend_from_slice(&(-42i64).to_be_bytes());
+            });
+            map_entry(out, "nested", |out| {
+                out.push(ANY_ARRAY);
+                out.extend_from_slice(&2u32.to_be_bytes());
+                out.extend_from_slice(&[ANY_BOOL, 1]);
+                any_string(out, "borrowed");
+            });
+            map_entry(out, "z", null);
+        });
+        let record = validate_record(&raw, DecodeLimits::default()).unwrap();
+        let mut entries = record.attributes.map_iter().unwrap();
+        assert_eq!(entries.len(), 3);
+
+        let (key, value) = entries.next().unwrap();
+        assert_eq!(key, "a");
+        assert!(matches!(value.value(), AnyValue::Int64(-42)));
+
+        let (key, value) = entries.next().unwrap();
+        assert_eq!(key, "nested");
+        let AnyValue::Array(array) = value.value() else {
+            panic!("expected array")
+        };
+        assert_eq!(array.len(), 2);
+        let mut values = array.iter();
+        assert!(matches!(
+            values.next().unwrap().value(),
+            AnyValue::Bool(true)
+        ));
+        assert!(matches!(
+            values.next().unwrap().value(),
+            AnyValue::String("borrowed")
+        ));
+        assert!(values.next().is_none());
+        assert_eq!(entries.next().unwrap().0, "z");
+        assert!(entries.next().is_none());
+        assert!(record.body.map_iter().is_none());
+    }
+
+    #[test]
+    fn canonical_text_preserves_root_string_and_escapes_nested_strings() {
+        let text = "exact body: \\\"line\\n\t雪";
+        let raw = standard(|out| any_string(out, text), empty_map);
+        let record = validate_record(&raw, DecodeLimits::default()).unwrap();
+        let mut output = String::from("prefix|");
+        record.body.write_canonical_text(&mut output);
+        assert_eq!(output, format!("prefix|{text}"));
+        output.clear();
+        record.body.write_typed_canonical_text(&mut output);
+        assert_eq!(output, r#""exact body: \\\"line\\n\t雪""#);
+
+        let raw = standard(
+            |out| {
+                out.push(ANY_ARRAY);
+                out.extend_from_slice(&2u32.to_be_bytes());
+                any_string(out, "quote:\" slash:\\ newline:\n tab:\t nul:\0 雪");
+                out.push(ANY_MAP);
+                out.extend_from_slice(&1u32.to_be_bytes());
+                map_entry(out, "k\n\"", |out| any_string(out, "v\r"));
+            },
+            empty_map,
+        );
+        let record = validate_record(&raw, DecodeLimits::default()).unwrap();
+        let mut output = String::new();
+        record.body.write_canonical_text(&mut output);
+        assert_eq!(
+            output,
+            "[\"quote:\\\" slash:\\\\ newline:\\n tab:\\t nul:\\u0000 雪\",{\"k\\n\\\"\":\"v\\r\"}]"
+        );
+    }
+
+    #[test]
+    fn canonical_text_renders_every_scalar_type_unambiguously() {
+        let raw = standard(
+            |out| {
+                out.push(ANY_ARRAY);
+                out.extend_from_slice(&10u32.to_be_bytes());
+                null(out);
+                out.extend_from_slice(&[ANY_BOOL, 0, ANY_BOOL, 1]);
+                out.push(ANY_INT64);
+                out.extend_from_slice(&i64::MIN.to_be_bytes());
+                for value in [1.0, 1.25, f64::INFINITY, f64::NEG_INFINITY] {
+                    out.push(ANY_DOUBLE);
+                    out.extend_from_slice(&value.to_bits().to_be_bytes());
+                }
+                out.push(ANY_DOUBLE);
+                out.extend_from_slice(&CANONICAL_NAN_BITS.to_be_bytes());
+                out.push(ANY_BYTES);
+                out.extend_from_slice(&3u32.to_be_bytes());
+                out.extend_from_slice(&[0, 0xab, 0xff]);
+            },
+            empty_map,
+        );
+        let record = validate_record(&raw, DecodeLimits::default()).unwrap();
+        let mut output = String::new();
+        record.body.write_canonical_text(&mut output);
+        assert_eq!(
+            output,
+            "[null,false,true,-9223372036854775808,1.0,1.25,Infinity,-Infinity,NaN,hex\"00abff\"]"
+        );
+    }
+
+    #[test]
+    fn canonical_map_text_retains_wire_sorted_order_and_empty_containers() {
+        let raw = standard(
+            |out| {
+                out.push(ANY_MAP);
+                out.extend_from_slice(&3u32.to_be_bytes());
+                map_entry(out, "array", |out| {
+                    out.push(ANY_ARRAY);
+                    out.extend_from_slice(&0u32.to_be_bytes());
+                });
+                map_entry(out, "bytes", |out| {
+                    out.push(ANY_BYTES);
+                    out.extend_from_slice(&0u32.to_be_bytes());
+                });
+                map_entry(out, "map", empty_map);
+            },
+            empty_map,
+        );
+        let record = validate_record(&raw, DecodeLimits::default()).unwrap();
+        let mut output = String::new();
+        record.body.write_canonical_text(&mut output);
+        assert_eq!(output, r#"{"array":[],"bytes":hex"","map":{}}"#);
     }
 
     #[test]

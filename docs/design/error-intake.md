@@ -1,14 +1,14 @@
 # Error event contract and intake — Design
 
-Status: partial — logs v2 reader/storage/query contract landed; writer outstanding
+Status: partial — native logs v2 writer implemented behind explicit negotiation; gateway mapping outstanding
 Owner: Bart
-Last updated: 2026-09-07
+Last updated: 2026-09-09
 
 ## Implementation status
 
 This document refines [Error monitoring](error-monitoring.md). D-073 accepts a
-lossless logs v2 representation; the reader-side wire/storage contract has landed,
-while gateway mapping and writer enablement remain outstanding.
+lossless logs v2 representation; the reader and native writer mechanics have landed,
+while producer mapping and operator enablement remain outstanding.
 
 ### Done
 
@@ -21,13 +21,17 @@ while gateway mapping and writer enablement remain outstanding.
   typed raw records alongside stable flat query projections.
 - [x] **Phase 0a — reader/storage/query contract.** Added the bounded canonical
   envelope/validator, exact Parquet v2 schema, v1/v2 query normalization, nullable
-  legacy/live compatibility, and schema-safe opaque compaction. No writer is enabled.
+  legacy/live compatibility, and schema-safe opaque compaction.
+- [x] **Phase 0b — native writer mechanics.** The ingest server can negotiate logs
+  v2 behind explicit `--enable-logs-v2`, write exact raw records plus the stable
+  projection, and rotate live/recovery blocks before schema changes. Existing
+  producers remain pinned to v1.
 
 ### Outstanding
 
-- [ ] **Phase 0b — native writer fidelity.** Map OTLP into logs v2 without loss,
-  rotate builders safely by schema generation, preserve event identity/observed time/
-  typed values/correlation/dropped counts, and capability-gate writer enablement.
+- [ ] **Phase 0c — producer fidelity.** Map gateway OTLP into logs v2 without loss,
+  preserve event identity/observed time/typed values/correlation/dropped counts,
+  and re-negotiate/re-encode safely across reconnects.
 - [ ] **Phase 1 — canonical extraction.** Normalize exception logs and deprecated
   span events into one bounded occurrence contract with exact/heuristic dedup.
 - [ ] **Phase 2 — hardened browser intake.** Add public app keys, exact origin
@@ -316,7 +320,11 @@ The stable logs v2 Parquet/query projection has these columns in contractual ord
 The normalized SQL table appends synthesized `labels` at index 13 using the same
 Map layout as `attributes`. The first five v2 fields retain the exact v1 names,
 types, nullability, and order. V1 normalization clones them and appends eight typed
-NULL arrays; it never fabricates missing fidelity.
+NULL arrays; it never fabricates missing fidelity. V2 keeps a root string body as
+familiar unquoted text, while non-string bodies and every identity-bearing Resource/
+attribute value use deterministic typed canonical text; exact types remain in
+`raw_record`. Stream identity hashes length-delimited canonical label bytes and
+rejects a repeated hash with different exact labels.
 
 The representation decision must specify the exact binschema/WAL/Parquet v2 shape,
 version-specific DataFusion adapters into one stable query schema, and compaction
@@ -326,9 +334,14 @@ readers concurrently; adding fields without those adapters is not “additive.�
 
 Rollout order is: ship all readers/adapters first; preserve new OTLP fields; add
 typed round trips; teach query/UI aliases; and extraction shadow mode; then enable
-new writers, `logs/dup`, and SDK guidance. Existing string-only blocks remain
-queryable and produce explicitly lower-quality occurrences without fabricated
-fidelity or guaranteed exact deduplication.
+new writers, `logs/dup`, and SDK guidance. The native writer is present behind
+mutual negotiation and visible default-off `--enable-logs-v2`; existing producers
+do not request it yet. V1 and v2 share the logs WAL by explicit product decision,
+so once v2 has been accepted an operator must not roll that WAL back to an older
+binary that cannot replay SL2 frames. Disabling new v2 acceptance does not disable
+recovery in a capable binary. Existing string-only blocks remain queryable and
+produce explicitly lower-quality occurrences without fabricated fidelity or
+guaranteed exact deduplication.
 
 ## Verification
 

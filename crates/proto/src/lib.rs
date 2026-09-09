@@ -56,9 +56,10 @@ pub use generated::{
 };
 
 pub use streaming_logs_v2::{
-    decode_logs_batch_v2_into, validate_record as validate_logs_v2_record, AnyValueRef,
-    CanonicalLogRecord, DecodeError as LogsV2DecodeError, DecodeLimits as LogsV2DecodeLimits,
-    LogsV2Appender,
+    decode_logs_batch_v2_into, validate_record as validate_logs_v2_record, AnyValue, AnyValueRef,
+    ArrayIter as AnyValueArrayIter, ArrayRef as AnyValueArrayRef, CanonicalLogRecord,
+    DecodeError as LogsV2DecodeError, DecodeLimits as LogsV2DecodeLimits, LogsV2Appender,
+    MapIter as AnyValueMapIter, MapRef as AnyValueMapRef,
 };
 
 pub use generated_query::{

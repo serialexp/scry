@@ -322,16 +322,54 @@ impl<B: BlockBuilder> Pipeline<B> {
         let mut recovery_hash = Sha256::new();
         for frame in wal.replay().context("scanning WAL for replay")? {
             let payload = frame.context("reading WAL frame")?;
-            recovery_hash.update((payload.len() as u64).to_be_bytes());
-            recovery_hash.update(&payload);
             // Match live ingest semantics: wire dictionaries and descriptor IDs
             // are batch-local, and a failed decode must not leave a partial
             // prefix in the shared recovery builder.
-            let n = (decode)(&payload, &mut scratch)
-                .with_context(|| format!("WAL replay: decode {} batch", B::SIGNAL))?;
+            let n = match (decode)(&payload, &mut scratch) {
+                Ok(n) => n,
+                Err(error) => {
+                    // Decoders may call begin_batch or append a valid prefix before
+                    // rejecting a later record. Never let that partial schema/state
+                    // bleed into a following frame if a caller inspects this error.
+                    scratch.reset();
+                    return Err(error)
+                        .with_context(|| format!("WAL replay: decode {} batch", B::SIGNAL));
+                }
+            };
+
+            // A block may contain only one physical content schema. Flush the
+            // preceding schema synchronously before merging this frame. In
+            // particular, hash the frame only after this boundary: the
+            // deterministic UUID of the preceding recovery block must not
+            // depend on the first frame of the next schema.
+            if !builder.is_empty()
+                && !scratch.is_empty()
+                && builder.content_schema_key() != scratch.content_schema_key()
+            {
+                upload_replay_block(
+                    &mut builder,
+                    writer_uuid,
+                    cfg,
+                    store.as_ref(),
+                    catalog.as_ref(),
+                    None,
+                    shard_index,
+                    recovery_block_uuid(
+                        writer_uuid,
+                        B::SIGNAL,
+                        shard_index,
+                        &recovery_hash.clone().finalize(),
+                    ),
+                )
+                .await?;
+                replayed_blocks += 1;
+            }
+
             builder.merge(&mut scratch);
             replayed_records += n as u64;
             replayed_frames += 1;
+            recovery_hash.update((payload.len() as u64).to_be_bytes());
+            recovery_hash.update(&payload);
 
             // Recovery used to accumulate every surviving WAL frame in one
             // builder, bypassing the normal block thresholds and OOMing before
@@ -540,6 +578,17 @@ impl<B: BlockBuilder> Pipeline<B> {
     /// The record count for the ack comes from the decode the caller already
     /// performed, so this returns the segment rather than a count.
     pub async fn ingest_decoded(&mut self, payload: &[u8], scratch: &mut B) -> Result<SegmentId> {
+        // Seal the existing block before the new frame enters its WAL range if
+        // decode selected a different physical schema. Both builders must be
+        // non-empty: fixed-schema builders use the default `None` key and an
+        // empty/no-op batch cannot create a boundary.
+        if !self.builder.is_empty()
+            && !scratch.is_empty()
+            && self.builder.content_schema_key() != scratch.content_schema_key()
+        {
+            self.spawn_upload().await?;
+        }
+
         // Order matters: WAL first, builder second — same invariant as
         // `ingest`. If the WAL append fails we never merge the scratch
         // records into the shared builder; the agent sees the BatchAck
@@ -1124,10 +1173,10 @@ mod tests {
     use futures::{stream::BoxStream, StreamExt};
     use object_store::{
         memory::InMemory, path::Path, CopyOptions, GetOptions, GetResult, ListResult,
-        MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload,
-        PutResult, RenameOptions, Result as OsResult,
+        MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt, PutMultipartOptions, PutOptions,
+        PutPayload, PutResult, RenameOptions, Result as OsResult,
     };
-    use scry_block::{BlockBuilderConfig, DummyBlockBuilder, MetricsBlockBuilder};
+    use scry_block::{BlockBuilderConfig, BlockMeta, DummyBlockBuilder, MetricsBlockBuilder};
     use scry_proto::generated::{
         IntegerValueV2Input, MetricDescriptorV2, MetricNumberV2, MetricPointV2, MetricPointV2Value,
         MetricsBatchV2, ScalarPointV2Input,
@@ -1353,6 +1402,168 @@ mod tests {
         use scry_proto::streaming::DummyAppender;
         b.append_raw(1_000_000_000, b"k", b"v");
         Ok(1)
+    }
+
+    /// Test-only schema-switching builder. Production builders remain fixed
+    /// schema and inherit `BlockBuilder::content_schema_key() == None`.
+    struct SchemaTestBuilder {
+        inner: DummyBlockBuilder,
+        schema: Option<u64>,
+    }
+
+    impl BlockBuilder for SchemaTestBuilder {
+        const SIGNAL: &'static str = "schema-test";
+
+        fn new(writer_id: Uuid, cfg: BlockBuilderConfig) -> Self {
+            Self {
+                inner: DummyBlockBuilder::new(writer_id, cfg),
+                schema: None,
+            }
+        }
+
+        fn is_empty(&self) -> bool {
+            self.inner.is_empty()
+        }
+
+        fn should_close(&self) -> bool {
+            self.inner.should_close()
+        }
+
+        fn content_schema_key(&self) -> Option<u64> {
+            self.schema
+        }
+
+        fn merge(&mut self, other: &mut Self) {
+            if self.is_empty() {
+                self.schema = other.schema;
+            }
+            self.inner.merge(&mut other.inner);
+            other.schema = None;
+        }
+
+        fn reset(&mut self) {
+            self.inner.reset();
+            self.schema = None;
+        }
+
+        fn set_compression_level(&mut self, level: i32) {
+            self.inner.set_compression_level(level);
+        }
+
+        fn set_wal_seg_max(&mut self, seg: u64) {
+            self.inner.set_wal_seg_max(seg);
+        }
+
+        fn set_wal_shard(&mut self, shard: u32) {
+            self.inner.set_wal_shard(shard);
+        }
+
+        fn set_block_uuid(&mut self, uuid: Uuid) {
+            self.inner.set_block_uuid(uuid);
+        }
+
+        async fn finish_and_upload(
+            self,
+            store: &dyn ObjectStore,
+        ) -> anyhow::Result<Option<BlockMeta>> {
+            self.inner.finish_and_upload(store).await
+        }
+    }
+
+    fn append_schema(payload: &[u8], b: &mut SchemaTestBuilder) -> anyhow::Result<usize> {
+        use scry_proto::streaming::DummyAppender;
+        let schema = u64::from(*payload.first().context("missing test schema key")?);
+        b.schema = Some(schema);
+        b.inner.append_raw(schema, b"k", payload);
+        Ok(1)
+    }
+
+    #[tokio::test]
+    async fn ingest_decoded_rotates_on_schema_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut pipeline = Pipeline::<SchemaTestBuilder>::open_with_config(
+            tmp.path().to_path_buf(),
+            store.clone(),
+            None,
+            Uuid::now_v7(),
+            append_schema,
+            BlockBuilderConfig {
+                max_rows: 100,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut scratch = pipeline.new_scratch();
+        append_schema(&[1], &mut scratch).unwrap();
+        let first_seg = pipeline.ingest_decoded(&[1], &mut scratch).await.unwrap();
+        append_schema(&[2], &mut scratch).unwrap();
+        let second_seg = pipeline.ingest_decoded(&[2], &mut scratch).await.unwrap();
+
+        assert_eq!(first_seg, SegmentId(0));
+        assert_eq!(second_seg, SegmentId(1), "rotation precedes WAL append");
+        assert_eq!(pipeline.builder.content_schema_key(), Some(2));
+
+        pipeline.flush().await.unwrap();
+        assert_eq!(store.list(None).count().await, 4); // 2 blocks × parquet/meta
+    }
+
+    #[tokio::test]
+    async fn replay_schema_boundary_uuid_excludes_next_frame() {
+        use sha2::{Digest, Sha256};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = Uuid::now_v7();
+        let mut wal = Wal::open(WalConfig::new(tmp.path(), SchemaTestBuilder::SIGNAL))
+            .await
+            .unwrap();
+        wal.append(&[1]).await.unwrap();
+        wal.append(&[2]).await.unwrap();
+        wal.rotate().await.unwrap();
+        drop(wal);
+
+        let mut first_prefix = Sha256::new();
+        first_prefix.update(1u64.to_be_bytes());
+        first_prefix.update([1]);
+        let expected_first = recovery_block_uuid(
+            writer,
+            SchemaTestBuilder::SIGNAL,
+            0,
+            &first_prefix.finalize(),
+        );
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        Pipeline::<SchemaTestBuilder>::open_with_config(
+            tmp.path().to_path_buf(),
+            store.clone(),
+            None,
+            writer,
+            append_schema,
+            BlockBuilderConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        let mut metas = store
+            .list(None)
+            .filter(|meta| {
+                futures::future::ready(
+                    meta.as_ref()
+                        .is_ok_and(|m| m.location.as_ref().ends_with("meta.json")),
+                )
+            })
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(metas.len(), 2);
+        let mut ids = Vec::new();
+        for meta in metas.drain(..) {
+            let location = meta.unwrap().location;
+            let bytes = store.get(&location).await.unwrap().bytes().await.unwrap();
+            ids.push(serde_json::from_slice::<BlockMeta>(&bytes).unwrap().uuid);
+        }
+        assert!(ids.contains(&expected_first));
     }
 
     /// Regression test for the unbounded-RSS bug: a bucket slower than

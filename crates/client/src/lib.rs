@@ -13,7 +13,7 @@ use anyhow::{bail, Context, Result};
 use scry_proto::{
     build,
     constants::{
-        ACK_ACCEPTED, CAP_AGENT_STATUS, CAP_STRUCTURED_METRICS_V2, GOODBYE_NORMAL,
+        ACK_ACCEPTED, CAP_AGENT_STATUS, CAP_LOGS_V2, CAP_STRUCTURED_METRICS_V2, GOODBYE_NORMAL,
         PROTOCOL_VERSION_V2,
     },
     framing::{read_frame, write_frame},
@@ -104,6 +104,31 @@ impl Client {
             resource_attrs,
             PROTOCOL_VERSION_V2,
             CAP_STRUCTURED_METRICS_V2,
+        )
+        .await
+    }
+
+    /// Connect while explicitly requesting logs-v2 support.
+    ///
+    /// Existing constructors deliberately do not request this capability, so
+    /// current agents and gateways remain pinned to logs v1. Callers must check
+    /// [`Client::supports_logs_v2`] after every connect/reconnect before encoding
+    /// an SL2 payload.
+    pub async fn connect_logs_v2(
+        addr: &str,
+        agent_id: [u8; 16],
+        hostname: &str,
+        signals: u8,
+        resource_attrs: Vec<LabelPair>,
+    ) -> Result<Self> {
+        Self::connect_with_protocol(
+            addr,
+            agent_id,
+            hostname,
+            signals,
+            resource_attrs,
+            scry_proto::constants::PROTOCOL_VERSION_V0,
+            CAP_LOGS_V2,
         )
         .await
     }
@@ -254,6 +279,10 @@ impl Client {
 
     pub fn supports_structured_metrics(&self) -> bool {
         self.capabilities & CAP_STRUCTURED_METRICS_V2 != 0
+    }
+
+    pub fn supports_logs_v2(&self) -> bool {
+        self.capabilities & CAP_LOGS_V2 != 0
     }
 
     /// Send one best-effort agent status report when the server negotiated support.

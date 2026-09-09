@@ -84,6 +84,20 @@ pub trait BlockBuilder: Send + 'static {
     fn is_empty(&self) -> bool;
     fn should_close(&self) -> bool;
 
+    /// Identity of the physical content schema currently buffered by this
+    /// builder. The generic pipeline uses this seam to keep one immutable
+    /// block from spanning a schema change. Builders whose schema is fixed may
+    /// use the default `None`; all such builders therefore retain the previous
+    /// merge and rotation behavior.
+    ///
+    /// A schema-switching builder should return the same key for builders whose
+    /// buffered records may safely be merged, and a different key after decode
+    /// selects a different physical schema. The value is deliberately opaque to
+    /// the pipeline.
+    fn content_schema_key(&self) -> Option<u64> {
+        None
+    }
+
     /// Drain `other`'s buffered records into `self`, leaving `other`
     /// empty (capacity retained) and reusable for the next batch.
     ///

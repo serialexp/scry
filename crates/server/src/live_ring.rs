@@ -38,6 +38,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use scry_proto::generated::LabelPair;
 use scry_proto::streaming::LogsAppender;
+use scry_proto::{CanonicalLogRecord, LogsV2Appender};
+
+const SCOPE_NAME_LABEL: &str = "otel.scope.name";
+const SCOPE_VERSION_LABEL: &str = "otel.scope.version";
 
 /// One retained log record. `labels` are the stream-level labels (shared
 /// across a stream's entries via `Arc`); `body`/`attributes` are per-entry.
@@ -204,6 +208,115 @@ impl<'a, A: LogsAppender> RetainingLogsAppender<'a, A> {
     }
 }
 
+/// A [`LogsV2Appender`] decorator that delegates the canonical storage
+/// callbacks unchanged while collecting the legacy live-protocol projection.
+/// The caller owns publication timing: collected rows are not visible until
+/// [`into_records`](Self::into_records) is called after a successful decode.
+pub struct RetainingLogsV2Appender<'a, A: LogsV2Appender> {
+    inner: &'a mut A,
+    collected: Vec<LiveLogRecord>,
+    label_scratch: Vec<LabelPair>,
+    text_scratch: String,
+}
+
+impl<'a, A: LogsV2Appender> RetainingLogsV2Appender<'a, A> {
+    pub fn new(inner: &'a mut A) -> Self {
+        Self {
+            inner,
+            collected: Vec::new(),
+            label_scratch: Vec::new(),
+            text_scratch: String::new(),
+        }
+    }
+
+    pub fn into_records(self) -> Vec<LiveLogRecord> {
+        self.collected
+    }
+}
+
+impl<A: LogsV2Appender> LogsV2Appender for RetainingLogsV2Appender<'_, A> {
+    fn begin_batch(&mut self, record_count: u32) -> Result<(), String> {
+        self.inner.begin_batch(record_count)?;
+        self.collected.reserve(record_count as usize);
+        Ok(())
+    }
+
+    fn record(&mut self, record: CanonicalLogRecord<'_>) -> Result<(), String> {
+        // Storage remains authoritative. In particular, builder schema checks
+        // and every canonical record field reach it exactly as decoded.
+        self.inner.record(record)?;
+
+        let ts_unix_nano = if record.time_unix_nano != 0 {
+            record.time_unix_nano
+        } else {
+            record.observed_time_unix_nano
+        };
+        let severity = u8::try_from(record.severity_number)
+            .map_err(|_| "severity_number does not fit u8".to_string())?;
+
+        self.label_scratch.clear();
+        let mut has_scope_name = false;
+        let mut has_scope_version = false;
+        for (key, value) in record
+            .resource_attributes
+            .map_iter()
+            .ok_or_else(|| "resource_attributes is not a map".to_string())?
+        {
+            has_scope_name |= key == SCOPE_NAME_LABEL;
+            has_scope_version |= key == SCOPE_VERSION_LABEL;
+            value.write_typed_canonical_text(&mut self.text_scratch);
+            self.label_scratch.push(LabelPair {
+                key: key.to_owned(),
+                value: std::mem::take(&mut self.text_scratch),
+            });
+        }
+        if !has_scope_name {
+            if let Some(name) = record.scope_name.filter(|value| !value.is_empty()) {
+                self.label_scratch.push(LabelPair {
+                    key: SCOPE_NAME_LABEL.into(),
+                    value: name.to_owned(),
+                });
+            }
+        }
+        if !has_scope_version {
+            if let Some(version) = record.scope_version.filter(|value| !value.is_empty()) {
+                self.label_scratch.push(LabelPair {
+                    key: SCOPE_VERSION_LABEL.into(),
+                    value: version.to_owned(),
+                });
+            }
+        }
+        self.label_scratch.sort_unstable_by(|left, right| {
+            (&left.key, &left.value).cmp(&(&right.key, &right.value))
+        });
+
+        let attrs_iter = record
+            .attributes
+            .map_iter()
+            .ok_or_else(|| "attributes is not a map".to_string())?;
+        let mut attributes = Vec::with_capacity(attrs_iter.len());
+        for (key, value) in attrs_iter {
+            value.write_typed_canonical_text(&mut self.text_scratch);
+            attributes.push(LabelPair {
+                key: key.to_owned(),
+                value: std::mem::take(&mut self.text_scratch),
+            });
+        }
+        record.body.write_canonical_text(&mut self.text_scratch);
+        let body = std::mem::take(&mut self.text_scratch);
+        self.collected.push(LiveLogRecord {
+            wal_shard: 0,
+            wal_seg: 0,
+            ts_unix_nano,
+            severity,
+            labels: Arc::new(self.label_scratch.clone()),
+            body,
+            attributes,
+        });
+        Ok(())
+    }
+}
+
 impl<A: LogsAppender> LogsAppender for RetainingLogsAppender<'_, A> {
     fn observe_stream(&mut self, fingerprint: u64, labels: Vec<(Vec<u8>, Vec<u8>)>) {
         // Coerce to UTF-8 LabelPairs once per stream (cold path), shared
@@ -306,6 +419,111 @@ mod tests {
         assert_eq!(recs[0].labels[0].value, "api");
         assert_eq!(recs[0].attributes.len(), 1);
         assert_eq!(recs[1].body, "world");
+    }
+
+    fn put_string(out: &mut Vec<u8>, value: &str) {
+        out.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        out.extend_from_slice(value.as_bytes());
+    }
+
+    fn v2_record() -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&0u16.to_be_bytes());
+        put_string(&mut out, "resource/v1");
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.push(scry_proto::streaming_logs_v2::ANY_MAP);
+        out.extend_from_slice(&1u32.to_be_bytes());
+        put_string(&mut out, "service");
+        out.push(scry_proto::streaming_logs_v2::ANY_STRING);
+        put_string(&mut out, "api");
+        out.push(1);
+        put_string(&mut out, "scope");
+        put_string(&mut out, "1.0");
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.push(scry_proto::streaming_logs_v2::ANY_MAP);
+        out.extend_from_slice(&0u32.to_be_bytes());
+        put_string(&mut out, "scope/v1");
+        out.extend_from_slice(&100u64.to_be_bytes());
+        out.extend_from_slice(&101u64.to_be_bytes());
+        out.extend_from_slice(&9i32.to_be_bytes());
+        put_string(&mut out, "INFO");
+        put_string(&mut out, "event");
+        out.push(scry_proto::streaming_logs_v2::ANY_STRING);
+        put_string(&mut out, "hello");
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.push(scry_proto::streaming_logs_v2::ANY_MAP);
+        out.extend_from_slice(&1u32.to_be_bytes());
+        put_string(&mut out, "code");
+        out.push(scry_proto::streaming_logs_v2::ANY_INT64);
+        out.extend_from_slice(&42i64.to_be_bytes());
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.push(0);
+        out.push(0);
+        out
+    }
+
+    #[derive(Default)]
+    struct V2Sink(usize);
+    impl LogsV2Appender for V2Sink {
+        fn record(&mut self, _: CanonicalLogRecord<'_>) -> Result<(), String> {
+            self.0 += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn retaining_v2_projects_canonical_values_and_delegates() {
+        let encoded = v2_record();
+        let canonical = scry_proto::validate_logs_v2_record(
+            &encoded,
+            scry_proto::LogsV2DecodeLimits::default(),
+        )
+        .unwrap();
+        let mut inner = V2Sink::default();
+        let mut retaining = RetainingLogsV2Appender::new(&mut inner);
+        retaining.record(canonical).unwrap();
+        let rows = retaining.into_records();
+        assert_eq!(inner.0, 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].ts_unix_nano, 100);
+        assert_eq!(rows[0].severity, 9);
+        assert_eq!(rows[0].body, "hello");
+        assert_eq!(rows[0].attributes[0].value, "42");
+        assert_eq!(
+            rows[0]
+                .labels
+                .iter()
+                .map(|pair| (pair.key.as_str(), pair.value.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("otel.scope.name", "scope"),
+                ("otel.scope.version", "1.0"),
+                ("service", "\"api\"")
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_v2_invokes_no_callbacks_and_collects_nothing() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&scry_proto::constants::LOGS_BATCH_V2_MAGIC.to_be_bytes());
+        payload.extend_from_slice(&scry_proto::constants::LOGS_RAW_VERSION_V1.to_be_bytes());
+        payload.extend_from_slice(&1u32.to_be_bytes());
+        let mut record = v2_record();
+        record.push(0); // trailing byte inside the length-delimited record
+        payload.extend_from_slice(&(record.len() as u32).to_be_bytes());
+        payload.extend_from_slice(&record);
+
+        let mut inner = V2Sink::default();
+        let mut retaining = RetainingLogsV2Appender::new(&mut inner);
+        assert!(scry_proto::decode_logs_batch_v2_into(
+            &payload,
+            scry_proto::LogsV2DecodeLimits::default(),
+            &mut retaining,
+        )
+        .is_err());
+        assert!(retaining.into_records().is_empty());
+        assert_eq!(inner.0, 0);
     }
 
     #[test]

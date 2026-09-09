@@ -81,6 +81,11 @@ pub struct Args {
     #[arg(long)]
     storage: bool,
 
+    /// Enable negotiated acceptance of the structured logs v2 wire format.
+    /// Disabled by default; peers must also request CAP_LOGS_V2 in Hello.
+    #[arg(long, default_value_t = false)]
+    enable_logs_v2: bool,
+
     /// Root directory for the WAL. A `dummy/` subdirectory is created
     /// for v0.1; real signals get their own subdirs later. Required
     /// when `--storage` is set.
@@ -674,6 +679,7 @@ pub async fn run(args: Args) -> Result<()> {
             listen_addr: args.listen,
             writer_id,
             writer_uuid,
+            enable_logs_v2: args.enable_logs_v2,
         },
         dummy_pipeline,
         metrics_pipeline,
@@ -1396,7 +1402,20 @@ fn rand_short() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_tail_advertise_addr;
+    use super::{resolve_tail_advertise_addr, Args};
+    use clap::{CommandFactory, Parser};
+
+    #[test]
+    fn logs_v2_flag_is_visible_and_defaults_off() {
+        let defaults = Args::try_parse_from(["scry-ingestd"]).unwrap();
+        assert!(!defaults.enable_logs_v2);
+
+        let enabled = Args::try_parse_from(["scry-ingestd", "--enable-logs-v2"]).unwrap();
+        assert!(enabled.enable_logs_v2);
+
+        let help = Args::command().render_help().to_string();
+        assert!(help.contains("--enable-logs-v2"));
+    }
 
     #[test]
     fn explicit_wins_over_everything() {

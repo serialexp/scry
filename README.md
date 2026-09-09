@@ -290,6 +290,11 @@ cargo build --release --workspace
 # Ingest server (add --storage --wal-dir … --catalog … to persist; see below):
 ./target/release/scry ingest --listen 127.0.0.1:4000
 
+# Logs v2 acceptance is an explicit, mutually negotiated opt-in. Existing agents
+# and the gateway still emit v1. Once a shared logs WAL contains v2 frames, do not
+# roll that ingester back to a binary that predates logs-v2 replay support.
+./target/release/scry ingest --listen 127.0.0.1:4000 --enable-logs-v2
+
 # Feed it synthetic load over the native wire:
 ./target/release/noise-spewer --addr 127.0.0.1:4000 --rate 50 --duration 3s
 ```
