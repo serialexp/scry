@@ -1,4 +1,4 @@
-//! Normalization of versioned logs parquet batches into the stable v2 query schema.
+//! Normalization of versioned logs parquet batches into the stable v3 query schema.
 use std::{any::Any, sync::Arc};
 
 use arrow::array::new_null_array;
@@ -17,6 +17,7 @@ pub(crate) fn physical_schema(version: u32) -> DfResult<SchemaRef> {
     match version {
         1 => Ok(scry_block::logs_physical_schema_v1()),
         2 => Ok(scry_block::logs_physical_schema_v2()),
+        3 => Ok(scry_block::logs_physical_schema_v3()),
         _ => Err(DataFusionError::Plan(format!(
             "unsupported logs block schema version {version}"
         ))),
@@ -70,7 +71,7 @@ impl LogsNormalizeExec {
         input_indices: Vec<usize>,
         output_indices: Vec<usize>,
     ) -> Self {
-        let full_schema = scry_block::logs_physical_schema_v2();
+        let full_schema = scry_block::logs_physical_schema_v3();
         let schema = Arc::new(
             full_schema
                 .project(&output_indices)
@@ -104,7 +105,7 @@ impl std::fmt::Debug for LogsNormalizeExec {
 
 impl DisplayAs for LogsNormalizeExec {
     fn fmt_as(&self, _: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "LogsNormalizeExec: v{} -> v2", self.version)
+        write!(f, "LogsNormalizeExec: v{} -> v3", self.version)
     }
 }
 
@@ -147,7 +148,7 @@ impl ExecutionPlan for LogsNormalizeExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DfResult<SendableRecordBatchStream> {
-        let schema = scry_block::logs_physical_schema_v2();
+        let schema = scry_block::logs_physical_schema_v3();
         let output_schema = self.schema.clone();
         let version = self.version;
         let input_indices = self.input_indices.clone();
@@ -166,6 +167,23 @@ impl ExecutionPlan for LogsNormalizeExec {
 mod tests {
     use super::*;
     use arrow::array::{Array, StringArray, UInt64Array, UInt8Array};
+
+    #[test]
+    fn physical_schemas_are_exactly_versioned() {
+        assert_eq!(
+            physical_schema(1).unwrap(),
+            scry_block::logs_physical_schema_v1()
+        );
+        assert_eq!(
+            physical_schema(2).unwrap(),
+            scry_block::logs_physical_schema_v2()
+        );
+        assert_eq!(
+            physical_schema(3).unwrap(),
+            scry_block::logs_physical_schema_v3()
+        );
+        assert!(physical_schema(4).is_err());
+    }
 
     #[test]
     fn v1_appends_typed_null_fidelity_columns() {
@@ -188,14 +206,49 @@ mod tests {
             ],
         )
         .unwrap();
-        let schema = scry_block::logs_physical_schema_v2();
-        let indices: Vec<usize> = (0..13).collect();
+        let schema = scry_block::logs_physical_schema_v3();
+        let indices: Vec<usize> = (0..14).collect();
         let normalized =
             normalize_batch(batch, 1, &(0..5).collect::<Vec<_>>(), &indices, &schema).unwrap();
         assert_eq!(normalized.schema(), schema);
-        assert_eq!(normalized.num_columns(), 13);
+        assert_eq!(normalized.num_columns(), 14);
         for column in normalized.columns().iter().skip(5) {
             assert_eq!(column.null_count(), 1);
         }
+    }
+
+    #[test]
+    fn v2_appends_only_typed_null_receipt_column() {
+        let v2 = scry_block::logs_physical_schema_v2();
+        let mut attrs = arrow::array::MapBuilder::new(
+            None,
+            arrow::array::StringBuilder::new(),
+            arrow::array::StringBuilder::new(),
+        );
+        attrs.append(true).unwrap();
+        let mut columns: Vec<arrow::array::ArrayRef> = vec![
+            Arc::new(UInt64Array::from(vec![7])),
+            Arc::new(UInt64Array::from(vec![11])),
+            Arc::new(UInt8Array::from(vec![17])),
+            Arc::new(StringArray::from(vec!["boom"])),
+            Arc::new(attrs.finish()),
+        ];
+        columns.extend(
+            v2.fields()
+                .iter()
+                .skip(5)
+                .map(|field| new_null_array(field.data_type(), 1)),
+        );
+        let batch = RecordBatch::try_new(v2, columns).unwrap();
+        let schema = scry_block::logs_physical_schema_v3();
+        let output: Vec<usize> = (0..14).collect();
+        let normalized =
+            normalize_batch(batch, 2, &(0..13).collect::<Vec<_>>(), &output, &schema).unwrap();
+        assert_eq!(normalized.schema(), schema);
+        assert_eq!(
+            normalized.column(13).data_type(),
+            &arrow::datatypes::DataType::UInt64
+        );
+        assert_eq!(normalized.column(13).null_count(), 1);
     }
 }

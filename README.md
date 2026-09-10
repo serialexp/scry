@@ -180,6 +180,16 @@ real. Architecture is documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.m
   single-trace waterfall, a frames overview, a logs reader, and live logs/
   metrics fed through the queryd tail front door (D-040, D-046, D-062/D-065).
   Sealed by `scripts/smoke-webui.sh` and `scripts/smoke-webui-tail.sh`.
+- **Error occurrence foundation.** Canonical logs producers emit raw-record v1;
+  ingest uniformly redacts structured sensitive keys on every logs/traces path,
+  stamps trusted receipt time before WAL, and stores raw-record v2 in logs Parquet/
+  query schema v3 (`received_ts_unix_nano`). The bounded, periodic single-writer
+  `scry errors` role conditionally establishes deployment identity, extracts only
+  eligible schema-3/raw-2 exception logs with strict producer IDs, publishes
+  immutable metadata-last occurrence Parquet with conditional creates, and folds a
+  deployment-bound rebuildable `errors.sqlite`. This foundation is implemented but
+  not deployed; clustered Valkey orchestration, browser intake, grouping/issues/UI,
+  accepted-record hints, and error snapshots/GC remain ahead.
 - **Bounded query and operations surfaces.** Queryd enforces a default one-hour
   look-back for otherwise unbounded requests, bounded DataFusion/cache budgets,
   result caching, label suggestions, and per-phase timing. Ingest/query/gateway
@@ -214,6 +224,8 @@ crates/
   valkey/              Valkey client: namespaced leases, block events, tail/status/deletion registries (scry-valkey)
   cluster/             multi-instance convergence + lease-guarded maintenance (scry-cluster)
   status/              shared local/Fleet status snapshots and HTTP dashboard (scry-status)
+  errors/              error occurrence identity, extraction, immutable projection, and SQLite fold (scry-errors)
+  scry-errorsd/        bounded `scry errors` manifest/reconciliation role; clustered mode remains fail-closed
   resources/           shared bounded-resource accounting and admission helpers (scry-resources)
   duration/            checked CLI duration parser shared by operator roles (scry-duration)
   match/               shared Prometheus-style label matcher grammar (scry-match)
@@ -290,10 +302,11 @@ cargo build --release --workspace
 # Ingest server (add --storage --wal-dir … --catalog … to persist; see below):
 ./target/release/scry ingest --listen 127.0.0.1:4000
 
-# Logs v2 acceptance is an explicit, mutually negotiated opt-in. The gateway
-# requests it for lossless OTLP logs; existing agents and non-OTLP log inputs stay
-# on v1. Once a shared logs WAL contains v2 frames, do not roll that ingester back
-# to a binary that predates logs-v2 replay support.
+# Canonical logs acceptance is an explicit, mutually negotiated opt-in. Producers
+# send raw-record v1; ingest redacts and stamps trusted receipt time before WAL,
+# producing raw-record v2 and logs Parquet/query schema v3. Existing agents and
+# non-OTLP log inputs remain on legacy logs v1. Once a shared logs WAL contains
+# canonical frames, do not roll that ingester back before logs-v2 replay support.
 ./target/release/scry ingest --listen 127.0.0.1:4000 --enable-logs-v2
 
 # Feed it synthetic load over the native wire:
@@ -508,8 +521,9 @@ Every sink is opt-in (`--upstream`, `--loki-url`, `--opensearch-url`,
 `--mimir-url`); at least one must be configured. `--listen-wire` and
 `--listen-otlp-grpc` are opt-in; with neither bound, the gateway serves only the
 foreign HTTP protocols. The scry sink connects lazily, so a down/absent scry server never
-blocks startup. OTLP logs are retained as canonical typed logs v2 when the upstream
-was started with `--enable-logs-v2`; the gateway refuses a lossy v1 downgrade for
+blocks startup. OTLP logs are sent as canonical producer raw-record v1 when the
+upstream was started with `--enable-logs-v2`; ingest stamps them before WAL as
+raw-record v2 and stores logs schema 3. The gateway refuses a lossy v1 downgrade for
 those batches when that capability is unavailable. This remains best-effort fan-out:
 the OTLP success response means accepted for bounded enqueue, not downstream WAL
 acceptance. Remote Write accepts v1 and v2 with their standard `proto=`

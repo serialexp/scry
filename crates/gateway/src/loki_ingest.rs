@@ -69,10 +69,16 @@ pub async fn handle(
             metrics.inbound_rejected(crate::metrics::Inbound::LokiHttp);
         }
     })?;
+    state.offer_logs(batch).map_err(|error| {
+        if let Some(metrics) = state.metrics() {
+            metrics.inbound_rejected(crate::metrics::Inbound::LokiHttp);
+        }
+        tracing::warn!(%error, "log redaction rejected Loki batch");
+        (StatusCode::BAD_REQUEST, "invalid log batch".into())
+    })?;
     if let Some(metrics) = state.metrics() {
         metrics.inbound_accepted(crate::metrics::Inbound::LokiHttp);
     }
-    state.offer_logs(batch);
     Ok(StatusCode::NO_CONTENT)
 }
 

@@ -84,6 +84,7 @@ use scry_block::{BlockBuilder, BlockBuilderConfig, BlockEvent, BlockEventSink};
 use scry_catalog::Catalog;
 use scry_wal::{SegmentId, Wal, WalConfig};
 use std::{
+    borrow::Cow,
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -136,6 +137,40 @@ pub const INGEST_SHARDS: usize = 8;
 /// a generic so the pipeline stays decoder-agnostic and binaries can
 /// wire up whichever decoder matches their builder.
 pub type DecodeFn<B> = fn(&[u8], &mut B) -> anyhow::Result<usize>;
+
+/// Replay-safe redaction for an encoded WAL payload. Logs-v2 is identified by
+/// its envelope magic and preserves its raw-record version and server receipt;
+/// all other logs frames are v1. Signals without structured redaction are
+/// returned borrowed and byte-identical.
+fn redact_replayed_payload<'a>(
+    signal: &str,
+    payload: &'a [u8],
+    logs_v2_scratch: &mut scry_proto::LogsV2StampScratch,
+) -> Result<Cow<'a, [u8]>> {
+    match signal {
+        "logs"
+            if payload
+                .get(..4)
+                .and_then(|bytes| bytes.try_into().ok())
+                .map(u32::from_be_bytes)
+                == Some(scry_proto::constants::LOGS_BATCH_V2_MAGIC) =>
+        {
+            scry_proto::redact_replayed_logs_v2(
+                payload,
+                scry_proto::LogsV2DecodeLimits::default(),
+                logs_v2_scratch,
+            )
+            .context("redacting replayed logs-v2 payload")
+        }
+        "logs" => {
+            scry_proto::redaction::redact_logs_v1(payload).context("redacting logs-v1 payload")
+        }
+        "traces" => {
+            scry_proto::redaction::redact_traces_v1(payload).context("redacting traces-v1 payload")
+        }
+        _ => Ok(Cow::Borrowed(payload)),
+    }
+}
 
 /// ZSTD level for the "dense" end of the adaptive dial: smallest blocks,
 /// slowest encode. Picked when uploads are the bottleneck (spend CPU to
@@ -200,6 +235,9 @@ pub struct Pipeline<B: BlockBuilder> {
     writer_uuid: Uuid,
     cfg: BlockBuilderConfig,
     decode: DecodeFn<B>,
+    /// Reusable output/record buffers for direct logs-v2 receipt stamping and
+    /// redaction. Other signals never touch this storage.
+    logs_v2_stamp_scratch: scry_proto::LogsV2StampScratch,
     /// Pending upload tasks. Each entry is a spawned task that owns the
     /// old builder + a semaphore permit. `flush()` drains this on
     /// shutdown; routine ingest only `try_join_next`s to reap finished
@@ -320,8 +358,15 @@ impl<B: BlockBuilder> Pipeline<B> {
         let mut replayed_frames = 0u64;
         let mut replayed_blocks = 0u64;
         let mut recovery_hash = Sha256::new();
+        // Reused across every replayed frame. In particular, logs-v2 replay
+        // redaction must not allocate fresh encoder scratch per frame and must
+        // preserve the server receipt already committed to the WAL.
+        let mut logs_v2_stamp_scratch = scry_proto::LogsV2StampScratch::default();
         for frame in wal.replay().context("scanning WAL for replay")? {
-            let payload = frame.context("reading WAL frame")?;
+            let wal_payload = frame.context("reading WAL frame")?;
+            let payload =
+                redact_replayed_payload(B::SIGNAL, &wal_payload, &mut logs_v2_stamp_scratch)
+                    .with_context(|| format!("WAL replay: redact {} batch", B::SIGNAL))?;
             // Match live ingest semantics: wire dictionaries and descriptor IDs
             // are batch-local, and a failed decode must not leave a partial
             // prefix in the shared recovery builder.
@@ -457,6 +502,7 @@ impl<B: BlockBuilder> Pipeline<B> {
             writer_uuid,
             cfg,
             decode,
+            logs_v2_stamp_scratch: scry_proto::LogsV2StampScratch::default(),
             in_flight: JoinSet::new(),
             upload_sem: Arc::new(Semaphore::new(MAX_INFLIGHT_UPLOADS)),
             upload_stats: None,
@@ -560,10 +606,14 @@ impl<B: BlockBuilder> Pipeline<B> {
     }
 
     /// Commit a batch that the caller already decoded into `scratch`
-    /// (lock-free). WAL-first, exactly like [`Pipeline::ingest`]: append
-    /// the raw payload, then merge the scratch builder's columns into the
-    /// shared builder. Auto-spawns a background upload if the merge tips
-    /// the builder past its close threshold.
+    /// (lock-free). `payload` **must already be validated and redacted**, and
+    /// `scratch` must have been decoded from those exact bytes. This internal
+    /// seam intentionally does not redact again because production callers
+    /// decode outside the pipeline lock. WAL-first, exactly like
+    /// [`Pipeline::ingest`]: append the transformed payload, then merge the
+    /// matching scratch builder's columns into the shared builder. Auto-spawns
+    /// a background upload if the merge tips the builder past its close
+    /// threshold.
     ///
     /// On WAL-append failure we return the error *before* merging, so the
     /// shared builder is untouched and the agent's retry re-decodes the
@@ -577,7 +627,11 @@ impl<B: BlockBuilder> Pipeline<B> {
     /// can dedup them against the catalog high-water (`kept iff seg > H`).
     /// The record count for the ack comes from the decode the caller already
     /// performed, so this returns the segment rather than a count.
-    pub async fn ingest_decoded(&mut self, payload: &[u8], scratch: &mut B) -> Result<SegmentId> {
+    pub(crate) async fn ingest_decoded(
+        &mut self,
+        payload: &[u8],
+        scratch: &mut B,
+    ) -> Result<SegmentId> {
         // Seal the existing block before the new frame enters its WAL range if
         // decode selected a different physical schema. Both builders must be
         // non-empty: fixed-schema builders use the default `None` key and an
@@ -619,13 +673,63 @@ impl<B: BlockBuilder> Pipeline<B> {
     }
 
     pub async fn ingest(&mut self, payload: &[u8]) -> Result<u64> {
-        // Keep this convenience path transactionally identical to production:
-        // fully decode first, append the accepted payload to WAL, then merge.
-        // A malformed batch can neither poison replay nor leave a rejected
-        // prefix in the active builder.
-        let mut scratch = self.new_scratch();
-        let n = (self.decode)(payload, &mut scratch)? as u64;
-        self.ingest_decoded(payload, &mut scratch).await?;
+        let received_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .context("system clock is before UNIX epoch")?
+            .as_nanos()
+            .try_into()
+            .context("server receipt timestamp exceeds u64")?;
+        self.ingest_at(payload, received_ns).await
+    }
+
+    /// Direct ingest with an explicit server receipt timestamp. Logs-v2
+    /// producer-v1 bytes are stamped and redacted before decode and the exact
+    /// transformed bytes are committed to WAL. The timestamp is ignored for
+    /// other signals and legacy logs.
+    pub async fn ingest_at(&mut self, payload: &[u8], received_ns: u64) -> Result<u64> {
+        let is_logs_v2 = B::SIGNAL == "logs"
+            && payload
+                .get(..4)
+                .and_then(|bytes| bytes.try_into().ok())
+                .map(u32::from_be_bytes)
+                == Some(scry_proto::constants::LOGS_BATCH_V2_MAGIC);
+        let transformed = if is_logs_v2 {
+            // The stamping API intentionally retains its output in reusable
+            // scratch. Direct ingest must own the bytes across async pipeline
+            // commits; production's decode-out-of-lock handler borrows the
+            // per-connection output without this copy.
+            scry_proto::redact_and_stamp_logs_v2(
+                payload,
+                received_ns,
+                scry_proto::LogsV2DecodeLimits::default(),
+                &mut self.logs_v2_stamp_scratch,
+            )
+            .context("stamping logs-v2 payload")?
+            .to_vec()
+        } else {
+            redact_replayed_payload(B::SIGNAL, payload, &mut self.logs_v2_stamp_scratch)?
+                .into_owned()
+        };
+        let mut scratch = B::new(self.writer_uuid, self.cfg);
+        let n = (self.decode)(&transformed, &mut scratch)? as u64;
+
+        // Commit only after complete transformation and decode.
+        if !self.builder.is_empty()
+            && !scratch.is_empty()
+            && self.builder.content_schema_key() != scratch.content_schema_key()
+        {
+            self.spawn_upload().await?;
+        }
+        {
+            let mut wal = self.wal.lock().await;
+            wal.append(&transformed).await.context("WAL append")?;
+        }
+        self.builder.merge(&mut scratch);
+        self.mark_block_started();
+        if self.builder.should_close() {
+            self.spawn_upload().await?;
+        }
+        self.reap_finished();
         Ok(n)
     }
 
@@ -1176,12 +1280,105 @@ mod tests {
         MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt, PutMultipartOptions, PutOptions,
         PutPayload, PutResult, RenameOptions, Result as OsResult,
     };
-    use scry_block::{BlockBuilderConfig, BlockMeta, DummyBlockBuilder, MetricsBlockBuilder};
+    use scry_block::{
+        BlockBuilderConfig, BlockMeta, DummyBlockBuilder, LogsBlockBuilder, MetricsBlockBuilder,
+    };
     use scry_proto::generated::{
-        IntegerValueV2Input, MetricDescriptorV2, MetricNumberV2, MetricPointV2, MetricPointV2Value,
-        MetricsBatchV2, ScalarPointV2Input,
+        IntegerValueV2Input, LabelPair, LogEntry, LogStream, LogsBatch, MetricDescriptorV2,
+        MetricNumberV2, MetricPointV2, MetricPointV2Value, MetricsBatchV2, ScalarPointV2Input,
+    };
+    use scry_proto::{
+        encode_logs_batch_v2_into, LogRecordInput as LogsV2LogRecordInput, LogsV2AnyValueInput,
+        LogsV2KeyValueInput,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn logs_v1_batch(secret: &str, safe: &str) -> Vec<u8> {
+        LogsBatch {
+            streams: vec![LogStream {
+                fingerprint: 7,
+                labels: vec![LabelPair {
+                    key: "service".into(),
+                    value: safe.into(),
+                }],
+                entries: vec![LogEntry {
+                    ts_unix_nano: 9,
+                    severity: 4,
+                    body: "stable body".into(),
+                    attributes: vec![
+                        LabelPair {
+                            key: "authorization".into(),
+                            value: secret.into(),
+                        },
+                        LabelPair {
+                            key: "safe".into(),
+                            value: safe.into(),
+                        },
+                    ],
+                }],
+            }],
+        }
+        .encode()
+        .unwrap()
+    }
+
+    fn decode_logs_without_replay_secret(
+        payload: &[u8],
+        builder: &mut LogsBlockBuilder,
+    ) -> anyhow::Result<usize> {
+        anyhow::ensure!(
+            !payload
+                .windows(b"replay-secret".len())
+                .any(|bytes| bytes == b"replay-secret"),
+            "replay decoder observed sensitive bytes"
+        );
+        anyhow::ensure!(
+            payload
+                .windows(b"safe-stability-marker".len())
+                .any(|bytes| bytes == b"safe-stability-marker"),
+            "replay changed an unaffected value"
+        );
+        crate::decode::logs(payload, builder)
+    }
+
+    fn logs_v2_batch(secret: &str, safe: &str) -> Vec<u8> {
+        let attrs = [
+            LogsV2KeyValueInput {
+                key: "password",
+                value: LogsV2AnyValueInput::String(secret),
+            },
+            LogsV2KeyValueInput {
+                key: "safe",
+                value: LogsV2AnyValueInput::String(safe),
+            },
+        ];
+        let record = LogsV2LogRecordInput {
+            resource_schema_url: "",
+            resource_dropped_attributes_count: 0,
+            resource_attributes: &[],
+            scope: None,
+            scope_schema_url: "",
+            time_unix_nano: 3,
+            observed_time_unix_nano: 4,
+            severity: 5,
+            severity_text: "info",
+            event_name: "event",
+            body: LogsV2AnyValueInput::String("stable body"),
+            dropped_attributes_count: 0,
+            attributes: &attrs,
+            trace_flags: 0,
+            trace_id: None,
+            span_id: None,
+        };
+        let mut encoded = Vec::new();
+        encode_logs_batch_v2_into(
+            &[record],
+            scry_proto::LogsV2DecodeLimits::default(),
+            &mut encoded,
+        )
+        .unwrap();
+        encoded
+    }
 
     fn structured_batch(name: &str, ts: u64) -> Vec<u8> {
         MetricsBatchV2 {
@@ -1220,6 +1417,164 @@ mod tests {
         }
         .encode()
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn direct_ingest_writes_exact_redacted_logs_v1_bytes_to_wal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut pipeline = Pipeline::<LogsBlockBuilder>::open(
+            tmp.path().to_path_buf(),
+            store,
+            None,
+            Uuid::now_v7(),
+            crate::decode::logs,
+        )
+        .await
+        .unwrap();
+        let input = logs_v1_batch("direct-secret", "unchanged-value");
+        let expected = scry_proto::redaction::redact_logs_v1(&input)
+            .unwrap()
+            .into_owned();
+
+        assert_eq!(pipeline.ingest(&input).await.unwrap(), 1);
+        pipeline.wal.lock().await.rotate().await.unwrap();
+        let frames = pipeline
+            .wal
+            .lock()
+            .await
+            .replay()
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(frames, vec![expected.clone()]);
+        assert!(!frames[0]
+            .windows(b"direct-secret".len())
+            .any(|bytes| bytes == b"direct-secret"));
+        let decoded = LogsBatch::decode(&frames[0]).unwrap();
+        assert_eq!(
+            decoded.streams[0].entries[0].attributes[0].value,
+            "[REDACTED]"
+        );
+        assert_eq!(
+            decoded.streams[0].entries[0].attributes[1].value,
+            "unchanged-value"
+        );
+        assert_eq!(decoded.streams[0].entries[0].body, "stable body");
+    }
+
+    #[tokio::test]
+    async fn direct_ingest_writes_exact_redacted_logs_v2_bytes_to_wal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut pipeline = Pipeline::<LogsBlockBuilder>::open(
+            tmp.path().to_path_buf(),
+            store,
+            None,
+            Uuid::now_v7(),
+            crate::decode::logs,
+        )
+        .await
+        .unwrap();
+        let input = logs_v2_batch("v2-direct-secret", "v2-unchanged");
+        let received_ns = 1_234_567_890;
+        let mut stamp_scratch = scry_proto::LogsV2StampScratch::default();
+        let expected = scry_proto::redact_and_stamp_logs_v2(
+            &input,
+            received_ns,
+            scry_proto::LogsV2DecodeLimits::default(),
+            &mut stamp_scratch,
+        )
+        .unwrap()
+        .to_vec();
+
+        assert_eq!(pipeline.ingest_at(&input, received_ns).await.unwrap(), 1);
+        pipeline.wal.lock().await.rotate().await.unwrap();
+        let frames = pipeline
+            .wal
+            .lock()
+            .await
+            .replay()
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(frames, vec![expected]);
+        assert!(!frames[0]
+            .windows(b"v2-direct-secret".len())
+            .any(|bytes| bytes == b"v2-direct-secret"));
+        assert!(frames[0]
+            .windows(b"v2-unchanged".len())
+            .any(|bytes| bytes == b"v2-unchanged"));
+        assert!(frames[0]
+            .windows(b"stable body".len())
+            .any(|bytes| bytes == b"stable body"));
+        struct Receipt(Option<u64>);
+        impl scry_proto::LogsV2Appender for Receipt {
+            fn record(
+                &mut self,
+                record: scry_proto::CanonicalLogRecord<'_>,
+            ) -> std::result::Result<(), String> {
+                self.0 = record.received_time_unix_nano;
+                Ok(())
+            }
+        }
+        let mut receipt = Receipt(None);
+        scry_proto::decode_logs_batch_v2_into(
+            &frames[0],
+            scry_proto::LogsV2DecodeLimits::default(),
+            &mut receipt,
+        )
+        .unwrap();
+        assert_eq!(receipt.0, Some(received_ns));
+    }
+
+    #[tokio::test]
+    async fn replay_redacts_logs_before_decode_and_hash_and_preserves_safe_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sensitive = logs_v1_batch("replay-secret", "safe-stability-marker");
+        let already_redacted = scry_proto::redaction::redact_logs_v1(&sensitive)
+            .unwrap()
+            .into_owned();
+        assert!(matches!(
+            scry_proto::redaction::redact_logs_v1(&already_redacted).unwrap(),
+            Cow::Borrowed(_)
+        ));
+        let mut wal = Wal::open(WalConfig::new(tmp.path(), "logs")).await.unwrap();
+        wal.append(&sensitive).await.unwrap();
+        wal.append(&already_redacted).await.unwrap();
+        wal.rotate().await.unwrap();
+        drop(wal);
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let pipeline = Pipeline::<LogsBlockBuilder>::open_with_config(
+            tmp.path().to_path_buf(),
+            store.clone(),
+            None,
+            Uuid::now_v7(),
+            decode_logs_without_replay_secret,
+            BlockBuilderConfig {
+                max_rows: 1,
+                ..BlockBuilderConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(pipeline.builder.is_empty());
+        assert!(store.list(None).count().await >= 2);
+        let names = store
+            .list(None)
+            .filter_map(|entry| async move { entry.ok().map(|meta| meta.location.to_string()) })
+            .collect::<Vec<_>>()
+            .await;
+        assert!(names.iter().all(|name| !name.contains("replay-secret")));
+        // Both source frames transform to identical bytes. Hashing transformed
+        // bytes therefore produces deterministic equivalent frame prefixes.
+        let mut stamp_scratch = scry_proto::LogsV2StampScratch::default();
+        let transformed = redact_replayed_payload("logs", &sensitive, &mut stamp_scratch).unwrap();
+        assert_eq!(transformed.as_ref(), already_redacted);
+        assert!(transformed
+            .windows(b"safe-stability-marker".len())
+            .any(|bytes| bytes == b"safe-stability-marker"));
     }
 
     #[test]

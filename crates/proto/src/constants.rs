@@ -12,12 +12,14 @@ pub const PROTOCOL_VERSION_V2: u16 = 0x0002;
 pub const METRICS_BATCH_V2_MAGIC: u32 = 1_397_568_000;
 /// Fixed `SL2\0` prefix on capability-gated `LogsBatchV2` payloads.
 pub const LOGS_BATCH_V2_MAGIC: u32 = 0x534c_3200;
-/// Canonical raw typed-log record version carried by `LogsBatchV2`.
+/// Producer canonical raw typed-log record version carried by `LogsBatchV2`.
 pub const LOGS_BATCH_V2_RAW_VERSION: u16 = 1;
-/// Short alias for the current canonical raw typed-log record version.
+/// Short alias for the producer canonical raw typed-log record version.
 pub const LOGS_RAW_VERSION: u16 = LOGS_BATCH_V2_RAW_VERSION;
 /// Explicit name for canonical raw typed-log record grammar version 1.
 pub const LOGS_RAW_VERSION_V1: u16 = LOGS_BATCH_V2_RAW_VERSION;
+/// Server-stamped canonical raw typed-log record grammar version 2.
+pub const LOGS_RAW_VERSION_V2: u16 = 2;
 
 // ── Private query-worker protocol ──────────────────────────────────────
 pub const QUERY_WORKER_PROTOCOL_VERSION_V1: u16 = 1;

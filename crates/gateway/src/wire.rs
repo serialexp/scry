@@ -306,8 +306,8 @@ async fn handle_conn(
                 // has no sink, so it's a no-op.
                 let decode_result: Result<()> = match sig.unwrap() {
                     Signal::Logs => LogsBatch::decode(&decompressed)
-                        .map(|batch| state.offer_logs(batch))
-                        .map_err(|e| anyhow::anyhow!("LogsBatch: {e}")),
+                        .map_err(|e| anyhow::anyhow!("LogsBatch: {e}"))
+                        .and_then(|batch| state.offer_logs(batch)),
                     Signal::Metrics
                         if decompressed
                             .get(..4)
@@ -328,8 +328,8 @@ async fn handle_conn(
                         .map(|batch| state.offer_metrics(batch))
                         .map_err(|e| anyhow::anyhow!("MetricsBatch: {e}")),
                     Signal::Traces => TracesBatch::decode(&decompressed)
-                        .map(|batch| state.offer_traces(batch))
-                        .map_err(|e| anyhow::anyhow!("TracesBatch: {e}")),
+                        .map_err(|e| anyhow::anyhow!("TracesBatch: {e}"))
+                        .and_then(|batch| state.offer_traces(batch)),
                     Signal::Profiles => ProfilesBatch::decode(&decompressed)
                         .map(|batch| state.offer_profiles(batch))
                         .map_err(|e| anyhow::anyhow!("ProfilesBatch: {e}")),

@@ -23,6 +23,8 @@ use std::sync::{
 use scry_proto::{
     constants::{SIGNAL_BIT_LOGS, SIGNAL_BIT_METRICS, SIGNAL_BIT_PROFILES, SIGNAL_BIT_TRACES},
     generated::{LogsBatch, MetricsBatch, MetricsBatchV2, ProfilesBatch, TracesBatch},
+    redaction::{redact_logs_v1, redact_logs_v2, redact_traces_v1, LogsV2RedactionScratch},
+    LogsV2DecodeLimits,
 };
 use tokio::sync::mpsc;
 use tracing::warn;
@@ -232,11 +234,11 @@ impl AppState {
         }
     }
 
-    pub fn offer_logs(&self, batch: LogsBatch) {
-        self.offer_logs_fanout(LogsFanout::v1(batch));
+    pub fn offer_logs(&self, batch: LogsBatch) -> anyhow::Result<()> {
+        self.offer_logs_fanout(LogsFanout::v1(batch))
     }
 
-    pub fn offer_logs_fanout(&self, batch: LogsFanout) {
+    pub fn offer_logs_fanout(&self, mut batch: LogsFanout) -> anyhow::Result<()> {
         let record_count = batch
             .canonical
             .as_ref()
@@ -250,12 +252,32 @@ impl AppState {
                     .sum()
             });
         if record_count == 0 {
-            return;
+            return Ok(());
         }
+
+        // This is the single gateway boundary shared by foreign adapters and the
+        // native wire. Redact both representations before any sink can observe the
+        // batch, so Scry and compatibility sinks cannot diverge.
+        let projection = batch
+            .projection
+            .encode()
+            .expect("typed LogsBatch encoding is infallible");
+        batch.projection = LogsBatch::decode(&redact_logs_v1(&projection)?)?;
+        if let Some(canonical) = &mut batch.canonical {
+            let mut scratch = LogsV2RedactionScratch::default();
+            canonical.payload = redact_logs_v2(
+                &canonical.payload,
+                LogsV2DecodeLimits::default(),
+                &mut scratch,
+            )?
+            .into_owned();
+        }
+
         if let Some(metrics) = &self.metrics {
             metrics.add_records(GatewaySignal::Logs, record_count);
         }
         self.fan(Fanout::Logs(Arc::new(batch)));
+        Ok(())
     }
 
     pub fn offer_metrics(&self, batch: MetricsBatch) {
@@ -278,14 +300,20 @@ impl AppState {
         self.fan(Fanout::StructuredMetrics(Arc::new(batch)));
     }
 
-    pub fn offer_traces(&self, batch: TracesBatch) {
+    pub fn offer_traces(&self, batch: TracesBatch) -> anyhow::Result<()> {
         if batch.spans.is_empty() {
-            return;
+            return Ok(());
         }
+        let span_count = batch.spans.len() as u64;
+        let payload = batch
+            .encode()
+            .expect("typed TracesBatch encoding is infallible");
+        let batch = TracesBatch::decode(&redact_traces_v1(&payload)?)?;
         if let Some(metrics) = &self.metrics {
-            metrics.add_records(GatewaySignal::Traces, batch.spans.len() as u64);
+            metrics.add_records(GatewaySignal::Traces, span_count);
         }
         self.fan(Fanout::Traces(Arc::new(batch)));
+        Ok(())
     }
 
     pub fn offer_profiles(&self, batch: ProfilesBatch) {

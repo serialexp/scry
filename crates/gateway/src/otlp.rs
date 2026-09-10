@@ -35,10 +35,16 @@ pub async fn handle(
                 metrics.inbound_rejected(crate::metrics::Inbound::OtlpHttp);
             }
         })?;
+    accept(&state, req).map_err(|error| {
+        if let Some(metrics) = state.metrics() {
+            metrics.inbound_rejected(crate::metrics::Inbound::OtlpHttp);
+        }
+        tracing::warn!(%error, "trace redaction rejected OTLP batch");
+        (StatusCode::BAD_REQUEST, "invalid trace batch".into())
+    })?;
     if let Some(metrics) = state.metrics() {
         metrics.inbound_accepted(crate::metrics::Inbound::OtlpHttp);
     }
-    accept(&state, req);
     Ok(encode_response(
         &ExportTraceServiceResponse::default(),
         encoding,
@@ -49,8 +55,8 @@ pub async fn handle(
 ///
 /// Both transports deliberately converge here so mapping, empty-batch handling,
 /// fan-out, and best-effort acknowledgement semantics cannot drift.
-pub fn accept(state: &AppState, req: ExportTraceServiceRequest) {
-    state.offer_traces(map_traces(req));
+pub fn accept(state: &AppState, req: ExportTraceServiceRequest) -> anyhow::Result<()> {
+    state.offer_traces(map_traces(req))
 }
 
 /// Pure mapping: OTLP `ExportTraceServiceRequest` → our `TracesBatch`.
@@ -225,5 +231,106 @@ pub fn sample_request(n_spans: usize) -> ExportTraceServiceRequest {
             }],
             schema_url: String::new(),
         }],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opentelemetry_proto::tonic::{
+        common::v1::{any_value::Value, AnyValue, KeyValue},
+        trace::v1::Status,
+    };
+
+    fn attr(key: &str, value: &str) -> KeyValue {
+        KeyValue {
+            key: key.into(),
+            value: Some(AnyValue {
+                value: Some(Value::StringValue(value.into())),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn fanout_redacts_trace_maps_without_scanning_free_text() {
+        let mut request = sample_request(1);
+        let resource = request.resource_spans[0].resource.as_mut().unwrap();
+        resource
+            .attributes
+            .push(attr("Authorization", "Bearer secret"));
+        resource.attributes.push(attr("region", "ordinary"));
+        let span = &mut request.resource_spans[0].scope_spans[0].spans[0];
+        span.name = "password remains in span name".into();
+        span.attributes.push(attr("password", "secret"));
+        span.events[0].name = "cookie remains in event name".into();
+        span.events[0].attributes.push(attr("Cookie", "secret"));
+        span.links[0].attributes.push(attr("api_key", "secret"));
+        span.status = Some(Status {
+            message: "token remains in status text".into(),
+            code: 2,
+        });
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let sink = crate::sink::spawn_sink(
+            "capture",
+            scry_proto::constants::SIGNAL_BIT_TRACES,
+            1,
+            move |mut input| async move {
+                assert!(tx.send(input.recv().await.unwrap()).is_ok());
+            },
+        );
+        let state = AppState::new(vec![sink]);
+        accept(&state, request).unwrap();
+        drop(state);
+        let crate::sink::Fanout::Traces(batch) = rx.await.unwrap() else {
+            panic!("expected traces fanout");
+        };
+
+        let resource = &batch.resources[0];
+        assert_eq!(
+            resource
+                .labels
+                .iter()
+                .find(|pair| pair.key == "Authorization")
+                .unwrap()
+                .value,
+            scry_proto::redaction::REDACTED
+        );
+        assert_eq!(
+            resource
+                .labels
+                .iter()
+                .find(|pair| pair.key == "region")
+                .unwrap()
+                .value,
+            "ordinary"
+        );
+        let span = &batch.spans[0];
+        assert_eq!(span.name, "password remains in span name");
+        assert_eq!(span.status_message, "token remains in status text");
+        assert_eq!(
+            span.attributes.last().unwrap().value,
+            scry_proto::redaction::REDACTED
+        );
+        assert_eq!(span.events[0].name, "cookie remains in event name");
+        assert_eq!(
+            span.events[0]
+                .attributes
+                .iter()
+                .find(|pair| pair.key == "Cookie")
+                .unwrap()
+                .value,
+            scry_proto::redaction::REDACTED
+        );
+        assert_eq!(
+            span.links[0]
+                .attributes
+                .iter()
+                .find(|pair| pair.key == "api_key")
+                .unwrap()
+                .value,
+            scry_proto::redaction::REDACTED
+        );
     }
 }

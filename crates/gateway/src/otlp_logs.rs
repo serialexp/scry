@@ -68,21 +68,30 @@ pub async fn handle(
                 metrics.inbound_rejected(crate::metrics::Inbound::OtlpHttp);
             }
         })?;
+    let response = accept(&state, request).map_err(|error| {
+        if let Some(metrics) = state.metrics() {
+            metrics.inbound_rejected(crate::metrics::Inbound::OtlpHttp);
+        }
+        tracing::warn!(%error, "log redaction rejected OTLP batch");
+        (StatusCode::BAD_REQUEST, "invalid log batch".into())
+    })?;
     if let Some(metrics) = state.metrics() {
         metrics.inbound_accepted(crate::metrics::Inbound::OtlpHttp);
     }
-    let response = accept(&state, request);
     Ok(encode_response(&response, encoding))
 }
 
-pub fn accept(state: &AppState, request: ExportLogsServiceRequest) -> ExportLogsServiceResponse {
+pub fn accept(
+    state: &AppState,
+    request: ExportLogsServiceRequest,
+) -> anyhow::Result<ExportLogsServiceResponse> {
     let mapped = map_logs(request);
     let response = response(mapped.rejected, &mapped.reasons);
     state.offer_logs_fanout(LogsFanout {
         projection: mapped.batch,
         canonical: Some(mapped.canonical),
-    });
-    response
+    })?;
+    Ok(response)
 }
 
 fn response(rejected: u64, reasons: &[u64; REASON_COUNT]) -> ExportLogsServiceResponse {
@@ -586,6 +595,85 @@ mod tests {
             value: Some(self::value(value)),
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn fanout_redacts_canonical_and_projection_consistently() {
+        let mut request = sample_request(1);
+        let record = &mut request.resource_logs[0].scope_logs[0].log_records[0];
+        record.body = Some(value(Value::StringValue(
+            "authorization remains in free text".into(),
+        )));
+        record.attributes.push(kv(
+            "Authorization",
+            Value::StringValue("Bearer secret".into()),
+        ));
+        record
+            .attributes
+            .iter_mut()
+            .find(|attribute| attribute.key == "request.id")
+            .unwrap()
+            .value = Some(value(Value::StringValue("ordinary".into())));
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let sink = crate::sink::spawn_sink(
+            "capture",
+            scry_proto::constants::SIGNAL_BIT_LOGS,
+            1,
+            move |mut input| async move {
+                assert!(tx.send(input.recv().await.unwrap()).is_ok());
+            },
+        );
+        let state = AppState::new(vec![sink]);
+        accept(&state, request).unwrap();
+        drop(state);
+        let crate::sink::Fanout::Logs(batch) = rx.await.unwrap() else {
+            panic!("expected logs fanout");
+        };
+
+        let entry = &batch.projection.streams[0].entries[0];
+        assert_eq!(entry.body, "authorization remains in free text");
+        assert_eq!(
+            entry
+                .attributes
+                .iter()
+                .find(|pair| pair.key == "Authorization")
+                .unwrap()
+                .value,
+            scry_proto::redaction::REDACTED
+        );
+        assert_eq!(
+            entry
+                .attributes
+                .iter()
+                .find(|pair| pair.key == "request.id")
+                .unwrap()
+                .value,
+            "ordinary"
+        );
+
+        #[derive(Default)]
+        struct Capture(Vec<String>);
+        impl LogsV2Appender for Capture {
+            fn record(&mut self, record: CanonicalLogRecord<'_>) -> Result<(), String> {
+                let mut attributes = String::new();
+                let mut body = String::new();
+                record.attributes.write_canonical_text(&mut attributes);
+                record.body.write_canonical_text(&mut body);
+                self.0.push(format!("{attributes}|{body}"));
+                Ok(())
+            }
+        }
+        let mut capture = Capture::default();
+        decode_logs_batch_v2_into(
+            &batch.canonical.as_ref().unwrap().payload,
+            LogsV2DecodeLimits::default(),
+            &mut capture,
+        )
+        .unwrap();
+        assert!(capture.0[0].contains("\"Authorization\":\"[REDACTED]\""));
+        assert!(capture.0[0].contains("\"request.id\":\"ordinary\""));
+        assert!(capture.0[0].contains("authorization remains in free text"));
     }
 
     #[test]

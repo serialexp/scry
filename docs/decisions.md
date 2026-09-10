@@ -3885,3 +3885,64 @@ state is a rebuildable projection, Valkey coordinates single-winner mutable work
 and D-072 conditional create/ETag-CAS semantics guard correctness-bearing commits.
 Subsystem-specific retention and access policies must target paths below `_scry/`;
 no bucket-wide lifecycle rule may treat the umbrella as one retention class.
+
+## D-074: Error occurrences are producer-identified exception logs with a coordinated foundation slice
+
+**Date:** 2026-09-10
+**Status:** accepted
+
+D-073 established lossless logs v2 but left several occurrence-foundation choices
+open. Earlier error-design text allowed deprecated exception span events as
+occurrence inputs, gateway or synthetic IDs, heuristic cross-signal deduplication,
+route-specific scrubbing, and independently rolling producer/extractor versions.
+This decision supersedes those parts of the proposal while preserving span events
+as ordinary trace telemetry and preserving D-073's logs representation.
+
+Only an eligible exception LogRecord Event with a syntactically valid canonical
+`scry.event.id` is an authoritative occurrence. The ID is generated before producer
+buffering and preserved end to end. A gateway, extractor, content hash, or physical
+locator never supplies a missing ID. Records with absent, malformed, or
+non-canonical IDs remain ordinary queryable logs but do not enter the occurrence
+projection. Deprecated exception span events never create occurrences, and Scry
+performs no heuristic or exact cross-signal occurrence deduplication. Binary
+trace/span IDs on the exception log provide best-effort linkage to an ordinary
+retained trace when available.
+
+Every logs and traces intake path, including ordinary non-error telemetry, applies
+one minimal versioned sensitive-key scrubber before WAL or any other durable write.
+Metrics and profiles are excluded. A fixed case-insensitive key set is matched at
+supported nested levels and matching values are replaced by the fixed string
+`[REDACTED]`. This is bounded key-based damage reduction, not content inspection:
+Scry makes no claim that it removes secrets from free-text bodies, messages, stack
+traces, URLs, or values under unknown keys. Stronger route/product privacy policy
+may be layered on top but cannot bypass the baseline.
+
+A deployment ID lives in a bucket manifest created only when this product slice
+needs it. Creation uses conditional create; racing participants read and validate
+the winner, and the stable identity is neither inferred nor overwritten.
+Application ID is derived deterministically, under a versioned normalization and
+encoding contract, from `service.namespace` and required `service.name`; it is not
+a separately trusted producer or gateway assignment.
+
+The next complete implementation slice includes these identities and scrubbing,
+a dedicated immutable metadata-last occurrence projection, its rebuildable
+`errors.sqlite` index, and the thin `scry errors` role. This slice lands before
+artifact processing, grouping, issue membership, workflow, or UI. Gateway/native
+producers, ingest, manifest consumers, and the occurrence role are deployed as one
+coordinated version; stale producers feeding the new occurrence system are not a
+supported topology. The earlier D-073 reader-first gate remains historical and
+continues to describe rollout of the already-established logs-v2 and `_scry/`
+reader contracts, not mixed-version operation of this new slice.
+
+**Implementation note (2026-09-10):** the D-074 foundation is implemented but not
+deployed. Producers emit canonical raw-record v1. Ingest validates and uniformly
+redacts logs/traces, stamps one trusted `received_time_unix_nano` before WAL, and
+writes canonical raw-record v2 in logs Parquet/query schema v3, whose appended
+`received_ts_unix_nano` column preserves older column positions. `scry errors`
+extracts only logs schema 3 rows carrying raw-record v2. It conditionally creates
+or validates the deployment manifest, derives versioned application identity,
+publishes deterministic occurrence Parquet and metadata-last commits with
+conditional create, folds a deployment-bound rebuildable `errors.sqlite`, and can
+run bounded periodic reconciliation under an exclusive local single-writer lock.
+Clustered Valkey orchestration, browser intake, grouping/issues/UI, accepted-record
+low-latency hints, and error projection snapshots/GC remain unimplemented.

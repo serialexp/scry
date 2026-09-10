@@ -143,7 +143,8 @@ async fn canonical_v2_crosses_pipeline_schema_boundaries_restarts_and_queries() 
             .unwrap(),
         1
     );
-    assert_eq!(pipeline.ingest(&v2).await.unwrap(), 1);
+    let received_ns = 8_765_432_100;
+    assert_eq!(pipeline.ingest_at(&v2, received_ns).await.unwrap(), 1);
     assert_eq!(
         pipeline
             .ingest(&v1_payload(0x303, 3_000, "legacy after"))
@@ -179,7 +180,7 @@ async fn canonical_v2_crosses_pipeline_schema_boundaries_restarts_and_queries() 
             .iter()
             .map(|meta| meta.schema_version)
             .collect::<Vec<_>>(),
-        vec![1, 2, 1]
+        vec![1, 3, 1]
     );
     assert!(metas.iter().all(|meta| meta.row_count == 1));
 
@@ -190,7 +191,7 @@ async fn canonical_v2_crosses_pipeline_schema_boundaries_restarts_and_queries() 
             .iter()
             .map(|entry| entry.meta.schema_version)
             .collect::<Vec<_>>(),
-        vec![1, 2, 1]
+        vec![1, 3, 1]
     );
 
     // Query through the existing scry-query table/catalog path. Selecting only
@@ -205,7 +206,7 @@ async fn canonical_v2_crosses_pipeline_schema_boundaries_restarts_and_queries() 
     let batches = ctx
         .sql(&format!(
             "SELECT ts_unix_nano, body, observed_ts_unix_nano, severity_text, \
-             event_name, trace_flags, raw_record_version, raw_record FROM {LOGS_TABLE_NAME} \
+             event_name, trace_flags, raw_record_version, raw_record, received_ts_unix_nano FROM {LOGS_TABLE_NAME} \
              WHERE event_name = 'exception'"
         ))
         .await
@@ -276,15 +277,22 @@ async fn canonical_v2_crosses_pipeline_schema_boundaries_restarts_and_queries() 
             .downcast_ref::<UInt16Array>()
             .unwrap()
             .value(0),
-        1
+        2
     );
+    let stored_raw = batch
+        .column(7)
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .unwrap()
+        .value(0);
+    assert_ne!(stored_raw, raw.as_slice());
     assert_eq!(
         batch
-            .column(7)
+            .column(8)
             .as_any()
-            .downcast_ref::<BinaryArray>()
+            .downcast_ref::<UInt64Array>()
             .unwrap()
             .value(0),
-        raw.as_slice()
+        received_ns
     );
 }

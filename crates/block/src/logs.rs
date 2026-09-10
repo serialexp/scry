@@ -72,6 +72,7 @@ use crate::{
 const SIGNAL: &str = "logs";
 const SCHEMA_VERSION_V1: u32 = 1;
 const SCHEMA_VERSION_V2: u32 = 2;
+const SCHEMA_VERSION_V3: u32 = 3;
 const SCOPE_NAME_LABEL: &str = "otel.scope.name";
 const SCOPE_VERSION_LABEL: &str = "otel.scope.version";
 
@@ -79,6 +80,7 @@ const SCOPE_VERSION_LABEL: &str = "otel.scope.version";
 enum LogsSchema {
     V1,
     V2,
+    V3,
 }
 
 impl LogsSchema {
@@ -86,6 +88,7 @@ impl LogsSchema {
         match self {
             Self::V1 => SCHEMA_VERSION_V1,
             Self::V2 => SCHEMA_VERSION_V2,
+            Self::V3 => SCHEMA_VERSION_V3,
         }
     }
 }
@@ -140,6 +143,20 @@ pub fn logs_physical_schema_v2() -> SchemaRef {
     Arc::new(Schema::new(fields))
 }
 
+/// Exact physical schema of server-stamped logs v3 parquet files.
+///
+/// V1 and v2 remain immutable historical schemas. V3 appends the trusted
+/// receipt timestamp so the existing v2 column indices do not move.
+pub fn logs_physical_schema_v3() -> SchemaRef {
+    let mut fields: Vec<Field> = logs_physical_schema_v2()
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect();
+    fields.push(Field::new("received_ts_unix_nano", DataType::UInt64, true));
+    Arc::new(Schema::new(fields))
+}
+
 /// One unique stream accumulated for this block. Owned labels for
 /// the same reason as `metrics::OwnedSeries`: we dedup by
 /// fingerprint and the wire payload is dropped after decode, so the
@@ -182,6 +199,7 @@ pub struct LogsBlockBuilder {
     trace_flags: Vec<Option<u8>>,
     raw_record_versions: Vec<Option<u16>>,
     raw_records: Vec<Option<Vec<u8>>>,
+    received_ts: Vec<Option<u64>>,
     schema: Option<LogsSchema>,
     // Reused while rendering typed values. Each completed String moves into its
     // durable column and this scratch retains capacity whenever no move is needed.
@@ -241,6 +259,7 @@ impl BlockBuilder for LogsBlockBuilder {
             trace_flags: Vec::with_capacity(4096),
             raw_record_versions: Vec::with_capacity(4096),
             raw_records: Vec::with_capacity(4096),
+            received_ts: Vec::with_capacity(4096),
             schema: None,
             text_scratch: String::new(),
             label_scratch: Vec::new(),
@@ -311,6 +330,7 @@ impl BlockBuilder for LogsBlockBuilder {
         self.raw_record_versions
             .append(&mut other.raw_record_versions);
         self.raw_records.append(&mut other.raw_records);
+        self.received_ts.append(&mut other.received_ts);
 
         // Stream dictionary: dedup against the *shared* builder's
         // `stream_seen` (same policy as metrics' series dedup).
@@ -348,6 +368,7 @@ impl BlockBuilder for LogsBlockBuilder {
         self.trace_flags.clear();
         self.raw_record_versions.clear();
         self.raw_records.clear();
+        self.received_ts.clear();
         self.schema = None;
         self.text_scratch.clear();
         self.label_scratch.clear();
@@ -461,16 +482,35 @@ impl LogsAppender for LogsBlockBuilder {
 
 impl LogsV2Appender for LogsBlockBuilder {
     fn begin_batch(&mut self, _record_count: u32) -> Result<(), String> {
-        if self.schema.is_some() && self.schema != Some(LogsSchema::V2) {
+        if self.schema == Some(LogsSchema::V1) {
             return Err("cannot mix logs v1 and v2 records".into());
         }
-        self.schema = Some(LogsSchema::V2);
+        // The callback intentionally has no envelope-version argument. Keep an
+        // existing v2/v3 selection; for an empty builder, record() refines this
+        // provisional v2 selection after inspecting CanonicalLogRecord.raw_version.
+        self.schema.get_or_insert(LogsSchema::V2);
         Ok(())
     }
 
     fn record(&mut self, record: CanonicalLogRecord<'_>) -> Result<(), String> {
-        if self.schema.is_some() && self.schema != Some(LogsSchema::V2) {
-            return Err("cannot mix logs v1 and v2 records".into());
+        let record_schema = match (record.raw_version, record.received_time_unix_nano) {
+            (scry_proto::constants::LOGS_RAW_VERSION_V1, None) => LogsSchema::V2,
+            (scry_proto::constants::LOGS_RAW_VERSION_V2, Some(_)) => LogsSchema::V3,
+            (scry_proto::constants::LOGS_RAW_VERSION_V1, Some(_)) => {
+                return Err("logs raw v1 record unexpectedly has a received timestamp".into())
+            }
+            (scry_proto::constants::LOGS_RAW_VERSION_V2, None) => {
+                return Err("logs raw v2 record is missing its received timestamp".into())
+            }
+            (version, _) => return Err(format!("unsupported logs raw record version {version}")),
+        };
+        // `begin_batch` cannot see the envelope version, so it provisionally
+        // selects v2. The first row may refine an otherwise-empty batch to v3.
+        if self.fingerprints.is_empty() && self.schema == Some(LogsSchema::V2) {
+            self.schema = Some(record_schema);
+        }
+        if self.schema.is_some() && self.schema != Some(record_schema) {
+            return Err("cannot mix logs raw record versions in one block".into());
         }
         let ts = if record.time_unix_nano != 0 {
             record.time_unix_nano
@@ -551,7 +591,7 @@ impl LogsV2Appender for LogsBlockBuilder {
         record.body.write_canonical_text(&mut self.text_scratch);
         let body = std::mem::take(&mut self.text_scratch);
 
-        self.schema = Some(LogsSchema::V2);
+        self.schema = Some(record_schema);
         self.ts_min = self.ts_min.min(ts);
         self.ts_max = self.ts_max.max(ts);
         let label_bytes: usize = self
@@ -593,9 +633,9 @@ impl LogsV2Appender for LogsBlockBuilder {
         self.trace_ids.push(record.trace_id.copied());
         self.span_ids.push(record.span_id.copied());
         self.trace_flags.push(Some(flags));
-        self.raw_record_versions
-            .push(Some(scry_proto::constants::LOGS_RAW_VERSION_V1));
+        self.raw_record_versions.push(Some(record.raw_version));
         self.raw_records.push(Some(record.encoded.to_vec()));
+        self.received_ts.push(record.received_time_unix_nano);
         if stream_is_new {
             assert!(self.stream_seen.insert(fingerprint));
             self.stream_dict.push(OwnedStream {
@@ -660,6 +700,7 @@ impl LogsBlockBuilder {
         let main_schema = match schema {
             LogsSchema::V1 => logs_physical_schema_v1(),
             LogsSchema::V2 => logs_physical_schema_v2(),
+            LogsSchema::V3 => logs_physical_schema_v3(),
         };
         let fp_arr: ArrayRef = Arc::new(UInt64Array::from_iter_values(
             order.iter().map(|&i| self.fingerprints[i as usize]),
@@ -717,7 +758,7 @@ impl LogsBlockBuilder {
         let bloom_size = bloom_bytes.as_ref().map(|bytes| bytes.len() as u64);
 
         let mut columns = vec![fp_arr, ts_arr, sev_arr, body_arr, attr_arr];
-        if schema == LogsSchema::V2 {
+        if matches!(schema, LogsSchema::V2 | LogsSchema::V3) {
             columns.push(Arc::new(UInt64Array::from_iter(
                 order.iter().map(|&i| self.observed_ts[i as usize]),
             )));
@@ -756,6 +797,11 @@ impl LogsBlockBuilder {
                     .iter()
                     .map(|&i| self.raw_records[i as usize].as_deref()),
             )));
+            if schema == LogsSchema::V3 {
+                columns.push(Arc::new(UInt64Array::from_iter(
+                    order.iter().map(|&i| self.received_ts[i as usize]),
+                )));
+            }
         }
 
         drop(order);
@@ -901,9 +947,11 @@ mod schema_tests {
     fn schemas_are_exact_and_default_schema_is_v1() {
         let v1 = logs_physical_schema_v1();
         let v2 = logs_physical_schema_v2();
+        let v3 = logs_physical_schema_v3();
         assert_eq!(LogsBlockBuilder::main_schema(), v1);
         assert_eq!(v1.fields().len(), 5);
         assert_eq!(v2.fields().len(), 13);
+        assert_eq!(v3.fields().len(), 14);
         let expected = [
             ("stream_fingerprint", DataType::UInt64, false),
             ("ts_unix_nano", DataType::UInt64, false),
@@ -928,6 +976,14 @@ mod schema_tests {
             .iter()
             .zip(v1.fields())
             .all(|(left, right)| left == right));
+        assert!(v3.fields()[..13]
+            .iter()
+            .zip(v2.fields())
+            .all(|(left, right)| left == right));
+        assert_eq!(
+            v3.field(13),
+            &Field::new("received_ts_unix_nano", DataType::UInt64, true)
+        );
     }
 
     fn put_string(out: &mut Vec<u8>, value: &str) {
@@ -1156,6 +1212,76 @@ mod schema_tests {
         for column in batch.columns().iter().skip(5) {
             assert_eq!(column.null_count(), 0);
         }
+    }
+
+    #[test]
+    fn server_stamped_raw_v2_selects_schema_v3_and_preserves_exact_record() {
+        let (mut payload, raw_v1) = v2_payload();
+        let marker = [
+            42u64.to_be_bytes().as_slice(),
+            17i32.to_be_bytes().as_slice(),
+        ]
+        .concat();
+        let severity_offset = raw_v1
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .unwrap()
+            + 8;
+        let received = 99u64;
+        let mut raw_v2 = raw_v1;
+        raw_v2.splice(severity_offset..severity_offset, received.to_be_bytes());
+        payload.clear();
+        payload.extend_from_slice(&scry_proto::constants::LOGS_BATCH_V2_MAGIC.to_be_bytes());
+        payload.extend_from_slice(&scry_proto::constants::LOGS_RAW_VERSION_V2.to_be_bytes());
+        payload.extend_from_slice(&1u32.to_be_bytes());
+        payload.extend_from_slice(&(raw_v2.len() as u32).to_be_bytes());
+        payload.extend_from_slice(&raw_v2);
+
+        let mut builder = LogsBlockBuilder::new(Uuid::nil(), BlockBuilderConfig::default());
+        scry_proto::decode_logs_batch_v2_into(&payload, Default::default(), &mut builder).unwrap();
+        assert_eq!(builder.content_schema_key(), Some(3));
+        let encoded = builder.encode().unwrap();
+        assert_eq!(encoded.meta.schema_version, 3);
+        let main = encoded
+            .puts
+            .iter()
+            .find(|(path, _)| {
+                path.as_ref().ends_with(".parquet") && !path.as_ref().ends_with("postings.parquet")
+            })
+            .unwrap();
+        let batch =
+            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(main.1.clone())
+                .unwrap()
+                .build()
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap();
+        assert_eq!(batch.schema(), logs_physical_schema_v3());
+        let raw = batch
+            .column_by_name("raw_record")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        assert_eq!(raw.value(0), raw_v2);
+        let raw_version = batch
+            .column_by_name("raw_record_version")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .unwrap();
+        assert_eq!(
+            raw_version.value(0),
+            scry_proto::constants::LOGS_RAW_VERSION_V2
+        );
+        let receipt = batch
+            .column_by_name("received_ts_unix_nano")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(receipt.value(0), received);
     }
 
     #[test]

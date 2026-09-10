@@ -73,13 +73,13 @@ use crate::Query;
 pub const LOGS_TABLE_NAME: &str = "logs";
 
 /// Stable normalized logs schema. Physical files are read with their exact
-/// version-specific schema and normalized to this v2 shape.
+/// version-specific schema and normalized to this v3 shape.
 fn logs_schema() -> SchemaRef {
-    scry_block::logs_physical_schema_v2()
+    scry_block::logs_physical_schema_v3()
 }
 
-/// The logs *table* schema as exposed to queries: 13 stable columns plus the
-/// synthesised `labels` column at index 13.
+/// The logs *table* schema as exposed to queries: 14 stable columns plus the
+/// synthesised `labels` column at index 14.
 fn logs_table_schema() -> SchemaRef {
     let mut fields: Vec<Field> = logs_schema()
         .fields()
@@ -657,6 +657,7 @@ pub struct LiveLogRow {
     pub trace_flags: Option<u8>,
     pub raw_record_version: Option<u16>,
     pub raw_record: Option<Vec<u8>>,
+    pub received_ts_unix_nano: Option<u64>,
 }
 
 /// The logs *table* schema (physical logs columns + synthesised `labels`),
@@ -693,6 +694,7 @@ pub fn build_live_logs_batch(rows: &[LiveLogRow]) -> DfResult<RecordBatch> {
     let mut trace_flags = UInt8Builder::with_capacity(rows.len());
     let mut raw_record_version = UInt16Builder::with_capacity(rows.len());
     let mut raw_record = BinaryBuilder::new();
+    let mut received_ts = UInt64Builder::with_capacity(rows.len());
     for r in rows {
         let pairs: Vec<scry_proto::LabelPair> = r
             .labels
@@ -725,6 +727,7 @@ pub fn build_live_logs_batch(rows: &[LiveLogRow]) -> DfResult<RecordBatch> {
         trace_flags.append_option(r.trace_flags);
         raw_record_version.append_option(r.raw_record_version);
         raw_record.append_option(r.raw_record.as_deref());
+        received_ts.append_option(r.received_ts_unix_nano);
         for (k, v) in &r.labels {
             labels.keys().append_value(k);
             labels.values().append_value(v);
@@ -745,6 +748,7 @@ pub fn build_live_logs_batch(rows: &[LiveLogRow]) -> DfResult<RecordBatch> {
         Arc::new(trace_flags.finish()),
         Arc::new(raw_record_version.finish()),
         Arc::new(raw_record.finish()),
+        Arc::new(received_ts.finish()),
         Arc::new(labels.finish()),
     ];
     RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)
@@ -762,6 +766,50 @@ pub fn register_live_logs_table(ctx: &SessionContext, rows: &[LiveLogRow]) -> Re
     ctx.register_table(LOGS_LIVE_TABLE_NAME, Arc::new(table))
         .map_err(|e| anyhow::anyhow!("register logs_live table: {e}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+    use datafusion::arrow::array::{Array, BinaryArray, UInt64Array};
+
+    #[test]
+    fn live_batch_matches_stable_schema_and_preserves_receipt_and_raw() {
+        let raw = vec![0, 0xff, 7];
+        let batch = build_live_logs_batch(&[LiveLogRow {
+            ts_unix_nano: 10,
+            severity: 4,
+            body: "body".into(),
+            labels: vec![("service".into(), "api".into())],
+            attributes: vec![],
+            observed_ts_unix_nano: Some(11),
+            severity_text: Some("INFO".into()),
+            event_name: Some("event".into()),
+            trace_id: None,
+            span_id: None,
+            trace_flags: Some(0),
+            raw_record_version: Some(scry_proto::constants::LOGS_RAW_VERSION_V2),
+            raw_record: Some(raw.clone()),
+            received_ts_unix_nano: Some(12),
+        }])
+        .unwrap();
+        assert_eq!(batch.schema(), logs_table_schema());
+        assert_eq!(batch.schema().index_of("labels").unwrap(), 14);
+        let receipt = batch
+            .column_by_name("received_ts_unix_nano")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(receipt.value(0), 12);
+        let stored_raw = batch
+            .column_by_name("raw_record")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        assert_eq!(stored_raw.value(0), raw);
+    }
 }
 
 // ── tiny helper: shared time_overlaps lives in table.rs ───────────

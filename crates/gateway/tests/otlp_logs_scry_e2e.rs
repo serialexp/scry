@@ -170,7 +170,7 @@ async fn rich_otlp_log_crosses_gateway_and_real_ingest_into_queryable_v2_block()
     let raw_len = u32::from_be_bytes(mapped.canonical.payload[10..14].try_into().unwrap()) as usize;
     let expected_raw = mapped.canonical.payload[14..14 + raw_len].to_vec();
 
-    let response = accept(&state, request);
+    let response = accept(&state, request).unwrap();
     assert!(response.partial_success.is_none());
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -197,11 +197,11 @@ async fn rich_otlp_log_crosses_gateway_and_real_ingest_into_queryable_v2_block()
 
     let metas = stored_meta(&store).await;
     assert_eq!(metas.len(), 1);
-    assert_eq!(metas[0].schema_version, 2);
+    assert_eq!(metas[0].schema_version, 3);
     assert_eq!(metas[0].row_count, 1);
     let entries = catalog.lock().unwrap().list_blocks().unwrap();
     assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].meta.schema_version, 2);
+    assert_eq!(entries[0].meta.schema_version, 3);
 
     let ctx = SessionContext::new();
     // Use a separate read connection so no synchronous mutex guard crosses the
@@ -213,7 +213,7 @@ async fn rich_otlp_log_crosses_gateway_and_real_ingest_into_queryable_v2_block()
     let batches = ctx
         .sql(&format!(
             "SELECT ts_unix_nano, observed_ts_unix_nano, severity_text, event_name, \
-         trace_flags, raw_record_version, raw_record FROM {LOGS_TABLE_NAME}"
+         trace_flags, raw_record_version, raw_record, received_ts_unix_nano FROM {LOGS_TABLE_NAME}"
         ))
         .await
         .unwrap()
@@ -274,15 +274,27 @@ async fn rich_otlp_log_crosses_gateway_and_real_ingest_into_queryable_v2_block()
             .downcast_ref::<UInt16Array>()
             .unwrap()
             .value(0),
-        1
+        2
     );
-    assert_eq!(
-        batch
-            .column(6)
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .unwrap()
-            .value(0),
-        expected_raw
-    );
+    let stored_raw = batch
+        .column(6)
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .unwrap()
+        .value(0);
+    assert_ne!(stored_raw, expected_raw);
+    let received = batch
+        .column(7)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap()
+        .value(0);
+    assert_ne!(received, 0);
+    let decoded = scry_proto::validate_logs_record_version(
+        stored_raw,
+        scry_proto::constants::LOGS_RAW_VERSION_V2,
+        scry_proto::LogsV2DecodeLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(decoded.received_time_unix_nano, Some(received));
 }

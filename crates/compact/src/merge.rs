@@ -214,6 +214,7 @@ fn expected_logs_schema(version: u32) -> Result<SchemaRef> {
     match version {
         1 => Ok(logs_physical_schema_v1()),
         2 => Ok(logs_physical_schema_v2()),
+        3 => Ok(scry_block::logs_physical_schema_v3()),
         _ => anyhow::bail!("unsupported logs block schema version {version}"),
     }
 }

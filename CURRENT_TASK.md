@@ -368,65 +368,60 @@ Do not deploy or mutate production without Bart's explicit confirmation.
 
 ---
 
-# Current task — error monitoring Phase 0 foundations
-
-## Decisions
-
-Bart selected **logs v2** for lossless raw error occurrences and
-`_scry/<subsystem>/` for durable control products. D-073 records the accepted
-architecture. `_catalog/` remains a permanent legacy sibling.
+# Current task — D-074 error-occurrence foundation
 
 ## Implemented in this run
 
-- Added the dependency-leaf `scry-storage-layout` crate with segment-aware
-  classification for `_catalog/`, `_scry/`, lookalikes, and untrusted prefixes.
-- Catalog reconcile and cluster full/incremental walkers classify reserved control
-  objects before `.meta.json` suffix checks, so control metadata is never fetched or
-  parsed as a telemetry block.
-- Targeted query repair refuses reserved control roots before listing.
-- Added catalog, convergence, query repair, and classifier tests with invalid
-  `_scry/**/*.meta.json` decoys; extended the catalog snapshot smoke likewise.
-- Added logs-v2's generated nonrecursive envelope and allocation-conscious,
-  two-pass canonical raw-record validator/borrowed decoder. It bounds bytes, nodes,
-  maps, containers, and depth before callbacks and retains full OTLP log semantics.
-- Added the exact logs Parquet v2 schema. Query normalizes v1 and v2 into one stable
-  schema, inserts typed NULL fidelity for legacy/live-v1 rows, and prunes raw payloads
-  from common projections.
-- Implemented a schema-selecting logs builder, typed canonical search projection,
-  exact raw-byte storage, homogeneous live/recovery block rotation, and mutually
-  negotiated server acceptance behind visible default-off `--enable-logs-v2`.
-- Compaction validates claimed logs schemas, rejects mixed/unknown/mislabeled inputs,
-  and preserves opaque v2 raw bytes exactly.
-- Best-effort tail and merged-live rows receive the compatible v1 projection only
-  after full decode and (when storage exists) WAL commit; typed live fields remain NULL.
-- Updated the design status/checklists and README workspace map.
+- Preserved the D-073 `_scry/` namespace and canonical logs reader/writer foundation.
+- Producers emit canonical raw-record v1. Ingest validates and uniformly redacts
+  structured sensitive keys, samples trusted receipt time, rewrites to canonical
+  raw-record v2, and only then sends the bytes through decode/live/WAL. Replay
+  preserves trusted receipt stamps while reapplying deterministic redaction.
+- Logs Parquet/query schema v3 appends nullable `received_ts_unix_nano`; historical
+  schemas normalize with typed NULL, and compaction preserves each supported schema
+  without mixing versions. The raw v2 receipt and flat schema-3 value must agree.
+- Uniform log/trace key redaction is shared through `scry-proto` and applied by
+  server, gateway, agent, and OpenSearch replay paths. It does not claim to inspect
+  free-text values. Metrics and profiles remain outside this policy.
+- Added strict logs-only occurrence eligibility: valid canonical producer
+  `scry.event.id`, valid service identity, exception event name/content, and no span
+  event or generated/synthetic fallback ID.
+- Added conditionally created/validated bucket deployment identity and deterministic,
+  versioned application identity from normalized service namespace/name.
+- Added deterministic immutable occurrence Parquet, metadata-last conditional commit
+  publication, exact duplicate/collision handling, and a deployment-bound rebuildable
+  `errors.sqlite` projection.
+- Added bounded occurrence-commit discovery and raw schema-3 block paging, plus
+  periodic completion-relative `scry errors serve` reconciliation under an exclusive
+  local single-writer lock. Clustered mode explicitly fails closed.
+- Updated README, D-074's implementation note, design statuses/checklists, schema
+  table/rollout text, and TODO follow-ups. No deployment was performed.
 
 ## Verification
 
-- `cargo test -p scry-storage-layout -p scry-catalog -p scry-cluster`
-- `cargo test -p scry-proto -p scry-block -p scry-query -p scry-server`
-- `cargo test -p scry-compact --lib --tests`
-- `cargo check --workspace`
-- `cargo fmt --all --check`
-- `bash -n` on the modified smoke and protocol generation scripts
-- deterministic protocol regeneration and generated-output byte comparison
-- `git diff --check`
+Code was checked directly for the producer-v1/server-v2 stamp boundary, pre-WAL
+redaction call sites, schema-3 query/compaction normalization, strict errorsd
+schema-3/raw-v2 gates, manifest/application identity, conditional metadata-last
+publication, SQLite deployment binding, bounded cursors/pages, and the periodic
+single-writer loop. Validation completed with `cargo test --workspace`, release
+workspace build, debug/release proto tests, focused errors/errorsd/server/gateway/
+query/compaction tests and Clippy, protocol drift checks, formatting/diff checks,
+and `scripts/smoke-gateway.sh` (`server-stamped logs-v3 rows=40 expected=40`).
 
 ## Remaining work
 
-1. Deploy this reader-only namespace and logs-schema support fleet-wide in a normal
-   release before enabling `_scry/` product writers or logs-v2 ingestion. Deployment
-   is not authorized in this run.
-2. ~~Implement the logs-v2 storage writer and safe per-schema builder rotation/WAL
-   replay.~~ Implemented behind visible, default-off `--enable-logs-v2`; mutual
-   capability negotiation gates new acceptance while recovery always understands v2.
-   The shared logs WAL deliberately does not support rollback to an older binary once
-   it contains v2 frames. Current agent emission and non-OTLP gateway inputs remain v1.
-3. ~~Map gateway OTLP protobuf/JSON/gzip/gRPC into canonical logs v2 without loss.~~
-   Implemented with typed canonicalization bounded by output bytes and aggregate
-   request-relative encoding work, deterministic per-record partial success, combined
-   capability negotiation, and reconnect-safe no-downgrade behavior.
-   The ingester's `--enable-logs-v2` remains the operator rollout gate; native-v1 and
-   Loki inputs remain v1.
-4. Extend typed fidelity into live-tail only behind a separate compatible contract;
-   current best-effort live rows intentionally expose the new fields as NULL.
+1. Replace `scry-errorsd`'s `Catalog::list_blocks()` source selection with an
+   ordered, cursor-filtered SQL query using `LIMIT`. The current call materializes
+   the entire live catalog before applying the reconciliation page bound, so memory
+   and startup work are not yet bounded by `max_blocks` at large catalog sizes.
+2. Deploy the coordinated producer/ingest/errors version through an explicitly
+   authorized rollout. No deployment is claimed or authorized by this documentation.
+3. Add clustered Valkey lease/fencing and convergence orchestration; clustered
+   `scry errors` remains fail-closed.
+4. Add hardened browser intake and SDK/build integration.
+5. Add artifact processing, grouping, issue lifecycle/API, and Errors UI.
+6. Add accepted-record low-latency hints without changing durable reconciliation as
+   the correctness path.
+7. Add occurrence/error projection snapshots and retention-aware orphan/generation GC.
+8. Extend typed trace fidelity as general observability work only; traces remain
+   correlation data, not an error-occurrence source.

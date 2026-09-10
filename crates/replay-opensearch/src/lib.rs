@@ -25,7 +25,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use scry_proto::generated::{LogStream, LogsBatch};
+use scry_proto::{
+    generated::{LogStream, LogsBatch},
+    redaction::redact_logs_v1,
+};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::time::{interval, MissedTickBehavior};
@@ -351,6 +354,13 @@ async fn run_sender(
     Ok(())
 }
 
+fn encode_redacted_logs(batch: LogsBatch) -> Result<Vec<u8>> {
+    let payload = batch.encode().context("encoding LogsBatch for the wire")?;
+    Ok(redact_logs_v1(&payload)
+        .context("redacting generated LogsBatch")?
+        .into_owned())
+}
+
 /// Encode + pace + ship the current batch, resetting the builder.
 async fn flush(
     builder: &mut BatchBuilder,
@@ -363,13 +373,13 @@ async fn flush(
     if count == 0 {
         return Ok(());
     }
-    let payload = batch.encode().context("encoding LogsBatch for the wire")?;
+    let payload = encode_redacted_logs(batch)?;
 
     pacer.pace(count as usize, controller.rate()).await;
 
     // Ship with a single reconnect-and-retry on link failure.
     let acks = match sender
-        .send_logs_batch(count, ts_min, ts_max, &payload)
+        .send_logs_batch(count, ts_min, ts_max, payload.as_ref())
         .await
     {
         Ok(acks) => acks,
@@ -380,7 +390,7 @@ async fn flush(
                 .await
                 .context("reconnecting to ingest server after send failure")?;
             sender
-                .send_logs_batch(count, ts_min, ts_max, &payload)
+                .send_logs_batch(count, ts_min, ts_max, payload.as_ref())
                 .await
                 .context("resending batch after reconnect")?
         }
@@ -463,4 +473,43 @@ fn hostname_string() -> String {
                 .map(|s| s.trim().to_string())
         })
         .unwrap_or_else(|| "unknown".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scry_proto::{generated::LogEntry, LabelPair};
+
+    #[test]
+    fn generated_logs_are_redacted_without_scanning_bodies() {
+        let payload = encode_redacted_logs(LogsBatch {
+            streams: vec![LogStream {
+                fingerprint: 1,
+                labels: vec![LabelPair {
+                    key: "service.name".into(),
+                    value: "ordinary".into(),
+                }],
+                entries: vec![LogEntry {
+                    ts_unix_nano: 1,
+                    severity: 9,
+                    body: "token remains in free text".into(),
+                    attributes: vec![LabelPair {
+                        key: "client_secret".into(),
+                        value: "secret".into(),
+                    }],
+                }],
+            }],
+        })
+        .unwrap();
+        let decoded = LogsBatch::decode(&payload).unwrap();
+        assert_eq!(decoded.streams[0].labels[0].value, "ordinary");
+        assert_eq!(
+            decoded.streams[0].entries[0].body,
+            "token remains in free text"
+        );
+        assert_eq!(
+            decoded.streams[0].entries[0].attributes[0].value,
+            scry_proto::redaction::REDACTED
+        );
+    }
 }

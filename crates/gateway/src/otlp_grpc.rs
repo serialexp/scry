@@ -63,8 +63,11 @@ impl TraceService for OtlpTraceService {
         &self,
         request: Request<ExportTraceServiceRequest>,
     ) -> Result<Response<ExportTraceServiceResponse>, Status> {
+        otlp::accept(&self.state, request.into_inner()).map_err(|error| {
+            tracing::warn!(%error, "trace redaction rejected OTLP/gRPC batch");
+            Status::invalid_argument("invalid trace batch")
+        })?;
         accepted(&self.state);
-        otlp::accept(&self.state, request.into_inner());
         Ok(Response::new(ExportTraceServiceResponse::default()))
     }
 }
@@ -74,11 +77,12 @@ impl LogsService for OtlpLogsService {
         &self,
         request: Request<ExportLogsServiceRequest>,
     ) -> Result<Response<ExportLogsServiceResponse>, Status> {
+        let response = otlp_logs::accept(&self.state, request.into_inner()).map_err(|error| {
+            tracing::warn!(%error, "log redaction rejected OTLP/gRPC batch");
+            Status::invalid_argument("invalid log batch")
+        })?;
         accepted(&self.state);
-        Ok(Response::new(otlp_logs::accept(
-            &self.state,
-            request.into_inner(),
-        )))
+        Ok(Response::new(response))
     }
 }
 #[tonic::async_trait]

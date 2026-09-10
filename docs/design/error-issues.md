@@ -1,19 +1,26 @@
 # Error issue indexing and lifecycle — Design
 
-Status: draft, not yet implemented
+Status: partial — occurrence storage/index prerequisite implemented; grouping and issues outstanding
 Owner: Bart
-Last updated: 2026-09-07
+Last updated: 2026-09-10
 
 ## Implementation status
 
-This document materializes the outputs of [Error intake](error-intake.md) and
+This document consumes the dedicated occurrence projection defined by
+[Error intake](error-intake.md), then materializes the outputs of
 [Error grouping](error-grouping.md). Alert consumers are defined in
-[Alert evaluation](alert-evaluation.md).
+[Alert evaluation](alert-evaluation.md). D-074 places the occurrence projection,
+`errors.sqlite`, and `scry errors` in an earlier full slice than grouping/issues.
 
 ### Done
 
 - [x] **Repository fit survey.** Block convergence, catalog snapshots, immutable
   object truth, Valkey leases, and local projections have been assessed.
+- [x] **Prerequisite slice — occurrence storage/index.** D-074 now publishes
+  deterministic immutable occurrence Parquet plus metadata-last conditional commits
+  and folds them into a deployment-bound, independently rebuildable `errors.sqlite`.
+  Discovery and raw-source processing are bounded and periodic in exclusive
+  single-writer mode; extraction accepts only logs schema 3/raw-record v2.
 
 ### Outstanding
 
@@ -21,12 +28,15 @@ This document materializes the outputs of [Error intake](error-intake.md) and
   and commutative-fold behavior.
 - [ ] **Decision — retention statistics.** Choose lifetime versus retained-window
   issue aggregates.
-- [ ] **Phase 0 — projection format.** Publish deterministic per-source-block
+- [ ] **Phase 0 — grouping projection format.** Consume the implemented occurrence
+  objects/index and publish deterministic per-occurrence
   grouping generations with metadata-last and an independently versioned index.
 - [ ] **Phase 1 — issue lifecycle.** Fold occurrences and immutable workflow events
   into issue summaries, regressions, facets, and audit history.
-- [ ] **Phase 2 — reconciliation.** Implement hints, cursors/full walks, snapshots,
-  reprocessing generations, compaction locator repair, and cold rebuild.
+- [ ] **Phase 2 — issue/grouping reconciliation.** Add clustered Valkey
+  orchestration, hints, snapshots/GC, reprocessing generations, compaction locator
+  repair, and grouping/issue cold rebuild. The D-074 occurrence-only bounded cursors
+  and SQLite rebuild path are already implemented.
 - [ ] **Phase 3 — issue API.** Add paginated reads and revision-checked mutations
   through the control plane.
 - [ ] **Phase 4 — verification.** Multi-instance, no-Valkey, retention, migration,
@@ -68,9 +78,12 @@ instances converge without treating Valkey as a database.
 
 ## Authorities
 
-- Raw event: ordinary immutable log/trace block.
-- Grouping result: immutable derived projection generation tied to exact source
-  block/event and processor versions.
+- Raw event: an ordinary immutable logs block; trace blocks are correlation data
+  only and never authoritative occurrence input.
+- Occurrence: dedicated immutable projection row derived only from an eligible
+  exception log with a valid canonical producer `scry.event.id`.
+- Grouping result: immutable derived projection generation tied to exact occurrence
+  and processor versions.
 - Workflow: immutable operator command/event objects.
 - Current issue view: replaceable `errors.sqlite` projection folded from both.
 - Snapshot: optional bootstrap optimization, version-checked and replaceable.
@@ -82,24 +95,41 @@ block catalog to rebuild or loses operator decisions.
 
 ## Projection objects
 
-Illustrative committed generation:
+D-074 supersedes the earlier implication that the first error projection combines
+extraction and grouping. The foundation publishes a dedicated, immutable,
+metadata-last occurrence generation before grouping exists:
 
 ```text
-_scry/errors/v1/projections/<date>/<source-block-uuid>/
+_scry/errors/v1/occurrences/<date>/<source-log-block-uuid>/
+  <extractor-generation>.parquet
+  <extractor-generation>.commit.json   # conditional create, PUT last
+```
+
+It contains only eligible exception logs with valid canonical `scry.event.id`,
+the deterministic `app_id`, occurrence fields, source-log locator/provenance, and
+best-effort trace/span link IDs. It contains no span-event occurrences, generated
+or synthetic IDs, heuristic dedup state, fingerprint, or issue membership. A local
+`errors.sqlite` occurrence index folds these objects and is independently
+rebuildable before grouping/issues ship.
+
+A later grouping generation consumes committed occurrence objects:
+
+```text
+_scry/errors/v1/projections/<date>/<occurrence-generation-id>/
   <processor-generation>.parquet
   <processor-generation>.commit.json   # conditional create, PUT last
 ```
 
-A row contains at least:
+A grouping row contains at least:
 
 ```text
-app_id, event_id, occurred_at, received_at
-source_signal, source_block_uuid, optional locator_hint
+deployment_id, app_id, event_id, occurred_at, received_at
+source_log_block_uuid, occurrence_projection_key, optional locator_hint
 issue_id, fingerprint_digest, fingerprint_version, grouping_policy_revision
 parser_version, symbolicator_version, artifact_digest_set
 exception_type, title, severity, handled, grouping_quality
 service, environment, release, user_hash, trace_id, span_id
-dedup_kind, canonical_result_digest
+canonical_result_digest
 ```
 
 The raw payload is not duplicated. `event_id` is stable identity; block UUID/row
@@ -119,10 +149,12 @@ storage fence even if a former holder's request arrives late.
 Indicative tables, not final SQL:
 
 ```text
-processed_blocks(source_block_uuid, processor_generation, projection_key,
-                 committed_at, PRIMARY KEY(...))
+processed_occurrence_generations(source_log_block_uuid, extractor_generation,
+                 occurrence_projection_key, committed_at, PRIMARY KEY(...))
+processed_grouping_generations(occurrence_projection_key, processor_generation,
+                 grouping_projection_key, committed_at, PRIMARY KEY(...))
 occurrences(deployment_id, app_id, event_id, active_issue_id, occurred_at,
-            projection_key, locator_hint, grouping_quality, ...,
+            occurrence_projection_key, locator_hint, grouping_quality, ...,
             PRIMARY KEY(deployment_id, app_id, event_id))
 issues(issue_id PRIMARY KEY, app_id, grouping_version, canonical_digest,
        title, first_seen, last_seen, occurrence_count, latest_event_id,
@@ -147,12 +179,18 @@ learn UUIDs and GET only unknown committed projection/source metadata, following
 D-066. Polls/walks are completion-relative and bounded-concurrency. A transient
 object error records lag and skips work rather than discarding the whole view.
 
-For each source block/grouping generation:
+In the implemented foundation slice, for each logs schema-3 source block, `scry
+errors` applies bounded admission, accepts only server-stamped raw-record v2, selects
+eligible exception logs with valid canonical producer IDs, folds exact duplicate
+IDs/collisions, and conditionally commits the dedicated occurrence generation
+metadata-last. It never scans trace span events for occurrences. Grouping is absent.
+
+In the later grouping phase, for each committed occurrence generation:
 
 1. acquire the partitioned projection lease when clustered;
-2. read canonical eligible events with bounded admission;
-3. extract, deduplicate, symbolize, and group using exact versioned inputs;
-4. stage deterministic projection data;
+2. read canonical occurrences with bounded admission;
+3. symbolize and group using exact versioned inputs;
+4. stage deterministic grouping projection data;
 5. recheck lease fence and source liveness/version policy;
 6. PUT commit metadata last;
 7. emit a hint; every instance folds the committed object idempotently.
@@ -166,9 +204,10 @@ grace (which can be zero), not retention TTL; deployments needing asynchronous
 projection must configure grace or a durable accepted-record path accordingly.
 Retention expiry before any surviving copy is processed is the irrecoverable case.
 
-A direct durably accepted-event observer may provisionally update a low-latency
-view, but cannot notify until the equivalent durable occurrence/issue-transition
-identity exists. Block reconciliation confirms or replaces provisional state.
+A direct durably accepted-log observer may provisionally update a low-latency view,
+but cannot notify until the equivalent durable occurrence/issue-transition identity
+exists. Block reconciliation confirms or replaces provisional state. Trace events
+cannot drive this observer.
 
 ## Durable issue transitions
 
@@ -245,8 +284,9 @@ fold before publishing a new snapshot/view.
 
 ## Retention
 
-Raw occurrence detail expires with logs/traces. The issue view marks retained
-sample availability and never promises a deleted example. Review chooses whether
+Raw occurrence detail expires with its source logs; independently retained linked
+traces may also expire. The issue view marks retained sample/link availability and
+never promises a deleted example. Review chooses whether
 aggregate counts are lifetime facts retained independently or describe the current
 raw-retention window. The API always names the semantics.
 
@@ -302,9 +342,9 @@ values are not accepted as workflow input. HTTP/API ownership is detailed in
   the storage precondition, not lease timing, determines whether it committed.
 - SQLite transaction failure: durable object remains and replays.
 - Snapshot mismatch/corruption: discard only the error snapshot and rebuild.
-- Source block compacted: follow ancestry to a descendant, insert occurrences by
-  stable scoped event ID, skip already-covered ancestry, and repair locator hints.
-- Source retained before any source/descendant is processed: report an irrecoverable
+- Source logs block compacted: follow ancestry to a descendant, insert occurrences
+  by stable scoped event ID, skip already-covered ancestry, and repair locator hints.
+- Source logs retained before any source/descendant is processed: report an irrecoverable
   gap and never invent an occurrence. Projection SLO/grace must prevent this.
 - Late event: apply explicit lateness/regression policy and preserve provenance.
 - Valkey loss: pause fenced writes, report stale, never mark issues healthy.
@@ -326,7 +366,8 @@ size, workflow payload/comment length, local cache size, and rebuild concurrency
 - Replay each object twice and in varied listing order; projections/folds match.
 - Crash at every data/metadata/SQLite boundary and cold-rebuild from objects.
 - Two-instance lease loss/takeover produces one committed generation/transition.
-- Compaction/retention fixtures prove event identity and locator repair.
+- Compaction/retention fixtures prove event identity and locator repair; eligibility
+  fixtures prove span events and missing/malformed/non-canonical IDs never project.
 - Revision conflicts, duplicate commands, ignore expiry, late events, resolve/
   regression, aliases, and grouping migrations preserve counts/audit.
 - Valkey-free declared single-instance and fail-closed accidental multi-instance

@@ -30,6 +30,8 @@ members = [
     "crates/httpsig",
     "crates/replay-opensearch",
     "crates/status",
+    "crates/errors",
+    "crates/scry-errorsd",
     "crates/scry",
 ]
 # The desktop query app (Tauri + SolidJS) is its own crate with a heavy,
@@ -90,6 +92,8 @@ scry-tail          = { path = "crates/tail" }
 scry-httpsig       = { path = "crates/httpsig" }
 scry-replay-opensearch = { path = "crates/replay-opensearch" }
 scry-status        = { path = "crates/status" }
+scry-errors        = { path = "crates/errors" }
+scry-errorsd       = { path = "crates/scry-errorsd" }
 
 anyhow    = "1"
 arrow     = "58"

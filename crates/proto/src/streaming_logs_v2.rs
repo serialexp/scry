@@ -12,7 +12,8 @@
 //!   if present: scope_name:utf8<u32>, scope_version:utf8<u32>,
 //!               scope_dropped_attributes_count:u32, scope_attributes:map,
 //! scope_schema_url:utf8<u32>,
-//! time_unix_nano:u64, observed_time_unix_nano:u64, severity_number:i32,
+//! time_unix_nano:u64, observed_time_unix_nano:u64,
+//! received_time_unix_nano:u64 (v2 only, nonzero), severity_number:i32,
 //! severity_text:utf8<u32>, event_name:utf8<u32>, body:AnyValue,
 //! dropped_attributes_count:u32, attributes:map, trace_flags:u32,
 //! trace_id_len:u8, trace_id:[u8; trace_id_len],
@@ -36,7 +37,7 @@
 //! string/bytes value. Validation is two-pass: the complete envelope is validated
 //! before any callback. Parsing creates only borrowed views and no per-value AST.
 
-use crate::constants::{LOGS_BATCH_V2_MAGIC, LOGS_RAW_VERSION_V1};
+use crate::constants::{LOGS_BATCH_V2_MAGIC, LOGS_RAW_VERSION_V1, LOGS_RAW_VERSION_V2};
 
 pub const ANY_NULL: u8 = 0;
 pub const ANY_STRING: u8 = 1;
@@ -99,6 +100,8 @@ pub enum DecodeError {
     UnsupportedVersion(u16),
     #[error("canonical record flags must be zero")]
     InvalidRecordFlags,
+    #[error("v2 received timestamp must be nonzero")]
+    ZeroReceivedTime,
     #[error("scope presence byte must be zero or one")]
     InvalidScopePresence,
     #[error("trailing bytes after logs-v2 envelope or record")]
@@ -476,6 +479,8 @@ fn write_nested_value(value: AnyValue<'_>, output: &mut String) {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CanonicalLogRecord<'a> {
+    /// Canonical grammar version selected by the containing envelope.
+    pub raw_version: u16,
     pub resource_schema_url: &'a str,
     pub resource_dropped_attributes_count: u32,
     pub resource_attributes: AnyValueRef<'a>,
@@ -486,6 +491,8 @@ pub struct CanonicalLogRecord<'a> {
     pub scope_schema_url: &'a str,
     pub time_unix_nano: u64,
     pub observed_time_unix_nano: u64,
+    /// Trusted server receipt time. Absent from producer grammar v1.
+    pub received_time_unix_nano: Option<u64>,
     pub severity_number: i32,
     pub severity_text: &'a str,
     pub event_name: &'a str,
@@ -502,6 +509,15 @@ pub trait LogsV2Appender {
     fn begin_batch(&mut self, _record_count: u32) -> Result<(), String> {
         Ok(())
     }
+
+    /// Begins an envelope with its canonical raw-record grammar version.
+    ///
+    /// The default preserves compatibility for appenders that do not need to
+    /// distinguish v1 producer records from v2 server-stamped records.
+    fn begin_batch_version(&mut self, _raw_version: u16, record_count: u32) -> Result<(), String> {
+        self.begin_batch(record_count)
+    }
+
     fn record(&mut self, record: CanonicalLogRecord<'_>) -> Result<(), String>;
 }
 
@@ -516,27 +532,34 @@ pub fn decode_logs_batch_v2_into(
         return Err(DecodeError::PayloadLimit);
     }
     let mut first = Cursor::new(payload);
-    validate_header(&mut first)?;
+    let raw_version = validate_header(&mut first)?;
     let count = first.u32()?;
     if count > limits.max_records {
         return Err(DecodeError::RecordCountLimit);
     }
     for _ in 0..count {
-        parse_record(length_delimited_record(&mut first, limits)?, limits)?;
+        parse_record(
+            length_delimited_record(&mut first, limits)?,
+            raw_version,
+            limits,
+        )?;
     }
     if !first.done() {
         return Err(DecodeError::TrailingBytes);
     }
 
-    appender.begin_batch(count).map_err(DecodeError::Appender)?;
+    appender
+        .begin_batch_version(raw_version, count)
+        .map_err(DecodeError::Appender)?;
     let mut second = Cursor::new(payload);
-    validate_header(&mut second)?;
+    let second_version = validate_header(&mut second)?;
+    debug_assert_eq!(second_version, raw_version);
     let second_count = second.u32()?;
     debug_assert_eq!(second_count, count);
     for _ in 0..count {
         let encoded = length_delimited_record(&mut second, limits)?;
         appender
-            .record(parse_record(encoded, limits)?)
+            .record(parse_record(encoded, raw_version, limits)?)
             .map_err(DecodeError::Appender)?;
     }
     debug_assert!(second.done());
@@ -548,22 +571,34 @@ pub fn validate_record(
     encoded: &[u8],
     limits: DecodeLimits,
 ) -> Result<CanonicalLogRecord<'_>, DecodeError> {
+    validate_record_version(encoded, LOGS_RAW_VERSION_V1, limits)
+}
+
+/// Validates and borrows one raw canonical record using its envelope grammar version.
+pub fn validate_record_version(
+    encoded: &[u8],
+    raw_version: u16,
+    limits: DecodeLimits,
+) -> Result<CanonicalLogRecord<'_>, DecodeError> {
     if encoded.len() > limits.max_record_bytes {
         return Err(DecodeError::RecordLimit);
     }
-    parse_record(encoded, limits)
+    if !matches!(raw_version, LOGS_RAW_VERSION_V1 | LOGS_RAW_VERSION_V2) {
+        return Err(DecodeError::UnsupportedVersion(raw_version));
+    }
+    parse_record(encoded, raw_version, limits)
 }
 
-fn validate_header(c: &mut Cursor<'_>) -> Result<(), DecodeError> {
+fn validate_header(c: &mut Cursor<'_>) -> Result<u16, DecodeError> {
     let magic = c.u32()?;
     if magic != LOGS_BATCH_V2_MAGIC {
         return Err(DecodeError::BadMagic(magic));
     }
     let version = c.u16()?;
-    if version != LOGS_RAW_VERSION_V1 {
+    if !matches!(version, LOGS_RAW_VERSION_V1 | LOGS_RAW_VERSION_V2) {
         return Err(DecodeError::UnsupportedVersion(version));
     }
-    Ok(())
+    Ok(version)
 }
 fn length_delimited_record<'a>(
     c: &mut Cursor<'a>,
@@ -614,6 +649,7 @@ impl RecordBudget {
 
 fn parse_record(
     encoded: &[u8],
+    raw_version: u16,
     limits: DecodeLimits,
 ) -> Result<CanonicalLogRecord<'_>, DecodeError> {
     let mut c = Cursor::new(encoded);
@@ -643,6 +679,15 @@ fn parse_record(
     let scope_schema_url = c.value_string(limits.max_string_bytes, &mut budget, limits)?;
     let time_unix_nano = c.u64()?;
     let observed_time_unix_nano = c.u64()?;
+    let received_time_unix_nano = if raw_version == LOGS_RAW_VERSION_V2 {
+        let received = c.u64()?;
+        if received == 0 {
+            return Err(DecodeError::ZeroReceivedTime);
+        }
+        Some(received)
+    } else {
+        None
+    };
     let severity_number = c.i32()?;
     let severity_text = c.value_string(limits.max_string_bytes, &mut budget, limits)?;
     let event_name = c.value_string(limits.max_string_bytes, &mut budget, limits)?;
@@ -679,6 +724,7 @@ fn parse_record(
         return Err(DecodeError::TrailingBytes);
     }
     Ok(CanonicalLogRecord {
+        raw_version,
         resource_schema_url,
         resource_dropped_attributes_count,
         resource_attributes,
@@ -689,6 +735,7 @@ fn parse_record(
         scope_schema_url,
         time_unix_nano,
         observed_time_unix_nano,
+        received_time_unix_nano,
         severity_number,
         severity_text,
         event_name,

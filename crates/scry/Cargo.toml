@@ -30,6 +30,7 @@ scry-compactd      = { workspace = true }
 scry-retention     = { workspace = true }
 scry-tail          = { workspace = true }
 scry-replay-opensearch = { workspace = true }
+scry-errorsd       = { workspace = true }
 
 [lints]
 workspace = true

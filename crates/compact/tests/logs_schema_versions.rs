@@ -10,8 +10,8 @@ use object_store::{memory::InMemory, path::Path as ObjPath, ObjectStore, ObjectS
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 use scry_block::{
-    block_path, logs_physical_schema_v2, AlwaysValid, BlockBuilder, BlockBuilderConfig,
-    LogsBlockBuilder,
+    block_path, logs_physical_schema_v2, logs_physical_schema_v3, AlwaysValid, BlockBuilder,
+    BlockBuilderConfig, LogsBlockBuilder,
 };
 use scry_catalog::CatalogEntry;
 use scry_compact::{merge_blocks, CompactResources, ResourceConfig};
@@ -51,10 +51,13 @@ async fn make_v1(
         .unwrap()
 }
 
-async fn relabel_as_v2_with_raw(
+async fn relabel_with_fidelity(
     store: &Arc<dyn ObjectStore>,
     mut meta: scry_block::BlockMeta,
+    schema_version: u32,
+    raw_version: u16,
     raw: &[u8],
+    received_ts: Option<u64>,
 ) -> scry_block::BlockMeta {
     let main_path = path(&meta, "parquet");
     let parquet = store.get(&main_path).await.unwrap().bytes().await.unwrap();
@@ -74,14 +77,19 @@ async fn relabel_as_v2_with_raw(
         Arc::new(FixedSizeBinaryArray::new_null(16, n)),
         Arc::new(FixedSizeBinaryArray::new_null(8, n)),
         Arc::new(UInt8Array::new_null(n)),
-        Arc::new(UInt16Array::from(vec![Some(1)])),
+        Arc::new(UInt16Array::from(vec![Some(raw_version)])),
         Arc::new(BinaryArray::from(vec![Some(raw)])),
     ]);
-    let batch = RecordBatch::try_new(logs_physical_schema_v2(), columns).unwrap();
+    let schema = if schema_version == 3 {
+        columns.push(Arc::new(UInt64Array::from(vec![received_ts])));
+        logs_physical_schema_v3()
+    } else {
+        logs_physical_schema_v2()
+    };
+    let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
     let mut output = Vec::new();
     {
-        let mut writer =
-            ArrowWriter::try_new(&mut output, logs_physical_schema_v2(), None).unwrap();
+        let mut writer = ArrowWriter::try_new(&mut output, schema, None).unwrap();
         writer.write(&batch).unwrap();
         writer.close().unwrap();
     }
@@ -89,7 +97,7 @@ async fn relabel_as_v2_with_raw(
         .put(&main_path, Bytes::from(output).into())
         .await
         .unwrap();
-    meta.schema_version = 2;
+    meta.schema_version = schema_version;
     let meta_path = path(&meta, "meta.json");
     store
         .put(
@@ -136,8 +144,24 @@ async fn logs_v2_merge_preserves_opaque_raw_bytes() {
     let writer = Uuid::now_v7();
     let raw_a = [0, 0xff, 0x80, 1, 2, 0];
     let raw_b = [0x53, 0x4c, 0x32, 0, 9, 8, 7];
-    let a = relabel_as_v2_with_raw(&store, make_v1(&store, writer, 1, 10).await, &raw_a).await;
-    let b = relabel_as_v2_with_raw(&store, make_v1(&store, writer, 2, 20).await, &raw_b).await;
+    let a = relabel_with_fidelity(
+        &store,
+        make_v1(&store, writer, 1, 10).await,
+        2,
+        1,
+        &raw_a,
+        None,
+    )
+    .await;
+    let b = relabel_with_fidelity(
+        &store,
+        make_v1(&store, writer, 2, 20).await,
+        2,
+        1,
+        &raw_b,
+        None,
+    )
+    .await;
     let inputs = vec![entry(a), entry(b)];
     let resources = CompactResources::new(ResourceConfig::default()).unwrap();
     let merged = merge_blocks(
@@ -187,11 +211,100 @@ async fn logs_v2_merge_preserves_opaque_raw_bytes() {
 }
 
 #[tokio::test]
+async fn logs_v3_merge_preserves_opaque_raw_and_receipt_values() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let writer = Uuid::now_v7();
+    let raw_a = [0, 0xff, 0x80, 1];
+    let raw_b = [0x53, 0x4c, 0x32, 0, 9];
+    let a = relabel_with_fidelity(
+        &store,
+        make_v1(&store, writer, 1, 10).await,
+        3,
+        scry_proto::constants::LOGS_RAW_VERSION_V2,
+        &raw_a,
+        Some(101),
+    )
+    .await;
+    let b = relabel_with_fidelity(
+        &store,
+        make_v1(&store, writer, 2, 20).await,
+        3,
+        scry_proto::constants::LOGS_RAW_VERSION_V2,
+        &raw_b,
+        Some(202),
+    )
+    .await;
+    let resources = CompactResources::new(ResourceConfig::default()).unwrap();
+    let merged = merge_blocks(
+        store.clone(),
+        "test",
+        "logs",
+        &[entry(a), entry(b)],
+        1,
+        Uuid::now_v7(),
+        &cfg(),
+        &AlwaysValid,
+        &resources,
+        resources.config().non_datafusion_memory_bytes,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(merged.schema_version, 3);
+    let parquet = store
+        .get(&path(&merged, "parquet"))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let batches: Vec<_> = ParquetRecordBatchReaderBuilder::try_new(parquet)
+        .unwrap()
+        .build()
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert!(batches
+        .iter()
+        .all(|batch| batch.schema() == logs_physical_schema_v3()));
+    let mut values = Vec::new();
+    for batch in batches {
+        let raws = batch
+            .column_by_name("raw_record")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        let receipts = batch
+            .column_by_name("received_ts_unix_nano")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        values.extend(
+            raws.iter()
+                .zip(receipts.iter())
+                .map(|(raw, receipt)| (raw.unwrap().to_vec(), receipt.unwrap())),
+        );
+    }
+    values.sort();
+    assert_eq!(values, vec![(raw_a.to_vec(), 101), (raw_b.to_vec(), 202)]);
+}
+
+#[tokio::test]
 async fn mixed_logs_versions_are_rejected_by_merge_entrypoint() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let writer = Uuid::now_v7();
     let v1 = make_v1(&store, writer, 1, 10).await;
-    let v2 = relabel_as_v2_with_raw(&store, make_v1(&store, writer, 2, 20).await, b"opaque").await;
+    let v2 = relabel_with_fidelity(
+        &store,
+        make_v1(&store, writer, 2, 20).await,
+        2,
+        1,
+        b"opaque",
+        None,
+    )
+    .await;
     let inputs = vec![entry(v1), entry(v2)];
     let resources = CompactResources::new(ResourceConfig::default()).unwrap();
 
@@ -223,7 +336,7 @@ async fn unknown_and_mislabeled_logs_schemas_are_rejected_without_output() {
     let b = make_v1(&store, writer, 2, 20).await;
     let resources = CompactResources::new(ResourceConfig::default()).unwrap();
 
-    for version in [2, 99] {
+    for version in [2, 3, 99] {
         let mut inputs = vec![entry(a.clone()), entry(b.clone())];
         for input in &mut inputs {
             input.meta.schema_version = version;
@@ -245,9 +358,11 @@ async fn unknown_and_mislabeled_logs_schemas_are_rejected_without_output() {
         .await
         .unwrap_err();
         let message = format!("{error:#}");
-        if version == 2 {
+        if matches!(version, 2 | 3) {
             assert!(
-                message.contains("parquet schema does not match logs schema version 2"),
+                message.contains(&format!(
+                    "parquet schema does not match logs schema version {version}"
+                )),
                 "{message}"
             );
         } else {

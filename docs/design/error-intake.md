@@ -1,14 +1,17 @@
 # Error event contract and intake — Design
 
-Status: partial — lossless logs v2 intake landed; canonical extraction outstanding
+Status: partial — D-074 occurrence foundation implemented; browser intake and producer guidance outstanding
 Owner: Bart
 Last updated: 2026-09-10
 
 ## Implementation status
 
 This document refines [Error monitoring](error-monitoring.md). D-073 accepts a
-lossless logs v2 representation; reader, native writer, and gateway OTLP producer
-mechanics have landed, while operator enablement and canonical extraction remain.
+lossless logs v2 representation. D-074's coordinated occurrence foundation is now
+implemented: producers emit canonical raw-record v1, ingest stamps trusted receipt
+time into canonical raw-record v2 before WAL, and logs Parquet/query schema v3
+exposes `received_ts_unix_nano`. Browser intake and producer guidance remain
+outstanding; this implementation has not been deployed.
 
 ### Done
 
@@ -28,17 +31,27 @@ mechanics have landed, while operator enablement and canonical extraction remain
 - [x] **Phase 0c — producer fidelity.** Gateway OTLP maps into bounded canonical
   logs v2 with event/observed time, typed values, correlation, schema and dropped
   counts, and reselects the format from each connection's negotiated capabilities.
+- [x] **Phase 1 — occurrence foundation.** Producers emit canonical raw-record v1;
+  ingest applies uniform log/trace key redaction and stamps trusted receipt time
+  before WAL into raw-record v2 and logs schema 3. Strict log-only extraction,
+  deployment/app identity, immutable conditional occurrence commits, rebuildable
+  deployment-bound `errors.sqlite`, bounded paging, and periodic single-writer
+  `scry errors` reconciliation are implemented.
 
 ### Outstanding
 
-- [ ] **Phase 1 — canonical extraction.** Normalize exception logs and deprecated
-  span events into one bounded occurrence contract with exact/heuristic dedup.
+- [ ] **Clustered occurrence orchestration.** Add Valkey lease/fencing, convergence
+  hints, and safe multi-writer takeover; clustered mode currently fails closed.
+- [ ] **Accepted-record low-latency hints.** Add the optional acceleration path;
+  sealed-block/occurrence-commit reconciliation remains the correctness path.
+- [ ] **Occurrence snapshots and GC.** Add bounded snapshot bootstrap, generation
+  and orphan cleanup, and retention-aware garbage collection.
 - [ ] **Phase 2 — hardened browser intake.** Add public app keys, exact origin
-  policy, quotas, small bounds, scrubbing, and dedicated status.
+  policy, quotas, small bounds, route-specific policy, and dedicated status.
 - [ ] **Phase 3 — trusted server guidance.** Publish per-language setup and
   independent exception-log sampling guidance.
 - [ ] **Phase 4 — verification.** Add lossless format, rejection, abuse, replay,
-  dual-signal, correlation, and end-to-end tests.
+  occurrence-projection, scrubbing, correlation, and end-to-end tests.
 
 ## Why this exists
 
@@ -55,8 +68,10 @@ only after this contract; see [error-grouping.md](error-grouping.md).
 
 ## Goals
 
-- Make the stable OpenTelemetry exception LogRecord Event the primary format.
-- Continue accepting deprecated exception span events during ecosystem migration.
+- Make eligible OpenTelemetry exception LogRecord Events the sole authoritative
+  source of error occurrences.
+- Retain trace spans as ordinary telemetry that can be linked best-effort from IDs
+  carried by an exception log, never as occurrence input.
 - Preserve raw typed values and canonical top-level fields without moving standard
   data into ad-hoc attributes.
 - Assign a retry-stable occurrence identity independent of issue grouping.
@@ -74,6 +89,8 @@ only after this contract; see [error-grouping.md](error-grouping.md).
 - Capturing resource load failures as fabricated exceptions. They may become a
   separate event type later.
 - Supporting Sentry Envelope/DSN compatibility unless separately designed.
+- Claiming that bounded key-based scrubbing removes secrets from free-text bodies,
+  messages, stack traces, or other string values.
 
 ## Canonical producer event
 
@@ -111,7 +128,12 @@ and exception content, not severity alone.
 
 ### Resource and context attributes
 
-Stable application identity belongs in Resource attributes:
+Stable application identity is derived by Scry rather than accepted as a separate
+producer-selected identifier. Normalize `service.namespace` and required
+`service.name` with one versioned algorithm, encode the pair unambiguously, and
+derive `app_id` deterministically from those bytes. Missing or invalid
+`service.name` makes an exception log ineligible; an absent namespace normalizes to
+the documented empty namespace. The source Resource attributes remain retained:
 
 - `service.name` (required by Scry browser/server setup)
 - `service.namespace`
@@ -134,16 +156,15 @@ before durability.
 OTel defines no generic event ID. Scry adds `scry.event.id`: a canonical lowercase
 128-bit random UUID generated before client buffering and retained unchanged over
 SDK, exporter, collector, gateway, WAL replay, and network retries. Scope is
-`(deployment, app_id, event_id)`. A repeated ID with canonically identical content
-is idempotent; the same ID with different canonical content is rejected and
-counted as an identity collision.
+`(deployment_id, app_id, event_id)`. A syntactically valid canonical ID is required
+for an exception log to be eligible for occurrence extraction. A repeated ID with
+canonically identical content is idempotent; the same ID with different canonical
+content is rejected and counted as an identity collision.
 
-Gateway-generated IDs are allowed only when a producer cannot supply one. They
-provide internal identity after that boundary but cannot make pre-gateway retry
-delivery exactly deduplicable. For legacy records, a synthetic ID hashes canonical
-semantic content plus event timestamp and canonical stream identity; identical real
-occurrences can still collide and compaction/replay can still double-count, so
-provenance and quality are explicit. Physical block/row identity is never used.
+The gateway and extractor never generate an occurrence ID. Missing, malformed, or
+non-canonical IDs leave a record queryable as an ordinary log but ineligible for the
+error occurrence projection. No content hash, receipt coordinates, physical
+block/row identity, or other synthetic identity substitutes for `scry.event.id`.
 
 Raw ingest has no deployment-wide ID index. It may append duplicate/conflicting
 representations; exact deduplication and collision quarantine happen in the durable
@@ -179,16 +200,14 @@ synthesized only at query/UI boundaries.
 
 ## Deprecated span exception events
 
-A trace span event named `exception` with standard exception attributes is
-accepted and normalized. During OTel's migration, one logical exception may arrive
-as a log, span event, or both (`logs/dup`). Exact cross-signal dedup uses the same
-producer `scry.event.id` embedded in both representations.
-
-Without that ID, Scry may identify a probable duplicate within a narrow bounded
-window using trace ID, span ID, event time, exception type, and a canonical digest
-of exception content. This is explicitly heuristic, records its confidence, and
-must never collapse independent exceptions merely because messages match. UI
-counts distinguish exact from heuristic dedup policy.
+The original proposal accepted and normalized deprecated trace span events named
+`exception`, then used exact or heuristic cross-signal deduplication when the same
+exception arrived as both a log and span event. **D-074 supersedes that proposal.**
+Span events remain ordinary trace telemetry and are never authoritative occurrence
+inputs. Scry performs no cross-signal occurrence deduplication, heuristic or
+otherwise. Producers that want an error occurrence emit one eligible exception log
+with `scry.event.id`; its top-level trace/span IDs provide best-effort linkage to a
+retained trace when one exists.
 
 ## Trace correlation and sampling
 
@@ -206,6 +225,26 @@ event discarded at the SDK.
 Product counters are observed telemetry, not claims about all real exceptions.
 Where sampling occurs after grouping, retain the sampling decision/probability and
 avoid presenting sampled count as exact raw count.
+
+## Uniform pre-WAL sensitive-key scrubbing
+
+D-074 requires one minimal, versioned sensitive-key scrubber on **all** log and
+trace intake paths, including ordinary telemetry that is not eligible as an error
+occurrence. It runs before any WAL append or other durable write. Metrics and
+profiles are outside this policy. The first implementation matches a fixed,
+documented case-insensitive set of sensitive attribute/map keys at every supported
+nested level and replaces each matched value with the fixed string marker
+`[REDACTED]` while preserving the key. Every protocol adapter and native producer
+path must reach the
+same scrubber; no route may bypass it.
+
+This is deliberately key-based damage reduction, not content inspection. It makes
+no promise to detect or scrub secrets embedded in free-text bodies, exception
+messages, stack traces, URLs, or values under unrecognized keys. Later configurable
+browser/privacy policy may be stricter but cannot weaken this uniform baseline.
+Scrubbing is deterministic and precedes WAL durability, canonical content hashing,
+and occurrence projection. A scrubber failure rejects the affected record rather
+than storing the original value.
 
 ## Intake surfaces
 
@@ -225,10 +264,15 @@ identifies policy, quotas, and revocation; it is not secret authentication.
 
 Required controls:
 
-- The public key resolves server-side to authoritative `app_id`; client service
-  identity is retained only as an untrusted facet and cannot select another app.
-- A stable `deployment_id` is created in a bucket control manifest and scopes IDs,
-  records, quotas, and restore; roles fail startup on bucket/namespace mismatch.
+- The public key resolves server-side to policy and the expected normalized service
+  namespace/name. `app_id` is derived from that pair by the same canonical algorithm;
+  conflicting client service identity is rejected or retained only as an untrusted
+  facet and cannot select another app.
+- A stable `deployment_id` is read from a conditionally created bucket manifest and
+  scopes IDs, records, quotas, and restore; roles fail startup on bucket/namespace
+  mismatch. The first coordinated-version role that needs it creates the manifest
+  with `PutMode::Create`; losers read and validate the winner. It is not created for
+  buckets that never enable this product slice.
 - TLS; explicit exact allowed origins and preflight policy (origin absence remains
   possible for non-browser clients and is separately governed).
 - Per-app event/byte/concurrency/cardinality token buckets and global overload
@@ -237,9 +281,10 @@ Required controls:
   32 MiB receiver, applied before allocation and after decompression.
 - Attribute count, nesting, array, string, stack, breadcrumb, debug-image, and
   batch-record limits; identity-bearing fields fail loudly instead of truncating.
-- Server-side allow/drop/hash/redact rules before durable storage, including URL
+- The uniform all-log/all-trace sensitive-key baseline plus route-specific
+  allow/drop/hash/redact rules before durable storage. Any stronger treatment of URL
   queries/fragments, headers, cookies, user fields, messages, stacks, and custom
-  attributes.
+  attributes is an explicit browser policy, not a claim made by the baseline.
 - No ambient forwarding credentials, no browser-selected upstream address, and
   no notifier/artifact secrets in client configuration.
 - Sparse failure logs and dedicated accepted/rejected/rate-limited/scrubbed status
@@ -291,14 +336,24 @@ against recursively reporting exporter failures.
 
 ## Schema evolution and rollout
 
-Version independently: raw typed log encoding, Scry occurrence extension,
-canonical identity serialization, scrub policy, and extracted flat projection.
-Readers reject unsupported identity-critical versions rather than guessing.
-D-073 reserves capability bit `0x0000_0008`, payload magic `0x534c3200`
-(`SL2\0`), and canonical raw-record version 1; readers land before advertisement
-or writer enablement.
+Schema fields remain independently versioned: raw typed log encoding, canonical
+identity serialization, scrub policy, application identity derivation, extracted
+occurrence projection, and physical logs schema. Producers emit canonical raw-record
+v1 and may not claim receipt time. On acceptance, the server validates and redacts
+the complete batch, samples one trusted receipt timestamp, rewrites every record as
+canonical raw-record v2, and only then passes those bytes to decode/live/WAL. Replay
+preserves existing v2 receipt stamps and re-applies deterministic redaction.
 
-The stable logs v2 Parquet/query projection has these columns in contractual order:
+Operational rollout is not independent: gateway/native producers, ingest, the
+deployment-manifest contract, and `scry errors` roll as one coordinated version for
+this phase. The implementation does not support stale producers feeding the newer
+occurrence system. Readers reject unsupported identity-critical versions rather
+than guessing. D-073 reserves capability bit `0x0000_0008` and payload magic
+`0x534c3200` (`SL2\0`). Its producer grammar is canonical raw-record v1; D-074 adds
+server-stamped canonical raw-record v2 and logs Parquet/query schema v3. This code
+has not been deployed.
+
+The stable logs v3 Parquet/query projection has these columns in contractual order:
 
 | Index | Column | Arrow type | Nullable | Logs v1 normalization |
 | ---: | --- | --- | :---: | --- |
@@ -315,15 +370,18 @@ The stable logs v2 Parquet/query projection has these columns in contractual ord
 | 10 | `trace_flags` | `UInt8` | yes | typed NULL |
 | 11 | `raw_record_version` | `UInt16` | yes | typed NULL |
 | 12 | `raw_record` | `Binary` | yes | typed NULL |
+| 13 | `received_ts_unix_nano` | `UInt64` | yes | typed NULL |
 
-The normalized SQL table appends synthesized `labels` at index 13 using the same
-Map layout as `attributes`. The first five v2 fields retain the exact v1 names,
-types, nullability, and order. V1 normalization clones them and appends eight typed
-NULL arrays; it never fabricates missing fidelity. V2 keeps a root string body as
-familiar unquoted text, while non-string bodies and every identity-bearing Resource/
-attribute value use deterministic typed canonical text; exact types remain in
-`raw_record`. Stream identity hashes length-delimited canonical label bytes and
-rejects a repeated hash with different exact labels.
+The normalized SQL table appends synthesized `labels` at index 14 using the same
+Map layout as `attributes`. Logs schema 2 remains the historical producer-v1 shape
+through `raw_record` at index 12; schema 3 appends trusted receipt time without
+moving those columns. V1/v2 normalization inserts typed NULL for unavailable later
+fields and never fabricates fidelity. In schema 3, `raw_record_version = 2`, the
+raw record's nonzero `received_time_unix_nano`, and `received_ts_unix_nano` agree.
+A root string body remains familiar unquoted text, while non-string bodies and every
+identity-bearing Resource/attribute value use deterministic typed canonical text;
+exact types remain in `raw_record`. Stream identity hashes length-delimited canonical
+label bytes and rejects a repeated hash with different exact labels.
 
 Gateway canonicalization accepts at most the logs-v2 decoder's 16 MiB envelope even
 though generic OTLP transport permits 32 MiB requests. Total record-encoding work is
@@ -334,31 +392,37 @@ entities/profile dictionary references, duplicate or empty keys, and encoding bo
 Absent and explicitly empty OTLP bodies both normalize to canonical null; `-0.0`
 normalizes to `+0.0` and NaN payloads to the canonical NaN by design.
 
-The representation decision must specify the exact binschema/WAL/Parquet v2 shape,
-version-specific DataFusion adapters into one stable query schema, and compaction
-compatibility. Mixed-schema blocks compact only within `(signal, schema_version)`
-until a lossless upgrade compactor exists. Rolling tests run old/new writers and
-readers concurrently; adding fields without those adapters is not “additive.”
+The representation decision specifies the exact binschema/WAL and versioned Parquet
+shapes, DataFusion adapters into the stable schema-3 query contract, and compaction
+compatibility. Compaction can normalize logs schema 2 into schema 3 with
+`received_ts_unix_nano = NULL`; it preserves schema-3 receipt values and rejects
+unknown/mislabeled schemas. Historical logs-v2 reader-first rollout
+continues to govern those blocks; D-074 supersedes any implication that the new
+occurrence producer/extractor slice supports mixed stale and current components.
 
-Rollout order is: ship all readers/adapters first; preserve new OTLP fields; add
-typed round trips; teach query/UI aliases; and extraction shadow mode; then enable
-new writers, `logs/dup`, and SDK guidance. The native writer is present behind
-mutual negotiation and visible default-off `--enable-logs-v2`. The gateway requests
-logs v2 automatically for canonical OTLP batches and refuses to downgrade them when
-the current upstream session does not negotiate it; native-v1 and Loki inputs remain
-v1. V1 and v2 share the logs WAL by explicit product decision, so once v2 has been
-accepted an operator must not roll that WAL back to an older
-binary that cannot replay SL2 frames. Disabling new v2 acceptance does not disable
-recovery in a capable binary. Existing string-only blocks remain queryable and
-produce explicitly lower-quality occurrences without fabricated fidelity or
-guaranteed exact deduplication.
+The original D-073 rollout was reader-first: ship readers/adapters, preserve new
+OTLP fields, add typed round trips, then enable writers. The native writer remains
+behind mutual negotiation and visible default-off `--enable-logs-v2`; the gateway
+requests logs v2 for canonical OTLP batches and refuses to downgrade them when the
+upstream session does not negotiate it. Native-v1 and Loki inputs remain v1. V1 and
+v2 share the logs WAL, so once v2 has been accepted an operator must not roll that
+WAL back to a binary that cannot replay SL2 frames; disabling new v2 acceptance does
+not disable recovery in a capable binary.
+
+**D-074 supersedes the planned extraction-shadow/`logs/dup` rollout and the claim
+that lower-fidelity legacy records could become occurrences.** Existing string-only
+blocks remain queryable only as ordinary logs. The occurrence foundation is
+implemented but not deployed. When enabled, its producer/ingest/errors components
+must roll as one coordinated version; errorsd accepts only schema-3/raw-record-v2
+input and never extracts span events.
 
 ## Verification
 
 - Golden protobuf/JSON/gzip/gRPC parity for every AnyValue variant, null/empty,
   int64 extremes, duplicate keys, observed timestamps, event names, scope/schema,
   dropped counts, and binary trace context.
-- Exact duplicate/collision and heuristic dual-signal fixtures.
+- Exact duplicate/collision fixtures plus proof that span events and logs without a
+  valid canonical `scry.event.id` never enter the occurrence projection.
 - Browser-origin/preflight, key revocation, decompression bomb, nesting, oversized
   stack, cardinality, scrub failure, hostile object, duplicate initialization, and
   unload/offline tests.
@@ -373,7 +437,8 @@ guaranteed exact deduplication.
 - Same-origin webui endpoint, dedicated gateway listener, or both?
 - Which browser fields are default-allow, default-hash, and default-drop?
 - Is temporary-unhandled rejection export delayed to observe `rejectionhandled`?
-- Which SDKs can carry `scry.event.id` on both log and span event automatically?
+- Which SDKs can generate and preserve canonical `scry.event.id` on exception logs
+  automatically?
 - What are qualified production bounds and per-app default quotas?
 
 ## References

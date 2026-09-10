@@ -1181,6 +1181,7 @@ impl QueryService {
                     trace_flags: None,
                     raw_record_version: None,
                     raw_record: None,
+                    received_ts_unix_nano: None,
                 });
             }
             if let Some(guard) = self.memory_guard.as_ref() {

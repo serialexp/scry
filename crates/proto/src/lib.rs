@@ -38,8 +38,10 @@ pub mod constants;
 pub mod fingerprint;
 pub mod framing;
 pub mod logs_v2_encoder;
+pub mod logs_v2_stamp;
 pub mod metrics_v2;
 pub mod payload;
+pub mod redaction;
 pub mod streaming;
 pub mod streaming_logs_v2;
 pub mod streaming_v2;
@@ -57,7 +59,8 @@ pub use generated::{
 };
 
 pub use streaming_logs_v2::{
-    decode_logs_batch_v2_into, validate_record as validate_logs_v2_record, AnyValue, AnyValueRef,
+    decode_logs_batch_v2_into, validate_record as validate_logs_v2_record,
+    validate_record_version as validate_logs_record_version, AnyValue, AnyValueRef,
     ArrayIter as AnyValueArrayIter, ArrayRef as AnyValueArrayRef, CanonicalLogRecord,
     DecodeError as LogsV2DecodeError, DecodeLimits as LogsV2DecodeLimits, LogsV2Appender,
     MapIter as AnyValueMapIter, MapRef as AnyValueMapRef,
@@ -74,6 +77,10 @@ pub use generated_query::{
     QueryStatsInput, QueryStatsOutput, ResponseSuperseded, ResponseSupersededInput,
     ResponseSupersededOutput, SchemaMsg, SchemaMsgInput, SchemaMsgOutput, StreamError,
     StreamErrorInput, StreamErrorOutput,
+};
+
+pub use logs_v2_stamp::{
+    redact_and_stamp_logs_v2, redact_replayed_logs_v2, LogsV2StampError, LogsV2StampScratch,
 };
 
 pub use logs_v2_encoder::{

@@ -1,0 +1,28 @@
+[package]
+name = "scry-errors"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pure error occurrence identity, extraction, scrubbing, canonicalization, and folding."
+
+[dependencies]
+arrow = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+object_store = { workspace = true }
+parquet = { workspace = true }
+rusqlite = { version = "0.31", features = ["bundled"] }
+scry-objstore = { workspace = true }
+scry-proto = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = "0.10"
+thiserror = { workspace = true }
+unicode-normalization = "0.1"
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

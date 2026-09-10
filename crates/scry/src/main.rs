@@ -66,6 +66,8 @@ enum Cmd {
     Compact(scry_compactd::Args),
     /// Per-signal TTL retention (dry-run by default).
     Retention(scry_retention::Args),
+    /// Error occurrence projection and reconciliation.
+    Errors(scry_errorsd::Args),
     /// Live log tailing (best-effort, straight off the ingest hot path).
     Tail(scry_tail::Args),
     /// Replay an OpenSearch corpus into a scry ingest server (throughput bench).
@@ -93,6 +95,7 @@ async fn main() -> Result<()> {
         Cmd::Web(a) => scry_webui::run(a).await,
         Cmd::Compact(a) => scry_compactd::run(a).await,
         Cmd::Retention(a) => scry_retention::run(a).await,
+        Cmd::Errors(a) => scry_errorsd::run(a).await,
         Cmd::Tail(a) => scry_tail::run(a).await,
         Cmd::ReplayOpensearch(a) => scry_replay_opensearch::run(a).await,
     }

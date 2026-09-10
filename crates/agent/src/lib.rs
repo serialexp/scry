@@ -21,6 +21,7 @@ use scry_proto::{
         LogEntry, LogStream, LogsBatch, MetricSample, MetricsBatch, ProfileBlob, ProfilesBatch,
         SeriesDictEntry,
     },
+    redaction::redact_logs_v1,
     LabelPair,
 };
 use tokio::sync::{mpsc, watch};
@@ -818,6 +819,15 @@ fn metrics_batch_would_overflow(
             || pending.approx_bytes.saturating_add(next_bytes) > max_bytes)
 }
 
+fn encode_redacted_logs(batch: LogsBatch) -> Result<Vec<u8>> {
+    let payload = batch
+        .encode()
+        .expect("LogsBatch encode is infallible for well-formed inputs");
+    Ok(redact_logs_v1(&payload)
+        .context("redacting generated LogsBatch")?
+        .into_owned())
+}
+
 /// Encode + compress the pending batch and ship it, reconnecting with capped
 /// exponential backoff if the ingest server has gone away (e.g. a rolling
 /// restart). No-op when empty.
@@ -839,9 +849,7 @@ async fn flush(
     let record_count = pending.record_count;
     let (ts_min, ts_max) = (pending.ts_min, pending.ts_max);
 
-    let payload = LogsBatch { streams }
-        .encode()
-        .expect("LogsBatch encode is infallible for well-formed inputs");
+    let payload = encode_redacted_logs(LogsBatch { streams })?;
     let uncompressed_size = payload.len() as u32;
     let compressed = zstd::encode_all(payload.as_slice(), ZSTD_LEVEL)
         .expect("zstd encode_all is infallible on Vec input");
@@ -1202,6 +1210,40 @@ mod tests {
             .iter()
             .find(|p| p.key == key)
             .map(|p| p.value.clone())
+    }
+
+    #[test]
+    fn generated_logs_are_redacted_without_scanning_bodies() {
+        let payload = encode_redacted_logs(LogsBatch {
+            streams: vec![LogStream {
+                fingerprint: 1,
+                labels: vec![LabelPair {
+                    key: "service.name".into(),
+                    value: "api".into(),
+                }],
+                entries: vec![LogEntry {
+                    ts_unix_nano: 7,
+                    severity: 9,
+                    body: "password=visible-in-free-text".into(),
+                    attributes: vec![
+                        LabelPair {
+                            key: "Authorization".into(),
+                            value: "Bearer secret".into(),
+                        },
+                        LabelPair {
+                            key: "request.id".into(),
+                            value: "ordinary".into(),
+                        },
+                    ],
+                }],
+            }],
+        })
+        .unwrap();
+        let decoded = LogsBatch::decode(&payload).unwrap();
+        let entry = &decoded.streams[0].entries[0];
+        assert_eq!(entry.body, "password=visible-in-free-text");
+        assert_eq!(entry.attributes[0].value, scry_proto::redaction::REDACTED);
+        assert_eq!(entry.attributes[1].value, "ordinary");
     }
 
     #[test]

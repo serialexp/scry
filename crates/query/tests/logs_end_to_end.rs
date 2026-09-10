@@ -31,7 +31,8 @@ use datafusion::physical_plan::ExecutionPlan;
 use object_store::{memory::InMemory, path::Path, ObjectStore, ObjectStoreExt};
 use parquet::arrow::ArrowWriter;
 use scry_block::{
-    block_path, logs_physical_schema_v2, BlockBuilder, BlockBuilderConfig, LogsBlockBuilder,
+    block_path, logs_physical_schema_v2, logs_physical_schema_v3, BlockBuilder, BlockBuilderConfig,
+    LogsBlockBuilder,
 };
 use scry_catalog::Catalog;
 use scry_proto::streaming::LogsAppender;
@@ -122,6 +123,16 @@ fn total_rows(batches: &[arrow::record_batch::RecordBatch]) -> usize {
 }
 
 fn synthetic_v2_batch(fp: u64, ts: u64) -> RecordBatch {
+    synthetic_fidelity_batch(fp, ts, 2, None, b"canonical-v1")
+}
+
+fn synthetic_fidelity_batch(
+    fp: u64,
+    ts: u64,
+    schema_version: u32,
+    received_ts: Option<u64>,
+    raw: &[u8],
+) -> RecordBatch {
     let mut attrs = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
     attrs.keys().append_value("exception.type");
     attrs.values().append_value("SyntheticError");
@@ -130,25 +141,28 @@ fn synthetic_v2_batch(fp: u64, ts: u64) -> RecordBatch {
     trace_id.append_value([1_u8; 16]).unwrap();
     let mut span_id = FixedSizeBinaryBuilder::with_capacity(1, 8);
     span_id.append_value([2_u8; 8]).unwrap();
-    RecordBatch::try_new(
-        logs_physical_schema_v2(),
-        vec![
-            Arc::new(UInt64Array::from(vec![fp])) as ArrayRef,
-            Arc::new(UInt64Array::from(vec![ts])),
-            Arc::new(UInt8Array::from(vec![17])),
-            Arc::new(StringArray::from(vec!["v2 failure"])),
-            Arc::new(attrs.finish()),
-            Arc::new(UInt64Array::from(vec![Some(ts + 5)])),
-            Arc::new(StringArray::from(vec![Some("ERROR")])),
-            Arc::new(StringArray::from(vec![Some("exception")])),
-            Arc::new(trace_id.finish()),
-            Arc::new(span_id.finish()),
-            Arc::new(UInt8Array::from(vec![Some(1)])),
-            Arc::new(UInt16Array::from(vec![Some(1)])),
-            Arc::new(BinaryArray::from(vec![Some(b"canonical-v1".as_slice())])),
-        ],
-    )
-    .unwrap()
+    let mut columns = vec![
+        Arc::new(UInt64Array::from(vec![fp])) as ArrayRef,
+        Arc::new(UInt64Array::from(vec![ts])),
+        Arc::new(UInt8Array::from(vec![17])),
+        Arc::new(StringArray::from(vec!["v2 failure"])),
+        Arc::new(attrs.finish()),
+        Arc::new(UInt64Array::from(vec![Some(ts + 5)])),
+        Arc::new(StringArray::from(vec![Some("ERROR")])),
+        Arc::new(StringArray::from(vec![Some("exception")])),
+        Arc::new(trace_id.finish()),
+        Arc::new(span_id.finish()),
+        Arc::new(UInt8Array::from(vec![Some(1)])),
+        Arc::new(UInt16Array::from(vec![Some((schema_version - 1) as u16)])),
+        Arc::new(BinaryArray::from(vec![Some(raw)])),
+    ];
+    let schema = if schema_version == 3 {
+        columns.push(Arc::new(UInt64Array::from(vec![received_ts])));
+        logs_physical_schema_v3()
+    } else {
+        logs_physical_schema_v2()
+    };
+    RecordBatch::try_new(schema, columns).unwrap()
 }
 
 fn collect_strings(batches: &[arrow::record_batch::RecordBatch], col: &str) -> Vec<String> {
@@ -616,10 +630,42 @@ async fn mixed_v1_v2_blocks_normalize_and_prune_projection() {
         .await
         .unwrap();
 
+    let v3_uuid = Uuid::now_v7();
+    let v3_ts = 3_000;
+    let raw_v2 = b"server-stamped-canonical-v2\0\xff";
+    let received_ts = 3_333;
+    let v3_batch = synthetic_fidelity_batch(0x33, v3_ts, 3, Some(received_ts), raw_v2);
+    let mut bytes = Vec::new();
+    let mut writer_out = ArrowWriter::try_new(&mut bytes, v3_batch.schema(), None).unwrap();
+    writer_out.write(&v3_batch).unwrap();
+    writer_out.close().unwrap();
+    store
+        .put(
+            &Path::from(block_path("logs", v3_ts, writer, v3_uuid, "parquet")),
+            Bytes::from(bytes.clone()).into(),
+        )
+        .await
+        .unwrap();
+    let mut v3_meta = v2_meta.clone();
+    v3_meta.uuid = v3_uuid;
+    v3_meta.ts_min_unix_nano = v3_ts;
+    v3_meta.ts_max_unix_nano = v3_ts;
+    v3_meta.byte_size = bytes.len() as u64;
+    v3_meta.schema_version = 3;
+    v3_meta.all_fingerprints = Some(vec![0x33]);
+    store
+        .put(
+            &Path::from(block_path("logs", v3_ts, writer, v3_uuid, "meta.json")),
+            Bytes::from(serde_json::to_vec_pretty(&v3_meta).unwrap()).into(),
+        )
+        .await
+        .unwrap();
+
     let tmp = TempDir::new().unwrap();
     let catalog = Catalog::open(&tmp.path().join("cat.sqlite"), BUCKET).unwrap();
     assert!(catalog.insert_block(&v1_meta).unwrap());
     assert!(catalog.insert_block(&v2_meta).unwrap());
+    assert!(catalog.insert_block(&v3_meta).unwrap());
 
     let ctx = SessionContext::new();
     register_logs_table(&ctx, &catalog, store, &Query::default())
@@ -627,7 +673,7 @@ async fn mixed_v1_v2_blocks_normalize_and_prune_projection() {
         .unwrap();
     let batches = ctx
         .sql(
-            "SELECT body, observed_ts_unix_nano, event_name, raw_record \
+            "SELECT body, observed_ts_unix_nano, event_name, raw_record, received_ts_unix_nano \
              FROM logs ORDER BY ts_unix_nano",
         )
         .await
@@ -635,9 +681,9 @@ async fn mixed_v1_v2_blocks_normalize_and_prune_projection() {
         .collect()
         .await
         .unwrap();
-    assert_eq!(total_rows(&batches), 2);
+    assert_eq!(total_rows(&batches), 3);
     let batch = arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
-    assert_eq!(batch.num_columns(), 4);
+    assert_eq!(batch.num_columns(), 5);
     let observed = batch
         .column(1)
         .as_any()
@@ -645,6 +691,7 @@ async fn mixed_v1_v2_blocks_normalize_and_prune_projection() {
         .unwrap();
     assert!(observed.is_null(0));
     assert_eq!(observed.value(1), v2_ts + 5);
+    assert_eq!(observed.value(2), v3_ts + 5);
     let events = batch
         .column(2)
         .as_any()
@@ -652,6 +699,7 @@ async fn mixed_v1_v2_blocks_normalize_and_prune_projection() {
         .unwrap();
     assert!(events.is_null(0));
     assert_eq!(events.value(1), "exception");
+    assert_eq!(events.value(2), "exception");
     let raw = batch
         .column(3)
         .as_any()
@@ -659,8 +707,17 @@ async fn mixed_v1_v2_blocks_normalize_and_prune_projection() {
         .unwrap();
     assert!(raw.is_null(0));
     assert_eq!(raw.value(1), b"canonical-v1");
+    assert_eq!(raw.value(2), raw_v2);
+    let receipts = batch
+        .column(4)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    assert!(receipts.is_null(0));
+    assert!(receipts.is_null(1));
+    assert_eq!(receipts.value(2), received_ts);
 
-    // The v2-only predicate is pushed only into the v2 parquet branch. The
+    // Version-specific predicates are pushed only into branches that physically
     // retained inexact filter above normalization still evaluates the v1
     // branch's typed NULL and therefore preserves SQL semantics.
     let filtered = ctx
@@ -670,6 +727,9 @@ async fn mixed_v1_v2_blocks_normalize_and_prune_projection() {
         .collect()
         .await
         .unwrap();
-    assert_eq!(total_rows(&filtered), 1);
-    assert_eq!(collect_strings(&filtered, "body"), vec!["v2 failure"]);
+    assert_eq!(total_rows(&filtered), 2);
+    assert_eq!(
+        collect_strings(&filtered, "body"),
+        vec!["v2 failure", "v2 failure"]
+    );
 }

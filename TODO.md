@@ -1,6 +1,9 @@
 
 ## Logs v2 follow-ups
 
+- Add a typed trace-v2 representation for general observability fidelity. The
+  current trace wire stringifies OTLP `AnyValue` attributes; traces remain
+  correlation telemetry and are explicitly not an error-occurrence source.
 - Teach the gateway's optional native `--listen-wire` receiver to negotiate,
   validate, and relay logs-v2 batches. Phase 0c covers foreign OTLP production;
   native-v1 and Loki-origin logs intentionally remain v1 today.

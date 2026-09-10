@@ -74,9 +74,9 @@ sleep 2; kill -INT "$GW_PID" 2>/dev/null || true; wait "$GW_PID" 2>/dev/null || 
 rows() { sqlite3 "$SMOKE_DIR/recon.sqlite" "SELECT COALESCE(SUM(row_count),0) FROM blocks WHERE signal='$1';"; }
 blocks() { sqlite3 "$SMOKE_DIR/recon.sqlite" "SELECT COUNT(*) FROM blocks WHERE signal='$1';"; }
 postings() { sqlite3 "$SMOKE_DIR/recon.sqlite" "SELECT COUNT(*) FROM blocks WHERE signal='$1' AND has_postings=1;"; }
-log_v2_rows=$(sqlite3 "$SMOKE_DIR/recon.sqlite" "SELECT COALESCE(SUM(row_count),0) FROM blocks WHERE signal='logs' AND schema_version=2;")
+log_v2_rows=$(sqlite3 "$SMOKE_DIR/recon.sqlite" "SELECT COALESCE(SUM(row_count),0) FROM blocks WHERE signal='logs' AND schema_version=3;")
 expected_otlp_logs=$((5 * REQUESTS * RECORDS))
-echo "[gw-smoke] logs-v2 rows=$log_v2_rows expected=$expected_otlp_logs"
+echo "[gw-smoke] server-stamped logs-v3 rows=$log_v2_rows expected=$expected_otlp_logs"
 failed=0
 [[ "$log_v2_rows" == "$expected_otlp_logs" ]] || failed=1
 for spec in "logs:$EXPECTED_LOGS:yes" "metrics:$EXPECTED_METRICS:yes" "traces:$EXPECTED_TRACES:no" "profiles:$EXPECTED_PROFILES:no"; do
