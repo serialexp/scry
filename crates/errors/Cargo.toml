@@ -11,6 +11,7 @@ bytes = { workspace = true }
 futures = { workspace = true }
 object_store = { workspace = true }
 parquet = { workspace = true }
+regex = { workspace = true }
 rusqlite = { version = "0.31", features = ["bundled"] }
 scry-objstore = { workspace = true }
 scry-proto = { workspace = true }

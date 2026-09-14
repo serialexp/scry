@@ -29,6 +29,9 @@ pub(crate) struct ErrorsStatus {
     fold_inserted: AtomicU64,
     fold_exact_duplicates: AtomicU64,
     fold_collisions: AtomicU64,
+    issues_created: AtomicU64,
+    issues_updated: AtomicU64,
+    occurrences_grouped: AtomicU64,
 }
 
 impl ErrorsStatus {
@@ -54,6 +57,9 @@ impl ErrorsStatus {
             fold_inserted: AtomicU64::new(0),
             fold_exact_duplicates: AtomicU64::new(0),
             fold_collisions: AtomicU64::new(0),
+            issues_created: AtomicU64::new(0),
+            issues_updated: AtomicU64::new(0),
+            occurrences_grouped: AtomicU64::new(0),
         }
     }
 
@@ -84,6 +90,14 @@ impl ErrorsStatus {
             .store(report.fold.exact_duplicates as u64, Ordering::Relaxed);
         self.fold_collisions
             .store(report.fold.collisions as u64, Ordering::Relaxed);
+        self.issues_created
+            .store(report.grouping.issues_created as u64, Ordering::Relaxed);
+        self.issues_updated
+            .store(report.grouping.issues_updated as u64, Ordering::Relaxed);
+        self.occurrences_grouped.store(
+            report.grouping.occurrences_grouped as u64,
+            Ordering::Relaxed,
+        );
         self.last_success_unix_ms
             .store(unix_ms_now(), Ordering::Release);
         self.reconcile_successes.fetch_add(1, Ordering::Relaxed);
@@ -139,6 +153,9 @@ impl LocalStatus for ErrorsStatus {
                     "fold_inserted": self.fold_inserted.load(Ordering::Relaxed),
                     "fold_exact_duplicates": self.fold_exact_duplicates.load(Ordering::Relaxed),
                     "fold_collisions": self.fold_collisions.load(Ordering::Relaxed),
+                    "issues_created": self.issues_created.load(Ordering::Relaxed),
+                    "issues_updated": self.issues_updated.load(Ordering::Relaxed),
+                    "occurrences_grouped": self.occurrences_grouped.load(Ordering::Relaxed),
                 }
             }),
         }

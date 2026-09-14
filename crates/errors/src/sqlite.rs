@@ -72,6 +72,45 @@ pub struct ReconcileCursor {
     pub updated_at_unix_nano: u64,
 }
 
+/// An occurrence that has not yet been grouped for a given generation.
+#[derive(Debug, Clone)]
+pub struct UngroupedOccurrence {
+    pub deployment_id: Vec<u8>,
+    pub app_id: Vec<u8>,
+    pub app_identity_sha256: Vec<u8>,
+    pub event_id: Vec<u8>,
+    pub occurred_at_unix_nano: u64,
+    pub received_at_unix_nano: u64,
+    pub canonical: Vec<u8>,
+    pub canonical_sha256: Vec<u8>,
+}
+
+/// Input for folding one occurrence's grouping result into the issue tables.
+#[derive(Debug, Clone)]
+pub struct GroupingRow {
+    pub deployment_id: Vec<u8>,
+    pub app_id: Vec<u8>,
+    pub app_identity_sha256: Vec<u8>,
+    pub event_id: Vec<u8>,
+    pub issue_id: Vec<u8>,
+    pub fingerprint_version: u16,
+    pub fingerprint_digest: Vec<u8>,
+    pub grouping_quality: u8,
+    pub grouping_generation: String,
+    pub title: String,
+    pub occurred_at_unix_nano: u64,
+    pub severity: i32,
+}
+
+/// Report from a grouping fold pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GroupingReport {
+    pub issues_created: usize,
+    pub issues_updated: usize,
+    pub occurrences_grouped: usize,
+    pub duplicate_skipped: usize,
+}
+
 pub struct ErrorsDb {
     conn: Connection,
     deployment_id: [u8; 16],
@@ -219,6 +258,72 @@ impl ErrorsDb {
             .optional()?)
     }
 
+    /// Read a bounded page of occurrences not yet grouped for the given
+    /// generation, ordered by `(occurred_at_unix_nano, event_id)` after an
+    /// optional cursor.
+    pub fn ungrouped_occurrences(
+        &self,
+        grouping_generation: &str,
+        after_cursor: Option<(&[u8], &[u8])>, // (occurred_at_unix_nano as [u8;8], event_id)
+        limit: usize,
+    ) -> Result<Vec<UngroupedOccurrence>, SqliteError> {
+        let (cursor_ts, cursor_eid): (Vec<u8>, Vec<u8>) = match after_cursor {
+            Some((ts, eid)) => (ts.to_vec(), eid.to_vec()),
+            None => (to_sql_i64(0).to_be_bytes().to_vec(), vec![0; 16]),
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT o.deployment_id, o.app_id, o.app_identity_sha256,
+                    o.event_id, o.occurred_at_unix_nano, o.received_at_unix_nano,
+                    o.canonical, o.canonical_sha256
+             FROM occurrences o
+             LEFT JOIN occurrence_issues oi
+                 ON o.deployment_id = oi.deployment_id
+                AND o.app_id = oi.app_id
+                AND o.event_id = oi.event_id
+                AND oi.grouping_generation = ?1
+             WHERE oi.event_id IS NULL
+               AND (o.occurred_at_unix_nano, o.event_id) > (?2, ?3)
+             ORDER BY o.occurred_at_unix_nano, o.event_id
+             LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                grouping_generation,
+                i64::from_be_bytes(cursor_ts.try_into().unwrap_or([0; 8])),
+                cursor_eid,
+                limit as i64
+            ],
+            |row| {
+                Ok(UngroupedOccurrence {
+                    deployment_id: row.get(0)?,
+                    app_id: row.get(1)?,
+                    app_identity_sha256: row.get(2)?,
+                    event_id: row.get(3)?,
+                    occurred_at_unix_nano: from_sql_i64(row.get(4)?),
+                    received_at_unix_nano: from_sql_i64(row.get(5)?),
+                    canonical: row.get(6)?,
+                    canonical_sha256: row.get(7)?,
+                })
+            },
+        )?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Atomically fold a batch of grouping results into the issue tables.
+    pub fn fold_grouped(&mut self, results: &[GroupingRow]) -> Result<GroupingReport, SqliteError> {
+        let tx = self.conn.transaction()?;
+        let mut report = GroupingReport::default();
+        for result in results {
+            fold_issue(&tx, result, &mut report)?;
+        }
+        tx.commit()?;
+        Ok(report)
+    }
+
     #[cfg(test)]
     fn counts(&self) -> (u64, u64, u64) {
         let count = |table: &str| {
@@ -304,10 +409,41 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
              highest_key TEXT NOT NULL,
              updated_at_unix_nano INTEGER NOT NULL
          ) STRICT, WITHOUT ROWID;
+         CREATE TABLE IF NOT EXISTS issues (
+             issue_id BLOB NOT NULL CHECK(length(issue_id) = 16),
+             deployment_id BLOB NOT NULL CHECK(length(deployment_id) = 16),
+             app_id BLOB NOT NULL CHECK(length(app_id) = 16),
+             app_identity_sha256 BLOB NOT NULL CHECK(length(app_identity_sha256) = 32),
+             fingerprint_version INTEGER NOT NULL,
+             fingerprint_digest BLOB NOT NULL CHECK(length(fingerprint_digest) = 32),
+             grouping_quality INTEGER NOT NULL,
+             title TEXT NOT NULL,
+             first_seen_unix_nano INTEGER NOT NULL,
+             last_seen_unix_nano INTEGER NOT NULL,
+             occurrence_count INTEGER NOT NULL,
+             max_severity INTEGER NOT NULL,
+             latest_event_id BLOB NOT NULL CHECK(length(latest_event_id) = 16),
+             grouping_generation TEXT NOT NULL,
+             PRIMARY KEY (deployment_id, issue_id)
+         ) STRICT, WITHOUT ROWID;
+         CREATE INDEX IF NOT EXISTS issues_last_seen
+             ON issues(last_seen_unix_nano DESC, issue_id);
+         CREATE TABLE IF NOT EXISTS occurrence_issues (
+             deployment_id BLOB NOT NULL CHECK(length(deployment_id) = 16),
+             app_id BLOB NOT NULL CHECK(length(app_id) = 16),
+             event_id BLOB NOT NULL CHECK(length(event_id) = 16),
+             issue_id BLOB NOT NULL CHECK(length(issue_id) = 16),
+             fingerprint_version INTEGER NOT NULL,
+             fingerprint_digest BLOB NOT NULL CHECK(length(fingerprint_digest) = 32),
+             grouping_generation TEXT NOT NULL,
+             PRIMARY KEY (deployment_id, app_id, event_id)
+         ) STRICT, WITHOUT ROWID;
          INSERT OR IGNORE INTO schema_migrations(version, applied_at_unix)
              VALUES (1, unixepoch());
          INSERT OR IGNORE INTO schema_migrations(version, applied_at_unix)
              VALUES (2, unixepoch());
+         INSERT OR IGNORE INTO schema_migrations(version, applied_at_unix)
+             VALUES (3, unixepoch());
          COMMIT;",
     )
 }
@@ -536,6 +672,97 @@ fn fold_row(
     Ok(())
 }
 
+fn fold_issue(
+    tx: &Transaction<'_>,
+    row: &GroupingRow,
+    report: &mut GroupingReport,
+) -> Result<(), SqliteError> {
+    // Check if this occurrence is already grouped for this generation.
+    let already: bool = tx
+        .query_row(
+            "SELECT 1 FROM occurrence_issues
+             WHERE deployment_id = ?1 AND app_id = ?2 AND event_id = ?3",
+            params![
+                row.deployment_id.as_slice(),
+                row.app_id.as_slice(),
+                row.event_id.as_slice(),
+            ],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if already {
+        report.duplicate_skipped += 1;
+        return Ok(());
+    }
+
+    // Insert the occurrence→issue mapping.
+    tx.execute(
+        "INSERT OR IGNORE INTO occurrence_issues
+             (deployment_id, app_id, event_id, issue_id,
+              fingerprint_version, fingerprint_digest, grouping_generation)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            row.deployment_id.as_slice(),
+            row.app_id.as_slice(),
+            row.event_id.as_slice(),
+            row.issue_id.as_slice(),
+            row.fingerprint_version as i64,
+            row.fingerprint_digest.as_slice(),
+            row.grouping_generation,
+        ],
+    )?;
+    report.occurrences_grouped += 1;
+
+    // Upsert the issue: create if new, update aggregates if existing.
+    let ts = to_sql_i64(row.occurred_at_unix_nano);
+    let updated = tx.execute(
+        "UPDATE issues SET
+             occurrence_count = occurrence_count + 1,
+             last_seen_unix_nano = MAX(last_seen_unix_nano, ?1),
+             max_severity = MAX(max_severity, ?2),
+             latest_event_id = CASE WHEN ?1 > last_seen_unix_nano
+                                    THEN ?3 ELSE latest_event_id END
+         WHERE deployment_id = ?4 AND issue_id = ?5",
+        params![
+            ts,
+            row.severity as i64,
+            row.event_id.as_slice(),
+            row.deployment_id.as_slice(),
+            row.issue_id.as_slice(),
+        ],
+    )?;
+    if updated == 0 {
+        tx.execute(
+            "INSERT INTO issues
+                 (issue_id, deployment_id, app_id, app_identity_sha256,
+                  fingerprint_version, fingerprint_digest, grouping_quality,
+                  title, first_seen_unix_nano, last_seen_unix_nano,
+                  occurrence_count, max_severity, latest_event_id,
+                  grouping_generation)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, 1, ?10, ?11, ?12)",
+            params![
+                row.issue_id.as_slice(),
+                row.deployment_id.as_slice(),
+                row.app_id.as_slice(),
+                row.app_identity_sha256.as_slice(),
+                row.fingerprint_version as i64,
+                row.fingerprint_digest.as_slice(),
+                row.grouping_quality as i64,
+                row.title,
+                ts,
+                row.severity as i64,
+                row.event_id.as_slice(),
+                row.grouping_generation,
+            ],
+        )?;
+        report.issues_created += 1;
+    } else {
+        report.issues_updated += 1;
+    }
+    Ok(())
+}
+
 /// SQLite INTEGER is signed; this mapping preserves the complete u64 ordering and bits.
 fn to_sql_i64(value: u64) -> i64 {
     (value ^ (1_u64 << 63)) as i64
@@ -760,5 +987,86 @@ mod tests {
             })
         ));
         assert_eq!(db.counts(), (0, 0, 0));
+    }
+
+    #[test]
+    fn grouping_fold_creates_and_updates_issues_idempotently() {
+        let mut db = memory_db();
+
+        let row1 = GroupingRow {
+            deployment_id: DEPLOYMENT.to_vec(),
+            app_id: vec![0x42; 16],
+            app_identity_sha256: vec![0x43; 32],
+            event_id: vec![0x01; 16],
+            issue_id: vec![0xA0; 16],
+            fingerprint_version: 1,
+            fingerprint_digest: vec![0xF0; 32],
+            grouping_quality: 0,
+            grouping_generation: "fp-v1".to_owned(),
+            title: "TypeError".to_owned(),
+            occurred_at_unix_nano: 1_000,
+            severity: 17,
+        };
+
+        // First occurrence creates the issue.
+        let r1 = db.fold_grouped(std::slice::from_ref(&row1)).unwrap();
+        assert_eq!(r1.issues_created, 1);
+        assert_eq!(r1.occurrences_grouped, 1);
+        assert_eq!(r1.issues_updated, 0);
+
+        // Same occurrence again is a duplicate.
+        let r2 = db.fold_grouped(std::slice::from_ref(&row1)).unwrap();
+        assert_eq!(r2.duplicate_skipped, 1);
+        assert_eq!(r2.issues_created, 0);
+        assert_eq!(r2.occurrences_grouped, 0);
+
+        // Second occurrence for the same issue updates aggregates.
+        let row2 = GroupingRow {
+            event_id: vec![0x02; 16],
+            occurred_at_unix_nano: 2_000,
+            severity: 21,
+            ..row1.clone()
+        };
+        let r3 = db.fold_grouped(&[row2]).unwrap();
+        assert_eq!(r3.issues_created, 0);
+        assert_eq!(r3.issues_updated, 1);
+        assert_eq!(r3.occurrences_grouped, 1);
+
+        // Verify the issue aggregates.
+        let (count, last_seen, max_sev): (i64, i64, i64) = db
+            .conn
+            .query_row(
+                "SELECT occurrence_count, last_seen_unix_nano, max_severity
+                 FROM issues WHERE deployment_id = ?1 AND issue_id = ?2",
+                params![DEPLOYMENT.as_slice(), vec![0xA0_u8; 16].as_slice()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(from_sql_i64(last_seen), 2_000);
+        assert_eq!(max_sev, 21);
+
+        // A different issue (different fingerprint) is separate.
+        let row3 = GroupingRow {
+            event_id: vec![0x03; 16],
+            issue_id: vec![0xB0; 16],
+            fingerprint_digest: vec![0xF1; 32],
+            title: "ValueError".to_owned(),
+            ..row1
+        };
+        let r4 = db.fold_grouped(&[row3]).unwrap();
+        assert_eq!(r4.issues_created, 1);
+
+        // Total: 2 issues, 3 occurrence_issues rows.
+        let issue_count: i64 = db
+            .conn
+            .query_row("SELECT count(*) FROM issues", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(issue_count, 2);
+        let oi_count: i64 = db
+            .conn
+            .query_row("SELECT count(*) FROM occurrence_issues", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(oi_count, 3);
     }
 }

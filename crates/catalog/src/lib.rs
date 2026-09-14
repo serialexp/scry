@@ -627,6 +627,52 @@ impl Catalog {
         Ok(out)
     }
 
+    /// List at most `limit` live blocks for a given signal and schema version,
+    /// cursor-paginated and ordered by `(date, uuid)`.
+    ///
+    /// When `after_cursor` is `Some("date/uuid")`, only blocks whose
+    /// `date || '/' || uuid` is strictly greater are returned. Pass `None`
+    /// (or `""`) to start from the beginning.
+    ///
+    /// This is a bounded alternative to [`list_blocks`](Self::list_blocks) for
+    /// callers that know their signal, schema version, and page size up front —
+    /// avoiding the full-catalog materialisation that `list_blocks` performs.
+    pub fn list_source_blocks(
+        &self,
+        signal: &str,
+        schema_version: u32,
+        after_cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<CatalogEntry>> {
+        let cursor = after_cursor.unwrap_or("");
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT uuid, bucket, signal, date, writer_id, level,
+                   ts_min, ts_max, row_count, byte_size,
+                   schema_version, fingerprint,
+                   has_postings, postings_size_bytes,
+                   has_body_bloom, body_bloom_size_bytes,
+                   wal_seg_max, wal_shard
+            FROM blocks
+            WHERE deleted_at IS NULL AND superseded = 0
+              AND signal = ?1
+              AND schema_version = ?2
+              AND (date || '/' || uuid) > ?3
+            ORDER BY date, uuid
+            LIMIT ?4
+            "#,
+        )?;
+        let rows = stmt.query_map(
+            params![signal, schema_version as i64, cursor, limit as i64],
+            row_to_entry,
+        )?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     /// Look up a single block by UUID. Returns `None` if no such row.
     pub fn get_block(&self, uuid: Uuid) -> Result<Option<CatalogEntry>> {
         let mut stmt = self.conn.prepare(

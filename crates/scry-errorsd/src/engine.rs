@@ -12,12 +12,14 @@ use scry_block::block_path;
 use scry_catalog::{Catalog, CatalogEntry};
 use scry_errors::{
     extract,
+    fingerprint::fingerprint_v1,
+    issue::derive_issue_id,
     projection::{
         decode_occurrences, encode_occurrences, occurrence_keys, OccurrenceCommit,
         OwnedProjectionRow, ProjectionLimits, ProjectionRow, OCCURRENCE_PROJECTION_PREFIX,
     },
     publication::{publish_occurrence_projection, PublicationOutcome},
-    sqlite::{ErrorsDb, FoldReport, ReconcileCursor},
+    sqlite::{ErrorsDb, FoldReport, GroupingReport, GroupingRow, ReconcileCursor},
     DeploymentId, Error as ExtractionError, Limits as ExtractionLimits, Occurrence, Scratch,
 };
 use scry_proto::{
@@ -26,6 +28,7 @@ use scry_proto::{
 use scry_storage_layout::is_reserved_control_key;
 
 pub const DEFAULT_EXTRACTOR_GENERATION: &str = "occurrence-v1";
+pub const DEFAULT_GROUPING_GENERATION: &str = "fp-v1";
 const OCCURRENCE_CURSOR_PARTITION: &str = "occurrence-commits-v1";
 const RAW_META_CURSOR_PARTITION: &str = "raw-logs-meta-v1";
 const MAX_COMMIT_BYTES: usize = 16 * 1024;
@@ -35,6 +38,7 @@ const RAW_OBJECTS_PER_BLOCK: usize = 4;
 #[derive(Debug, Clone)]
 pub struct ReconcileConfig {
     pub extractor_generation: String,
+    pub grouping_generation: String,
     pub max_blocks: usize,
     pub max_source_rows: usize,
     pub max_source_bytes: usize,
@@ -48,6 +52,7 @@ impl Default for ReconcileConfig {
     fn default() -> Self {
         Self {
             extractor_generation: DEFAULT_EXTRACTOR_GENERATION.to_owned(),
+            grouping_generation: DEFAULT_GROUPING_GENERATION.to_owned(),
             max_blocks: 128,
             max_source_rows: 65_536,
             max_source_bytes: 256 * 1024 * 1024,
@@ -71,6 +76,7 @@ pub struct EngineReport {
     pub publications_created: usize,
     pub publications_existing: usize,
     pub fold: FoldReport,
+    pub grouping: GroupingReport,
 }
 
 impl EngineReport {
@@ -125,37 +131,33 @@ pub async fn reconcile_once(
     let catalog = Catalog::open(catalog_path, bucket)
         .with_context(|| format!("opening owned source catalog {}", catalog_path.display()))?;
     reconcile_raw_meta_page(store.as_ref(), config, &mut db, &catalog, &mut report).await?;
-    let mut candidates: Vec<_> = catalog
-        .list_blocks()
-        .context("listing live source blocks")?
-        .into_iter()
-        .filter(|entry| entry.meta.signal == "logs" && entry.meta.schema_version == 3)
-        .collect();
-    candidates.sort_by_key(source_entry_key);
+
+    // Bounded, cursor-filtered selection: the SQL query pushes signal, schema version,
+    // ordering, cursor, and LIMIT into SQLite so memory and startup work are O(max_blocks)
+    // rather than O(catalog). When the cursor passes the last entry the page is empty
+    // and we wrap to the beginning.
+    let cursor = db.reconcile_cursor("raw-logs")?;
+    let after = cursor.as_ref().map(|c| c.highest_key.as_str());
+    let mut candidates = catalog
+        .list_source_blocks("logs", 3, after, config.max_blocks)
+        .context("listing live logs-v3 source blocks")?;
+    if candidates.is_empty() && after.is_some() {
+        candidates = catalog
+            .list_source_blocks("logs", 3, None, config.max_blocks)
+            .context("listing live logs-v3 source blocks (wrap)")?;
+    }
     ensure!(
         candidates.iter().all(|entry| entry.bucket == bucket),
         "source catalog contains a live logs block for a different bucket"
     );
     report.candidate_blocks = candidates.len();
 
-    let cursor = db.reconcile_cursor("raw-logs")?;
-    let after = cursor
-        .as_ref()
-        .map(|cursor| cursor.highest_key.as_str())
-        .unwrap_or("");
-    let mut start = candidates.partition_point(|entry| source_entry_key(entry).as_str() <= after);
-    if start == candidates.len() {
-        start = 0;
-    }
-    let end = start
-        .saturating_add(config.max_blocks)
-        .min(candidates.len());
-
-    // list_blocks is live-only. Resolve only this bounded page as a defensive lineage
-    // check so a stale catalog can never make this worker guess a terminal. An immutable
-    // object that cannot be processed is quarantined for this cycle; moving the cursor
-    // prevents it from wedging later keys, while cyclic wrap makes it retryable.
-    for entry in &candidates[start..end] {
+    // list_source_blocks is live-only. Resolve only this bounded page as a defensive
+    // lineage check so a stale catalog can never make this worker guess a terminal. An
+    // immutable object that cannot be processed is quarantined for this cycle; moving
+    // the cursor prevents it from wedging later keys, while cyclic wrap makes it
+    // retryable.
+    for entry in &candidates {
         let terminal_is_consistent = match catalog.resolve_terminal(entry.meta.uuid)? {
             scry_catalog::TerminalResolution::Unique(uuid) => uuid == entry.meta.uuid,
             _ => false,
@@ -190,6 +192,12 @@ pub async fn reconcile_once(
             updated_at_unix_nano: entry.meta.ts_max_unix_nano,
         })?;
     }
+
+    // Grouping phase: compute fingerprints for ungrouped occurrences and fold
+    // into issue summaries. Runs after occurrence extraction so newly committed
+    // occurrences are available in `errors.sqlite`.
+    group_occurrence_page(&mut db, deployment_id, config, &mut report)?;
+
     Ok(report)
 }
 
@@ -875,6 +883,73 @@ fn ineligible(error: &ExtractionError) -> bool {
     )
 }
 
+/// Groups a bounded page of ungrouped occurrences from `errors.sqlite`,
+/// computing fingerprints and folding issue summaries. This runs after
+/// occurrence extraction so newly committed occurrences are available.
+fn group_occurrence_page(
+    db: &mut ErrorsDb,
+    deployment_id: DeploymentId,
+    config: &ReconcileConfig,
+    report: &mut EngineReport,
+) -> Result<()> {
+    let generation = &config.grouping_generation;
+    let page = db
+        .ungrouped_occurrences(generation, None, config.max_blocks)
+        .context("querying ungrouped occurrences")?;
+    if page.is_empty() {
+        return Ok(());
+    }
+    let mut rows = Vec::with_capacity(page.len());
+    for occ in &page {
+        let fp = match fingerprint_v1(
+            &occ.canonical,
+            occ.app_identity_sha256
+                .as_slice()
+                .try_into()
+                .context("app_identity_sha256 is not 32 bytes")?,
+        ) {
+            Ok(fp) => fp,
+            Err(error) => {
+                tracing::warn!(
+                    event_id = ?occ.event_id,
+                    %error,
+                    "skipping occurrence: OCC1 decode failed"
+                );
+                continue;
+            }
+        };
+        let issue_id = derive_issue_id(
+            deployment_id.as_bytes(),
+            occ.app_identity_sha256
+                .as_slice()
+                .try_into()
+                .context("app_identity_sha256 is not 32 bytes")?,
+            fp.version,
+            &fp.digest,
+        );
+        rows.push(GroupingRow {
+            deployment_id: occ.deployment_id.clone(),
+            app_id: occ.app_id.clone(),
+            app_identity_sha256: occ.app_identity_sha256.clone(),
+            event_id: occ.event_id.clone(),
+            issue_id: issue_id.as_bytes().to_vec(),
+            fingerprint_version: fp.version,
+            fingerprint_digest: fp.digest.to_vec(),
+            grouping_quality: fp.quality as u8,
+            grouping_generation: generation.clone(),
+            title: fp.title,
+            occurred_at_unix_nano: occ.occurred_at_unix_nano,
+            severity: 17, // TODO: extract from OCC1 decoded severity
+        });
+    }
+    let fold = db.fold_grouped(&rows).context("folding grouping results")?;
+    report.grouping.issues_created += fold.issues_created;
+    report.grouping.issues_updated += fold.issues_updated;
+    report.grouping.occurrences_grouped += fold.occurrences_grouped;
+    report.grouping.duplicate_skipped += fold.duplicate_skipped;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use object_store::{memory::InMemory, PutPayload};
@@ -1293,6 +1368,9 @@ mod tests {
         assert_eq!(first.occurrence_rows, 1);
         assert_eq!(first.publications_created, 1);
         assert_eq!(first.fold.inserted, 1);
+        // Grouping phase: the occurrence should be fingerprinted and create one issue.
+        assert_eq!(first.grouping.occurrences_grouped, 1);
+        assert_eq!(first.grouping.issues_created, 1);
 
         let keys =
             occurrence_keys(&first_date(&meta), block_id, DEFAULT_EXTRACTOR_GENERATION).unwrap();
@@ -1337,7 +1415,13 @@ mod tests {
         assert_eq!(second.fold.exact_duplicates, 2);
 
         let connection = Connection::open(&errors_path).unwrap();
-        for table in ["occurrences", "projection_commits", "source_coverage"] {
+        for table in [
+            "occurrences",
+            "projection_commits",
+            "source_coverage",
+            "issues",
+            "occurrence_issues",
+        ] {
             let count: u64 = connection
                 .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
                     row.get(0)
@@ -1345,6 +1429,11 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 1, "unexpected count in {table}");
         }
+        // Verify issue has the expected title from the exception type.
+        let title: String = connection
+            .query_row("SELECT title FROM issues", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(title, "DatabaseError");
         drop(connection);
 
         // More live blocks than max_blocks advance deterministically instead of making
@@ -1372,7 +1461,8 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(page_two.candidate_blocks, 3);
+        // candidate_blocks is the bounded page size, not the total catalog count.
+        assert_eq!(page_two.candidate_blocks, 1);
         assert_eq!(page_two.processed_blocks, 1);
         let page_three = reconcile_once(
             &catalog_path,
@@ -1384,7 +1474,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(page_three.candidate_blocks, 3);
+        assert_eq!(page_three.candidate_blocks, 1);
         assert_eq!(page_three.processed_blocks, 1);
 
         // The local database is disposable: committed projection objects alone rebuild

@@ -410,10 +410,12 @@ and `scripts/smoke-gateway.sh` (`server-stamped logs-v3 rows=40 expected=40`).
 
 ## Remaining work
 
-1. Replace `scry-errorsd`'s `Catalog::list_blocks()` source selection with an
-   ordered, cursor-filtered SQL query using `LIMIT`. The current call materializes
-   the entire live catalog before applying the reconciliation page bound, so memory
-   and startup work are not yet bounded by `max_blocks` at large catalog sizes.
+1. ~~Replace `scry-errorsd`'s `Catalog::list_blocks()` source selection with an
+   ordered, cursor-filtered SQL query using `LIMIT`.~~ **Done.** Added
+   `Catalog::list_source_blocks` with signal/schema/cursor/LIMIT pushed into SQL.
+   `reconcile_once` now fetches at most `max_blocks` entries per pass instead of
+   materializing the full catalog. `candidate_blocks` is now the bounded page
+   size, not the total catalog count.
 2. Deploy the coordinated producer/ingest/errors version through an explicitly
    authorized rollout. No deployment is claimed or authorized by this documentation.
 3. Add clustered Valkey lease/fencing and convergence orchestration; clustered

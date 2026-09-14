@@ -4670,6 +4670,7 @@ dependencies = [
  "futures",
  "object_store",
  "parquet",
+ "regex",
  "rusqlite",
  "scry-objstore",
  "scry-proto",

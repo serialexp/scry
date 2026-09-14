@@ -972,3 +972,99 @@ fn live_block_stats_matches_the_scans_it_replaces() {
         "status counts exactly what a query would read"
     );
 }
+
+/// `list_source_blocks` filters by signal, schema version, applies cursor
+/// pagination and LIMIT, and excludes deleted/superseded blocks.
+#[test]
+fn list_source_blocks_filters_paginates_and_excludes_non_live() {
+    let tmp = TempDir::new().unwrap();
+    let cat = Catalog::open(&tmp.path().join("cat.sqlite"), "test-bucket").unwrap();
+    let writer = Uuid::from_u128(0x11);
+
+    let logs_v3 = |uuid_val: u128, ts_min: u64| {
+        let mut m = meta(Uuid::from_u128(uuid_val), writer, ts_min, 10);
+        m.signal = "logs".into();
+        m.schema_version = 3;
+        m
+    };
+    let metrics_v1 = |uuid_val: u128, ts_min: u64| {
+        let mut m = meta(Uuid::from_u128(uuid_val), writer, ts_min, 10);
+        m.signal = "metrics".into();
+        m.schema_version = 1;
+        m
+    };
+    let logs_v2 = |uuid_val: u128, ts_min: u64| {
+        let mut m = meta(Uuid::from_u128(uuid_val), writer, ts_min, 10);
+        m.signal = "logs".into();
+        m.schema_version = 2;
+        m
+    };
+
+    // Insert a mix of signals and schema versions. Use ts_min values that
+    // map to different dates so ordering is exercised.
+    let day1: u64 = 1_700_000_000_000_000_000; // 2023-11-14
+    let day2: u64 = 1_700_100_000_000_000_000; // 2023-11-16
+
+    // 3 logs-v3 blocks across 2 dates
+    let a = logs_v3(0xA0, day1);
+    let b = logs_v3(0xB0, day1 + 1_000_000_000);
+    let c = logs_v3(0xC0, day2);
+    // 1 metrics block, 1 logs-v2 block — should never appear
+    let m = metrics_v1(0xD0, day1);
+    let old = logs_v2(0xE0, day1);
+
+    for block in [&a, &b, &c, &m, &old] {
+        cat.insert_block(block).unwrap();
+    }
+
+    // Unfiltered: all 3 logs-v3 blocks returned, ordered by (date, uuid)
+    let all = cat.list_source_blocks("logs", 3, None, 100).unwrap();
+    assert_eq!(all.len(), 3);
+    assert_eq!(all[0].meta.uuid, a.uuid);
+    assert_eq!(all[1].meta.uuid, b.uuid);
+    assert_eq!(all[2].meta.uuid, c.uuid);
+
+    // LIMIT works
+    let page = cat.list_source_blocks("logs", 3, None, 2).unwrap();
+    assert_eq!(page.len(), 2);
+    assert_eq!(page[0].meta.uuid, a.uuid);
+    assert_eq!(page[1].meta.uuid, b.uuid);
+
+    // Cursor pagination: after the second block, only the third is returned
+    let cursor = format!("{}/{}", page[1].date, page[1].meta.uuid);
+    let next = cat
+        .list_source_blocks("logs", 3, Some(&cursor), 100)
+        .unwrap();
+    assert_eq!(next.len(), 1);
+    assert_eq!(next[0].meta.uuid, c.uuid);
+
+    // Cursor past the last entry: returns nothing (caller wraps)
+    let last_cursor = format!("{}/{}", next[0].date, next[0].meta.uuid);
+    let empty = cat
+        .list_source_blocks("logs", 3, Some(&last_cursor), 100)
+        .unwrap();
+    assert!(empty.is_empty());
+
+    // Empty cursor string behaves like None (starts from beginning)
+    let from_start = cat.list_source_blocks("logs", 3, Some(""), 100).unwrap();
+    assert_eq!(from_start.len(), 3);
+
+    // Superseded blocks are excluded
+    cat.stage_superseded(&[a.uuid], c.uuid, 0).unwrap();
+    let after_supersede = cat.list_source_blocks("logs", 3, None, 100).unwrap();
+    assert_eq!(after_supersede.len(), 2);
+    assert!(after_supersede.iter().all(|e| e.meta.uuid != a.uuid));
+
+    // Deleted blocks are excluded
+    let ts = day2 + 1_000_000_000;
+    cat.mark_deleted(&[b.uuid], ts, ts + 600_000_000_000)
+        .unwrap();
+    let after_delete = cat.list_source_blocks("logs", 3, None, 100).unwrap();
+    assert_eq!(after_delete.len(), 1);
+    assert_eq!(after_delete[0].meta.uuid, c.uuid);
+
+    // Different signal filter
+    let metrics = cat.list_source_blocks("metrics", 1, None, 100).unwrap();
+    assert_eq!(metrics.len(), 1);
+    assert_eq!(metrics[0].meta.uuid, m.uuid);
+}
