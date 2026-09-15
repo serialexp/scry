@@ -915,8 +915,12 @@ impl MetricsV2Appender for MetricsBlockBuilder {
     }
 
     fn descriptor(&mut self, descriptor: &MetricDescriptorV2) -> std::result::Result<(), String> {
+        // Skip duplicates rather than rejecting them. Older writers could emit
+        // the same descriptor ID twice in a single batch; WAL segments written
+        // by those versions must remain replayable. First-wins: the initial
+        // descriptor with this ID is authoritative.
         if self.descriptors.contains_key(&descriptor.id) {
-            return Err(format!("duplicate metric descriptor {}", descriptor.id));
+            return Ok(());
         }
         let encoded_len = descriptor
             .encode()
