@@ -5,10 +5,5 @@
 ### Features
 
 - establish the logs v2 reader contract
-
-## 0.22.0 (2026-09-05)
-
-### Features
-
-- stream structured points over live tail
+- add fingerprint v1 grouping and bounded catalog query
 
