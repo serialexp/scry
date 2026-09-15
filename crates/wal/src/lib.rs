@@ -415,10 +415,14 @@ impl Iterator for ReplayIter {
             }
             if let Err(e) = f.read_exact(&mut hdr[1..]) {
                 if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                    return Some(Err(anyhow::anyhow!(
-                        "WAL replay: segment {} has a truncated frame header",
-                        self.cur_seq
-                    )));
+                    // Torn tail: the process was killed mid-header write.
+                    // Skip the rest of this segment and continue to the next.
+                    tracing::warn!(
+                        seq = self.cur_seq,
+                        "WAL replay: torn tail (truncated header), skipping rest of segment"
+                    );
+                    self.cur_file = None;
+                    continue;
                 }
                 return Some(Err(anyhow::Error::from(e)));
             }
@@ -435,21 +439,27 @@ impl Iterator for ReplayIter {
             match f.read_exact(&mut buf) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    return Some(Err(anyhow::anyhow!(
-                        "WAL replay: segment {} has a truncated frame payload",
-                        self.cur_seq
-                    )));
+                    // Torn tail: the process was killed mid-payload write.
+                    // Skip the rest of this segment and continue to the next.
+                    tracing::warn!(
+                        seq = self.cur_seq,
+                        "WAL replay: torn tail (truncated payload), skipping rest of segment"
+                    );
+                    self.cur_file = None;
+                    continue;
                 }
                 Err(e) => return Some(Err(anyhow::Error::from(e))),
             }
             let crc_actual = crc32fast::hash(&buf);
             if crc_actual != crc_expected {
-                return Some(Err(anyhow::anyhow!(
-                    "WAL replay: segment {} CRC mismatch (expected {}, got {})",
-                    self.cur_seq,
-                    crc_expected,
-                    crc_actual
-                )));
+                // CRC mismatch on a complete frame is also a torn tail: the
+                // payload bytes were not fully flushed before the kill.
+                tracing::warn!(
+                    seq = self.cur_seq,
+                    "WAL replay: torn tail (CRC mismatch), skipping rest of segment"
+                );
+                self.cur_file = None;
+                continue;
             }
             return Some(Ok(buf));
         }

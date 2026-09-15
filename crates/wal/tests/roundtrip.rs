@@ -187,7 +187,7 @@ async fn append_rejects_payload_above_replay_limit_without_writing() {
 }
 
 #[tokio::test]
-async fn replay_fails_closed_on_torn_tail() {
+async fn replay_skips_torn_tail() {
     let tmp = TempDir::new().unwrap();
     {
         let mut w = Wal::open(cfg(&tmp, 1024 * 1024)).await.unwrap();
@@ -211,9 +211,11 @@ async fn replay_fails_closed_on_torn_tail() {
     }
     let w2 = Wal::open(cfg(&tmp, 1024 * 1024)).await.unwrap();
     let mut replay = w2.replay().unwrap();
+    // The good record from before the torn tail is still readable.
     assert_eq!(replay.next().unwrap().unwrap(), b"good-record");
-    let error = replay.next().unwrap().unwrap_err();
-    assert!(error.to_string().contains("truncated frame header"));
+    // The torn tail is skipped (the rest of the segment is abandoned)
+    // and replay ends because there are no further segments.
+    assert!(replay.next().is_none());
     assert!(
         seg0.exists(),
         "torn source segment must remain for recovery"
