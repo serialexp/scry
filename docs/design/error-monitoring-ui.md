@@ -1,18 +1,29 @@
 # Errors, issues, and alerts UI/API — Design
 
-Status: draft, not yet implemented
+Status: partial — issue list route and query-wire read implemented; detail, mutations, and alerts UI outstanding
 Owner: Bart
-Last updated: 2026-09-07
+Last updated: 2026-09-15
 
 ## Implementation status
 
 This document presents the backend contracts in the rest of the
 [Error monitoring suite](error-monitoring.md). It does not redefine their state.
+The issue list is now served over the query wire protocol and displayed in a
+browser `/errors` route. Issue detail, mutations, and the full alerts UI remain
+outstanding.
 
 ### Done
 
 - [x] **Frontend survey.** Solid routing/stores, Arrow query transport, inspector,
   browser/Tauri split, webui authentication, and inert Alerts route are mapped.
+- [x] **Phase 1a — issue list view.** `/errors` route added to the SolidJS app with
+  a table showing title, occurrence count, max severity badge, grouping quality,
+  and first/last seen timestamps. Store signals (`issueListStatus`, `issues`,
+  `issueListError`, `issueListUpdatedAt`) and `refreshIssues()` action poll via
+  `fetchIssueList()` over the query wire (`IssueListRequest` → `IssueListResponse`).
+  The webui relay passes frames unchanged. Queryd `--errors-db` opens `errors.sqlite`
+  read-only and serves from a `Mutex<ErrorsDb>`. Nav link placed between Alerts and
+  Fleet. Error state (ISSUES_UNAVAILABLE) handled gracefully.
 
 ### Outstanding
 
@@ -22,8 +33,10 @@ This document presents the backend contracts in the rest of the
   v1 or require identities/roles before mutation.
 - [ ] **Phase 0 — control API.** Add authenticated, CSRF-protected, bounded,
   revisioned proxies and typed clients for issues, artifacts, rules, and delivery.
-- [ ] **Phase 1 — Errors views.** Add issue list/detail, occurrence inspector,
-  grouping explanation, stack/source, trace jump, workflow, and deep links.
+- [ ] **Phase 1b — issue detail and workflow views.** Add issue detail page,
+  occurrence inspector, grouping explanation, stack/source display, trace links,
+  workflow actions (resolve/ignore/assign), and deep links. The issue list is
+  implemented; everything past the list remains.
 - [ ] **Phase 2 — Alerts views.** Replace the inert page with monitor/state/history,
   editor/test, silences, destinations, outbox, and delivery diagnostics.
 - [ ] **Phase 3 — parity and accessibility.** Implement browser/Tauri transport,

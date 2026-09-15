@@ -4665,6 +4665,7 @@ version = "0.22.2"
 name = "scry-errors"
 version = "0.22.2"
 dependencies = [
+ "anyhow",
  "arrow",
  "bytes",
  "futures",
@@ -4672,13 +4673,18 @@ dependencies = [
  "parquet",
  "regex",
  "rusqlite",
+ "scry-block",
+ "scry-catalog",
  "scry-objstore",
  "scry-proto",
+ "scry-storage-layout",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
  "unicode-normalization",
  "uuid",
 ]
@@ -4779,6 +4785,7 @@ dependencies = [
  "scry-cluster",
  "scry-compact",
  "scry-duration",
+ "scry-errors",
  "scry-objstore",
  "scry-resources",
  "scry-retention",

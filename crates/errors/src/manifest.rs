@@ -24,7 +24,7 @@ impl DeploymentManifest {
     }
 }
 
-pub(crate) fn validate_deployment_id(value: &str) -> Result<Uuid> {
+pub fn validate_deployment_id(value: &str) -> Result<Uuid> {
     let parsed = Uuid::parse_str(value).context("deployment ID must be a UUID")?;
     if parsed.is_nil() {
         bail!("deployment ID must not be the nil UUID");

@@ -299,6 +299,22 @@ pub struct Args {
     /// with `--catalog`. Accepts `ms`/`s`/`m`/`h`/`d` (bare number = seconds).
     #[arg(long, value_parser = parse_duration, default_value = "300s")]
     catalog_snapshot_interval: Duration,
+
+    // ── Error processing (D-074) ─────────────────────────────────
+    /// Path to the errors projection database. Enables error processing
+    /// (occurrence extraction, fingerprinting, issue grouping) as a
+    /// periodic maintenance task in `full` mode. The projection is
+    /// snapshotted to S3 alongside the catalog so queryd can restore it.
+    #[arg(long)]
+    errors_db: Option<PathBuf>,
+
+    /// Seconds between error processing passes (default 30).
+    #[arg(long, default_value_t = 30)]
+    errors_interval: u64,
+
+    /// Disable error processing even when `--errors-db` is set.
+    #[arg(long)]
+    no_errors: bool,
 }
 
 /// Instance role; see `--mode`.
@@ -797,6 +813,34 @@ pub async fn run(args: Args) -> Result<()> {
             }));
         }
 
+        // 0a. errors.sqlite snapshot producer — same pattern as catalog snapshot.
+        // Gated on --errors-db being set (and not --no-errors).
+        if let Some(ref errors_db_path) = args.errors_db {
+            if !args.no_errors && !args.catalog_snapshot_interval.is_zero() {
+                let store = store.clone();
+                let path = errors_db_path.clone();
+                let interval = args.catalog_snapshot_interval;
+                info!(
+                    interval_secs = interval.as_secs(),
+                    "errors snapshot producer enabled"
+                );
+                bg_tasks.push(tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(interval);
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    tick.tick().await;
+                    loop {
+                        tick.tick().await;
+                        match scry_errors::snapshot::save_errors_snapshot(&path, store.as_ref())
+                            .await
+                        {
+                            Ok(r) => info!(bytes = r.bytes, "errors snapshot uploaded"),
+                            Err(e) => warn!(error = %e, "errors snapshot failed"),
+                        }
+                    }
+                }));
+            }
+        }
+
         // 0b. catalog gauge: sample block count + per-level split on a timer so
         // the status page can report which way the catalog is *moving*, not
         // just how big it is. Reads through its own read-only connection, so
@@ -982,6 +1026,45 @@ pub async fn run(args: Args) -> Result<()> {
             let compact_interval = Duration::from_secs(args.compact_interval.max(1));
             let retention_interval = Duration::from_secs(args.retention_interval.max(1));
 
+            // Error processing config: resolve the deployment manifest from S3
+            // and build a ReconcileConfig. Errors are an optional maintenance
+            // task — failures here are non-fatal to the rest of maintenance.
+            let errors_config = if let Some(ref errors_db_path) = args.errors_db {
+                if !args.no_errors {
+                    match scry_errors::manifest::ensure_deployment_manifest(store.as_ref(), None)
+                        .await
+                    {
+                        Ok(manifest) => {
+                            let deployment_id = scry_errors::DeploymentId::parse(
+                                &manifest.deployment_id,
+                                "deployment_id",
+                            )
+                            .context("parsing deployment ID from manifest")?;
+                            info!(
+                                deployment_id = %manifest.deployment_id,
+                                errors_db = %errors_db_path.display(),
+                                interval_secs = args.errors_interval,
+                                "error processing enabled in maintenance loop"
+                            );
+                            Some((
+                                errors_db_path.clone(),
+                                deployment_id,
+                                scry_errors::engine::ReconcileConfig::default(),
+                                Duration::from_secs(args.errors_interval.max(1)),
+                            ))
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "deployment manifest unavailable; error processing disabled");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             match valkey.as_ref() {
                 Some(c) => {
                     if let Some(metrics) = stats_metrics.as_ref() {
@@ -992,6 +1075,7 @@ pub async fn run(args: Args) -> Result<()> {
                         provider,
                         store,
                         bucket,
+                        catalog_path.clone(),
                         catalog,
                         compact_cfg,
                         block_cfg,
@@ -1002,6 +1086,7 @@ pub async fn run(args: Args) -> Result<()> {
                         compact_interval,
                         retention_interval,
                         lease_ttl,
+                        errors_config.clone(),
                     )));
                 }
                 None if args.allow_unfenced_maintenance => {
@@ -1014,6 +1099,7 @@ pub async fn run(args: Args) -> Result<()> {
                         provider,
                         store,
                         bucket,
+                        catalog_path.clone(),
                         catalog,
                         compact_cfg,
                         block_cfg,
@@ -1024,6 +1110,7 @@ pub async fn run(args: Args) -> Result<()> {
                         compact_interval,
                         retention_interval,
                         lease_ttl,
+                        errors_config,
                     )));
                 }
                 None => info!(
@@ -1200,10 +1287,19 @@ fn update_compaction_resource_stats(stats: &CompactionResourceStats, resources: 
     );
 }
 
+/// Errors maintenance config: deployment ID, reconcile config, errors.sqlite path, interval.
+type ErrorsMaintenanceConfig = (
+    PathBuf,
+    scry_errors::DeploymentId,
+    scry_errors::engine::ReconcileConfig,
+    Duration,
+);
+
 async fn run_maintenance_loop<L: LeaseProvider>(
     provider: L,
     store: Arc<dyn ObjectStore>,
     bucket: String,
+    catalog_path: PathBuf,
     catalog: Arc<std::sync::Mutex<Catalog>>,
     compact_cfg: CompactConfig,
     block_cfg: BlockBuilderConfig,
@@ -1214,6 +1310,7 @@ async fn run_maintenance_loop<L: LeaseProvider>(
     compact_interval: Duration,
     retention_interval: Duration,
     lease_ttl: Duration,
+    errors_config: Option<ErrorsMaintenanceConfig>,
 ) {
     let noop = NoopSink;
     let compaction_progress = metrics
@@ -1224,8 +1321,19 @@ async fn run_maintenance_loop<L: LeaseProvider>(
     compact_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut retention_tick = tokio::time::interval(retention_interval);
     retention_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    // Errors processing ticker — only armed when errors_config is present.
+    let errors_active = errors_config.is_some();
+    let errors_interval = errors_config
+        .as_ref()
+        .map(|(_, _, _, i)| *i)
+        .unwrap_or(Duration::from_secs(30));
+    let mut errors_tick = tokio::time::interval(errors_interval);
+    errors_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     info!(
         retention_active,
+        errors_active,
         apply = retention_cfg.apply,
         "maintenance loop started"
     );
@@ -1318,6 +1426,38 @@ async fn run_maintenance_loop<L: LeaseProvider>(
                         record_retention_metrics(metrics.as_deref(), &r, started.elapsed());
                     }
                     Err(e) => warn!(error = %e, "retention pass failed"),
+                }
+            }
+            _ = errors_tick.tick(), if errors_active => {
+                // Safety: errors_active is true only when errors_config is Some.
+                let (errors_db_path, deployment_id, reconcile_config, _) =
+                    errors_config.as_ref().unwrap();
+                match scry_errors::engine::reconcile_once(
+                    scry_errors::engine::CatalogMode::Converged {
+                        catalog_path: &catalog_path,
+                        bucket: &bucket,
+                    },
+                    store.clone(),
+                    errors_db_path,
+                    *deployment_id,
+                    reconcile_config,
+                ).await {
+                    Ok(r) => {
+                        if r.processed_blocks > 0
+                            || r.grouping.occurrences_grouped > 0
+                            || r.grouping.issues_created > 0
+                        {
+                            info!(
+                                blocks = r.processed_blocks,
+                                occurrences = r.fold.inserted,
+                                grouped = r.grouping.occurrences_grouped,
+                                issues_created = r.grouping.issues_created,
+                                issues_updated = r.grouping.issues_updated,
+                                "errors pass completed"
+                            );
+                        }
+                    }
+                    Err(e) => warn!(error = %e, "errors pass failed"),
                 }
             }
         }

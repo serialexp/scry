@@ -10,7 +10,8 @@ use object_store::{path::Path as ObjectPath, GetOptions, ObjectStore, ObjectStor
 use parquet::arrow::{arrow_reader::ParquetRecordBatchReaderBuilder, ProjectionMask};
 use scry_block::block_path;
 use scry_catalog::{Catalog, CatalogEntry};
-use scry_errors::{
+
+use crate::{
     extract,
     fingerprint::fingerprint_v1,
     issue::derive_issue_id,
@@ -29,6 +30,25 @@ use scry_storage_layout::is_reserved_control_key;
 
 pub const DEFAULT_EXTRACTOR_GENERATION: &str = "occurrence-v1";
 pub const DEFAULT_GROUPING_GENERATION: &str = "fp-v1";
+
+/// Controls how the reconciliation engine accesses the block catalog.
+pub enum CatalogMode<'a> {
+    /// Standalone: open a read-write catalog at `catalog_path` and reconcile
+    /// its raw metadata from S3 before selecting source blocks. Used by the
+    /// standalone `scry errors` role which owns its own catalog.
+    Owned {
+        catalog_path: &'a Path,
+        bucket: &'a str,
+    },
+    /// Embedded in another role (e.g. `scry ingest`): the catalog is already
+    /// converged by the host's convergence loop. Open it read-only and skip
+    /// `reconcile_raw_meta_page`. The bucket identity is still needed for
+    /// source-block validation.
+    Converged {
+        catalog_path: &'a Path,
+        bucket: &'a str,
+    },
+}
 const OCCURRENCE_CURSOR_PARTITION: &str = "occurrence-commits-v1";
 const RAW_META_CURSOR_PARTITION: &str = "raw-logs-meta-v1";
 const MAX_COMMIT_BYTES: usize = 16 * 1024;
@@ -102,13 +122,15 @@ struct ExtractedRow {
 /// Processing is intentionally serial. This is the single-writer implementation and
 /// therefore has an explicit concurrency bound of one source block.
 pub async fn reconcile_once(
-    catalog_path: &Path,
-    bucket: &str,
+    catalog_mode: CatalogMode<'_>,
     store: Arc<dyn ObjectStore>,
     errors_db_path: &Path,
     deployment_id: DeploymentId,
     config: &ReconcileConfig,
 ) -> Result<EngineReport> {
+    let bucket = match &catalog_mode {
+        CatalogMode::Owned { bucket, .. } | CatalogMode::Converged { bucket, .. } => *bucket,
+    };
     validate_config(config)?;
     ensure!(
         !bucket.is_empty(),
@@ -124,18 +146,55 @@ pub async fn reconcile_once(
     // rebuilding the disposable SQLite projection.
     fold_occurrence_page(store.as_ref(), config, &mut db, &mut report).await?;
 
-    // This role owns a disposable catalog. Converge a bounded page from object-store
-    // truth before selecting source blocks so a fresh, lost, or stale catalog cannot
-    // hide committed raw logs. The shared catalog insertion path preserves compaction
-    // lineage and liveness semantics.
-    let catalog = Catalog::open(catalog_path, bucket)
-        .with_context(|| format!("opening owned source catalog {}", catalog_path.display()))?;
-    reconcile_raw_meta_page(store.as_ref(), config, &mut db, &catalog, &mut report).await?;
+    // In Owned mode, reconcile a bounded page of raw metadata from S3 into
+    // the catalog before selecting source blocks. reconcile_raw_meta_page
+    // opens and drops its own Catalog internally so no !Sync type lives
+    // across .await, keeping reconcile_once's future Send.
+    // In Converged mode (e.g. embedded in ingestd), the host's convergence
+    // loop already keeps the catalog current, so we skip this step.
+    if let CatalogMode::Owned {
+        catalog_path,
+        bucket,
+    } = &catalog_mode
+    {
+        reconcile_raw_meta_page(
+            store.as_ref(),
+            config,
+            &mut db,
+            catalog_path,
+            bucket,
+            &mut report,
+        )
+        .await?;
+    }
+
+    // Open the catalog for the source-block query phase. All queries are
+    // synchronous; the catalog is dropped before any .await in the
+    // block-processing loop.
+    let catalog = match &catalog_mode {
+        CatalogMode::Owned {
+            catalog_path,
+            bucket,
+        } => Catalog::open(catalog_path, *bucket)
+            .with_context(|| format!("opening owned source catalog {}", catalog_path.display()))?,
+        CatalogMode::Converged { catalog_path, .. } => Catalog::open_read_only(catalog_path)
+            .with_context(|| {
+                format!(
+                    "opening converged source catalog {}",
+                    catalog_path.display()
+                )
+            })?,
+    };
 
     // Bounded, cursor-filtered selection: the SQL query pushes signal, schema version,
     // ordering, cursor, and LIMIT into SQLite so memory and startup work are O(max_blocks)
     // rather than O(catalog). When the cursor passes the last entry the page is empty
     // and we wrap to the beginning.
+    //
+    // All catalog queries are resolved eagerly so the Catalog (which is !Send due to
+    // rusqlite) is dropped before any .await in the block-processing loop. This keeps
+    // the returned future Send when the caller needs to spawn it on a multi-threaded
+    // runtime.
     let cursor = db.reconcile_cursor("raw-logs")?;
     let after = cursor.as_ref().map(|c| c.highest_key.as_str());
     let mut candidates = catalog
@@ -157,12 +216,23 @@ pub async fn reconcile_once(
     // immutable object that cannot be processed is quarantined for this cycle; moving
     // the cursor prevents it from wedging later keys, while cyclic wrap makes it
     // retryable.
-    for entry in &candidates {
-        let terminal_is_consistent = match catalog.resolve_terminal(entry.meta.uuid)? {
-            scry_catalog::TerminalResolution::Unique(uuid) => uuid == entry.meta.uuid,
-            _ => false,
-        };
-        let result = if terminal_is_consistent {
+    //
+    // Pre-resolve all terminal checks while the catalog is still alive so we can
+    // drop it before the async processing loop.
+    let terminal_consistent: Vec<bool> = candidates
+        .iter()
+        .map(|entry| {
+            catalog
+                .resolve_terminal(entry.meta.uuid)
+                .map(|res| matches!(res, scry_catalog::TerminalResolution::Unique(uuid) if uuid == entry.meta.uuid))
+                .unwrap_or(false)
+        })
+        .collect();
+    // Drop the catalog so the future stays Send across the async loop below.
+    drop(catalog);
+
+    for (entry, &consistent) in candidates.iter().zip(&terminal_consistent) {
+        let result = if consistent {
             process_block(
                 entry,
                 store.clone(),
@@ -209,11 +279,16 @@ fn source_entry_key(entry: &CatalogEntry) -> String {
 /// logs sidecars. Restricting the listing to `logs/` avoids unrelated signals; the
 /// shared storage-layout classifier excludes control keys, and catalog insertion
 /// retains the established liveness and lineage semantics.
+///
+/// Split into two phases — async listing/fetch then sync catalog insertion — so
+/// no `&Catalog` (which is `!Sync`) is held across `.await` points, keeping the
+/// caller's future `Send`.
 async fn reconcile_raw_meta_page(
     store: &dyn ObjectStore,
     config: &ReconcileConfig,
     db: &mut ErrorsDb,
-    catalog: &Catalog,
+    catalog_path: &Path,
+    bucket: &str,
     report: &mut EngineReport,
 ) -> Result<()> {
     let prefix = ObjectPath::from("logs/");
@@ -228,11 +303,12 @@ async fn reconcile_raw_meta_page(
     };
     let max_list_objects = config.max_blocks.saturating_mul(RAW_OBJECTS_PER_BLOCK);
     let mut scanned = 0usize;
-    let mut inserted = 0usize;
+    // Phase 1 (async): list objects and fetch/validate metadata into owned structs.
+    let mut validated_metas: Vec<scry_block::BlockMeta> = Vec::new();
     let mut last_location = None;
     let mut exhausted = false;
 
-    while inserted < config.max_blocks && scanned < max_list_objects {
+    while validated_metas.len() < config.max_blocks && scanned < max_list_objects {
         let Some(item) = listing.next().await else {
             exhausted = true;
             break;
@@ -295,14 +371,29 @@ async fn reconcile_raw_meta_page(
             last_location = Some(object.location);
             continue;
         }
-        if catalog.insert_block(&meta).is_err() {
-            report.raw_meta_quarantined += 1;
-            tracing::warn!(path = %key, "quarantining invalid raw logs sidecar metadata");
-            last_location = Some(object.location);
-            continue;
-        }
-        inserted += 1;
+        validated_metas.push(meta);
         last_location = Some(object.location);
+    }
+
+    // Phase 2 (sync): open the catalog and insert validated metadata. The Catalog
+    // is created and dropped entirely within synchronous code — no .await while
+    // it's alive.
+    {
+        let catalog = Catalog::open(catalog_path, bucket).with_context(|| {
+            format!(
+                "opening owned source catalog {} for raw-meta insertion",
+                catalog_path.display()
+            )
+        })?;
+        for meta in &validated_metas {
+            if catalog.insert_block(meta).is_err() {
+                report.raw_meta_quarantined += 1;
+                tracing::warn!(
+                    block_uuid = %meta.uuid,
+                    "quarantining invalid raw logs sidecar metadata"
+                );
+            }
+        }
     }
 
     if let Some(last_location) = last_location {
@@ -460,7 +551,7 @@ async fn fold_occurrence_commit(
     Ok(())
 }
 
-pub(crate) fn validate_config(config: &ReconcileConfig) -> Result<()> {
+pub fn validate_config(config: &ReconcileConfig) -> Result<()> {
     ensure!(config.max_blocks > 0, "max_blocks must be nonzero");
     ensure!(
         config.max_source_rows > 0,
@@ -602,7 +693,7 @@ async fn process_block(
     )
     .await?;
     ensure!(
-        scry_errors::projection::OccurrenceCommit::new(
+        crate::projection::OccurrenceCommit::new(
             commit.source_log_block_uuid,
             commit.extractor_generation.clone(),
             commit.data_key.clone(),
@@ -1066,8 +1157,10 @@ mod tests {
         let catalog_path = fixture.directory.path().join("catalog.sqlite");
         let errors_path = fixture.directory.path().join("errors.sqlite");
         let first = reconcile_once(
-            &catalog_path,
-            "test-bucket",
+            CatalogMode::Owned {
+                catalog_path: &catalog_path,
+                bucket: "test-bucket",
+            },
             fixture.store.clone(),
             &errors_path,
             fixture.deployment_id,
@@ -1080,8 +1173,10 @@ mod tests {
         // sidecar is admitted and processed in the same pass after the poison key.
         assert_eq!(first.processed_blocks, 1);
         let second = reconcile_once(
-            &catalog_path,
-            "test-bucket",
+            CatalogMode::Owned {
+                catalog_path: &catalog_path,
+                bucket: "test-bucket",
+            },
             fixture.store.clone(),
             &errors_path,
             fixture.deployment_id,
@@ -1101,8 +1196,10 @@ mod tests {
         let mut retried_after_wrap = false;
         for _ in 0..8 {
             let report = reconcile_once(
-                &catalog_path,
-                "test-bucket",
+                CatalogMode::Owned {
+                    catalog_path: &catalog_path,
+                    bucket: "test-bucket",
+                },
                 fixture.store.clone(),
                 &errors_path,
                 fixture.deployment_id,
@@ -1151,8 +1248,10 @@ mod tests {
             ..Default::default()
         };
         let report = reconcile_once(
-            &catalog_path,
-            "test-bucket",
+            CatalogMode::Owned {
+                catalog_path: &catalog_path,
+                bucket: "test-bucket",
+            },
             fixture.store,
             &fixture.directory.path().join("errors.sqlite"),
             fixture.deployment_id,
@@ -1176,8 +1275,10 @@ mod tests {
         let catalog_path = fixture.directory.path().join("catalog.sqlite");
         let source_errors = fixture.directory.path().join("source.sqlite");
         reconcile_once(
-            &catalog_path,
-            "test-bucket",
+            CatalogMode::Owned {
+                catalog_path: &catalog_path,
+                bucket: "test-bucket",
+            },
             fixture.store.clone(),
             &source_errors,
             fixture.deployment_id,
@@ -1223,8 +1324,10 @@ mod tests {
         let mut inserted = 0usize;
         for _ in 0..8 {
             let report = reconcile_once(
-                &empty_catalog,
-                "test-bucket",
+                CatalogMode::Owned {
+                    catalog_path: &empty_catalog,
+                    bucket: "test-bucket",
+                },
                 fixture.store.clone(),
                 &rebuilt,
                 fixture.deployment_id,
@@ -1247,8 +1350,10 @@ mod tests {
         let mut retried_after_wrap = false;
         for _ in 0..8 {
             let report = reconcile_once(
-                &empty_catalog,
-                "test-bucket",
+                CatalogMode::Owned {
+                    catalog_path: &empty_catalog,
+                    bucket: "test-bucket",
+                },
                 fixture.store.clone(),
                 &rebuilt,
                 fixture.deployment_id,
@@ -1354,8 +1459,10 @@ mod tests {
         };
         let deployment_id = DeploymentId::parse(&deployment.to_string(), "deployment_id").unwrap();
         let first = reconcile_once(
-            &catalog_path,
-            "test-bucket",
+            CatalogMode::Owned {
+                catalog_path: &catalog_path,
+                bucket: "test-bucket",
+            },
             store.clone(),
             &errors_path,
             deployment_id,
@@ -1399,8 +1506,10 @@ mod tests {
         assert_eq!(rows[0].source_row_ordinal, 0);
 
         let second = reconcile_once(
-            &catalog_path,
-            "test-bucket",
+            CatalogMode::Owned {
+                catalog_path: &catalog_path,
+                bucket: "test-bucket",
+            },
             store.clone(),
             &errors_path,
             deployment_id,
@@ -1452,8 +1561,10 @@ mod tests {
         }
         drop(catalog);
         let page_two = reconcile_once(
-            &catalog_path,
-            "test-bucket",
+            CatalogMode::Owned {
+                catalog_path: &catalog_path,
+                bucket: "test-bucket",
+            },
             store.clone(),
             &errors_path,
             deployment_id,
@@ -1465,8 +1576,10 @@ mod tests {
         assert_eq!(page_two.candidate_blocks, 1);
         assert_eq!(page_two.processed_blocks, 1);
         let page_three = reconcile_once(
-            &catalog_path,
-            "test-bucket",
+            CatalogMode::Owned {
+                catalog_path: &catalog_path,
+                bucket: "test-bucket",
+            },
             store.clone(),
             &errors_path,
             deployment_id,
@@ -1490,8 +1603,10 @@ mod tests {
             store.delete(&key).await.unwrap();
         }
         let rebuilt = reconcile_once(
-            &missing_catalog,
-            "test-bucket",
+            CatalogMode::Owned {
+                catalog_path: &missing_catalog,
+                bucket: "test-bucket",
+            },
             store,
             &rebuilt_path,
             deployment_id,

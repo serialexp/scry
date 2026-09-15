@@ -398,9 +398,10 @@ pub struct Args {
     stats_log_interval: u64,
 
     // ── Error tracking (D-074) ───────────────────────────────────
-    /// Path to the errors SQLite database (read-only). When provided,
-    /// queryd serves `IssueListRequest` frames from this file. Typically
-    /// points at the same `errors.sqlite` that errorsd writes.
+    /// Local path for the errors projection database. When set, queryd
+    /// restores the errors snapshot from the bucket on cold boot (unless
+    /// `--no-snapshot-restore`) and serves `IssueListRequest` frames from
+    /// it. Typically set to an emptyDir path alongside the catalog.
     #[arg(long)]
     errors_db: Option<PathBuf>,
 }
@@ -796,10 +797,42 @@ pub async fn run(args: Args) -> Result<()> {
         }));
     }
 
+    // Restore errors.sqlite from the bucket snapshot on cold boot, following
+    // the same pattern as the catalog snapshot restore above.
+    if let Some(ref errors_path) = args.errors_db {
+        if !errors_path.exists() && !args.no_snapshot_restore {
+            match scry_errors::snapshot::restore_errors_snapshot(
+                errors_path,
+                store.as_ref(),
+                scry_errors::sqlite::ERRORS_SCHEMA_VERSION,
+            )
+            .await
+            {
+                Ok(scry_errors::snapshot::RestoreOutcome::Restored { issues }) => {
+                    info!(issues, "restored errors database from bucket snapshot");
+                }
+                Ok(scry_errors::snapshot::RestoreOutcome::NoSnapshot) => {
+                    info!("no errors snapshot in bucket; issues will be unavailable until an ingest writer produces one");
+                }
+                Ok(scry_errors::snapshot::RestoreOutcome::VersionMismatch { found, expected }) => {
+                    warn!(
+                        found,
+                        expected, "errors snapshot schema version mismatch; skipping restore"
+                    );
+                }
+                Err(e) => {
+                    warn!(error = %e, "errors snapshot restore failed");
+                }
+            }
+        }
+    }
+
     let errors_db = args
         .errors_db
+        .as_ref()
+        .filter(|p| p.exists())
         .map(|p| {
-            scry_errors::sqlite::ErrorsDb::open_read_only(&p)
+            scry_errors::sqlite::ErrorsDb::open_read_only(p)
                 .with_context(|| format!("opening errors database at {}", p.display()))
         })
         .transpose()?;

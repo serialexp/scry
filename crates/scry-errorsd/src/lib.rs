@@ -4,8 +4,7 @@
 //! into immutable occurrence objects and folds verified projections into rebuildable
 //! local SQLite.
 
-pub mod engine;
-mod manifest;
+pub use scry_errors::engine;
 mod singleton;
 mod status;
 
@@ -19,9 +18,9 @@ use tokio::sync::watch;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-pub use manifest::{
+pub use scry_errors::manifest::{
     ensure_deployment_manifest, read_deployment_manifest, require_deployment_manifest,
-    DeploymentManifest,
+    validate_deployment_id, DeploymentManifest,
 };
 pub use singleton::SingletonLock;
 
@@ -170,7 +169,7 @@ pub async fn prepare(args: &Args) -> Result<RuntimeFoundation> {
 
 fn validate_args(args: &Args) -> Result<()> {
     if let Some(deployment_id) = args.deployment_id.as_deref() {
-        manifest::validate_deployment_id(deployment_id)?;
+        validate_deployment_id(deployment_id)?;
     }
     if !(1..=86_400).contains(&args.reconcile_interval_secs) {
         bail!("reconcile_interval_secs must be between 1 and 86400")
@@ -227,8 +226,10 @@ pub async fn run(args: Args) -> Result<()> {
     engine::validate_config(&config)?;
     if args.command == Command::Reconcile {
         let report = engine::reconcile_once(
-            &args.catalog,
-            &foundation.bucket,
+            engine::CatalogMode::Owned {
+                catalog_path: &args.catalog,
+                bucket: &foundation.bucket,
+            },
             foundation.store.clone(),
             &foundation.errors_db,
             deployment_id,
@@ -276,8 +277,10 @@ pub async fn run(args: Args) -> Result<()> {
     let interval = Duration::from_secs(args.reconcile_interval_secs);
     run_reconcile_loop(interval, shutdown_rx, status, || {
         engine::reconcile_once(
-            &args.catalog,
-            &foundation.bucket,
+            engine::CatalogMode::Owned {
+                catalog_path: &args.catalog,
+                bucket: &foundation.bucket,
+            },
             foundation.store.clone(),
             &foundation.errors_db,
             deployment_id,

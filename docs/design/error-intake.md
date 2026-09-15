@@ -1,8 +1,8 @@
 # Error event contract and intake — Design
 
-Status: partial — D-074 occurrence foundation implemented; browser intake and producer guidance outstanding
+Status: partial — D-074 occurrence foundation implemented; bounded catalog query added; browser intake and producer guidance outstanding
 Owner: Bart
-Last updated: 2026-09-10
+Last updated: 2026-09-15
 
 ## Implementation status
 
@@ -37,6 +37,11 @@ outstanding; this implementation has not been deployed.
   deployment/app identity, immutable conditional occurrence commits, rebuildable
   deployment-bound `errors.sqlite`, bounded paging, and periodic single-writer
   `scry errors` reconciliation are implemented.
+- [x] **Bounded catalog query.** `Catalog::list_source_blocks()` replaced the
+  unbounded `list_blocks()` call in errorsd with a SQL-bounded, cursor-filtered,
+  signal/schema-specific query. Wrap-around pagination ensures eventual coverage.
+  Test covers signal filtering, schema_version filtering, cursor pagination,
+  LIMIT, and superseded/deleted exclusion.
 
 ### Outstanding
 

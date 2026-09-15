@@ -19,6 +19,7 @@ scry-duration        = { workspace = true }
 scry-block        = { workspace = true }
 scry-catalog      = { workspace = true }
 scry-cluster      = { workspace = true }
+scry-errors       = { workspace = true }
 scry-compact      = { workspace = true }
 scry-objstore     = { workspace = true }
 scry-resources    = { workspace = true }

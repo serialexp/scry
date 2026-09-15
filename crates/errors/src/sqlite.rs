@@ -522,7 +522,11 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
          INSERT OR IGNORE INTO schema_migrations(version, applied_at_unix)
              VALUES (3, unixepoch());
          COMMIT;",
-    )
+    )?;
+    // Stamp user_version so snapshot restore can version-check.
+    // PRAGMA writes cannot run inside a transaction.
+    conn.pragma_update(None, "user_version", ERRORS_SCHEMA_VERSION)?;
+    Ok(())
 }
 
 fn bind_deployment(conn: &mut Connection, expected: [u8; 16]) -> Result<(), SqliteError> {

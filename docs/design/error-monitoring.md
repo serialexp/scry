@@ -1,8 +1,8 @@
 # Error monitoring — Architecture
 
-Status: partial — D-074 occurrence foundation implemented; product layers outstanding
+Status: partial — occurrence foundation, fingerprint v1 grouping, and issue list UI implemented; not yet deployed
 Owner: Bart
-Last updated: 2026-09-10
+Last updated: 2026-09-15
 
 ## Implementation status
 
@@ -10,8 +10,12 @@ Tracking the gap between this design suite and the implementation tree. D-073
 accepts logs v2 and the `_scry/<subsystem>/` namespace. D-074's identity,
 pre-WAL scrubbing, server receipt stamping, occurrence projection, rebuildable
 `errors.sqlite`, and periodic single-writer `scry errors` foundation are implemented.
-They have not been deployed. Cluster orchestration and all product layers remain
-outstanding.
+Fingerprint v1 grouping (OCC1 decoder, message normalization, digest, quality
+levels), deterministic issue identity, issue/occurrence_issues SQLite tables with
+grouping reconciliation, and issue list visibility through the query wire protocol
+and a browser `/errors` route have landed. None of this has been deployed.
+Artifacts, symbolication, stack parsing, issue workflow, alert evaluation, and
+browser SDK remain outstanding.
 
 ### Done
 
@@ -34,6 +38,20 @@ outstanding.
   manifest/app identity, immutable conditional occurrence commits, deployment-bound
   rebuildable `errors.sqlite`, bounded commit/raw paging, and periodic exclusive
   single-writer `scry errors` reconciliation are implemented. This has not been deployed.
+- [x] **Phase 1a — fingerprint v1 grouping.** OCC1 binary decoder, regex-based
+  message normalization (UUIDs, hex, timestamps, IPs, floats, long numbers),
+  SHA-256 fingerprint digest, `GroupingQuality` levels (TypeAndMessage / TypeOnly /
+  Fallback), deterministic `IssueId` from domain-tagged deployment/app/fingerprint,
+  `issues` and `occurrence_issues` SQLite tables, `fold_grouped()` transactional
+  upsert, and `group_occurrence_page()` reconciliation phase in errorsd. Bounded
+  catalog query (`list_source_blocks`) replaced unbounded `list_blocks()`.
+- [x] **Phase 3a — issue list over query wire.** `IssueListRequest`/
+  `IssueListResponse` added to the query protocol schema, queryd `--errors-db`
+  opens `errors.sqlite` read-only, `QueryService` dispatches before admission
+  (same pattern as `FleetStatusRequest`), `QUERY_ERR_ISSUES_UNAVAILABLE` error
+  code, TypeScript `fetchIssueList()` client, SolidJS `/errors` route with issue
+  inbox table (title, count, severity, quality, first/last seen, polling refresh),
+  store signals, and nav link. The webui relay passes the new frames unchanged.
 
 ### Outstanding
 
@@ -41,12 +59,18 @@ outstanding.
   multi-instance convergence; clustered `scry errors` currently fails closed.
 - [ ] **Occurrence freshness and lifecycle.** Add accepted-record low-latency hints,
   snapshot bootstrap, and projection/orphan garbage collection.
-- [ ] **Phase 1 — artifacts and grouping.** Upload, index, symbolize, normalize,
-  fingerprint, and explain issue membership.
-- [ ] **Phase 2 — issue projection.** Reconcile occurrences into a rebuildable
-  index and add durable human workflow state.
-- [ ] **Phase 3 — control API and Errors UI.** Expose issue reads/mutations and
-  ship issue list/detail workflows in browser and Tauri.
+- [ ] **Phase 1b — artifacts and symbolication.** Upload, index, and symbolize
+  stacks; stack parsing for supported runtimes; explicit fingerprint overrides;
+  reprocessing after late artifacts. Fingerprint v1 is implemented but operates
+  without symbolication or parsed frames.
+- [ ] **Phase 2 — issue lifecycle and workflow.** Add durable immutable workflow
+  commands (resolve/ignore/assign), revision-checked mutations, issue facets,
+  regression detection, and issue-transition event stream. The rebuildable issue
+  index exists but carries no human workflow state.
+- [ ] **Phase 3b — issue detail and mutations UI.** Add issue detail view,
+  occurrence inspector, grouping explanation, stack/source display, trace links,
+  workflow actions, and CSRF-protected mutation proxies. The issue list is
+  implemented; detail, mutation, and deep-link views remain.
 - [ ] **Phase 4 — alert evaluation.** Persist and evaluate typed issue-transition
   and scalar threshold monitors under independent resource admission.
 - [ ] **Phase 5 — notification delivery.** Deliver durable intents through bounded,
@@ -186,11 +210,15 @@ The occurrence foundation implements two reusable domain crates with a thin role
 wrapper; later phases extend them and add the alert pair:
 
 - `scry-errors`: implemented occurrence identity/extraction, immutable projection,
-  conditional publication, collision quarantine, and SQLite fold; later artifact,
-  grouping, issue, and workflow domain behavior remains outstanding.
+  conditional publication, collision quarantine, SQLite fold, OCC1 binary decoder,
+  fingerprint v1 (normalization/digest/quality), deterministic issue identity,
+  issue/occurrence_issues tables, `fold_grouped`, and read-only `list_issues`;
+  later artifact, symbolication, stack parsing, issue workflow, and facet domain
+  behavior remains outstanding.
 - `scry-errorsd`: implemented `scry errors` manifest initialization, bounded periodic
-  single-writer reconciliation, and status; clustered leases and a private product
-  control endpoint remain outstanding.
+  single-writer reconciliation, grouping reconciliation phase (`group_occurrence_page`),
+  and status; clustered leases and a private product control endpoint remain
+  outstanding.
 - `scry-alert`: rule/state/outbox domain and evaluator/notifier engines.
 - `scry-alertd`: `scry alert`, schedules, queryd clients, leases, APIs, and status.
 

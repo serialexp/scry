@@ -6,12 +6,15 @@
 //! scrubbed semantic log content and logical identity, but no signal/source, block,
 //! row, receipt-time, or other physical provenance.
 
+pub mod engine;
 pub mod fingerprint;
 pub mod issue;
+pub mod manifest;
 pub mod occ1;
 pub mod projection;
 pub mod publication;
 pub mod quarantine;
+pub mod snapshot;
 pub mod sqlite;
 
 use scry_proto::{AnyValue, AnyValueRef, CanonicalLogRecord};

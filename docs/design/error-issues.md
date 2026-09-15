@@ -1,8 +1,8 @@
 # Error issue indexing and lifecycle — Design
 
-Status: partial — occurrence storage/index prerequisite implemented; grouping and issues outstanding
+Status: partial — issue tables and grouping reconciliation implemented; workflow and clustered operation outstanding
 Owner: Bart
-Last updated: 2026-09-10
+Last updated: 2026-09-15
 
 ## Implementation status
 
@@ -11,6 +11,10 @@ This document consumes the dedicated occurrence projection defined by
 [Error grouping](error-grouping.md). Alert consumers are defined in
 [Alert evaluation](alert-evaluation.md). D-074 places the occurrence projection,
 `errors.sqlite`, and `scry errors` in an earlier full slice than grouping/issues.
+The `issues` and `occurrence_issues` SQLite tables, transactional `fold_grouped()`
+upsert, `group_occurrence_page()` reconciliation, read-only `list_issues()`, and
+read-only query-wire serving are now implemented. Human workflow state, facets,
+regressions, and durable transitions remain outstanding.
 
 ### Done
 
@@ -21,6 +25,21 @@ This document consumes the dedicated occurrence projection defined by
   and folds them into a deployment-bound, independently rebuildable `errors.sqlite`.
   Discovery and raw-source processing are bounded and periodic in exclusive
   single-writer mode; extraction accepts only logs schema 3/raw-record v2.
+- [x] **Phase 0a — issue index tables.** `errors.sqlite` schema v3 adds `issues`
+  (keyed by `deployment_id, issue_id`, indexed on `last_seen_unix_nano`) and
+  `occurrence_issues` (keyed by `deployment_id, app_id, event_id, issue_id`).
+  `fold_grouped()` transactionally upserts issues (accumulating `occurrence_count`,
+  `last_seen`, `max_severity`) and inserts occurrence-issue links with
+  INSERT-OR-IGNORE idempotency. `ErrorsDb::open_read_only()` opens with
+  `SQLITE_OPEN_READ_ONLY` for queryd. `list_issues(limit)` returns `IssueSummary`
+  ordered by `last_seen DESC` with UUID-formatted IDs. Tests cover ordering,
+  limit, aggregates, idempotent duplicates, and read-only access.
+- [x] **Phase 0b — grouping reconciliation.** `group_occurrence_page()` in errorsd
+  reads ungrouped occurrences from SQLite, decodes OCC1, computes fingerprint v1,
+  derives issue IDs, and folds into issue tables. Called from `reconcile_once`
+  after occurrence processing. `GroupingReport` added to `EngineReport` and
+  `ErrorsStatus` (issues_created/updated, occurrences_grouped). Integration test
+  asserts end-to-end grouping from log block through issue creation.
 
 ### Outstanding
 
@@ -28,17 +47,17 @@ This document consumes the dedicated occurrence projection defined by
   and commutative-fold behavior.
 - [ ] **Decision — retention statistics.** Choose lifetime versus retained-window
   issue aggregates.
-- [ ] **Phase 0 — grouping projection format.** Consume the implemented occurrence
-  objects/index and publish deterministic per-occurrence
-  grouping generations with metadata-last and an independently versioned index.
-- [ ] **Phase 1 — issue lifecycle.** Fold occurrences and immutable workflow events
-  into issue summaries, regressions, facets, and audit history.
-- [ ] **Phase 2 — issue/grouping reconciliation.** Add clustered Valkey
+- [ ] **Phase 1 — issue lifecycle.** Add durable immutable workflow commands
+  (resolve/ignore/assign), revision-checked mutations, regression detection,
+  facets, and audit history. The rebuildable issue index and aggregates exist but
+  carry no human workflow state.
+- [ ] **Phase 2 — clustered issue/grouping reconciliation.** Add Valkey
   orchestration, hints, snapshots/GC, reprocessing generations, compaction locator
-  repair, and grouping/issue cold rebuild. The D-074 occurrence-only bounded cursors
-  and SQLite rebuild path are already implemented.
+  repair, and grouping/issue cold rebuild. Single-writer grouping reconciliation
+  and the D-074 bounded cursors are already implemented.
 - [ ] **Phase 3 — issue API.** Add paginated reads and revision-checked mutations
-  through the control plane.
+  through the control plane. Read-only issue list is served over the query wire;
+  mutations and detail queries remain.
 - [ ] **Phase 4 — verification.** Multi-instance, no-Valkey, retention, migration,
   collision, workflow conflict, and rebuild tests.
 
