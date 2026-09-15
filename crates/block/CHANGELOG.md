@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.23.1 (2026-09-15)
+
+### Bug Fixes
+
+- skip duplicate metric descriptors during WAL replay
+
 ## 0.23.0 (2026-09-15)
 
 ### Features
