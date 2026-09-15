@@ -23,6 +23,8 @@ import {
   type LabelValuesResponseOutput,
   type FleetStatusRequestInput,
   type FleetStatusResponseOutput,
+  type IssueListRequestInput,
+  type IssueListResponseOutput,
   type SchemaMsgOutput,
   type BatchMsgOutput,
   type ResponseSupersededOutput,
@@ -55,6 +57,7 @@ type TaggedFrame =
   | { type: "LabelNamesResponse"; value: LabelNamesResponseOutput }
   | { type: "LabelValuesResponse"; value: LabelValuesResponseOutput }
   | { type: "FleetStatusResponse"; value: FleetStatusResponseOutput }
+  | { type: "IssueListResponse"; value: IssueListResponseOutput }
   | { type: "StreamError"; value: StreamErrorOutput };
 
 /** High-level, ergonomic query description (the UI's vocabulary). */
@@ -501,6 +504,54 @@ export async function fetchFleetStatus(
       Array.isArray(parsed.data)
     ) {
       throw new Error("queryd returned an invalid fleet status document");
+    }
+    return parsed;
+  });
+}
+
+// ── Issue list ──────────────────────────────────────────────────────
+
+/** A single error tracking issue as returned by the errors database. */
+export interface Issue {
+  issue_id: string;
+  app_id: string;
+  title: string;
+  grouping_quality: number;
+  first_seen_unix_nano: number;
+  last_seen_unix_nano: number;
+  occurrence_count: number;
+  max_severity: number;
+  fingerprint_version: number;
+}
+
+/** Fetch tracked error issues from the selected queryd's errors database.
+ * The response is one terminal, non-Arrow frame. */
+export async function fetchIssueList(
+  transport: Transport,
+  addr: string,
+  limit = 100,
+): Promise<Issue[]> {
+  const value: IssueListRequestInput = { limit };
+  const frameInput = {
+    msg: { type: "IssueListRequest", value },
+  } as unknown as QueryFrameInput;
+  const requestFrame = frame(new QueryFrameEncoder().encode(frameInput));
+  const responseBytes = await transport.query(addr, requestFrame);
+  const msg = decodeMetaResponse(responseBytes);
+  if (msg.type === "StreamError") throw new QueryError(msg.value.code, msg.value.message);
+  if (msg.type !== "IssueListResponse") {
+    throw new Error(`expected IssueListResponse, got ${msg.type}`);
+  }
+
+  return msg.value.issues_json.map((json) => {
+    const parsed = JSON.parse(json) as Issue;
+    if (
+      !parsed ||
+      typeof parsed.issue_id !== "string" ||
+      typeof parsed.title !== "string" ||
+      typeof parsed.occurrence_count !== "number"
+    ) {
+      throw new Error("queryd returned an invalid issue document");
     }
     return parsed;
   });

@@ -10,7 +10,7 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use crate::projection::{occurrence_keys, OccurrenceCommit};
 use crate::quarantine::{collision_id, CollisionMirror};
 
-pub const ERRORS_SCHEMA_VERSION: u32 = 2;
+pub const ERRORS_SCHEMA_VERSION: u32 = 3;
 pub const DEFAULT_MAX_ROWS_PER_TRANSACTION: usize = 4_096;
 const DEPLOYMENT_METADATA_KEY: &str = "deployment_id";
 
@@ -102,6 +102,20 @@ pub struct GroupingRow {
     pub severity: i32,
 }
 
+/// An issue summary for API responses.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct IssueSummary {
+    pub issue_id: String,
+    pub app_id: String,
+    pub title: String,
+    pub grouping_quality: u8,
+    pub first_seen_unix_nano: u64,
+    pub last_seen_unix_nano: u64,
+    pub occurrence_count: u64,
+    pub max_severity: i32,
+    pub fingerprint_version: u16,
+}
+
 /// Report from a grouping fold pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GroupingReport {
@@ -124,6 +138,20 @@ impl ErrorsDb {
 
     pub fn open_in_memory(deployment_id: [u8; 16]) -> Result<Self, SqliteError> {
         Self::from_connection(Connection::open_in_memory()?, deployment_id)
+    }
+
+    /// Open an existing errors database **read-only**. Skips migration and
+    /// deployment binding since a read-only connection cannot write. WAL mode
+    /// allows concurrent readers alongside the single writer.
+    pub fn open_read_only(path: &Path) -> Result<Self, SqliteError> {
+        let flags =
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = Connection::open_with_flags(path, flags)?;
+        Ok(Self {
+            conn,
+            deployment_id: [0; 16],
+            max_rows_per_transaction: DEFAULT_MAX_ROWS_PER_TRANSACTION,
+        })
     }
 
     fn from_connection(mut conn: Connection, deployment_id: [u8; 16]) -> Result<Self, SqliteError> {
@@ -322,6 +350,55 @@ impl ErrorsDb {
         }
         tx.commit()?;
         Ok(report)
+    }
+
+    /// List issues ordered by `last_seen` descending, limited to `limit` rows.
+    /// Suitable for read-only connections.
+    pub fn list_issues(&self, limit: usize) -> Result<Vec<IssueSummary>, SqliteError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT issue_id, app_id, title, grouping_quality,
+                    first_seen_unix_nano, last_seen_unix_nano,
+                    occurrence_count, max_severity, fingerprint_version
+             FROM issues
+             ORDER BY last_seen_unix_nano DESC, issue_id
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            let issue_id: Vec<u8> = row.get(0)?;
+            let app_id: Vec<u8> = row.get(1)?;
+            Ok(IssueSummary {
+                issue_id: uuid::Uuid::from_slice(&issue_id)
+                    .map(|u| u.to_string())
+                    .unwrap_or_else(|_| issue_id.iter().map(|b| format!("{b:02x}")).collect()),
+                app_id: uuid::Uuid::from_slice(&app_id)
+                    .map(|u| u.to_string())
+                    .unwrap_or_else(|_| app_id.iter().map(|b| format!("{b:02x}")).collect()),
+                title: row.get(2)?,
+                grouping_quality: {
+                    let v: i64 = row.get(3)?;
+                    v as u8
+                },
+                first_seen_unix_nano: from_sql_i64(row.get(4)?),
+                last_seen_unix_nano: from_sql_i64(row.get(5)?),
+                occurrence_count: {
+                    let v: i64 = row.get(6)?;
+                    v as u64
+                },
+                max_severity: {
+                    let v: i64 = row.get(7)?;
+                    v as i32
+                },
+                fingerprint_version: {
+                    let v: i64 = row.get(8)?;
+                    v as u16
+                },
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 
     #[cfg(test)]
@@ -1068,5 +1145,92 @@ mod tests {
             .query_row("SELECT count(*) FROM occurrence_issues", [], |r| r.get(0))
             .unwrap();
         assert_eq!(oi_count, 3);
+    }
+
+    #[test]
+    fn list_issues_returns_issues_ordered_by_last_seen_desc() {
+        let mut db = memory_db();
+
+        // Insert two issues with different last_seen timestamps.
+        let early_issue = GroupingRow {
+            deployment_id: DEPLOYMENT.to_vec(),
+            app_id: vec![0x42; 16],
+            app_identity_sha256: vec![0x43; 32],
+            event_id: vec![0x01; 16],
+            issue_id: vec![0xA0; 16],
+            fingerprint_version: 1,
+            fingerprint_digest: vec![0xF0; 32],
+            grouping_quality: 0,
+            grouping_generation: "fp-v1".to_owned(),
+            title: "EarlyError".to_owned(),
+            occurred_at_unix_nano: 1_000,
+            severity: 10,
+        };
+        let late_issue = GroupingRow {
+            event_id: vec![0x02; 16],
+            issue_id: vec![0xB0; 16],
+            fingerprint_digest: vec![0xF1; 32],
+            title: "LateError".to_owned(),
+            occurred_at_unix_nano: 5_000,
+            severity: 20,
+            ..early_issue.clone()
+        };
+
+        db.fold_grouped(std::slice::from_ref(&early_issue)).unwrap();
+        db.fold_grouped(std::slice::from_ref(&late_issue)).unwrap();
+
+        let issues = db.list_issues(10).unwrap();
+        assert_eq!(issues.len(), 2);
+        // Most recent first.
+        assert_eq!(issues[0].title, "LateError");
+        assert_eq!(issues[0].occurrence_count, 1);
+        assert_eq!(issues[0].max_severity, 20);
+        assert_eq!(issues[0].last_seen_unix_nano, 5_000);
+        assert_eq!(issues[1].title, "EarlyError");
+        assert_eq!(issues[1].occurrence_count, 1);
+
+        // Limit works.
+        let limited = db.list_issues(1).unwrap();
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].title, "LateError");
+    }
+
+    #[test]
+    fn open_read_only_can_read_issues_written_by_primary() {
+        let path = temporary_db_path("readonly");
+        {
+            let mut db = ErrorsDb::open(&path, DEPLOYMENT).unwrap();
+            let row = GroupingRow {
+                deployment_id: DEPLOYMENT.to_vec(),
+                app_id: vec![0x42; 16],
+                app_identity_sha256: vec![0x43; 32],
+                event_id: vec![0x01; 16],
+                issue_id: vec![0xA0; 16],
+                fingerprint_version: 1,
+                fingerprint_digest: vec![0xF0; 32],
+                grouping_quality: 0,
+                grouping_generation: "fp-v1".to_owned(),
+                title: "ReadOnlyTest".to_owned(),
+                occurred_at_unix_nano: 3_000,
+                severity: 15,
+            };
+            db.fold_grouped(std::slice::from_ref(&row)).unwrap();
+        }
+
+        let ro = ErrorsDb::open_read_only(&path).unwrap();
+        let issues = ro.list_issues(10).unwrap();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].title, "ReadOnlyTest");
+        assert_eq!(issues[0].last_seen_unix_nano, 3_000);
+        assert_eq!(issues[0].max_severity, 15);
+        assert_eq!(issues[0].fingerprint_version, 1);
+
+        // Verify issue_id is UUID-formatted.
+        assert!(Uuid::parse_str(&issues[0].issue_id).is_ok());
+
+        std::fs::remove_file(&path).unwrap();
+        // WAL/SHM cleanup.
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 }

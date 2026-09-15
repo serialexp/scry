@@ -23,6 +23,7 @@
             { "type": "LabelNamesRequest",  "when": "value === 0x02" },
             { "type": "LabelValuesRequest", "when": "value === 0x03" },
             { "type": "FleetStatusRequest", "when": "value === 0x04" },
+            { "type": "IssueListRequest",  "when": "value === 0x05" },
             { "type": "SchemaMsg",          "when": "value === 0x10" },
             { "type": "BatchMsg",           "when": "value === 0x11" },
             { "type": "ResponseSuperseded", "when": "value === 0x12" },
@@ -31,6 +32,7 @@
             { "type": "LabelNamesResponse", "when": "value === 0x20" },
             { "type": "LabelValuesResponse","when": "value === 0x21" },
             { "type": "FleetStatusResponse","when": "value === 0x22" },
+            { "type": "IssueListResponse", "when": "value === 0x23" },
             { "type": "StreamError",        "when": "value === 0xF0" }
           ]
         }
@@ -123,6 +125,23 @@
       "sequence": [
         { "name": "tag", "type": "uint8", "const": 34 },
         { "name": "instances_json", "type": "array", "kind": "length_prefixed", "length_type": "uint32",
+          "items": { "type": "string", "kind": "length_prefixed", "length_type": "uint32", "encoding": "utf8" } }
+      ]
+    },
+
+    "IssueListRequest": {
+      "description": "Client → server. Requests error issues from the errors.sqlite projection. A daemon with a configured errors database replies with one IssueListResponse and closes; a daemon without one replies with QUERY_ERR_ISSUES_UNAVAILABLE.",
+      "sequence": [
+        { "name": "tag",   "type": "uint8", "const": 5 },
+        { "name": "limit", "type": "uint32" }
+      ]
+    },
+
+    "IssueListResponse": {
+      "description": "Server → client. One terminal response containing error issue summaries as JSON strings, ordered by last_seen descending. Records are canonical JSON so the protocol stays independent of the issue schema evolution.",
+      "sequence": [
+        { "name": "tag", "type": "uint8", "const": 35 },
+        { "name": "issues_json", "type": "array", "kind": "length_prefixed", "length_type": "uint32",
           "items": { "type": "string", "kind": "length_prefixed", "length_type": "uint32", "encoding": "utf8" } }
       ]
     },

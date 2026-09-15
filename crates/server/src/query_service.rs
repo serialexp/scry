@@ -51,19 +51,21 @@ use futures::StreamExt;
 use object_store::{path::Path as ObjPath, ObjectMeta, ObjectStore, ObjectStoreExt};
 use scry_block::BlockMeta;
 use scry_catalog::{Catalog, CatalogEntry, TerminalResolution};
+use scry_errors::sqlite::ErrorsDb;
 use scry_objstore::{BufPool, PoolStats};
 use scry_proto::{
     constants::{
         Signal, QUERY_CAP_ATTEMPT_SUPERSESSION, QUERY_ERR_BAD_REQUEST, QUERY_ERR_FLEET_UNAVAILABLE,
-        QUERY_ERR_INTERNAL, QUERY_ERR_LIVE_UNAVAILABLE, QUERY_ERR_PLAN, QUERY_ERR_RESOURCES,
-        QUERY_ERR_SQL_PARSE, QUERY_SUPERSEDED_REASON_RETIRED_BLOCK_DISAPPEARED,
+        QUERY_ERR_INTERNAL, QUERY_ERR_ISSUES_UNAVAILABLE, QUERY_ERR_LIVE_UNAVAILABLE,
+        QUERY_ERR_PLAN, QUERY_ERR_RESOURCES, QUERY_ERR_SQL_PARSE,
+        QUERY_SUPERSEDED_REASON_RETIRED_BLOCK_DISAPPEARED,
         QUERY_SUPERSEDED_REASON_SUPERSEDED_BLOCK_DISAPPEARED,
     },
     framing::{read_frame, write_frame, Framed, MAX_FRAME_BYTES},
-    BatchMsgInput, EndOfStreamInput, FleetStatusResponseInput, LabelNamesRequestOutput,
-    LabelNamesResponseInput, LabelValuesRequestOutput, LabelValuesResponseInput, LiveNodeTiming,
-    QueryFrame, QueryFrameMsg, QueryStatsInput, ResponseSupersededInput, SchemaMsgInput,
-    StreamErrorInput,
+    BatchMsgInput, EndOfStreamInput, FleetStatusResponseInput, IssueListRequestOutput,
+    IssueListResponseInput, LabelNamesRequestOutput, LabelNamesResponseInput,
+    LabelValuesRequestOutput, LabelValuesResponseInput, LiveNodeTiming, QueryFrame, QueryFrameMsg,
+    QueryStatsInput, ResponseSupersededInput, SchemaMsgInput, StreamErrorInput,
 };
 use scry_query::{
     collect_label_names, collect_label_values, hash128, list_metrics_candidates,
@@ -318,6 +320,10 @@ pub struct QueryService {
     /// server-level trait so this crate has no direct Valkey dependency. `None`
     /// deliberately means "fleet unavailable", not a one-instance fallback.
     fleet: Option<Arc<dyn crate::stats::FleetSource>>,
+    /// Read-only handle to the errors SQLite database for serving
+    /// `IssueListRequest`. `None` when `--errors-db` is not configured.
+    /// Wrapped in `Mutex` because `rusqlite::Connection` is `!Send`.
+    errors_db: Option<Mutex<ErrorsDb>>,
     /// Identifier stamped into every `QueryStats` frame so a client can tell
     /// *which* daemon produced a breakdown. Empty unless the daemon sets one
     /// (`scry query` passes its ephemeral instance uuid — the same id it uses
@@ -374,6 +380,7 @@ impl QueryService {
             live_discovery: None,
             metrics: None,
             fleet: None,
+            errors_db: None,
             default_query_window_nanos: scry_query::DEFAULT_QUERY_WINDOW_SECS * 1_000_000_000,
             memory_guard: None,
             live_fetch_limits: LiveFetchLimits::default(),
@@ -471,6 +478,12 @@ impl QueryService {
     /// `QUERY_ERR_FLEET_UNAVAILABLE` rather than an incomplete local view.
     pub fn with_fleet_source(mut self, fleet: Option<Arc<dyn crate::stats::FleetSource>>) -> Self {
         self.fleet = fleet;
+        self
+    }
+
+    /// Attach a read-only errors database for serving `IssueListRequest`.
+    pub fn with_errors_db(mut self, db: Option<ErrorsDb>) -> Self {
+        self.errors_db = db.map(Mutex::new);
         self
     }
 
@@ -734,6 +747,9 @@ impl QueryService {
             QueryFrameMsg::FleetStatusRequest(_) => {
                 return self.handle_fleet_status(&mut wr, peer).await;
             }
+            QueryFrameMsg::IssueListRequest(req) => {
+                return self.handle_issue_list(req, &mut wr, peer).await;
+            }
             QueryFrameMsg::QueryRequest(q) => q,
             other => {
                 let name = match other {
@@ -745,11 +761,13 @@ impl QueryService {
                     QueryFrameMsg::LabelNamesResponse(_) => "LabelNamesResponse",
                     QueryFrameMsg::LabelValuesResponse(_) => "LabelValuesResponse",
                     QueryFrameMsg::FleetStatusResponse(_) => "FleetStatusResponse",
+                    QueryFrameMsg::IssueListResponse(_) => "IssueListResponse",
                     QueryFrameMsg::StreamError(_) => "StreamError",
                     QueryFrameMsg::QueryRequest(_)
                     | QueryFrameMsg::LabelNamesRequest(_)
                     | QueryFrameMsg::LabelValuesRequest(_)
-                    | QueryFrameMsg::FleetStatusRequest(_) => unreachable!(),
+                    | QueryFrameMsg::FleetStatusRequest(_)
+                    | QueryFrameMsg::IssueListRequest(_) => unreachable!(),
                 };
                 let _ = emit_stream_error(
                     &mut wr,
@@ -1772,6 +1790,76 @@ impl QueryService {
         };
         if let Err(e) = write_frame(wr, &frame).await {
             warn!(%peer, error = %e, "writing FleetStatusResponse");
+        }
+        let _ = wr.flush().await;
+        Ok(())
+    }
+
+    /// `IssueListRequest` → one `IssueListResponse`. Reads from the local
+    /// errors SQLite database (opened read-only). Returns
+    /// `QUERY_ERR_ISSUES_UNAVAILABLE` when no `--errors-db` was configured.
+    async fn handle_issue_list<W>(
+        &self,
+        req: IssueListRequestOutput,
+        wr: &mut BufWriter<W>,
+        peer: SocketAddr,
+    ) -> Result<()>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        let Some(db) = &self.errors_db else {
+            let _ = emit_stream_error(
+                wr,
+                QUERY_ERR_ISSUES_UNAVAILABLE,
+                "issues unavailable: queryd was not started with --errors-db",
+            )
+            .await;
+            let _ = wr.flush().await;
+            return Ok(());
+        };
+
+        let limit = if req.limit == 0 {
+            100
+        } else {
+            req.limit as usize
+        };
+
+        // Do all synchronous SQLite + serde work under the lock, then drop
+        // the guard before any async I/O.
+        let issues_json = {
+            let db = db.lock().unwrap();
+            match db.list_issues(limit) {
+                Ok(issues) => {
+                    let json: Vec<String> = issues
+                        .iter()
+                        .filter_map(|s| serde_json::to_string(s).ok())
+                        .collect();
+                    Ok(json)
+                }
+                Err(e) => Err(e),
+            }
+        };
+
+        let issues_json = match issues_json {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(%peer, error = %e, "list_issues failed");
+                let _ = emit_stream_error(
+                    wr,
+                    QUERY_ERR_INTERNAL,
+                    format!("errors database query failed: {e}"),
+                )
+                .await;
+                let _ = wr.flush().await;
+                return Ok(());
+            }
+        };
+
+        let frame = QueryFrame {
+            msg: QueryFrameMsg::IssueListResponse(IssueListResponseInput { issues_json }.into()),
+        };
+        if let Err(e) = write_frame(wr, &frame).await {
+            warn!(%peer, error = %e, "writing IssueListResponse");
         }
         let _ = wr.flush().await;
         Ok(())

@@ -396,6 +396,13 @@ pub struct Args {
     /// always built now). See D-059.
     #[arg(long, default_value_t = 30)]
     stats_log_interval: u64,
+
+    // ── Error tracking (D-074) ───────────────────────────────────
+    /// Path to the errors SQLite database (read-only). When provided,
+    /// queryd serves `IssueListRequest` frames from this file. Typically
+    /// points at the same `errors.sqlite` that errorsd writes.
+    #[arg(long)]
+    errors_db: Option<PathBuf>,
 }
 
 /// Run the query daemon until SIGINT or SIGTERM.
@@ -789,6 +796,17 @@ pub async fn run(args: Args) -> Result<()> {
         }));
     }
 
+    let errors_db = args
+        .errors_db
+        .map(|p| {
+            scry_errors::sqlite::ErrorsDb::open_read_only(&p)
+                .with_context(|| format!("opening errors database at {}", p.display()))
+        })
+        .transpose()?;
+    if errors_db.is_some() {
+        info!("errors database opened (read-only) for IssueListRequest");
+    }
+
     let service = Arc::new(
         QueryService::new(
             catalog,
@@ -827,7 +845,8 @@ pub async fn run(args: Args) -> Result<()> {
             args.query_max_waiting,
             Duration::from_secs(args.query_queue_timeout),
         )
-        .with_memory_guard(memory_guard),
+        .with_memory_guard(memory_guard)
+        .with_errors_db(errors_db),
     );
 
     // D-069: shift the normal recent-window cost to readiness so the first

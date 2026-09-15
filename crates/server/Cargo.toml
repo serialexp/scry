@@ -21,6 +21,7 @@ rand              = { workspace = true }
 sha2              = "0.10"
 scry-block        = { workspace = true }
 scry-catalog      = { workspace = true }
+scry-errors       = { workspace = true }
 scry-match        = { workspace = true }
 scry-objstore     = { workspace = true }
 scry-proto        = { workspace = true }

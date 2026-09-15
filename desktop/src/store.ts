@@ -21,9 +21,11 @@ import {
   fetchLabelNames,
   fetchLabelValues,
   fetchFleetStatus,
+  fetchIssueList,
   type QuerySpec,
   type MetaScope,
   type FleetInstance,
+  type Issue,
   type QueryTiming,
 } from "./protocol/client";
 import { LiveUnavailableError } from "./protocol/transport";
@@ -389,6 +391,33 @@ export async function refreshFleet(): Promise<void> {
     if (err instanceof UnauthorizedError) setAuthed(false);
     setFleetError(err instanceof Error ? err.message : String(err));
     setFleetStatus("error");
+  }
+}
+
+// ── Error tracking issues ────────────────────────────────────────────
+
+export type IssueListStatus = "idle" | "loading" | "ready" | "error";
+const [issueListStatus, setIssueListStatus] = createSignal<IssueListStatus>("idle");
+const [issues, setIssues] = createSignal<Issue[]>([]);
+const [issueListError, setIssueListError] = createSignal<string | null>(null);
+const [issueListUpdatedAt, setIssueListUpdatedAt] = createSignal<number | null>(null);
+export { issueListStatus, issues, issueListError, issueListUpdatedAt };
+
+/** Refresh the issue list through the selected queryd. Safe to call from a
+ * timer: failures preserve the previous snapshot while exposing the error. */
+export async function refreshIssues(): Promise<void> {
+  setIssueListStatus("loading");
+  setIssueListError(null);
+  try {
+    const transport = await getTransport();
+    const result = await fetchIssueList(transport, inBrowser ? state.target : state.addr);
+    setIssues(result);
+    setIssueListUpdatedAt(Date.now());
+    setIssueListStatus("ready");
+  } catch (err) {
+    if (err instanceof UnauthorizedError) setAuthed(false);
+    setIssueListError(err instanceof Error ? err.message : String(err));
+    setIssueListStatus("error");
   }
 }
 

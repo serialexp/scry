@@ -5,8 +5,8 @@
 //! loading placeholder, then either the login form or the app. The desktop
 //! (Tauri) shell talks straight to the daemon and is always "authed".
 //!
-//! Once authed, the app is a `@solidjs/router` with four views — Explore,
-//! Dashboards, Alerts, Fleet — hosted under a shared shell (brand + nav +
+//! Once authed, the app is a `@solidjs/router` with five views — Explore,
+//! Dashboards, Alerts, Errors, Fleet — hosted under a shared shell (brand + nav +
 //! version + logout). The query path lives entirely in Explore; the other
 //! views are placeholders until their phases land.
 
@@ -18,6 +18,7 @@ import ConnectionPicker from "./components/ConnectionPicker";
 import Explore from "./views/Explore";
 import Dashboards from "./views/Dashboards";
 import Alerts from "./views/Alerts";
+import Errors from "./views/Errors";
 import Fleet from "./views/Fleet";
 import { inBrowser, authed, authChecked, checkSession, logout } from "./store";
 
@@ -39,6 +40,9 @@ const Shell: Component<{ children?: JSX.Element }> = (props) => {
           </A>
           <A href="/alerts" class="nav-link" activeClass="active">
             Alerts
+          </A>
+          <A href="/errors" class="nav-link" activeClass="active">
+            Errors
           </A>
           <A href="/fleet" class="nav-link" activeClass="active">
             Fleet
@@ -78,6 +82,7 @@ const App: Component = () => {
           <Route path="/explore" component={Explore} />
           <Route path="/dashboards" component={Dashboards} />
           <Route path="/alerts" component={Alerts} />
+          <Route path="/errors" component={Errors} />
           <Route path="/fleet" component={Fleet} />
           {/* Unknown paths land on Explore. */}
           <Route path="*" component={Explore} />

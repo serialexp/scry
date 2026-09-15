@@ -69,14 +69,15 @@ pub use streaming_logs_v2::{
 pub use generated_query::{
     BatchMsg, BatchMsgInput, BatchMsgOutput, EndOfStream, EndOfStreamInput, EndOfStreamOutput,
     FleetStatusRequest, FleetStatusRequestInput, FleetStatusRequestOutput, FleetStatusResponse,
-    FleetStatusResponseInput, FleetStatusResponseOutput, LabelNamesRequest, LabelNamesRequestInput,
-    LabelNamesRequestOutput, LabelNamesResponse, LabelNamesResponseInput, LabelNamesResponseOutput,
-    LabelValuesRequest, LabelValuesRequestInput, LabelValuesRequestOutput, LabelValuesResponse,
-    LabelValuesResponseInput, LabelValuesResponseOutput, LiveNodeTiming, Matcher, QueryFrame,
-    QueryFrameMsg, QueryRequest, QueryRequestInput, QueryRequestOutput, QueryStats,
-    QueryStatsInput, QueryStatsOutput, ResponseSuperseded, ResponseSupersededInput,
-    ResponseSupersededOutput, SchemaMsg, SchemaMsgInput, SchemaMsgOutput, StreamError,
-    StreamErrorInput, StreamErrorOutput,
+    FleetStatusResponseInput, FleetStatusResponseOutput, IssueListRequest, IssueListRequestInput,
+    IssueListRequestOutput, IssueListResponse, IssueListResponseInput, IssueListResponseOutput,
+    LabelNamesRequest, LabelNamesRequestInput, LabelNamesRequestOutput, LabelNamesResponse,
+    LabelNamesResponseInput, LabelNamesResponseOutput, LabelValuesRequest, LabelValuesRequestInput,
+    LabelValuesRequestOutput, LabelValuesResponse, LabelValuesResponseInput,
+    LabelValuesResponseOutput, LiveNodeTiming, Matcher, QueryFrame, QueryFrameMsg, QueryRequest,
+    QueryRequestInput, QueryRequestOutput, QueryStats, QueryStatsInput, QueryStatsOutput,
+    ResponseSuperseded, ResponseSupersededInput, ResponseSupersededOutput, SchemaMsg,
+    SchemaMsgInput, SchemaMsgOutput, StreamError, StreamErrorInput, StreamErrorOutput,
 };
 
 pub use logs_v2_stamp::{

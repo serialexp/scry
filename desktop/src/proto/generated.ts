@@ -23,11 +23,12 @@ export interface QueryFrameInput {
    * @remarks
    *
    * Discriminator: peek uint8
-   * Variants: 13
+   * Variants: 15
    * - QueryRequest (when value === 0x01)
    * - LabelNamesRequest (when value === 0x02)
    * - LabelValuesRequest (when value === 0x03)
    * - FleetStatusRequest (when value === 0x04)
+   * - IssueListRequest (when value === 0x05)
    * - SchemaMsg (when value === 0x10)
    * - BatchMsg (when value === 0x11)
    * - ResponseSuperseded (when value === 0x12)
@@ -36,9 +37,10 @@ export interface QueryFrameInput {
    * - LabelNamesResponse (when value === 0x20)
    * - LabelValuesResponse (when value === 0x21)
    * - FleetStatusResponse (when value === 0x22)
+   * - IssueListResponse (when value === 0x23)
    * - StreamError (when value === 0xF0)
    */
-  msg: { type: 'QueryRequest'; value: QueryRequestInput } | { type: 'LabelNamesRequest'; value: LabelNamesRequestInput } | { type: 'LabelValuesRequest'; value: LabelValuesRequestInput } | { type: 'FleetStatusRequest'; value: FleetStatusRequestInput } | { type: 'SchemaMsg'; value: SchemaMsgInput } | { type: 'BatchMsg'; value: BatchMsgInput } | { type: 'ResponseSuperseded'; value: ResponseSupersededInput } | { type: 'QueryStats'; value: QueryStatsInput } | { type: 'EndOfStream'; value: EndOfStreamInput } | { type: 'LabelNamesResponse'; value: LabelNamesResponseInput } | { type: 'LabelValuesResponse'; value: LabelValuesResponseInput } | { type: 'FleetStatusResponse'; value: FleetStatusResponseInput } | { type: 'StreamError'; value: StreamErrorInput };
+  msg: { type: 'QueryRequest'; value: QueryRequestInput } | { type: 'LabelNamesRequest'; value: LabelNamesRequestInput } | { type: 'LabelValuesRequest'; value: LabelValuesRequestInput } | { type: 'FleetStatusRequest'; value: FleetStatusRequestInput } | { type: 'IssueListRequest'; value: IssueListRequestInput } | { type: 'SchemaMsg'; value: SchemaMsgInput } | { type: 'BatchMsg'; value: BatchMsgInput } | { type: 'ResponseSuperseded'; value: ResponseSupersededInput } | { type: 'QueryStats'; value: QueryStatsInput } | { type: 'EndOfStream'; value: EndOfStreamInput } | { type: 'LabelNamesResponse'; value: LabelNamesResponseInput } | { type: 'LabelValuesResponse'; value: LabelValuesResponseInput } | { type: 'FleetStatusResponse'; value: FleetStatusResponseInput } | { type: 'IssueListResponse'; value: IssueListResponseInput } | { type: 'StreamError'; value: StreamErrorInput };
 }
 
 /**
@@ -52,11 +54,12 @@ export interface QueryFrameOutput {
    * @remarks
    *
    * Discriminator: peek uint8
-   * Variants: 13
+   * Variants: 15
    * - QueryRequest (when value === 0x01)
    * - LabelNamesRequest (when value === 0x02)
    * - LabelValuesRequest (when value === 0x03)
    * - FleetStatusRequest (when value === 0x04)
+   * - IssueListRequest (when value === 0x05)
    * - SchemaMsg (when value === 0x10)
    * - BatchMsg (when value === 0x11)
    * - ResponseSuperseded (when value === 0x12)
@@ -65,9 +68,10 @@ export interface QueryFrameOutput {
    * - LabelNamesResponse (when value === 0x20)
    * - LabelValuesResponse (when value === 0x21)
    * - FleetStatusResponse (when value === 0x22)
+   * - IssueListResponse (when value === 0x23)
    * - StreamError (when value === 0xF0)
    */
-  msg: { type: 'QueryRequest'; value: QueryRequestOutput } | { type: 'LabelNamesRequest'; value: LabelNamesRequestOutput } | { type: 'LabelValuesRequest'; value: LabelValuesRequestOutput } | { type: 'FleetStatusRequest'; value: FleetStatusRequestOutput } | { type: 'SchemaMsg'; value: SchemaMsgOutput } | { type: 'BatchMsg'; value: BatchMsgOutput } | { type: 'ResponseSuperseded'; value: ResponseSupersededOutput } | { type: 'QueryStats'; value: QueryStatsOutput } | { type: 'EndOfStream'; value: EndOfStreamOutput } | { type: 'LabelNamesResponse'; value: LabelNamesResponseOutput } | { type: 'LabelValuesResponse'; value: LabelValuesResponseOutput } | { type: 'FleetStatusResponse'; value: FleetStatusResponseOutput } | { type: 'StreamError'; value: StreamErrorOutput };
+  msg: { type: 'QueryRequest'; value: QueryRequestOutput } | { type: 'LabelNamesRequest'; value: LabelNamesRequestOutput } | { type: 'LabelValuesRequest'; value: LabelValuesRequestOutput } | { type: 'FleetStatusRequest'; value: FleetStatusRequestOutput } | { type: 'IssueListRequest'; value: IssueListRequestOutput } | { type: 'SchemaMsg'; value: SchemaMsgOutput } | { type: 'BatchMsg'; value: BatchMsgOutput } | { type: 'ResponseSuperseded'; value: ResponseSupersededOutput } | { type: 'QueryStats'; value: QueryStatsOutput } | { type: 'EndOfStream'; value: EndOfStreamOutput } | { type: 'LabelNamesResponse'; value: LabelNamesResponseOutput } | { type: 'LabelValuesResponse'; value: LabelValuesResponseOutput } | { type: 'FleetStatusResponse'; value: FleetStatusResponseOutput } | { type: 'IssueListResponse'; value: IssueListResponseOutput } | { type: 'StreamError'; value: StreamErrorOutput };
 }
 
 export type QueryFrame = QueryFrameOutput;
@@ -80,6 +84,7 @@ export const enum QueryFrameMsgVariant {
   LabelNamesRequest = 'LabelNamesRequest',
   LabelValuesRequest = 'LabelValuesRequest',
   FleetStatusRequest = 'FleetStatusRequest',
+  IssueListRequest = 'IssueListRequest',
   SchemaMsg = 'SchemaMsg',
   BatchMsg = 'BatchMsg',
   ResponseSuperseded = 'ResponseSuperseded',
@@ -88,6 +93,7 @@ export const enum QueryFrameMsgVariant {
   LabelNamesResponse = 'LabelNamesResponse',
   LabelValuesResponse = 'LabelValuesResponse',
   FleetStatusResponse = 'FleetStatusResponse',
+  IssueListResponse = 'IssueListResponse',
   StreamError = 'StreamError',
 }
 
@@ -125,6 +131,13 @@ export class QueryFrameEncoder extends BitStreamEncoder {
     }
     else if (value.msg.type === 'FleetStatusRequest') {
       const encoder_value = new FleetStatusRequestEncoder();
+      const encoded_value = encoder_value.encode(value.msg.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
+    }
+    else if (value.msg.type === 'IssueListRequest') {
+      const encoder_value = new IssueListRequestEncoder();
       const encoded_value = encoder_value.encode(value.msg.value);
       for (const byte of encoded_value) {
         this.writeUint8(byte);
@@ -186,6 +199,13 @@ export class QueryFrameEncoder extends BitStreamEncoder {
         this.writeUint8(byte);
       }
     }
+    else if (value.msg.type === 'IssueListResponse') {
+      const encoder_value = new IssueListResponseEncoder();
+      const encoded_value = encoder_value.encode(value.msg.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
+    }
     else if (value.msg.type === 'StreamError') {
       const encoder_value = new StreamErrorEncoder();
       const encoded_value = encoder_value.encode(value.msg.value);
@@ -220,6 +240,10 @@ export class QueryFrameEncoder extends BitStreamEncoder {
       const _enc = new FleetStatusRequestEncoder();
       size += _enc.calculateSize(value.msg.value);
     }
+    else if (value.msg.type === 'IssueListRequest') {
+      const _enc = new IssueListRequestEncoder();
+      size += _enc.calculateSize(value.msg.value);
+    }
     else if (value.msg.type === 'SchemaMsg') {
       const _enc = new SchemaMsgEncoder();
       size += _enc.calculateSize(value.msg.value);
@@ -250,6 +274,10 @@ export class QueryFrameEncoder extends BitStreamEncoder {
     }
     else if (value.msg.type === 'FleetStatusResponse') {
       const _enc = new FleetStatusResponseEncoder();
+      size += _enc.calculateSize(value.msg.value);
+    }
+    else if (value.msg.type === 'IssueListResponse') {
+      const _enc = new IssueListResponseEncoder();
       size += _enc.calculateSize(value.msg.value);
     }
     else if (value.msg.type === 'StreamError') {
@@ -296,6 +324,12 @@ export class QueryFrameDecoder extends SeekableBitStreamDecoder {
       const decodedValue = decoder.decode();
       this.byteOffset += decoder.byteOffset;
       value.msg = { type: 'FleetStatusRequest', value: decodedValue };
+    }
+    else if (discriminator === 0x05) {
+      const decoder = new IssueListRequestDecoder(this.bytes.slice(this.byteOffset), value);
+      const decodedValue = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.msg = { type: 'IssueListRequest', value: decodedValue };
     }
     else if (discriminator === 0x10) {
       const decoder = new SchemaMsgDecoder(this.bytes.slice(this.byteOffset), value);
@@ -344,6 +378,12 @@ export class QueryFrameDecoder extends SeekableBitStreamDecoder {
       const decodedValue = decoder.decode();
       this.byteOffset += decoder.byteOffset;
       value.msg = { type: 'FleetStatusResponse', value: decodedValue };
+    }
+    else if (discriminator === 0x23) {
+      const decoder = new IssueListResponseDecoder(this.bytes.slice(this.byteOffset), value);
+      const decodedValue = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.msg = { type: 'IssueListResponse', value: decodedValue };
     }
     else if (discriminator === 0xF0) {
       const decoder = new StreamErrorDecoder(this.bytes.slice(this.byteOffset), value);
@@ -1441,6 +1481,181 @@ export class FleetStatusResponseDecoder extends SeekableBitStreamDecoder {
         throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
       }
       value.instances_json.push(instances_json__iter);
+    }
+    return value;
+  }
+}
+
+/**
+ * Client → server. Requests error issues from the errors.sqlite projection. A daemon with a configured errors database replies with one IssueListResponse and closes; a daemon without one replies with QUERY_ERR_ISSUES_UNAVAILABLE.
+ */
+export interface IssueListRequestInput {
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  limit: number;
+}
+
+/**
+ * Client → server. Requests error issues from the errors.sqlite projection. A daemon with a configured errors database replies with one IssueListResponse and closes; a daemon without one replies with QUERY_ERR_ISSUES_UNAVAILABLE.
+ */
+export interface IssueListRequestOutput {
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  tag: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  limit: number;
+}
+
+export type IssueListRequest = IssueListRequestOutput;
+
+export class IssueListRequestEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("msb_first");
+  }
+
+  encode(value: IssueListRequestInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint8(5);
+    this.writeUint32(value.limit, "big_endian");
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a IssueListRequest value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: IssueListRequest): number {
+    return 5; // tag (const) + limit
+  }
+}
+
+export class IssueListRequestDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "msb_first");
+  }
+
+  decode(): IssueListRequestOutput {
+    const value: any = {};
+
+    value.tag = this.readUint8();
+    value.limit = this.readUint32("big_endian");
+    return value;
+  }
+}
+
+/**
+ * Server → client. One terminal response containing error issue summaries as JSON strings, ordered by last_seen descending. Records are canonical JSON so the protocol stays independent of the issue schema evolution.
+ */
+export interface IssueListResponseInput {
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  issues_json: string[];
+}
+
+/**
+ * Server → client. One terminal response containing error issue summaries as JSON strings, ordered by last_seen descending. Records are canonical JSON so the protocol stays independent of the issue schema evolution.
+ */
+export interface IssueListResponseOutput {
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  tag: number;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  issues_json: string[];
+}
+
+export type IssueListResponse = IssueListResponseOutput;
+
+export class IssueListResponseEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("msb_first");
+  }
+
+  encode(value: IssueListResponseInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint8(35);
+    this.writeUint32(value.issues_json.length, "big_endian");
+    for (let value_issues_json__iter_index = 0; value_issues_json__iter_index < value.issues_json.length; value_issues_json__iter_index++) {
+      const value_issues_json__iter = value.issues_json[value_issues_json__iter_index];
+      const value_issues_json__iter_bytes = new TextEncoder().encode(value_issues_json__iter);
+      this.writeUint32(value_issues_json__iter_bytes.length, "big_endian");
+      for (const byte of value_issues_json__iter_bytes) {
+        this.writeUint8(byte);
+      }
+    }
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a IssueListResponse value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: IssueListResponse): number {
+    let size = 0;
+    size += 1; // tag (const)
+    // issues_json: array (kind: length_prefixed)
+    for (const item of value.issues_json) {
+      size += 0;
+    }
+    size += 4; // length prefix (uint32)
+    return size;
+  }
+}
+
+export class IssueListResponseDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "msb_first");
+  }
+
+  decode(): IssueListResponseOutput {
+    const value: any = {};
+
+    value.tag = this.readUint8();
+    value.issues_json = [];
+    const issues_json_length = this.readUint32("big_endian");
+    for (let i = 0; i < issues_json_length; i++) {
+      let issues_json__iter: any;
+      const issues_json__iter_length = this.readUint32("big_endian");
+      const issues_json__iter_bytes = this.readBytesSlice(issues_json__iter_length);
+      try {
+        issues_json__iter = new TextDecoder("utf-8", { fatal: true }).decode(issues_json__iter_bytes);
+      } catch (e) {
+        throw new BinSchemaError(ErrorCode.INVALID_UTF8, "Invalid UTF-8 in decoded string", { cause: e as Error });
+      }
+      value.issues_json.push(issues_json__iter);
     }
     return value;
   }

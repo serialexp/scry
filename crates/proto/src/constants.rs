@@ -208,6 +208,10 @@ pub const QUERY_ERR_LIVE_UNAVAILABLE: u16 = 0x0005;
 /// represent the deployment, so the request is refused explicitly.
 pub const QUERY_ERR_FLEET_UNAVAILABLE: u16 = 0x0006;
 
+/// The daemon does not have a configured errors database. Emitted by
+/// `IssueListRequest` when `--errors-db` was not supplied to queryd.
+pub const QUERY_ERR_ISSUES_UNAVAILABLE: u16 = 0x0007;
+
 /// Catch-all for any other server-side failure (catalog mutex
 /// poisoned, unexpected DataFusion error, postings sidecar fetch
 /// failure mid-query, …). Message field carries human-readable
@@ -224,6 +228,7 @@ pub fn query_err_name(code: u16) -> &'static str {
         QUERY_ERR_RESOURCES => "QUERY_ERR_RESOURCES",
         QUERY_ERR_LIVE_UNAVAILABLE => "QUERY_ERR_LIVE_UNAVAILABLE",
         QUERY_ERR_FLEET_UNAVAILABLE => "QUERY_ERR_FLEET_UNAVAILABLE",
+        QUERY_ERR_ISSUES_UNAVAILABLE => "QUERY_ERR_ISSUES_UNAVAILABLE",
         QUERY_ERR_INTERNAL => "QUERY_ERR_INTERNAL",
         _ => "QUERY_ERR_UNKNOWN",
     }
