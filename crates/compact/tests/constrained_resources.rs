@@ -106,7 +106,7 @@ fn sidecar_path(meta: &scry_block::BlockMeta, suffix: &str) -> ObjPath {
 }
 
 #[tokio::test]
-async fn cumulative_input_meta_budget_is_a_controlled_failure() {
+async fn large_input_meta_does_not_block_compaction() {
     let (store, catalog, _tmp) = fixture(["first", "second"]).await;
     let input = catalog.lock().unwrap().list_blocks().unwrap()[0].clone();
     let path = sidecar_path(&input.meta, "meta.json");
@@ -119,7 +119,10 @@ async fn cumulative_input_meta_budget_is_a_controlled_failure() {
         .unwrap()
         .to_vec();
     // JSON permits trailing whitespace. Keep the sidecar semantically valid while
-    // making the cumulative bytes exceed the permit-relative metadata share.
+    // making it large — input meta is unbounded because the admission estimate
+    // does not include meta.json sizes (it covers postings and bloom working
+    // sets). A production metrics meta.json routinely reaches 1–3 MiB due to
+    // all_fingerprints and series_types arrays.
     json.resize(json.len() + MIB as usize, b' ');
     store.put(&path, Bytes::from(json).into()).await.unwrap();
 
@@ -133,11 +136,9 @@ async fn cumulative_input_meta_budget_is_a_controlled_failure() {
         resources.clone(),
     )
     .await
-    .expect("oversized input metadata is a report outcome");
-    assert_eq!(report.merges, 0);
-    assert_eq!(report.resource_failed, 1);
-    assert_eq!(meta_count(&store).await, 2, "no output committed");
-    assert_eq!(catalog.lock().unwrap().list_blocks().unwrap().len(), 2);
+    .expect("large input metadata should not prevent compaction");
+    assert_eq!(report.merges, 1, "merge should succeed despite large meta");
+    assert_eq!(report.resource_failed, 0);
     assert_eq!(resources.telemetry().weighted_running_bytes, 0);
 }
 
