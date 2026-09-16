@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.23.3 (2026-09-16)
+
+### Bug Fixes
+
+- widen input meta budget and surface compaction failures
+
 ## 0.23.0 (2026-09-15)
 
 ### Features
