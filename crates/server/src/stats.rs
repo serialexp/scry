@@ -604,7 +604,37 @@ impl ServerMetrics {
             .sum();
         let cap = self.upload_concurrency;
 
-        if total_waiters > 0 {
+        // Compaction health: if resource failures dominate successful merges,
+        // the compactor is stuck and blocks will accumulate indefinitely.
+        let compaction_enabled = self.compaction_enabled.load(Ordering::Relaxed) != 0;
+        let compaction_merges = self.compaction_merges.load(Ordering::Relaxed);
+        let compaction_resource_failed = self.compaction_resource_failed.load(Ordering::Relaxed);
+        let compaction_partition_failed = self.compaction_partition_failed.load(Ordering::Relaxed);
+        let compaction_total_failed = compaction_resource_failed + compaction_partition_failed;
+
+        if compaction_enabled && compaction_total_failed > 0 && compaction_merges == 0 {
+            (
+                "compaction_stuck",
+                "error",
+                format!(
+                    "Compaction has not completed a single merge — every attempt failed \
+                     ({compaction_resource_failed} resource, {compaction_partition_failed} partition). \
+                     Blocks will accumulate until this is resolved."
+                ),
+            )
+        } else if compaction_enabled
+            && compaction_total_failed > 10
+            && compaction_total_failed > compaction_merges.saturating_mul(2)
+        {
+            (
+                "compaction_degraded",
+                "warn",
+                format!(
+                    "Compaction is partially failing — {compaction_total_failed} failures \
+                     vs {compaction_merges} successful merges. Some partitions may not compact."
+                ),
+            )
+        } else if total_waiters > 0 {
             let plural = if total_waiters == 1 { "" } else { "s" };
             (
                 "upload_bound",

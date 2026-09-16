@@ -103,17 +103,31 @@ struct SidecarBudgets {
 
 impl SidecarBudgets {
     fn for_permit(admitted_non_df_bytes: u64, fixed_bytes: u64) -> Self {
-        // These states can overlap near the end of a logs/metrics merge. Divide
-        // only the permit remainder after fixed writer/upload state, and make
-        // the weighted shares sum to one complete sidecar allowance.
-        let unit = admitted_non_df_bytes.saturating_sub(fixed_bytes) / 8;
+        // Divide only the permit remainder after fixed writer/upload state into
+        // weighted shares that sum to one complete sidecar allowance.
+        //
+        // Lifecycle: input_meta runs first and is released before the DataFusion
+        // scan. fingerprints, bloom, postings, and series_types live during the
+        // scan. output_meta runs last after everything else is released. Since
+        // input_meta and output_meta don't overlap with the scan-phase budgets,
+        // they share a pool that's separate from the scan-phase pool.
+        //
+        // Pool split: half for the scan phase (fingerprints + bloom + postings +
+        // series_types), half for the sequential meta phases (input_meta first,
+        // output_meta later — they never coexist).
+        let pool = admitted_non_df_bytes.saturating_sub(fixed_bytes);
+        let meta_pool = pool / 2;
+        let scan_pool = pool.saturating_sub(meta_pool);
+        // scan_pool divided: bloom and postings each get 2 shares,
+        // fingerprints and series_types each get 1 share → 6 shares total.
+        let scan_unit = scan_pool / 6;
         Self {
-            input_meta: unit,
-            fingerprints: unit,
-            bloom: unit.saturating_mul(2),
-            postings: unit.saturating_mul(2),
-            series_types: unit,
-            output_meta: unit,
+            input_meta: meta_pool,
+            fingerprints: scan_unit,
+            bloom: scan_unit.saturating_mul(2),
+            postings: scan_unit.saturating_mul(2),
+            series_types: scan_unit,
+            output_meta: meta_pool,
         }
     }
 }
