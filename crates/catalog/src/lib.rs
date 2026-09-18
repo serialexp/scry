@@ -222,6 +222,7 @@ impl Catalog {
         // back off a v1 catalog. The migration doesn't reference it, so
         // there's nothing to carry across.
         self.add_column_if_missing("blocks", "delete_eligible_at", "INTEGER")?;
+        self.add_column_if_missing("blocks", "meta_json_size_bytes", "INTEGER")?;
 
         // The DDL matches ARCHITECTURE.md § The catalog § Schema with
         // the `buckets` table omitted (one bucket in v0.1) and the
@@ -266,7 +267,8 @@ impl Catalog {
               -- losslessly; the authoritative high-water lives in
               -- wal_watermarks below).
               wal_seg_max         INTEGER,
-              wal_shard           INTEGER
+              wal_shard           INTEGER,
+              meta_json_size_bytes INTEGER
             );
 
             CREATE INDEX IF NOT EXISTS idx_blocks_query
@@ -484,7 +486,8 @@ impl Catalog {
               postings_size_bytes, has_postings,
               body_bloom_size_bytes, has_body_bloom,
               schema_version, fingerprint, superseded_by, superseded, deleted_at,
-              reap_output_uuid, reap_eligible_at, wal_seg_max, wal_shard
+              reap_output_uuid, reap_eligible_at, wal_seg_max, wal_shard,
+              meta_json_size_bytes
             ) VALUES (
               ?1, ?2, ?3, ?4, ?5, ?16,
               ?6, ?7, ?8, ?9,
@@ -497,7 +500,8 @@ impl Catalog {
                 WHERE l.ancestor_uuid = ?1
                   AND d.deleted_at IS NULL AND d.superseded = 0
               ) THEN 1 ELSE 0 END,
-              NULL, NULL, NULL, ?17, ?18
+              NULL, NULL, NULL, ?17, ?18,
+              ?19
             )
             "#,
                 params![
@@ -522,6 +526,7 @@ impl Catalog {
                     meta.level as i64,
                     meta.wal_seg_max.map(|v| v as i64),
                     meta.wal_shard.map(|v| v as i64),
+                    meta.meta_json_size_bytes.map(|v| v as i64),
                 ],
             )
             .context("INSERT OR IGNORE block")?;
@@ -613,7 +618,7 @@ impl Catalog {
                    schema_version, fingerprint,
                    has_postings, postings_size_bytes,
                    has_body_bloom, body_bloom_size_bytes,
-                   wal_seg_max, wal_shard
+                   wal_seg_max, wal_shard, meta_json_size_bytes
             FROM blocks
             WHERE deleted_at IS NULL AND superseded = 0
             ORDER BY date, ts_min, uuid
@@ -652,7 +657,7 @@ impl Catalog {
                    schema_version, fingerprint,
                    has_postings, postings_size_bytes,
                    has_body_bloom, body_bloom_size_bytes,
-                   wal_seg_max, wal_shard
+                   wal_seg_max, wal_shard, meta_json_size_bytes
             FROM blocks
             WHERE deleted_at IS NULL AND superseded = 0
               AND signal = ?1
@@ -682,7 +687,7 @@ impl Catalog {
                    schema_version, fingerprint,
                    has_postings, postings_size_bytes,
                    has_body_bloom, body_bloom_size_bytes,
-                   wal_seg_max, wal_shard
+                   wal_seg_max, wal_shard, meta_json_size_bytes
             FROM blocks
             WHERE uuid = ?1
             "#,
@@ -964,7 +969,7 @@ impl Catalog {
                    schema_version, fingerprint,
                    has_postings, postings_size_bytes,
                    has_body_bloom, body_bloom_size_bytes,
-                   wal_seg_max, wal_shard,
+                   wal_seg_max, wal_shard, meta_json_size_bytes,
                    reap_output_uuid, reap_eligible_at
             FROM blocks
             WHERE superseded = 1 AND reap_eligible_at IS NOT NULL
@@ -974,8 +979,8 @@ impl Catalog {
         )?;
         let rows = stmt.query_map(params![now_unix_nano.min(i64::MAX as u64) as i64], |row| {
             let entry = row_to_entry(row)?;
-            let output: String = row.get(18)?;
-            let eligible: i64 = row.get(19)?;
+            let output: String = row.get(19)?;
+            let eligible: i64 = row.get(20)?;
             let output_uuid = Uuid::parse_str(&output).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
                     18,
@@ -1133,7 +1138,7 @@ impl Catalog {
                    b.schema_version, b.fingerprint,
                    b.has_postings, b.postings_size_bytes,
                    b.has_body_bloom, b.body_bloom_size_bytes,
-                   b.wal_seg_max, b.wal_shard
+                   b.wal_seg_max, b.wal_shard, b.meta_json_size_bytes
             FROM blocks b
             WHERE b.signal = ?1
               AND b.deleted_at IS NULL AND b.superseded = 0
@@ -1344,7 +1349,7 @@ impl Catalog {
                    schema_version, fingerprint,
                    has_postings, postings_size_bytes,
                    has_body_bloom, body_bloom_size_bytes,
-                   wal_seg_max, wal_shard
+                   wal_seg_max, wal_shard, meta_json_size_bytes
             FROM blocks
             WHERE deleted_at IS NOT NULL AND delete_eligible_at IS NOT NULL
               AND delete_eligible_at <= ?1
@@ -1512,7 +1517,7 @@ impl Catalog {
                     continue;
                 }
             };
-            let meta: BlockMeta = match serde_json::from_slice(&bytes) {
+            let mut meta: BlockMeta = match serde_json::from_slice(&bytes) {
                 Ok(m) => m,
                 Err(e) => {
                     report.failed += 1;
@@ -1520,6 +1525,7 @@ impl Catalog {
                     continue;
                 }
             };
+            meta.meta_json_size_bytes = Some(bytes.len() as u64);
             match self.insert_block(&meta) {
                 Ok(true) => report.inserted += 1,
                 Ok(false) => report.already_present += 1,
@@ -1670,6 +1676,7 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<CatalogEntry> {
     let body_bloom_size_bytes: Option<i64> = row.get(15)?;
     let wal_seg_max: Option<i64> = row.get(16)?;
     let wal_shard: Option<i64> = row.get(17)?;
+    let meta_json_size_bytes: Option<i64> = row.get(18)?;
 
     let uuid = Uuid::parse_str(&uuid_str).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
@@ -1707,6 +1714,7 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<CatalogEntry> {
             all_fingerprints: None,
             has_body_bloom: has_body_bloom_raw != 0,
             body_bloom_size_bytes: body_bloom_size_bytes.map(|v| v as u64),
+            meta_json_size_bytes: meta_json_size_bytes.map(|v| v as u64),
             wal_seg_max: wal_seg_max.map(|v| v as u64),
             wal_shard: wal_shard.map(|v| v as u32),
             compacted_from: Vec::new(),

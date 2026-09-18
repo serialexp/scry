@@ -414,7 +414,7 @@ where
                 continue;
             }
         };
-        let meta: BlockMeta = match serde_json::from_slice(&bytes) {
+        let mut meta: BlockMeta = match serde_json::from_slice(&bytes) {
             Ok(m) => m,
             Err(e) => {
                 report.failed += 1;
@@ -423,6 +423,7 @@ where
                 continue;
             }
         };
+        meta.meta_json_size_bytes = Some(bytes.len() as u64);
 
         let inserted = catalog
             .with(|c| c.insert_block(&meta))

@@ -1134,7 +1134,7 @@ impl MetricsBlockBuilder {
         // lets `scry_query::postings::resolve_fingerprints` handle
         // empty-matcher queries without a metrics-specific branch.
         let all_fingerprints: Vec<u64> = series_types.iter().map(|(fp, _)| *fp).collect();
-        let meta = BlockMeta {
+        let mut meta = BlockMeta {
             uuid: block_uuid,
             signal: SIGNAL.to_string(),
             writer_id: self.writer_id,
@@ -1155,9 +1155,11 @@ impl MetricsBlockBuilder {
             body_bloom_size_bytes: None,
             wal_seg_max: self.cfg.wal_seg_max,
             wal_shard: self.cfg.wal_shard,
+            meta_json_size_bytes: None,
         };
         let meta_bytes =
             Bytes::from(serde_json::to_vec_pretty(&meta).context("serialising metrics BlockMeta")?);
+        meta.meta_json_size_bytes = Some(meta_bytes.len() as u64);
 
         // ── Upload order: main → postings → meta ───────────────────
         //

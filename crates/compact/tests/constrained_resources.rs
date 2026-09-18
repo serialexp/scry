@@ -39,7 +39,10 @@ fn constrained(timeout: Duration) -> Arc<CompactResources> {
     CompactResources::new(ResourceConfig {
         envelope_bytes: 128 * MIB,
         datafusion_memory_bytes: 64 * MIB,
-        non_datafusion_memory_bytes: 16 * MIB,
+        // 32 MiB covers fixed merge overhead (~14 MiB) plus the 4 MiB fallback
+        // meta estimate per input (2 inputs × 4 MiB = 8 MiB) with room for
+        // scan-phase sidecars.
+        non_datafusion_memory_bytes: 32 * MIB,
         spill_bytes: 64 * MIB,
         spill_page_cache_headroom_bytes: 8 * MIB,
         spill_dir: None,
@@ -119,12 +122,27 @@ async fn large_input_meta_does_not_block_compaction() {
         .unwrap()
         .to_vec();
     // JSON permits trailing whitespace. Keep the sidecar semantically valid while
-    // making it large — input meta is unbounded because the admission estimate
-    // does not include meta.json sizes (it covers postings and bloom working
-    // sets). A production metrics meta.json routinely reaches 1–3 MiB due to
-    // all_fingerprints and series_types arrays.
+    // making it large. The admission estimate now includes catalog-tracked
+    // `meta_json_size_bytes`, so the budget is correctly sized to accommodate
+    // realistically-large meta files. A production metrics meta.json routinely
+    // reaches 1–3 MiB due to all_fingerprints and series_types arrays.
+    //
+    // After inflating the on-disk sidecar we must also update the catalog entry's
+    // `meta_json_size_bytes` so the admission estimate matches reality — otherwise
+    // the budget is derived from the original small size and the fetch fails.
     json.resize(json.len() + MIB as usize, b' ');
+    let inflated_size = json.len() as u64;
     store.put(&path, Bytes::from(json).into()).await.unwrap();
+
+    // Re-insert the block with the updated meta_json_size_bytes so the admission
+    // estimate includes the inflated size.
+    {
+        let cat = catalog.lock().unwrap();
+        cat.delete_blocks(&[input.meta.uuid]).unwrap();
+        let mut updated_meta = input.meta.clone();
+        updated_meta.meta_json_size_bytes = Some(inflated_size);
+        cat.insert_block(&updated_meta).unwrap();
+    }
 
     let resources = constrained(Duration::from_secs(1));
     let report = compact_once(
@@ -206,7 +224,10 @@ async fn default_envelope_admits_a_real_merge_without_starvation() {
 async fn admission_deferral_does_not_abort_pass_and_next_pass_recovers() {
     let (store, catalog, _tmp) = fixture(["first", "second"]).await;
     let resources = constrained(Duration::from_millis(20));
-    let all = resources.admit(16 * MIB).await.unwrap();
+    // Hold enough capacity that the merge estimate (~14 MiB fixed + meta +
+    // postings) can't fit in whatever remains of the 32 MiB budget. 24 MiB
+    // leaves only 8 MiB free, which is less than fixed overhead alone.
+    let all = resources.admit(24 * MIB).await.unwrap();
 
     let deferred = compact_once(
         store.clone(),

@@ -311,7 +311,7 @@ impl DummyBlockBuilder {
             "meta.json",
         ));
 
-        let meta = BlockMeta {
+        let mut meta = BlockMeta {
             uuid: block_uuid,
             signal: SIGNAL.to_string(),
             writer_id: self.writer_id,
@@ -333,9 +333,11 @@ impl DummyBlockBuilder {
             body_bloom_size_bytes: None,
             wal_seg_max: self.cfg.wal_seg_max,
             wal_shard: self.cfg.wal_shard,
+            meta_json_size_bytes: None,
         };
         let meta_bytes =
             Bytes::from(serde_json::to_vec_pretty(&meta).context("serialising BlockMeta")?);
+        meta.meta_json_size_bytes = Some(meta_bytes.len() as u64);
 
         // Upload order: parquet first, meta.json last. The sidecar is
         // the catalog's "block exists" signal; if we crash between the

@@ -93,6 +93,7 @@ impl Drop for OutputCleanupGuard {
 
 #[derive(Clone, Copy)]
 struct SidecarBudgets {
+    input_meta: u64,
     fingerprints: u64,
     bloom: u64,
     postings: u64,
@@ -101,25 +102,30 @@ struct SidecarBudgets {
 }
 
 impl SidecarBudgets {
-    fn for_permit(admitted_non_df_bytes: u64, fixed_bytes: u64) -> Self {
+    fn for_permit(admitted_non_df_bytes: u64, fixed_bytes: u64, meta_estimate: u64) -> Self {
         // Divide only the permit remainder after fixed writer/upload state into
         // weighted shares that sum to one complete sidecar allowance.
         //
-        // input_meta is NOT budgeted here — it's fetched before the scan phase
-        // and not included in the admission estimate. See fetch_meta_unbounded.
+        // Lifecycle: input_meta runs first and is released before the DataFusion
+        // scan. fingerprints, bloom, postings, and series_types live during the
+        // scan. output_meta runs last after everything else is released.
         //
-        // output_meta runs last after everything else is released, so it can
-        // use the full pool. The scan-phase consumers (fingerprints, bloom,
-        // postings, series_types) overlap and share the pool: bloom and postings
-        // each get 2 shares, fingerprints and series_types each get 1 → 6 total.
-        let pool = admitted_non_df_bytes.saturating_sub(fixed_bytes);
-        let scan_unit = pool / 6;
+        // The admission estimate includes the catalog-tracked meta.json sizes
+        // (with a conservative fallback for pre-upgrade blocks), so the permit
+        // is large enough to cover realistic meta.json files.
+        let scan_pool = admitted_non_df_bytes
+            .saturating_sub(fixed_bytes)
+            .saturating_sub(meta_estimate);
+        // scan_pool divided: bloom and postings each get 2 shares,
+        // fingerprints and series_types each get 1 share → 6 shares total.
+        let scan_unit = scan_pool / 6;
         Self {
+            input_meta: meta_estimate,
             fingerprints: scan_unit,
             bloom: scan_unit.saturating_mul(2),
             postings: scan_unit.saturating_mul(2),
             series_types: scan_unit,
-            output_meta: pool,
+            output_meta: meta_estimate.max(scan_unit),
         }
     }
 }
@@ -379,9 +385,11 @@ async fn merge_blocks_inner(
     cleanup: &OutputCleanupGuard,
 ) -> Result<Option<BlockMeta>> {
     let spec = spec_for(signal)?;
+    let meta_estimate = super::engine::meta_json_estimate(inputs);
     let budgets = SidecarBudgets::for_permit(
         admitted_non_df_bytes,
         resources.config().merge_fixed_bytes(),
+        meta_estimate,
     );
 
     // Catalog entries intentionally omit sidecar-only fields. Fetch every
@@ -389,18 +397,16 @@ async fn merge_blocks_inner(
     // sidecar requested by the catalog entry, and reuse it for every metadata
     // concern below (series types and ancestry).
     //
-    // Input metas are NOT budgeted from the admission permit. The admit
-    // estimate (`estimate_non_datafusion_bytes`) accounts for postings and
-    // bloom working sets, not meta.json. Capping metas against an estimate
-    // that never included them makes every merge fail when the JSON sidecars
-    // are large (production metrics blocks carry all_fingerprints + series_types
-    // arrays that can reach 1–3 MiB per file). The JSON GET responses are
-    // transient — each is parsed into a compact BlockMeta and the text is
-    // released before the next fetch — so the peak is one response in flight
-    // plus the parsed Vec<BlockMeta> (much smaller than the JSON).
+    // Input metas are budgeted: the admission estimate includes per-input
+    // `meta_json_size_bytes` from the catalog (with a conservative fallback for
+    // pre-upgrade blocks that lack the field). The budget enforced here should
+    // therefore always fit unless a sidecar was rewritten larger between catalog
+    // read and fetch.
+    let meta_budget = budgets.input_meta;
+    let mut meta_cumulative = 0u64;
     let mut input_metas = Vec::with_capacity(inputs.len());
     for entry in inputs {
-        let fetched = fetch_meta_unbounded(&store, &entry.meta).await?;
+        let fetched = fetch_meta(&store, &entry.meta, &mut meta_cumulative, meta_budget).await?;
         anyhow::ensure!(
             fetched.uuid == entry.meta.uuid,
             "input meta UUID mismatch: requested {}, fetched {}",
@@ -707,7 +713,7 @@ async fn merge_blocks_inner(
         v
     });
 
-    let meta = BlockMeta {
+    let mut meta = BlockMeta {
         uuid: block_uuid,
         signal: signal.to_string(),
         writer_id,
@@ -734,8 +740,10 @@ async fn merge_blocks_inner(
         // regresses it. Same for the shard discriminator.
         wal_seg_max: None,
         wal_shard: None,
+        meta_json_size_bytes: None,
     };
     let meta_bytes = Bytes::from(serde_json::to_vec(&meta).context("serialise merged meta")?);
+    meta.meta_json_size_bytes = Some(meta_bytes.len() as u64);
     let meta_budget = budgets.output_meta;
     if meta_bytes.len() as u64 > meta_budget {
         return Err(crate::resource::ResourceError::SidecarLimit {
@@ -975,13 +983,20 @@ async fn cleanup_paths(store: &Arc<dyn ObjectStore>, paths: &[ObjPath]) {
     }
 }
 
-/// Fetch and parse a block's `meta.json` sidecar from the bucket.
+/// Fetch, parse, and budget-check a block's `meta.json` sidecar.
 ///
-/// Unbounded: meta.json sizes are not included in the admission estimate
-/// (which covers postings and bloom working sets), so capping them against
-/// the permit would reject every merge whose JSON sidecars are large —
-/// which on a production metrics deployment is all of them.
-async fn fetch_meta_unbounded(store: &Arc<dyn ObjectStore>, meta: &BlockMeta) -> Result<BlockMeta> {
+/// The admission estimate now includes per-input `meta_json_size_bytes` from
+/// the catalog, so the permit is sized to cover realistic meta.json files.
+/// This function enforces the budget that `SidecarBudgets::for_permit`
+/// computed, aborting the merge cleanly if an input is unexpectedly larger
+/// than what the catalog reported (e.g. a sidecar was rewritten between
+/// catalog read and fetch).
+async fn fetch_meta(
+    store: &Arc<dyn ObjectStore>,
+    meta: &BlockMeta,
+    cumulative: &mut u64,
+    budget: u64,
+) -> Result<BlockMeta> {
     let p = block_path(
         &meta.signal,
         meta.ts_min_unix_nano,
@@ -994,5 +1009,11 @@ async fn fetch_meta_unbounded(store: &Arc<dyn ObjectStore>, meta: &BlockMeta) ->
         .await
         .context("get input meta.json")?;
     let bytes = result.bytes().await.context("read input meta.json body")?;
-    serde_json::from_slice(&bytes).context("parse input meta.json")
+    *cumulative += bytes.len() as u64;
+    if *cumulative > budget {
+        return Err(sidecar_limit("input meta.json", budget));
+    }
+    let mut fetched: BlockMeta = serde_json::from_slice(&bytes).context("parse input meta.json")?;
+    fetched.meta_json_size_bytes = Some(bytes.len() as u64);
+    Ok(fetched)
 }

@@ -205,6 +205,17 @@ pub struct BlockMeta {
     #[serde(default)]
     pub body_bloom_size_bytes: Option<u64>,
 
+    /// On-disk size of the `meta.json` sidecar object itself. Recorded by the
+    /// catalog after serialization (block upload) or GET (bucket reconciliation)
+    /// so the compaction admission estimate can account for the cost of fetching
+    /// all input metas during a merge. `None` for pre-v0.24 sidecars whose
+    /// catalogs haven't been reconciled yet; the compactor uses a conservative
+    /// fallback for those. Not serialized into the sidecar JSON — the sidecar
+    /// can't know its own size — so it's always `None` when deserialized from
+    /// disk; the catalog column is the authoritative source.
+    #[serde(default)]
+    pub meta_json_size_bytes: Option<u64>,
+
     /// Highest WAL segment sequence number this block durably contains,
     /// for the WAL instance `(writer_id, signal, wal_shard)`. Set at
     /// upload time from the `SegmentId` the pipeline just sealed (the
@@ -260,6 +271,7 @@ mod tests {
             all_fingerprints: None,
             has_body_bloom: false,
             body_bloom_size_bytes: None,
+            meta_json_size_bytes: None,
             wal_seg_max: None,
             wal_shard: None,
         }

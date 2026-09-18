@@ -220,6 +220,7 @@ mod tests {
             all_fingerprints: None,
             has_body_bloom: false,
             body_bloom_size_bytes: None,
+            meta_json_size_bytes: None,
             wal_seg_max: Some(7),
             wal_shard: Some(2),
             compacted_from: Vec::new(),

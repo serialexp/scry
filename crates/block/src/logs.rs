@@ -841,7 +841,7 @@ impl LogsBlockBuilder {
         // ── Sidecar JSON ───────────────────────────────────────────
         let block_uuid = self.block_uuid.unwrap_or_else(Uuid::now_v7);
         let all_fingerprints: Vec<u64> = self.stream_dict.iter().map(|s| s.fingerprint).collect();
-        let meta = BlockMeta {
+        let mut meta = BlockMeta {
             uuid: block_uuid,
             signal: SIGNAL.to_string(),
             writer_id: self.writer_id,
@@ -867,9 +867,11 @@ impl LogsBlockBuilder {
             body_bloom_size_bytes: bloom_size,
             wal_seg_max: self.cfg.wal_seg_max,
             wal_shard: self.cfg.wal_shard,
+            meta_json_size_bytes: None,
         };
         let meta_bytes =
             Bytes::from(serde_json::to_vec_pretty(&meta).context("serialising logs BlockMeta")?);
+        meta.meta_json_size_bytes = Some(meta_bytes.len() as u64);
 
         // ── Upload order: main → postings → meta ───────────────────
         //

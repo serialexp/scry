@@ -56,6 +56,30 @@ use crate::resource::CompactResources;
 const BODY_BLOOM_WORKING_SET_MULTIPLIER: u64 = 160;
 const SIDECAR_DECODE_MULTIPLIER: u64 = 3;
 
+/// Conservative fallback per-input estimate for meta.json fetch + parse memory,
+/// used for pre-v0.24 catalog entries that don't yet have `meta_json_size_bytes`
+/// recorded. Production metrics blocks carry `all_fingerprints` and `series_types`
+/// arrays that make them 295 KiB to 2.9 MiB (measured Sep 2026). 4 MiB per input
+/// leaves headroom for growth until the catalog is reconciled and real sizes are
+/// available.
+pub(crate) const META_JSON_FALLBACK_PER_INPUT: u64 = 4 * 1024 * 1024;
+
+/// Sum the expected meta.json sizes for a set of compaction inputs.
+///
+/// Uses the catalog-tracked `meta_json_size_bytes` when available; falls back to
+/// [`META_JSON_FALLBACK_PER_INPUT`] for pre-upgrade entries that haven't been
+/// reconciled yet.
+pub(crate) fn meta_json_estimate(inputs: &[scry_catalog::CatalogEntry]) -> u64 {
+    inputs.iter().fold(0u64, |acc, entry| {
+        acc.saturating_add(
+            entry
+                .meta
+                .meta_json_size_bytes
+                .unwrap_or(META_JSON_FALLBACK_PER_INPUT),
+        )
+    })
+}
+
 fn estimate_non_datafusion_bytes(plan: &PlannedMerge, resources: &CompactResources) -> Result<u64> {
     let (postings, body_blooms) = plan
         .inputs
@@ -85,6 +109,7 @@ fn estimate_non_datafusion_bytes(plan: &PlannedMerge, resources: &CompactResourc
             budget_bytes: resources.config().non_datafusion_memory_bytes,
         })?;
     let fixed = resources.config().merge_fixed_bytes();
+    let meta_estimate = meta_json_estimate(&plan.inputs);
     postings
         .checked_mul(SIDECAR_DECODE_MULTIPLIER)
         .and_then(|bytes| {
@@ -93,6 +118,7 @@ fn estimate_non_datafusion_bytes(plan: &PlannedMerge, resources: &CompactResourc
                 .and_then(|bloom| bytes.checked_add(bloom))
         })
         .and_then(|bytes| bytes.checked_add(fixed))
+        .and_then(|bytes| bytes.checked_add(meta_estimate))
         .ok_or_else(|| {
             crate::resource::ResourceError::RequestTooLarge {
                 requested_bytes: u64::MAX,
@@ -484,6 +510,7 @@ mod tests {
             all_fingerprints: Some(vec![1]),
             has_body_bloom: true,
             body_bloom_size_bytes: None,
+            meta_json_size_bytes: None,
             wal_seg_max: None,
             wal_shard: None,
         };
