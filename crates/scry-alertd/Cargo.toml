@@ -1,0 +1,36 @@
+[package]
+name = "scry-alertd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Clustered scalar alert evaluator and private control service for scry."
+
+[dependencies]
+anyhow = { workspace = true }
+axum = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+fs2 = "0.4"
+futures = { workspace = true }
+object_store = { workspace = true }
+scry-alert = { workspace = true }
+scry-block = { workspace = true }
+scry-cluster = { workspace = true }
+scry-objstore = { workspace = true }
+scry-query = { workspace = true }
+scry-valkey = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+
+[dev-dependencies]
+reqwest = { workspace = true }
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+
+[lints]
+workspace = true

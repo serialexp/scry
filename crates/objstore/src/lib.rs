@@ -25,6 +25,7 @@
 //! on that contract; accepting but ignoring preconditions is not enough.
 
 pub mod conditional;
+pub mod manifest;
 mod pool;
 mod store;
 

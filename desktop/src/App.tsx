@@ -7,8 +7,7 @@
 //!
 //! Once authed, the app is a `@solidjs/router` with five views — Explore,
 //! Dashboards, Alerts, Errors, Fleet — hosted under a shared shell (brand + nav +
-//! version + logout). The query path lives entirely in Explore; the other
-//! views are placeholders until their phases land.
+//! version + logout).
 
 import { Show, onMount, type Component, type JSX } from "solid-js";
 import { HashRouter, Route, Navigate, A } from "@solidjs/router";

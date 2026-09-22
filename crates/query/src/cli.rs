@@ -33,8 +33,6 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use arrow::util::pretty::pretty_format_batches;
-use arrow_buffer::Buffer;
-use arrow_ipc::reader::StreamDecoder;
 use clap::Parser;
 use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::metrics::MetricValue;
@@ -45,15 +43,10 @@ use futures::StreamExt;
 use object_store::ObjectStore;
 use scry_catalog::Catalog;
 use scry_objstore::{open_with_pool_config, BufPool, BufPoolConfig, ObjStoreConfig};
-use scry_proto::{
-    constants::{query_err_name, Signal},
-    framing::{read_frame, write_frame},
-    QueryFrame, QueryFrameMsg,
-};
-use tokio::io::{BufReader as TokioBufReader, BufWriter as TokioBufWriter};
-use tokio::net::TcpStream;
+use scry_proto::constants::{query_err_name, Signal};
 
 use crate::{
+    client::QueryWireClient,
     logs::{register_logs_table, LOGS_TABLE_NAME},
     profiles::{register_profiles_table, PROFILES_TABLE_NAME},
     register_metrics_table,
@@ -631,14 +624,6 @@ async fn run_remote(
     // no amount of server-side instrumentation can see.
     let wall_start = std::time::Instant::now();
 
-    let sock = TcpStream::connect(host_port)
-        .await
-        .with_context(|| format!("connecting to {host_port}"))?;
-    let (r, w) = sock.into_split();
-    let mut r = TokioBufReader::new(r);
-    let mut w = TokioBufWriter::new(w);
-
-    // Send the request frame.
     let req = QueryRequest {
         signal: signal.0 as u8,
         query,
@@ -649,127 +634,16 @@ async fn run_remote(
         // history+live view (D-054) is driven via the probe / a live client.
         live: false,
     };
-    let request_frame = QueryFrame {
-        msg: QueryFrameMsg::QueryRequest(req.to_wire().into()),
-    };
-    write_frame(&mut w, &request_frame)
+    let response = QueryWireClient::new(host_port)
+        .query(req)
         .await
-        .context("writing QueryRequest frame")?;
-    tokio::io::AsyncWriteExt::flush(&mut w)
-        .await
-        .context("flushing QueryRequest frame")?;
-
-    // Drain the response stream. StreamDecoder is fed every ipc_bytes
-    // payload from SchemaMsg / BatchMsg verbatim; the server's
-    // `write_message` calls produced exactly the IPC stream framing
-    // StreamDecoder expects (continuation marker + length + flatbuf
-    // + body), so no client-side reframing is needed.
-    let mut decoder = StreamDecoder::new();
-    let mut total_rows: usize = 0;
-    let mut active_attempt: u32 = 0;
-    let mut awaiting_schema = true;
-    let mut timing: Option<scry_proto::QueryStatsOutput> = None;
-
-    let server_total_rows: u64 = loop {
-        let frame: QueryFrame = read_frame(&mut r).await.context("reading response frame")?;
-        match frame.msg {
-            QueryFrameMsg::SchemaMsg(s) => {
-                if !awaiting_schema {
-                    anyhow::bail!("server sent duplicate schema in query attempt");
-                }
-                awaiting_schema = false;
-                let mut buf = Buffer::from(s.ipc_bytes);
-                // Schema messages don't yield a RecordBatch but they
-                // do populate `decoder.schema()`. Calling `decode`
-                // until the buffer is empty advances the state machine.
-                while !buf.is_empty() {
-                    let maybe = decoder
-                        .decode(&mut buf)
-                        .context("decoding schema IPC bytes")?;
-                    if let Some(batch) = maybe {
-                        total_rows += batch.num_rows();
-                    }
-                }
-            }
-            QueryFrameMsg::BatchMsg(b) => {
-                if awaiting_schema {
-                    anyhow::bail!("server sent batch before schema");
-                }
-                let mut buf = Buffer::from(b.ipc_bytes);
-                while !buf.is_empty() {
-                    let maybe = decoder
-                        .decode(&mut buf)
-                        .context("decoding batch IPC bytes")?;
-                    if let Some(batch) = maybe {
-                        total_rows += batch.num_rows();
-                    }
-                }
-            }
-            QueryFrameMsg::ResponseSuperseded(reset) => {
-                if awaiting_schema
-                    || active_attempt >= 2
-                    || reset.superseded_attempt != active_attempt
-                    || reset.next_attempt != active_attempt + 1
-                {
-                    anyhow::bail!("invalid ResponseSuperseded attempt transition");
-                }
-                active_attempt = reset.next_attempt;
-                decoder = StreamDecoder::new();
-                total_rows = 0;
-                awaiting_schema = true;
-                // A superseded attempt's timings describe work whose results
-                // we just threw away. Drop them with the rows, or we would
-                // report the discarded attempt's breakdown for the one that
-                // actually answered.
-                timing = None;
-            }
-            QueryFrameMsg::QueryStats(s) => {
-                // Non-terminal, and always the *last* stats frame wins: a
-                // restarted attempt re-sends its own.
-                timing = Some(s);
-            }
-            QueryFrameMsg::EndOfStream(end) => {
-                if awaiting_schema {
-                    anyhow::bail!("server sent EndOfStream before schema");
-                }
-                break end.total_rows;
-            }
-            QueryFrameMsg::StreamError(err) => {
-                anyhow::bail!(
-                    "server returned {} (code={:#06x}): {}",
-                    query_err_name(err.code),
-                    err.code,
-                    err.message,
-                );
-            }
-            QueryFrameMsg::QueryRequest(_)
-            | QueryFrameMsg::LabelNamesRequest(_)
-            | QueryFrameMsg::LabelValuesRequest(_)
-            | QueryFrameMsg::FleetStatusRequest(_)
-            | QueryFrameMsg::IssueListRequest(_)
-            | QueryFrameMsg::IssueOccurrencesRequest(_) => {
-                anyhow::bail!("server sent a request frame as response (protocol violation)");
-            }
-            QueryFrameMsg::LabelNamesResponse(_)
-            | QueryFrameMsg::LabelValuesResponse(_)
-            | QueryFrameMsg::FleetStatusResponse(_)
-            | QueryFrameMsg::IssueListResponse(_)
-            | QueryFrameMsg::IssueOccurrencesResponse(_) => {
-                anyhow::bail!(
-                    "server sent a metadata response to a data query (protocol violation)"
-                );
-            }
-        }
-    };
+        .context("remote query")?;
+    let server_total_rows = response.total_rows;
 
     let signal_name = signal.name();
     eprintln!();
-    anyhow::ensure!(
-        server_total_rows as usize == total_rows,
-        "remote query row-count mismatch: decoded {total_rows}, server reported {server_total_rows}"
-    );
     eprintln!("# scan: {server_total_rows} {signal_name} rows total (via remote {host_port})");
-    if let Some(stats) = timing {
+    if let Some(stats) = response.stats {
         print_remote_timing(&stats, wall_start.elapsed());
     }
     Ok(())

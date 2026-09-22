@@ -29,6 +29,7 @@ scry-proto         = { workspace = true }
 serde              = { workspace = true, features = ["derive"] }
 serde_json         = { workspace = true }
 tokio              = { workspace = true }
+thiserror           = { workspace = true }
 tracing            = { workspace = true }
 twox-hash          = { workspace = true }
 url                = { workspace = true }

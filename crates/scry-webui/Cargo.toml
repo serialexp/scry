@@ -12,12 +12,15 @@ anyhow = { workspace = true }
 async-stream = { workspace = true }
 axum = { workspace = true }
 axum-extra = { workspace = true }
+base64 = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 cookie = { workspace = true }
 futures = { workspace = true }
 mime_guess = { workspace = true }
+rand = { workspace = true }
+reqwest = { workspace = true }
 rust-embed = { workspace = true }
 scry-server = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

@@ -1,21 +1,24 @@
 # Error monitoring — Architecture
 
-Status: partial — occurrence foundation, fingerprint v1 grouping, and issue list UI implemented; not yet deployed
+Status: partial — occurrence/basic-issue foundation and first clustered scalar alerting CRUD/evaluation slice implemented; delivery and issue workflow outstanding
 Owner: Bart
-Last updated: 2026-09-15
+Last updated: 2026-09-22
 
 ## Implementation status
 
 Tracking the gap between this design suite and the implementation tree. D-073
 accepts logs v2 and the `_scry/<subsystem>/` namespace. D-074's identity,
 pre-WAL scrubbing, server receipt stamping, occurrence projection, rebuildable
-`errors.sqlite`, and periodic single-writer `scry errors` foundation are implemented.
-Fingerprint v1 grouping (OCC1 decoder, message normalization, digest, quality
-levels), deterministic issue identity, issue/occurrence_issues SQLite tables with
-grouping reconciliation, and issue list visibility through the query wire protocol
-and a browser `/errors` route have landed. None of this has been deployed.
-Artifacts, symbolication, stack parsing, issue workflow, alert evaluation, and
-browser SDK remain outstanding.
+`errors.sqlite`, periodic single-writer `scry errors`, and version-checked snapshot
+bootstrap are implemented. Basic fingerprint v1 grouping (OCC1 decoder, generic-token
+message normalization, digest, and quality levels), deterministic issue identity,
+issue/occurrence_issues SQLite tables with grouping reconciliation, and read-only
+issue list/basic detail visibility through the query wire protocol and browser
+`/errors` routes have landed. D-076's first ungrouped scalar alerting slice now adds
+separate alert crates/role, clustered leases, durable state, private/browser CRUD,
+and `/alerts` state visibility without delivery. None of this has been deployed.
+Artifacts, symbolication, stack parsing, rich occurrence inspection, issue workflow,
+alert delivery/advanced monitor types, and browser SDK remain outstanding.
 
 ### Done
 
@@ -52,41 +55,61 @@ browser SDK remain outstanding.
   code, TypeScript `fetchIssueList()` client, SolidJS `/errors` route with issue
   inbox table (title, count, severity, quality, first/last seen, polling refresh),
   store signals, and nav link. The webui relay passes the new frames unchanged.
+- [x] **Phase 3b — basic issue detail read.** `IssueOccurrencesRequest`/
+  `IssueOccurrencesResponse`, read-only SQLite issue/occurrence lookups, queryd
+  dispatch, typed client/store state, and list-to-detail navigation have landed.
+  `/errors/:issueId` shows issue metadata plus recent event/time/trace IDs; the API
+  also returns span IDs that are not displayed. This is not the full occurrence
+  inspector or workflow surface.
+- [x] **Errors snapshot bootstrap.** A version-checked `errors.sqlite` snapshot can
+  be saved, uploaded periodically by ingestd, and restored by queryd on cold start.
+- [x] **Phase 4a — first scalar alerting vertical slice.** Added separate
+  `scry-alert`/`scry-alertd` ownership, restricted ungrouped scalar SQL, bounded
+  queryd client, durable revision/state/SQLite projection, Pending/Recovering and
+  explicit no-data/error policies, aligned scheduler, Valkey per-monitor leases or
+  explicit local lock, environment bearer control API, secure-cookie/CSRF webui
+  proxy, and browser rule CRUD/current-state views. Delivery is excluded.
 
 ### Outstanding
 
 - [ ] **Clustered occurrence orchestration.** Add Valkey leases/fencing, hints, and
   multi-instance convergence; clustered `scry errors` currently fails closed.
 - [ ] **Occurrence freshness and lifecycle.** Add accepted-record low-latency hints,
-  snapshot bootstrap, and projection/orphan garbage collection.
+  bounded/generation-aware snapshot lifecycle, and projection/orphan garbage
+  collection. Basic single-object snapshot upload/restore is implemented.
 - [ ] **Phase 1b — artifacts and symbolication.** Upload, index, and symbolize
   stacks; stack parsing for supported runtimes; explicit fingerprint overrides;
-  reprocessing after late artifacts. Fingerprint v1 is implemented but operates
-  without symbolication or parsed frames.
+  reprocessing after late artifacts. Basic fingerprint v1 is implemented but uses
+  one generic normalization token, discards explanation components after grouping,
+  lacks platform/policy revision and collision disambiguation, and currently folds
+  a hardcoded severity rather than the decoded OCC1 severity.
 - [ ] **Phase 2 — issue lifecycle and workflow.** Add durable immutable workflow
   commands (resolve/ignore/assign), revision-checked mutations, issue facets,
   regression detection, and issue-transition event stream. The rebuildable issue
   index exists but carries no human workflow state.
-- [ ] **Phase 3b — issue detail and mutations UI.** Add issue detail view,
-  occurrence inspector, grouping explanation, stack/source display, trace links,
-  workflow actions, and CSRF-protected mutation proxies. The issue list is
-  implemented; detail, mutation, and deep-link views remain.
-- [ ] **Phase 4 — alert evaluation.** Persist and evaluate typed issue-transition
-  and scalar threshold monitors under independent resource admission.
+- [ ] **Phase 3c — complete issue detail and mutations UI.** Add event deep links,
+  raw occurrence inspection, grouping explanation, stack/source display, actual
+  trace navigation/nearby logs, workflow actions, and CSRF-protected mutation
+  proxies. Basic issue metadata and recent occurrence rows are implemented.
+- [ ] **Phase 4b — later alert evaluation.** Add typed issue-transition and grouped
+  threshold monitors under independent resource admission.
 - [ ] **Phase 5 — notification delivery.** Deliver durable intents through bounded,
   observable, at-least-once notifier workers.
 - [ ] **Phase 6 — browser SDK.** Ship standards-based browser capture, public
   intake controls, build integration, and source-map upload tooling.
-- [ ] **Phase 7 — qualification.** Complete security, failure, rolling-upgrade,
-  rebuild, multi-instance, capacity, and end-to-end smoke qualification.
+- [ ] **Phase 7 — qualification.** Add focused basic-detail SQLite/query-wire/UI
+  tests; enforce server-side query limits; complete security, failure,
+  rolling-upgrade, rebuild, multi-instance, capacity, accessibility, and end-to-end
+  smoke qualification.
 
 ## Why this exists
 
-Scry already accepts OpenTelemetry logs and traces containing exceptions, but it
-stores them only as generic telemetry. It has no stable occurrence identity,
-source-map symbolication, issue grouping, issue lifecycle, rule evaluator, or
-notification delivery. The existing Alerts route is deliberately inert
-(`v1.0-web-ui.md`). A Sentry-like product is therefore not one adapter: it is a
+Scry accepts OpenTelemetry logs and traces containing exceptions and now projects
+eligible exception logs into stable occurrences plus basic type/message issues. It
+still has no source-map symbolication, rich issue lifecycle, rule evaluator, or
+notification delivery. The Alerts route was deliberately inert in the original
+v1.0 UI; D-076's scalar CRUD/state slice has since replaced that placeholder. A
+Sentry-like product is therefore not one adapter: it is a
 set of related data-plane and control-plane systems.
 
 This document is the suite's contract. The focused documents define mechanics:
@@ -163,8 +186,9 @@ durability, identity, or failure semantics here.
    to explain and repeat their output.
 5. A hint or lease may improve freshness/exclusion but never substitutes for an
    idempotent reconciliation path.
-6. A state transition and its notification intents become durable before any
-   external request is attempted.
+6. Once notification delivery is enabled, a state transition and its notification
+   intents become durable before any external request is attempted. The first alert
+   slice performs no external notification request.
 7. Loss of evaluation never means `OK`; stale/error/no-data are distinct states.
 8. Error processing has independent byte, CPU, concurrency, queue, and deadline
    budgets and cannot bypass normal query admission.
@@ -188,13 +212,13 @@ browser/server SDK
                                                     block poll/walk
                                                               v
 scry errors -> immutable occurrence projection -> local errors.sqlite
-  -> later symbolication/grouping -> issue projections
-  -> Issues API/UI and durable workflow commands
+  -> basic type/message grouping now; later symbolication/frame grouping
+  -> read-only issue list/basic detail now; later durable workflow commands
                                      |
                        issue transition event stream
                                      v
-scry alert: scheduled/transition evaluation -> durable state + outbox intents
-  -> notifier workers -> webhook/Slack/email/etc.
+scry alert: scheduled scalar evaluation -> durable alert state
+  -> later slice: outbox intents -> notifier workers -> external delivery
 ```
 
 Bounded catalog paging plus immutable occurrence-commit discovery are the
@@ -211,16 +235,19 @@ wrapper; later phases extend them and add the alert pair:
 
 - `scry-errors`: implemented occurrence identity/extraction, immutable projection,
   conditional publication, collision quarantine, SQLite fold, OCC1 binary decoder,
-  fingerprint v1 (normalization/digest/quality), deterministic issue identity,
-  issue/occurrence_issues tables, `fold_grouped`, and read-only `list_issues`;
-  later artifact, symbolication, stack parsing, issue workflow, and facet domain
-  behavior remains outstanding.
+  basic fingerprint v1 (generic-token normalization/digest/quality), deterministic
+  issue identity, issue/occurrence_issues tables, `fold_grouped`, and read-only
+  `list_issues`, `get_issue`, and `list_occurrences_for_issue`; later artifact,
+  symbolication, full fingerprint contract, stack parsing, issue workflow, and
+  facet domain behavior remains outstanding.
 - `scry-errorsd`: implemented `scry errors` manifest initialization, bounded periodic
   single-writer reconciliation, grouping reconciliation phase (`group_occurrence_page`),
   and status; clustered leases and a private product control endpoint remain
   outstanding.
-- `scry-alert`: rule/state/outbox domain and evaluator/notifier engines.
-- `scry-alertd`: `scry alert`, schedules, queryd clients, leases, APIs, and status.
+- `scry-alert`: rule/state domain and evaluator engine; later delivery work adds the
+  outbox and notifier domain without making evaluation depend on it.
+- `scry-alertd`: the separate `scry alert` role, schedules, direct queryd clients,
+  clustered leases or explicit local single-writer exclusion, APIs, and status.
 
 This follows the existing engine/thin-role convention. It does not require four
 processes: the multicall binary can run roles separately, and a later supervised
@@ -259,15 +286,17 @@ _scry/alerts/v1/transitions/...
 _scry/alerts/v1/outbox-results/...
 ```
 
-The first complete product slice stops after the dedicated immutable occurrence
-projection, its rebuildable `errors.sqlite` index, and the `scry errors` role.
-Grouping, artifacts, issue membership, and workflow remain later phases; the
-occurrence projection is not merely an internal grouping output.
+The first complete product slice stopped after the dedicated immutable occurrence
+projection, its rebuildable `errors.sqlite` index, and the `scry errors` role. Basic
+local type/message grouping and issue membership have since landed. Immutable
+grouping generations, artifacts, symbolication, richer indexing, and workflow remain
+later phases; the occurrence projection is not merely an internal grouping output.
 
 `errors.sqlite` and `alerts.sqlite` are separate from the block catalog. This
 avoids coupling their schema migrations/snapshots to block query readiness.
-Optional snapshots follow the existing version-checked, atomic-restore pattern;
-a mismatch rebuilds only its owning projection.
+The errors projection now uploads and restores one version-checked SQLite snapshot;
+a mismatch rebuilds only its owning projection. Bounded generation management and
+cleanup remain outstanding. Future alerts snapshots follow the same ownership rule.
 
 The error-control plane requires an S3-compatible backend with atomic conditional
 writes: `If-None-Match: *`/`PutMode::Create` and ETag-guarded `If-Match` updates.
@@ -344,10 +373,14 @@ a person nor payload truth.
 
 Artifact upload and all control-plane mutations require authenticated operator
 access. Browser/Tauri read and mutation APIs initially inherit the single shared
-webui session, so authorization is all-or-nothing; CSRF/origin protection is a
-prerequisite for mutation. Secret values are resolved from opaque, operator-
-configured secret IDs and never appear in object records, projections, responses,
-status, logs, or rendered intents.
+webui session, so v1 authorization is deliberately all-or-nothing shared-admin;
+CSRF/origin protection is a prerequisite for mutation. Session cookies are Secure
+by default, with only an explicit insecure opt-out for plain-HTTP development.
+Webui-to-alertd service authentication uses a high-entropy bearer token supplied by
+environment, never a token file; rotation updates the environment and restarts the
+affected services. Secret values are resolved from opaque, operator-configured
+secret IDs and never appear in object records, projections, responses, status, logs,
+or rendered intents.
 
 ## Cross-document decisions requiring review
 
@@ -368,15 +401,15 @@ status, logs, or rendered intents.
    move occurrences through an audited alias transaction.
 7. **Lifetime counts:** preserve lifetime aggregates after raw retention or make
    issue statistics retention-window scoped.
-8. **Role topology:** separate `scry errors` and `scry alert` roles initially, or a
-   single control role with internally independent engines and budgets.
-9. **Single-instance declaration:** how an operator proves that local unfenced
-   mode cannot accidentally be started twice.
-10. **Artifact upload authentication:** define CI/operator credentials and the
+8. **Alert first slice (resolved by D-076):** use a separate `scry alert` role,
+   clustered operation plus explicit locally locked single-writer mode, ungrouped
+   restricted scalar SQL, explicit rule policies, persisted recovery, no past-slot
+   revision, direct service hops, shared-admin browser CRUD, and no delivery.
+9. **Artifact upload authentication:** define CI/operator credentials and the
     authenticated service hop before build tooling ships.
-11. **Notifier revisions:** whether queued intents use pinned or latest destination
+10. **Notifier revisions:** whether queued intents use pinned or latest destination
     metadata, and how disable/rotation affects them.
-12. **Privacy beyond the D-074 baseline:** defaults for user identifiers, URL
+11. **Privacy beyond the D-074 baseline:** defaults for user identifiers, URL
    query/fragment retention, free-text treatment, `sourcesContent`, and deletion
    guarantees.
 
@@ -437,17 +470,23 @@ editing.
   the dedicated occurrence projection/SQLite/role slice, and coordinated-version
   rollout. These decisions explicitly supersede the earlier dual-signal,
   synthetic-ID, heuristic-dedup, optional-scrub, and independently rolling text.
-- **Still blocking review decisions after D-074:** workflow fold conflicts;
+- **2026-09-22 — D-076 selects the first alerting vertical slice.** The slice is a
+  separate clustered-capable `scry alert` role with an explicit local single-writer
+  mode, ungrouped restricted scalar SQL, explicit no-data/error policy, durable
+  Recovering, final past slots, browser shared-admin CRUD, direct authenticated
+  service hops, and no notification delivery. This records scope and contracts;
+  alerting remains unimplemented.
+- **Still blocking review decisions after D-076:** workflow fold conflicts;
   late-symbolication membership; lifetime count semantics; source-map/parser
-  implementation; single-instance exclusivity; privacy defaults beyond the minimal
-  scrub baseline; and initial notification policy. These remain explicit rather
-  than silently selected by reviewers.
+  implementation; privacy defaults beyond the minimal scrub baseline; and initial
+  notification-delivery policy. These remain explicit rather than silently selected
+  by reviewers.
 
 ## References
 
 - `docs/ARCHITECTURE.md` — durable truth, resource isolation, block lifecycle.
 - `docs/decisions.md` — D-007, D-027, D-038/D-039, D-041, D-049, D-055,
-  D-059, D-064, D-066, D-070, D-071, D-073, D-074.
+  D-059, D-064, D-066, D-070, D-071, D-073, D-074, D-076.
 - `docs/design/gateway-ingestion-protocols.md`
 - `docs/design/conditional-object-storage.md`
 - `docs/design/v1.0-web-ui.md`

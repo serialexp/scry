@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "scry — single-binary observability for metrics, logs, traces, and profiles. One binary, many roles: `scry ingest`, `scry query`, `scry get`, `scry list`, `scry agent`, `scry gateway`, `scry web`, `scry compact`, `scry retention`."
+description = "scry — single-binary observability for metrics, logs, traces, and profiles. One binary, many roles: `scry ingest`, `scry query`, `scry get`, `scry list`, `scry agent`, `scry gateway`, `scry web`, `scry compact`, `scry retention`, `scry errors`, `scry alert`."
 
 [[bin]]
 name = "scry"
@@ -31,6 +31,7 @@ scry-retention     = { workspace = true }
 scry-tail          = { workspace = true }
 scry-replay-opensearch = { workspace = true }
 scry-errorsd       = { workspace = true }
+scry-alertd        = { workspace = true }
 
 [lints]
 workspace = true

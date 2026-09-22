@@ -652,6 +652,29 @@ async fn query_round_trip() {
     // unbounded backlog makes this fine in practice.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
+    // The reusable bounded client used by alertd must interoperate with the real
+    // QueryService, not only its fake-peer protocol fixtures.
+    let alert_scalar = scry_query::client::QueryWireClient::new(listen_addr.to_string())
+        .with_limits(scry_query::client::QueryLimits {
+            max_frames: 64,
+            max_bytes: 1024 * 1024,
+            max_rows: 1,
+        })
+        .scalar(QueryRequest {
+            signal: Signal::Metrics as u8,
+            query: Query::default(),
+            sql: Some("SELECT count(*) AS value FROM metrics".into()),
+            limit: None,
+            request_id: Some("test-alert-scalar-client".into()),
+            live: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        alert_scalar,
+        scry_query::client::ScalarOutcome::Value(scry_query::client::QueryScalar::Number(500.0))
+    );
+
     // ── Matcher-only query ─────────────────────────────────────────
     let req = QueryRequest {
         signal: Signal::Metrics as u8,

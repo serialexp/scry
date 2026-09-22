@@ -91,8 +91,9 @@ DataFusion query service surfaced through per-signal views. That's `scry`.
   native wire are its own — the reason the upstream protocols are messy is
   precisely the kind of accidental complexity we're escaping.
 - **Not (yet) a Grafana drop-in.** scry has its *own* source-built query UI —
-  a desktop app and a browser server (`scry web`) with per-signal views, a
-  single-trace waterfall, a frames overview, and a logs reader — but
+  a desktop app and a browser server (`scry web`) with per-signal views, plus
+  browser-hosted scalar alert rule CRUD/state visibility, a single-trace waterfall,
+  a frames overview, and a logs reader — but
   **Grafana datasource adapters** (keep your existing dashboards) are a
   later milestone, as is flamegraph rendering for profiles.
 - **Not configurable for the sake of being configurable.** Every knob
@@ -180,6 +181,13 @@ real. Architecture is documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.m
   single-trace waterfall, a frames overview, a logs reader, and live logs/
   metrics fed through the queryd tail front door (D-040, D-046, D-062/D-065).
   Sealed by `scripts/smoke-webui.sh` and `scripts/smoke-webui-tail.sh`.
+- **Scalar alert evaluation.** The separate `scry alert` role stores immutable
+  monitor revisions and fenced state transitions in object storage, folds a local
+  `alerts.sqlite`, schedules aligned ungrouped scalar SQL through ordinary queryd
+  admission, and coordinates per monitor through Valkey (or an explicit locally
+  locked single-writer mode). The browser exposes shared-admin rule CRUD,
+  validation, and current Inactive/Pending/Firing/Recovering/NoData/Error state via
+  a CSRF-protected direct webui-to-alertd proxy. Notification delivery is deferred.
 - **Error occurrence foundation.** Canonical logs producers emit raw-record v1;
   ingest uniformly redacts structured sensitive keys on every logs/traces path,
   stamps trusted receipt time before WAL, and stores raw-record v2 in logs Parquet/
@@ -226,6 +234,8 @@ crates/
   status/              shared local/Fleet status snapshots and HTTP dashboard (scry-status)
   errors/              error occurrence identity, extraction, immutable projection, and SQLite fold (scry-errors)
   scry-errorsd/        bounded `scry errors` manifest/reconciliation role; clustered mode remains fail-closed
+  alert/               durable scalar monitor validation, state machine, object records, and SQLite projection (scry-alert)
+  scry-alertd/         clustered/local `scry alert` scheduler and authenticated private control API
   resources/           shared bounded-resource accounting and admission helpers (scry-resources)
   duration/            checked CLI duration parser shared by operator roles (scry-duration)
   match/               shared Prometheus-style label matcher grammar (scry-match)

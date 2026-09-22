@@ -33,7 +33,10 @@ fn app_with(raw_queryd: &[String], raw_tail: &[String], limits: RelayLimits) -> 
         password: PASSWORD.to_string(),
         key: Key::from(&[5u8; 64]),
         session_ttl: 3600,
-        secure_cookie: false,
+        insecure_cookie: true,
+        alertd_token: None,
+        alertd_timeout: Duration::from_secs(15),
+        max_alertd_requests: 16,
         limits,
     }))
 }

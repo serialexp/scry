@@ -242,6 +242,8 @@ export interface TargetInfo {
   /** Whether `scry web` has a `--queryd-tail` address for this target, i.e.
    *  whether live tailing is possible against it. Absent on older servers. */
   live?: boolean;
+  alerts?: boolean;
+  alert_mutations?: boolean;
 }
 
 // The target allowlist fetched from `scry-webui` after login (browser only).

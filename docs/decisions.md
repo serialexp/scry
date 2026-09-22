@@ -3983,3 +3983,70 @@ existing resource error code. This decision does not invent a fixed per-query
 reservation: calibrated weighted admission and query spill remain separate
 measured work. The complete contract and qualification matrix live in
 `docs/design/query-memory-pressure.md`.
+
+## D-076: First alerting slice is separate, clustered scalar evaluation with browser CRUD and no delivery
+
+**Date:** 2026-09-22
+**Status:** accepted; first scalar evaluation/CRUD slice implemented, delivery deferred
+
+The first operator-selected alerting vertical slice runs as the separate thin
+`scry alert`/alertd role over the reusable alert engine. It is clustered from its
+first implementation, using per-rule Valkey leases and fenced durable commits, and
+also supports an explicit local single-writer mode with local process exclusion.
+Local mode is never inferred merely because Valkey is unavailable. This preserves
+independent alert resource budgets and avoids making errorsd, queryd, or webui the
+owner of alert state.
+
+The initial rule language is ungrouped restricted SQL producing exactly one bounded
+numeric or boolean scalar. Grouped alert instances and issue-transition monitors
+come later. Each rule persists an explicit no-data policy and a separate explicit
+execution-error policy. `Recovering` is durable state whose timing survives restart
+or takeover. A logical slot is evaluated once after its allowed lateness delay; late
+data never revises an already evaluated past slot and can affect only later windows.
+
+The browser v1 surface is revision-safe rule CRUD under the existing all-or-nothing
+`shared-admin` session. It reuses the same opaque target IDs as query selection:
+webui resolves a target directly to alertd, while alertd resolves that target and
+connects directly to queryd. Neither hop hairpins through the other service. Private
+service hops use scoped high-entropy bearer credentials supplied through environment
+variables. Token files and live token reload are excluded; rotation changes the
+environment and restarts affected services. Browser session cookies are Secure by
+default, with an explicit insecure-cookie opt-out for plain-HTTP development.
+
+Notification destinations, intents, outbox processing, notifier workers, test sends,
+and external delivery are not part of this slice. This entry selects architecture
+and scope only; it does not record any alerting implementation as complete. The
+mechanical contracts and outstanding work remain in
+`docs/design/alert-evaluation.md`, `docs/design/notification-delivery.md`, and
+`docs/design/error-monitoring-ui.md`.
+
+## D-077: Notification targets own formatting, encrypted secrets, and firing/resolved delivery
+
+**Date:** 2026-09-22
+**Status:** accepted; not yet implemented
+
+The next alerting slice adds **notification targets** as a separate section of the
+Alerts UI. “Notification target” is the product/API term; targets are not split into
+independently managed notifier, destination, and message-format resources. Each
+immutable target revision selects a built-in format or stores one complete bounded
+custom placeholder template. This deliberately avoids Grafana-style reusable contact
+point/template composition.
+
+Every selected target receives both Firing and Resolved intents. Evaluation commits
+one durable intent per target before external I/O; delivery remains bounded,
+observable, at-least-once, and independent across targets. Test-send is part of the
+initial target API and UI and runs through the real template, secret, TLS, admission,
+and response-classification path without creating an alert transition.
+
+Target secrets are encrypted before storage in the deployment's S3-compatible object
+store. Every alertd instance receives the shared operator-supplied encryption key;
+APIs expose neither plaintext nor ciphertext. The implementation must define a
+versioned authenticated-encryption envelope and current/previous-key rotation process
+before landing, so key replacement cannot strand existing target revisions.
+
+A dedicated dead-letter management and manual-retry interface is deferred. Delivery
+still requires finite attempt/age bounds and a visible terminal failure outcome;
+“deferred dead-letter UI” does not permit infinite retries or silent loss. Exact
+template syntax, encryption-key rotation mechanics, retry bounds/terminal naming,
+and optional first-slice HMAC signing remain implementation-blocking decisions in
+`docs/design/notification-delivery.md`.

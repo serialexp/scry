@@ -1,33 +1,55 @@
 # Alert and monitor evaluation — Design
 
-Status: draft, not yet implemented
+Status: partial — first scalar alerting vertical slice implemented; delivery, issue monitors, snapshots, and full qualification outstanding
 Owner: Bart
-Last updated: 2026-09-07
+Last updated: 2026-09-22
 
 ## Implementation status
 
-This document consumes generic queries and issue transitions. It produces durable
-intents governed by [Notification delivery](notification-delivery.md).
+This document consumes generic queries and, in a later slice, issue transitions. It
+produces durable alert state; once delivery is implemented, delivery-bearing
+transitions also produce durable intents governed by
+[Notification delivery](notification-delivery.md). The first ungrouped scalar slice
+now has a separate alert domain/role, immutable rule revisions and state heads,
+`alerts.sqlite`, bounded query-wire evaluation, local/Valkey lease modes, a private
+control API, secure webui proxy, and browser CRUD/state views. Delivery,
+issue-transition monitors, snapshots, richer history/status, and full clustered
+qualification remain outstanding.
 
 ### Done
 
 - [x] **Execution survey.** Query admission/memory guards, maintenance scheduling,
   Valkey leases, status, and current Alerts deferral have been reviewed.
+- [x] **First vertical slice — scalar role and control plane.** Added the separate
+  `scry-alert`/`scry alert` role, immutable revision/state records with conditional
+  heads, deployment-bound `alerts.sqlite`, direct bounded query-wire scalar client,
+  aligned scheduling, local lock or Valkey per-monitor leases, private bearer-token
+  CRUD/validate/test API, secure webui proxy, and browser CRUD/state views. Delivery
+  is intentionally outside this slice.
+- [x] **Phase 0a — initial durable model.** Versioned monitor, transition, empty
+  intent array, rule/state head, tombstone, mutation-receipt, and SQLite projection
+  contracts exist. Storage tests cover immutable replay, tombstone anti-resurrection,
+  and competing head CAS; reads pin object versions and validate the winning state
+  head's transition identity and digest before folding.
+- [x] **Phase 1a — initial evaluator.** Scalar evaluation uses ordinary queryd
+  admission with deadlines and cumulative frame/byte/row limits, newest completed
+  aligned slots, deterministic jitter, Pending/Recovering persistence, explicit
+  no-data/error policies, Valkey leases, and an explicit locally locked mode.
 
 ### Outstanding
 
-- [ ] **Decision — role topology.** Confirm separate alert role versus a combined
-  control role with independent engines and budgets.
-- [ ] **Phase 0 — durable model.** Define versioned monitor/revision/state/
-  transition/evaluation records and rebuildable projection.
-- [ ] **Phase 1 — evaluator.** Add completion-relative scheduling, jitter,
-  admission, query-wire client, leases, and state-machine semantics.
 - [ ] **Phase 2 — issue monitors.** Consume new/regressed/resolved/severity/release
   transitions with exact deduplication.
-- [ ] **Phase 3 — scalar monitors.** Evaluate bounded queries, thresholds, `for`,
-  recovery, no-data, and execution-error policies.
-- [ ] **Phase 4 — control API/status.** Add revisioned CRUD, validation/test,
-  silences, history, staleness, and fleet observability.
+- [ ] **Phase 3b — complete scalar monitors.** Add expression/function/physical-plan
+  allowlisting beyond the current single-statement/single-signal-relation boundary,
+  configurable evaluator budgets, durable skip/error audit history, richer late/clock
+  diagnostics, incremental convergence, and representative-scale scheduler
+  qualification. Basic ungrouped threshold, `for`, recovery, no-data, and
+  execution-error behavior is implemented.
+- [ ] **Phase 4b — complete control API/status.** Add cursor-paginated transition
+  history, silences, manual reconciliation/status, fleet registration, projection
+  lag/staleness, and snapshot health. Basic revisioned CRUD, validate/test, current
+  state, service auth, CSRF proxy, and browser views are implemented.
 - [ ] **Phase 5 — verification.** Crash, clock, late-data, overload, edit/delete,
   failover, and notification-intent atomicity tests.
 
@@ -50,7 +72,8 @@ thresholds while keeping detection separate from delivery.
   and typed resource-error path.
 - Preserve pending time and transition identity across restart/failover.
 - Make no-data, stale, disabled, and execution-error states visible and distinct.
-- Atomically commit transitions with notification intents before delivery.
+- When delivery is enabled in a later slice, atomically commit transitions with
+  notification intents before any external delivery.
 - Bound schedules, concurrency, queueing, result shape/bytes, and history.
 
 ## Non-goals (v1)
@@ -64,11 +87,14 @@ thresholds while keeping detection separate from delivery.
 
 ## Ownership and authority
 
-A reusable `scry-alert` engine and thin `scry-alertd` role (`scry alert`) are the
-initial shape. `alerts.sqlite` is a local projection. Authoritative immutable
-objects live under the suite's reserved namespace; Valkey supplies per-rule leases
-and hints only. Alertd evaluates through configured, allowlisted queryd targets via
-a small query-wire client rather than calling `QueryService` internals.
+D-076 selects a reusable `scry-alert` engine and separate thin `scry-alertd` role
+(`scry alert`) for the first vertical slice; alert evaluation is not folded into
+errorsd, queryd, or webui. `alerts.sqlite` is a local projection. Authoritative
+immutable objects live under the suite's reserved namespace; Valkey supplies
+per-rule leases and hints only. The first slice is clustered from the outset and
+also supports an explicitly configured local single-writer mode. Alertd connects
+directly to configured, allowlisted queryd targets via a small query-wire client
+rather than routing through webui or calling `QueryService` internals.
 
 This preserves queryd admission (`active`, `waiting`, queue timeout), DataFusion
 memory, cgroup guard, default-window validation, and resource errors. Alert queries
@@ -109,12 +135,18 @@ Condition {
 }
 ```
 
-V1 validation requires either one numeric/boolean scalar row or a bounded set of
-labeled scalar groups defined by a typed schema. An empty set is no-data, not zero,
-unless the reducer contract says `count(empty)=0`. NaN/Inf handling is explicit.
-Unbounded time, live mode, DDL/DML, filesystem/object functions, or ambiguous
-schemas are rejected. A validation/test run uses normal admission but creates no
-state transition or outbox event.
+The first vertical slice accepts only **ungrouped** restricted SQL that produces
+exactly one numeric/boolean scalar. Grouped/labeled result sets are deferred. An
+empty result is no-data, not zero, unless the reducer contract says
+`count(empty)=0`; multiple rows or columns are invalid. NaN/Inf handling is
+explicit. Current AST validation requires exactly one read-only query whose only
+relation, including nested queries, is the selected telemetry table; it rejects
+DDL/DML, joins, CTEs, table-valued/derived sources, and additional relations. The
+query-wire request supplies the explicit bounded time window and disables live mode.
+A function/expression and physical-plan allowlist is still outstanding, so the
+current implementation must not be described as proving that every filesystem,
+object, or network-capable scalar function is excluded. A validation/test run uses
+normal admission but creates no state transition or notification intent.
 
 ## Durable rule model
 
@@ -128,8 +160,8 @@ Monitor {
   condition,
   for_duration,
   recover_for,
-  no_data: Inactive|Pending|Firing|NoData,
-  execution_error: KeepLast|Error|Firing,
+  no_data_policy: Inactive|Pending|Firing|NoData,
+  execution_error_policy: KeepLast|Error|Firing,
   error_for_duration,
   repeat_interval,
   notify_on_resolve,
@@ -174,9 +206,12 @@ state has an audited TTL. Group overflow rejects the whole evaluation as a resou
 error; it never evaluates a truncated set.
 
 `for_duration` and recovery duration use persisted `since`; restart does not reset
-them. `KeepLast` retains prior health but marks it stale/error—it never reports OK.
-No-data policy is separate from execution-error policy. Group identity is a wide
-cryptographic digest of canonical typed labels plus collision disambiguator.
+them. `Recovering` is a durable state, not an in-memory/display-only derivation, so
+its start time and progress survive restart and clustered takeover. Every rule must
+store explicit no-data and execution-error policies; neither inherits a hidden
+deployment default. `KeepLast` retains prior health but marks it stale/error—it never
+reports OK. Group identity is a wide cryptographic digest of canonical typed labels
+plus collision disambiguator (needed only after grouped rules are introduced).
 
 Transition sequence is monotonic per `(monitor, group)` across cosmetic and semantic
 rule revisions. Every state change has a deterministic key from deployment, monitor/
@@ -194,11 +229,13 @@ A reminder can be coalesced; firing/resolved cannot.
 
 Intervals define wall-clock-aligned logical slots: `slot_id = floor(time/every)`.
 Deterministic per-rule jitter changes execution time, never slot identity or query
-window. On startup reconcile durable rule/state objects, evaluate at most the newest
-eligible overdue slot, and record older skipped slots. Never replay every missed
-interval. While running use monotonic wakeups mapped to slots; persist wall timestamps
-for recovery/audit. Clock jumps are bounded and surfaced. Slow completion cannot
-create uncovered gaps or shift future windows.
+window. On startup reconcile durable rule/state objects and evaluate at most the newest
+eligible overdue slot. The current slice then polls due work once per second and does
+a full bounded object-store reconciliation every 30 passes; it does not yet persist
+an audit record for older skipped slots, use convergence hints/incremental cursors, or
+surface clock-jump diagnostics. Never replay every missed interval. Future scheduler
+qualification must prove that slow completion cannot create uncovered gaps or shift
+future windows.
 
 No overlapping evaluation for the same `(rule, group, slot)`. Reevaluating a slot
 uses the same identity and cannot allocate a new transition sequence. Global controls
@@ -214,19 +251,21 @@ For each due unit:
 3. execute the admitted query or consume transition;
 4. classify value/no-data/error and compute state using injected time;
 5. recheck rule revision and lease fence;
-6. commit state transition plus complete notification intents metadata-last;
-7. publish a hint and release; delivery occurs separately.
+6. commit state transition metadata-last, including complete notification intents
+   only after delivery is enabled in a later slice;
+7. publish a hint and release; eventual delivery occurs separately.
 
 Do not hold a lease while waiting on external notification I/O.
 
 ## Late data and evaluation windows
 
 Queries use explicit half-open `[slot_end-lookback, slot_end)` event-time windows,
-plus a configured lateness allowance/watermark policy. Received time is retained
-for diagnosis. Window overlap is intentional when lookback exceeds interval; there
-are no gaps from execution duration. Re-evaluating a past slot must not emit another
-transition with a new identity. Review must define whether late data can revise a
-prior scalar value, trigger only the current state, or cause an audited late transition.
+plus a configured lateness allowance before the slot's one evaluation. Received time
+is retained for diagnosis. Window overlap is intentional when lookback exceeds the
+interval; there are no gaps from execution duration. Once evaluated, a past slot is
+never revised for late data and is not re-evaluated to change prior value or state.
+Late arrivals can affect only a later slot whose window includes them. This keeps one
+final result and transition identity per slot and avoids retrospective alert churn.
 
 Issue transitions carry their own durable occurrence/transition time and are
 consumed once. A late old occurrence cannot become a regression unless the issue
@@ -265,21 +304,26 @@ expiry.
 
 ## Multi-instance and no-Valkey behavior
 
-Per-rule leases distribute work and avoid a global leader. Deterministic identities
-and folds remain necessary. In a declared single alertd deployment,
-`LocalLeaseProvider` is correct without Valkey. If exclusivity is not declared or
-multiple instances are possible, mutations/evaluation/delivery fail closed unless
-an explicitly unsafe override is selected. Raw telemetry and existing state reads
-remain available.
+The first slice supports clustered operation, rather than postponing fencing until a
+later phase. Per-rule leases distribute work and avoid a global leader; deterministic
+identities and folds remain necessary. An explicit local single-writer mode may use
+`LocalLeaseProvider` without Valkey and must hold an exclusive local process lock.
+It is a distinct operator-selected mode, not a fallback inferred from Valkey being
+absent. Clustered mode fails closed on unavailable fencing or lease loss. Raw
+telemetry and existing state reads remain available.
 
 ## API and observability
 
-Control endpoints provide monitor CRUD with `Idempotency-Key`/`If-Match`, validation,
-test evaluation, state/groups, cursor-paginated history, silences, and enable/
-disable. Webui proxies to an allowlisted alertd and adds CSRF/origin defense; see
-[error-monitoring-ui.md](error-monitoring-ui.md).
+The implemented control endpoints provide monitor list/get/create/update/delete,
+validation, and side-effect-free test evaluation. Mutations use UUID
+`Idempotency-Key` values; create/update persist request-digest receipts for exact
+replay, delete persists a command tombstone, and updates/deletes also require
+`If-Match`. The webui proxies these routes only to an allowlisted alertd and adds
+CSRF/origin defense; see [error-monitoring-ui.md](error-monitoring-ui.md). Transition
+history, groups, silences, manual reconciliation/status, and destination/delivery
+routes remain outstanding.
 
-Fleet role `alert` reports rules enabled, due/running/queued, oldest due age,
+The target fleet role `alert` reports rules enabled, due/running/queued, oldest due age,
 evaluation outcomes/resource rejections, state counts/staleness, transitions,
 silences, query latency/targets, outbox pending/age, delivery summary, lease health,
 and local projection reconcile/snapshot health. No query text, secret, error body,
@@ -301,15 +345,21 @@ or user value enters status.
 - Two alertd instances prove one transition; takeover retains Pending/Firing time.
 - Valkey loss marks stale and resumes without duplicate Firing/Resolved intents.
 
-## Open questions for review
+## Selected first-slice decisions and remaining review
 
-- Separate `scry alert` and `scry errors`, or one control role with hard resource
-  isolation?
-- V1 scalar-only rules or bounded labeled multi-dimensional alert instances?
-- Late-data revision policy for already evaluated windows?
-- Which no-data/error defaults minimize surprise without hiding monitoring failure?
-- Are silences required before first notifier rollout?
-- How does a no-Valkey deployment declare/prove one alertd instance?
+D-076 resolves the first-slice choices: a separate `scry alert` role; clustered
+operation plus explicit local single-writer mode; ungrouped restricted scalar SQL;
+explicit per-rule no-data and execution-error policies; persisted `Recovering`; no
+late revision of evaluated slots; browser CRUD under shared-admin authorization;
+and no notification delivery. These are design decisions, not implementation claims.
+
+Still open for later slices:
+
+- Which concrete no-data/error policy choices should the rule editor suggest while
+  still persisting the operator's explicit selection?
+- Are silences required before the first notifier rollout?
+- What grouped-result identity and cardinality limits apply when grouped monitors
+  are introduced?
 
 ## References
 

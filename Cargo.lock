@@ -4468,6 +4468,7 @@ dependencies = [
  "anyhow",
  "clap",
  "scry-agent",
+ "scry-alertd",
  "scry-alloc",
  "scry-compact",
  "scry-compactd",
@@ -4510,6 +4511,53 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "zstd",
+]
+
+[[package]]
+name = "scry-alert"
+version = "0.23.4"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "chrono",
+ "object_store",
+ "rusqlite",
+ "scry-objstore",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlparser",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "scry-alertd"
+version = "0.23.4"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "clap",
+ "fs2",
+ "futures",
+ "object_store",
+ "reqwest",
+ "scry-alert",
+ "scry-block",
+ "scry-cluster",
+ "scry-objstore",
+ "scry-query",
+ "scry-valkey",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tower",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -4819,7 +4867,10 @@ dependencies = [
  "bytes",
  "futures",
  "object_store",
+ "serde",
+ "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -4856,6 +4907,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 1.0.69",
  "tokio",
  "tracing",
  "twox-hash 1.6.3",
@@ -5039,6 +5091,7 @@ dependencies = [
  "async-stream",
  "axum",
  "axum-extra",
+ "base64",
  "bytes",
  "chrono",
  "clap",
@@ -5046,6 +5099,8 @@ dependencies = [
  "futures",
  "http-body-util",
  "mime_guess",
+ "rand 0.8.6",
+ "reqwest",
  "rust-embed",
  "scry-server",
  "serde",

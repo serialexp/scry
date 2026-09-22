@@ -15,6 +15,7 @@
 //! request/response, but from this server's side identical: write the client's
 //! bytes, stream back whatever comes.
 
+pub mod alertd;
 pub mod assets;
 pub mod auth;
 pub mod query;
@@ -34,6 +35,9 @@ use tracing::info;
 
 /// Env var carrying the shared login password (kept out of argv).
 pub const PASSWORD_ENV: &str = "SCRY_WEBUI_PASSWORD";
+/// Global alertd service credential. It is read once at startup, so rotation
+/// takes effect on restart, and is never serialized to a browser response.
+pub const ALERTD_TOKEN_ENV: &str = "SCRY_WEBUI_ALERTD_TOKEN";
 
 /// CLI arguments for the `scry web` subcommand (formerly the `scry-webui` bin).
 #[derive(Parser, Debug)]
@@ -62,24 +66,32 @@ pub struct Args {
     #[arg(long, value_name = "ID=ADDR")]
     pub queryd_tail: Vec<String>,
 
+    /// Alert control API for an existing `--queryd` target, as `id=ADDR`.
+    /// Repeatable; a bare address is accepted only with one query target.
+    /// The service bearer credential is read only from
+    /// `SCRY_WEBUI_ALERTD_TOKEN`, once at startup (restart to rotate it), and is
+    /// never exposed to the browser.
+    #[arg(long, value_name = "ID=ADDR")]
+    pub alertd: Vec<String>,
+
     /// Session lifetime in seconds (default 1 day).
     #[arg(long, default_value_t = 86_400)]
     pub session_ttl: i64,
 
-    /// Set the `Secure` attribute on the session cookie. Enable this only when
-    /// the browser reaches scry-webui over HTTPS (e.g. behind a TLS reverse
-    /// proxy such as Caddy); over plain `http://` a `Secure` cookie is dropped
-    /// by the browser and login silently fails. Also via `SCRY_WEBUI_SECURE_COOKIE`
-    /// (accepts 1/0/true/false/yes/no/on/off). Bare `--secure-cookie` ⇒ true.
+    /// Disable the session cookie's `Secure` attribute. Use only when accessing
+    /// scry-webui directly over plain HTTP for local development. Cookies are
+    /// secure by default for HTTPS and TLS-reverse-proxy deployments. Also via
+    /// `SCRY_WEBUI_INSECURE_COOKIE` (accepts 1/0/true/false/yes/no/on/off).
+    /// Bare `--insecure-cookie` means true.
     #[arg(
         long,
-        env = "SCRY_WEBUI_SECURE_COOKIE",
+        env = "SCRY_WEBUI_INSECURE_COOKIE",
         num_args = 0..=1,
         default_value_t = false,
         default_missing_value = "true",
         value_parser = clap::builder::BoolishValueParser::new(),
     )]
-    pub secure_cookie: bool,
+    pub insecure_cookie: bool,
 
     /// Deadline for connecting to queryd and writing the request, in seconds.
     /// A failure before response streaming starts returns 504.
@@ -110,6 +122,14 @@ pub struct Args {
     /// the query pool would let a few open browser tabs starve queries.
     #[arg(long, default_value_t = 8)]
     pub max_tails: usize,
+
+    /// Total alertd request deadline, in seconds.
+    #[arg(long, default_value_t = 15)]
+    pub alertd_timeout: u64,
+
+    /// Maximum concurrent alertd requests. Excess requests fail without queueing.
+    #[arg(long, default_value_t = 16)]
+    pub max_alertd_requests: usize,
 }
 
 /// Serve the browser query UI and relay queries to the query daemon.
@@ -125,6 +145,12 @@ pub async fn run(args: Args) -> Result<()> {
     if args.max_tails == 0 {
         bail!("--max-tails must be at least 1");
     }
+    if args.max_alertd_requests == 0 {
+        bail!("--max-alertd-requests must be at least 1");
+    }
+    if args.alertd_timeout == 0 {
+        bail!("--alertd-timeout must be at least 1 second");
+    }
 
     // Derive a stable cookie-signing key from the password: sessions survive a
     // restart, and rotating the password naturally invalidates old sessions.
@@ -134,6 +160,17 @@ pub async fn run(args: Args) -> Result<()> {
         parse_targets(&args.queryd).context("parsing --queryd targets")?;
     attach_tail_targets(&mut targets, &args.queryd_tail)
         .context("parsing --queryd-tail addresses")?;
+    attach_alertd_targets(&mut targets, &args.alertd).context("parsing --alertd addresses")?;
+    let alertd_token = if args.alertd.is_empty() {
+        None
+    } else {
+        let token = std::env::var(ALERTD_TOKEN_ENV)
+            .map_err(|_| anyhow::anyhow!("{ALERTD_TOKEN_ENV} must be set when --alertd is used"))?;
+        if token.is_empty() {
+            bail!("{ALERTD_TOKEN_ENV} must not be empty");
+        }
+        Some(token)
+    };
     let targets_desc = targets
         .iter()
         .map(|t| match &t.tail_addr {
@@ -149,7 +186,10 @@ pub async fn run(args: Args) -> Result<()> {
         password,
         key,
         session_ttl: args.session_ttl,
-        secure_cookie: args.secure_cookie,
+        insecure_cookie: args.insecure_cookie,
+        alertd_token,
+        alertd_timeout: Duration::from_secs(args.alertd_timeout),
+        max_alertd_requests: args.max_alertd_requests,
         limits: RelayLimits {
             setup_timeout: Duration::from_secs(args.relay_timeout),
             idle_timeout: Duration::from_secs(args.relay_idle_timeout),
@@ -219,6 +259,8 @@ pub struct Target {
     /// The `host:port` of this target's queryd `--tail-listen` port, when the
     /// operator configured one. `None` ⇒ this target cannot serve live tails.
     pub tail_addr: Option<String>,
+    /// Base HTTP address of this target's private alert control API.
+    pub alertd_addr: Option<String>,
 }
 
 /// Parse repeatable `--queryd` values into the target allowlist, returning the
@@ -237,6 +279,7 @@ pub fn parse_targets(raw: &[String]) -> Result<(Vec<Target>, String)> {
                 label: addr.clone(),
                 addr,
                 tail_addr: None,
+                alertd_addr: None,
             }],
             "default".into(),
         ));
@@ -257,6 +300,7 @@ pub fn parse_targets(raw: &[String]) -> Result<(Vec<Target>, String)> {
                     label: id.to_string(),
                     addr: addr.to_string(),
                     tail_addr: None,
+                    alertd_addr: None,
                 }
             }
             None => {
@@ -272,6 +316,7 @@ pub fn parse_targets(raw: &[String]) -> Result<(Vec<Target>, String)> {
                     label: entry.to_string(),
                     addr: entry.to_string(),
                     tail_addr: None,
+                    alertd_addr: None,
                 }
             }
         };
@@ -321,6 +366,36 @@ pub fn attach_tail_targets(targets: &mut [Target], raw: &[String]) -> Result<()>
     Ok(())
 }
 
+/// Attach repeatable `--alertd id=ADDR` values to existing query target IDs.
+pub fn attach_alertd_targets(targets: &mut [Target], raw: &[String]) -> Result<()> {
+    for entry in raw {
+        let entry = entry.trim();
+        let (id, addr) = match entry.split_once('=') {
+            Some((id, addr)) => (id.trim().to_string(), addr.trim()),
+            None if targets.len() == 1 => (targets[0].id.clone(), entry),
+            None => bail!(
+                "invalid --alertd '{entry}': name the target as 'id=ADDR' when more than one --queryd is configured"
+            ),
+        };
+        if id.is_empty() || addr.is_empty() {
+            bail!("invalid --alertd '{entry}': expected 'id=ADDR'");
+        }
+        let Some(target) = targets.iter_mut().find(|target| target.id == id) else {
+            bail!("--alertd '{entry}' names unknown target id '{id}' (declare it with --queryd first)");
+        };
+        if target.alertd_addr.is_some() {
+            bail!("duplicate --alertd for target id '{id}'");
+        }
+        let parsed = reqwest::Url::parse(addr)
+            .with_context(|| format!("invalid --alertd address '{addr}'"))?;
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+            bail!("invalid --alertd address '{addr}': expected http(s) URL");
+        }
+        target.alertd_addr = Some(addr.trim_end_matches('/').to_string());
+    }
+    Ok(())
+}
+
 /// Shared, clone-cheap application state (mirrors `scry-gateway`'s pattern: a
 /// `#[derive(Clone)]` handle over `Arc`-d internals).
 #[derive(Clone)]
@@ -337,10 +412,9 @@ struct Inner {
     key: Key,
     /// Session lifetime in seconds.
     session_ttl: i64,
-    /// Set the `Secure` attribute on the session cookie. Enable only when the
-    /// browser reaches scry-webui over HTTPS (e.g. behind a TLS reverse proxy);
-    /// a `Secure` cookie is dropped by the browser over plain `http://`.
-    secure_cookie: bool,
+    /// Disable the session cookie's `Secure` attribute for direct plain-HTTP
+    /// local development. Production cookies are secure by default.
+    insecure_cookie: bool,
     /// Deadline for connecting and writing the request to queryd. Shared by the
     /// query and tail relays — both fail before any response header is sent.
     relay_timeout: Duration,
@@ -354,6 +428,10 @@ struct Inner {
     /// Live-tail admission, kept separate so long-lived tails cannot starve
     /// queries out of the pool.
     tail_permits: Arc<Semaphore>,
+    alertd_token: Option<String>,
+    alertd_client: reqwest::Client,
+    alertd_timeout: Duration,
+    alertd_permits: Arc<Semaphore>,
 }
 
 /// Admission and timeout limits for the two relay paths.
@@ -391,7 +469,10 @@ pub struct AppConfig {
     pub password: String,
     pub key: Key,
     pub session_ttl: i64,
-    pub secure_cookie: bool,
+    pub insecure_cookie: bool,
+    pub alertd_token: Option<String>,
+    pub alertd_timeout: Duration,
+    pub max_alertd_requests: usize,
     pub limits: RelayLimits,
 }
 
@@ -403,12 +484,21 @@ impl AppState {
             password: cfg.password,
             key: cfg.key,
             session_ttl: cfg.session_ttl,
-            secure_cookie: cfg.secure_cookie,
+            insecure_cookie: cfg.insecure_cookie,
             relay_timeout: cfg.limits.setup_timeout,
             relay_idle_timeout: cfg.limits.idle_timeout,
             tail_idle_timeout: cfg.limits.tail_idle_timeout,
             relay_permits: Arc::new(Semaphore::new(cfg.limits.max_relays.max(1))),
             tail_permits: Arc::new(Semaphore::new(cfg.limits.max_tails.max(1))),
+            alertd_token: cfg.alertd_token,
+            // Redirects are returned to the browser instead of followed: following
+            // an alertd-controlled Location could escape the configured SSRF allowlist.
+            alertd_client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("static alertd HTTP client configuration is valid"),
+            alertd_timeout: cfg.alertd_timeout,
+            alertd_permits: Arc::new(Semaphore::new(cfg.max_alertd_requests.max(1))),
         }))
     }
 
@@ -443,8 +533,8 @@ impl AppState {
         self.0.session_ttl
     }
 
-    pub fn secure_cookie(&self) -> bool {
-        self.0.secure_cookie
+    pub fn insecure_cookie(&self) -> bool {
+        self.0.insecure_cookie
     }
 
     pub fn relay_timeout(&self) -> Duration {
@@ -466,6 +556,22 @@ impl AppState {
     pub fn tail_permits(&self) -> &Arc<Semaphore> {
         &self.0.tail_permits
     }
+
+    pub(crate) fn alertd_token(&self) -> Option<&str> {
+        self.0.alertd_token.as_deref()
+    }
+
+    pub(crate) fn alertd_client(&self) -> &reqwest::Client {
+        &self.0.alertd_client
+    }
+
+    pub(crate) fn alertd_timeout(&self) -> Duration {
+        self.0.alertd_timeout
+    }
+
+    pub(crate) fn alertd_permits(&self) -> &Arc<Semaphore> {
+        &self.0.alertd_permits
+    }
 }
 
 /// `SignedCookieJar` extracts the signing key from app state via `FromRef`.
@@ -475,9 +581,9 @@ impl FromRef<AppState> for Key {
     }
 }
 
-/// Maximum request-body size for `/api/query`. The framed `QueryRequest` is
-/// tiny (tens of bytes to a few KB); 8 MiB is generous headroom and well under
-/// the wire's 32 MiB frame ceiling.
+/// Maximum request-body size for query and alert mutations. The framed
+/// `QueryRequest` and alert JSON documents are small; 8 MiB is generous
+/// headroom and remains a hard bound before handlers run.
 const API_BODY_LIMIT: usize = 8 * 1024 * 1024;
 
 /// Build the application router: the `/api/*` surface plus the embedded SPA
@@ -487,9 +593,18 @@ pub fn router(state: AppState) -> Router {
         .route("/api/login", post(auth::login))
         .route("/api/logout", post(auth::logout))
         .route("/api/me", get(auth::me))
+        .route("/api/csrf", get(auth::csrf))
         .route("/api/targets", get(query::targets))
         .route("/api/query", post(query::query))
         .route("/api/tail", post(query::tail))
+        .route(
+            "/api/v1/alerts/{*path}",
+            get(alertd::proxy)
+                .post(alertd::proxy)
+                .put(alertd::proxy)
+                .patch(alertd::proxy)
+                .delete(alertd::proxy),
+        )
         .layer(DefaultBodyLimit::max(API_BODY_LIMIT))
         .fallback(assets::serve)
         .with_state(state)
@@ -498,6 +613,19 @@ pub fn router(state: AppState) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cookies_are_secure_unless_insecure_flag_is_explicit() {
+        let default = Args::try_parse_from(["scry-webui"]).unwrap();
+        assert!(!default.insecure_cookie);
+        let opted_out = Args::try_parse_from(["scry-webui", "--insecure-cookie"]).unwrap();
+        assert!(opted_out.insecure_cookie);
+    }
+
+    #[test]
+    fn old_secure_cookie_flag_is_rejected() {
+        assert!(Args::try_parse_from(["scry-webui", "--secure-cookie"]).is_err());
+    }
 
     #[test]
     fn empty_falls_back_to_a_single_default() {
@@ -560,7 +688,10 @@ mod tests {
             password: "pw".into(),
             key: Key::from(&[7u8; 64]),
             session_ttl: 60,
-            secure_cookie: false,
+            insecure_cookie: true,
+            alertd_token: None,
+            alertd_timeout: Duration::from_secs(15),
+            max_alertd_requests: 16,
             limits: RelayLimits::default(),
         });
         assert_eq!(state.resolve_target(Some("gothab")), Some("127.0.0.1:4100"));

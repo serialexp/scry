@@ -2,12 +2,17 @@
 
 Status: draft, not yet implemented
 Owner: Bart
-Last updated: 2026-09-07
+Last updated: 2026-09-22
 
 ## Implementation status
 
 This document delivers intents created by
-[Alert evaluation](alert-evaluation.md). Delivery never decides alert state.
+[Alert evaluation](alert-evaluation.md). Delivery never decides alert state. D-076
+excluded notification intents, targets, outbox processing, and external delivery
+from the completed first alerting slice; D-077 selects them as the next slice. No
+alert outbox, notification-target model, delivery worker/integration, or
+delivery-specific verification exists yet; only the surveyed generic
+HTTP/TLS/secret/lease patterns are implemented.
 
 ### Done
 
@@ -16,18 +21,26 @@ This document delivers intents created by
 
 ### Outstanding
 
-- [ ] **Decision — first integrations.** Confirm generic HTTPS webhook first and
-  whether Slack webhook ships in the same phase.
-- [ ] **Phase 0 — destination model.** Implement revisioned metadata, secret
-  references, validation/test, TLS profiles, and redacted API views.
-- [ ] **Phase 1 — durable outbox.** Project committed intents and attempts with
-  at-least-once identity, retry schedules, dead letters, and manual retry.
+- [ ] **Decision — template language.** Select a bounded placeholder syntax and
+  escaping rules for per-target built-in or custom payload templates.
+- [ ] **Decision — retry exhaustion.** Select the bounded terminal behavior and UI
+  wording for repeatedly failed delivery; a dead-letter/manual-retry workflow is
+  deferred, but retries cannot remain unbounded.
+- [ ] **Phase 0 — notification-target model and UI.** Implement revisioned targets,
+  encrypted S3 secret material, validation/test-send, redacted API views, and a
+  separate Notification targets section under Alerts.
+- [ ] **Phase 1 — durable outbox.** Atomically commit one Firing or Resolved intent per
+  selected target and project at-least-once delivery state with bounded retries.
 - [ ] **Phase 2 — webhook worker.** Add bounded pooled HTTP delivery, response
-  classification, idempotency, templates, and observability.
-- [ ] **Phase 3 — integrations.** Add Slack formatting, then SMTP/on-call adapters
-  only through the common delivery contract.
-- [ ] **Phase 4 — verification.** Crash-after-send, Retry-After, rotated secrets,
-  malformed templates, rate limits, SSRF, redaction, and multi-instance tests.
+  classification, idempotency, built-in/custom per-target templates, and observability.
+- [ ] **Phase 3 — built-in formats.** Ship useful built-in target formats such as
+  generic JSON and Slack-compatible payloads through the same target contract; do not
+  introduce independently reusable formatting resources.
+- [ ] **Defer — dead-letter workflow and manual retry.** Retain visible terminal
+  failures, but defer dedicated dead-letter management and manual retry controls.
+- [ ] **Phase 4 — verification.** Crash-after-send, Retry-After, encryption-key
+  rotation, malformed templates, rate limits, SSRF, redaction, and multi-instance
+  tests.
 
 ## Why this exists
 
@@ -83,40 +96,48 @@ NotificationIntent {
 
 Fields and rendered sizes are bounded and scrubbed. No secret value is included.
 `event_id` is deterministic over deployment, monitor revision/group, transition
-sequence, kind, and destination. One intent per destination prevents a failed
-Slack target from blocking a webhook. Firing and Resolved are never coalesced;
-Reminder creation may be coalesced by evaluator policy.
+sequence, kind, and notification target. One intent per target prevents a failed
+Slack target from blocking a webhook. Every configured target receives both Firing
+and Resolved transitions; sending only Firing would leave operators with a noisy,
+open-ended alarm. Firing and Resolved are never coalesced. Reminder creation remains
+deferred and may later be coalesced by evaluator policy.
 
 Intent lives inside the committed alert transition or in a deterministic object
 that transition commits atomically by reference. Visibility must have one commit
 point; readers never see state as Firing without its required intents.
 
-## Destination model
+## Notification-target model
 
 ```text
-Notifier {
+NotificationTarget {
   schema_version, id, revision, name, enabled, kind,
   endpoint metadata,
-  secret_ref,
+  encrypted_secret,
   timeout,
   tls_profile { ca_file, insecure_skip_verify=false },
-  bounded headers/format options,
+  format: BuiltIn(format_id) | CustomTemplate(template),
+  bounded headers/options,
   created_at, updated_at
 }
-SecretRef = OpaqueConfiguredSecretId(id)
 ```
 
+“Notification target” is the product and API term; the implementation should not
+retain a separate `Notifier`/destination vocabulary. Formatting belongs to the target
+revision itself. A target selects a built-in format or stores one complete custom
+template with bounded placeholders; there is no separately managed/reusable format
+resource.
+
 Definitions are immutable revisions in object storage and projected locally.
-Mutation uses expected revision and a lease in clustered mode. Intents pin all
-non-secret delivery metadata to one immutable notifier revision; only its secret
-value is resolved live so rotation remains possible and historical routing cannot
-change silently. Referenced revisions/tombstones outlive every dependent intent.
-API responses show only metadata and an opaque secret ID, never paths, environment
-names, or values. Operators map IDs at startup to allowlisted files under a
-canonical secret root (rejecting symlink/escape) or allowlisted environment names.
-API users cannot select arbitrary process-readable files. Resolve file values on
-each attempt so Kubernetes-projected rotation is followed. Terminal newlines are
-trimmed where the secret format calls for it.
+Mutation uses expected revision and a lease in clustered mode. Intents pin the target
+revision so later endpoint/template edits cannot silently rewrite historical routing.
+Target secrets are encrypted before they are written to S3-compatible object storage.
+Every alertd instance receives the same operator-supplied encryption key and decrypts
+only while validating or delivering. API responses never return ciphertext, key
+identifiers that disclose deployment configuration, or plaintext; mutation accepts a
+write-only secret field and an unchanged-secret sentinel. Key versioning and an
+explicit rotation/re-encryption procedure are required before implementation so a
+single abrupt key replacement cannot make existing targets unreadable. Referenced
+revisions/tombstones outlive every dependent intent.
 
 Generic webhook requires HTTPS by default, validates a configured absolute URL,
 rejects userinfo/fragments and non-allowlisted schemes, caps headers, and does not
@@ -202,17 +223,22 @@ Crash cases:
 
 ## Templates and payloads
 
-Templates are versioned, bounded, non-Turing-complete field selection/formatting.
-No network/file/env access, loops over unbounded event data, or secret interpolation.
-Render and scrub at intent creation so later rule/template edits cannot rewrite
-history; destination adapters may add protocol framing only.
+Formatting is configured directly on each notification target. The target chooses a
+built-in template or supplies one complete custom template using a bounded,
+non-Turing-complete placeholder language. Formats are not independently named,
+versioned, or shared between targets. The target's own immutable revision versions its
+template. Templates have no network/file/env access, loops over unbounded event data,
+or secret interpolation. Output bytes are bounded. Render and scrub at intent
+creation so later target edits cannot rewrite history; protocol adapters may add
+framing only.
 
-Generic webhook emits a stable JSON schema with transition, labels, annotations,
-value/issue summary, timestamps, links, and event ID. It can optionally sign exact
-body bytes with an HMAC secret reference and timestamp; signature version and
-replay window are documented. Slack adapter maps the same intent into bounded
-blocks/text and includes Scry link and transition, without owning alert logic.
-SMTP later uses the same snapshot and Message-ID derived from event ID.
+The generic JSON built-in emits a stable schema with transition, labels, annotations,
+value/issue summary, timestamps, links, and event ID. A Slack-compatible built-in maps
+the same intent into bounded blocks/text and includes the Scry link and transition,
+without owning alert logic. A generic webhook may optionally sign exact body bytes
+with its encrypted target secret and timestamp; signature version and replay window
+are documented. SMTP later uses the same snapshot and Message-ID derived from event
+ID.
 
 Links are built from configured public Scry base URL and typed IDs, never from
 untrusted Host headers. Payload previews in UI are scrubbed and clearly exclude
@@ -235,6 +261,9 @@ without inhibition.
 
 ## Integrations and phasing
 
+Delivery begins only after the no-delivery first alerting slice is complete; none of
+these phases is implied by browser rule CRUD or alert-state evaluation:
+
 1. generic HTTPS JSON webhook with optional HMAC;
 2. Slack incoming webhook formatting;
 3. SMTP with TLS and stable Message-ID;
@@ -246,10 +275,12 @@ Jira tickets, chat actions, and bidirectional workflows are separate features.
 
 ## Control API and observability
 
-Authenticated endpoints provide destination list/create/update/delete with expected
-revision, test-send, redacted payload preview, delivery history, dead-letter list,
-and manual retry. Test sends use the same admission/TLS/secret/response handling but
-an explicit test event namespace and no monitor transition.
+Authenticated endpoints provide notification-target list/create/update/delete with
+expected revision, test-send, redacted payload preview, and recent delivery outcomes.
+The Alerts UI exposes targets in a separate section rather than mixing them into the
+monitor list. Test-send is part of the first target UI and uses the actual
+admission/template/TLS/secret/response path with an explicit test event namespace and
+no monitor transition. Dedicated dead-letter and manual-retry APIs are deferred.
 
 Status exposes intents created, pending/retrying/dead/succeeded, oldest age,
 delivery latency, outcomes by notifier kind/status class, rate-limit/backoff,
@@ -291,11 +322,22 @@ intent would resurrect pending delivery after cold rebuild and is forbidden. Man
 retry after the documented receiver idempotency horizon is labeled as possibly
 duplicating even with the same event ID.
 
-## Open questions for review
+## Selected decisions and remaining review
 
-- Generic webhook only in first implementation, or Slack formatting alongside it?
-- Initial success/dead attempt-history and receiver idempotency retention?
-- Is HMAC signing required for v1 generic webhooks?
+D-076 deferred delivery from the completed first alerting slice. D-077 selects the
+next slice: notification targets are managed in their own Alerts UI section; each
+target owns either a built-in or complete custom template; monitors emit both Firing
+and Resolved intents; target secrets are encrypted in object storage using a shared
+operator-supplied key; test-send ships with target CRUD; and a dedicated dead-letter/
+manual-retry workflow is deferred.
+
+Still to resolve before implementation:
+
+- exact bounded placeholder syntax, JSON/text escaping behavior, and custom-template
+  validation UX;
+- encryption envelope/key identifier and current/previous-key rotation procedure;
+- bounded retry maximum/age and the name presented for exhausted terminal failure;
+- whether optional HMAC signing is part of the first generic-webhook target.
 
 ## References
 

@@ -1,8 +1,8 @@
 # Stack processing and issue grouping — Design
 
-Status: partial — fingerprint v1 core implemented without symbolication or stack parsing
+Status: partial — basic type/message fingerprinting implemented; full fingerprint contract, symbolication, and stack parsing outstanding
 Owner: Bart
-Last updated: 2026-09-15
+Last updated: 2026-09-22
 
 ## Implementation status
 
@@ -11,25 +11,27 @@ and feeds [Issue indexing and lifecycle](error-issues.md). Fingerprint v1 is
 implemented at the type+message level without parsed/symbolicated frames (no
 artifact contract, stack parsing, or source-map lookup yet). The OCC1 binary
 decoder, regex-based message normalization, SHA-256 digest, quality levels, and
-deterministic issue identity are operational and tested.
+deterministic issue identity are operational and tested. This is a narrower slice
+than the full fingerprint contract below: normalization currently uses one generic
+replacement token, explanation components are not persisted, and grouping-policy,
+platform, and collision-disambiguation semantics remain outstanding.
 
 ### Done
 
 - [x] **External model survey.** TC39 debug IDs, Sentry artifact/symbolicator
   designs, OTel natural stack conventions, and current grouping strategies have
   been reviewed.
-- [x] **Phase 2a — fingerprint v1 core.** OCC1 zero-copy binary decoder extracts
-  identity, severity, event_name, body, and attributes from canonical occurrence
-  bytes. Regex-based `normalize_message()` replaces UUIDs, 0x-hex, ISO timestamps,
-  URLs, IP-like sequences, floats, and numbers ≥4 digits with typed tokens.
-  `compute_digest()` hashes domain tag + app + exception type + normalized message
-  via SHA-256. `fingerprint_v1()` produces a `FingerprintResult` with
-  `GroupingQuality` (TypeAndMessage=0, TypeOnly=1, Fallback=2) and explanation
-  components. Deterministic `IssueId` derived from domain-tagged
-  `SHA-256(deployment || app || fp_version || fp_digest)[..16]`. Tests cover
-  normalization, quality levels, determinism, and distinctness. This operates at
-  the message level (steps 7–8 of the design's automatic fp-v1 sequence);
-  frame-based grouping (steps 2–6) requires stack parsing and symbolication.
+- [x] **Phase 2a — basic fingerprint v1 core.** OCC1 zero-copy binary decoder
+  extracts identity, severity, event_name, body, and attributes from canonical
+  occurrence bytes. Regex-based `normalize_message()` replaces UUIDs, 0x-hex, ISO
+  timestamps, URLs, IP-like sequences, floats, and numbers ≥4 digits with one
+  generic token. `compute_digest()` hashes length-tagged fingerprint version, app,
+  optional exception type, and optional normalized message via SHA-256.
+  `fingerprint_v1()` produces `GroupingQuality` (TypeAndMessage=0, TypeOnly=1,
+  Fallback=2) and in-memory explanation components. Deterministic `IssueId` is
+  derived from domain-tagged deployment/app/fingerprint version/digest bytes. Tests
+  cover normalization, quality levels, determinism, and distinctness. This is the
+  implemented message-level fallback; the full contract below remains outstanding.
 
 ### Outstanding
 
@@ -39,14 +41,21 @@ deterministic issue identity are operational and tested.
   manifests, exact lookup, rebuildable index, auth, limits, and garbage collection.
 - [ ] **Phase 1 — stack processors.** Parse supported runtimes into versioned raw/
   parsed/symbolicated frame layers with bounded partial failure.
-- [ ] **Phase 2b — frame-based fingerprint.** Add in-application frame selection,
-  system/framework exclusion, recursive collapse, and explicit `scry.error.fingerprint`
-  override from the design's automatic fp-v1 steps 2–6. Currently fingerprinting
-  falls through to type+message (step 7) for all occurrences.
+- [ ] **Phase 2b — full fingerprint contract.** Add typed normalization tokens,
+  persisted canonical components/explanations, platform and grouping-policy
+  revision, canonical-byte collision comparison/disambiguation, in-application
+  frame selection, system/framework exclusion, recursive collapse, and explicit
+  `scry.error.fingerprint` override. Current grouping uses type/message or fallback
+  body/severity and does not preserve the explanation after reconciliation.
+- [ ] **Grouping fold fidelity.** Propagate decoded OCC1 severity into issue
+  aggregation instead of the current hardcoded value so `max_severity` reflects
+  source occurrences.
 - [ ] **Phase 3 — reprocessing.** Add bounded late-artifact retries and explicit
   grouping migration shadow/activation workflows.
-- [ ] **Phase 4 — verification.** Golden stacks/maps, malicious maps, deterministic
-  fingerprints, late uploads, cache invalidation, and rebuild tests.
+- [ ] **Phase 4 — remaining verification.** Add canonical-byte/collision and
+  persisted-explanation coverage plus golden stacks/maps, malicious maps, late
+  uploads, cache invalidation, migration, and rebuild tests. Basic normalization,
+  quality, determinism, and distinctness tests already exist.
 
 ## Why this exists
 

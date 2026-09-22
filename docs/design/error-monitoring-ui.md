@@ -1,16 +1,20 @@
 # Errors, issues, and alerts UI/API — Design
 
-Status: partial — issue list route and query-wire read implemented; detail, mutations, and alerts UI outstanding
+Status: partial — issue list/basic detail and first scalar Alerts CRUD/state UI implemented; rich issue inspection and later alerting views outstanding
 Owner: Bart
-Last updated: 2026-09-15
+Last updated: 2026-09-22
 
 ## Implementation status
 
 This document presents the backend contracts in the rest of the
 [Error monitoring suite](error-monitoring.md). It does not redefine their state.
 The issue list is now served over the query wire protocol and displayed in a
-browser `/errors` route. Issue detail, mutations, and the full alerts UI remain
-outstanding.
+browser `/errors` route. A basic `/errors/:issueId` route shows issue metadata and
+recent occurrence identifiers, timestamps, and trace IDs; the read API also returns
+span IDs. Rich occurrence inspection, trace navigation, grouping explanation,
+workflow mutations, and the later delivery/silence/history alert surfaces remain
+outstanding. The first scalar alert slice now exposes secure shared-admin rule CRUD,
+validation, current state, and status polling in `/alerts`.
 
 ### Done
 
@@ -24,31 +28,44 @@ outstanding.
   The webui relay passes frames unchanged. Queryd `--errors-db` opens `errors.sqlite`
   read-only and serves from a `Mutex<ErrorsDb>`. Nav link placed between Alerts and
   Fleet. Error state (ISSUES_UNAVAILABLE) handled gracefully.
+- [x] **Phase 1b — basic issue detail read.** `/errors/:issueId` is linked from the
+  inbox and polls `IssueOccurrencesRequest` over the query wire. SQLite/queryd,
+  typed client/store state, and the Solid page expose the issue summary plus recent
+  event IDs, occurrence timestamps, and trace IDs. The API additionally returns
+  span IDs, which the page does not display. This is metadata-only, not the designed
+  occurrence inspector.
+- [x] **First alerting vertical slice — browser rule CRUD/state.** Added direct
+  same-target webui-to-alertd proxying, environment bearer service auth, secure
+  cookies by default, nonce CSRF/same-origin mutation checks, bounded proxying,
+  dedicated Solid alert store, scalar rule list/create/edit/delete/validate, conflict
+  handling, polling, and explicit alert state/staleness presentation. Delivery UI
+  and issue/artifact mutations are not included.
 
 ### Outstanding
 
-- [ ] **Decision — control topology.** Confirm separate configured errors/alertd
-  upstreams and proxy routes versus one combined control endpoint.
-- [ ] **Decision — authorization.** Accept all-or-nothing shared-session admin for
-  v1 or require identities/roles before mutation.
-- [ ] **Phase 0 — control API.** Add authenticated, CSRF-protected, bounded,
-  revisioned proxies and typed clients for issues, artifacts, rules, and delivery.
-- [ ] **Phase 1b — issue detail and workflow views.** Add issue detail page,
-  occurrence inspector, grouping explanation, stack/source display, trace links,
-  workflow actions (resolve/ignore/assign), and deep links. The issue list is
-  implemented; everything past the list remains.
-- [ ] **Phase 2 — Alerts views.** Replace the inert page with monitor/state/history,
-  editor/test, silences, destinations, outbox, and delivery diagnostics.
-- [ ] **Phase 3 — parity and accessibility.** Implement browser/Tauri transport,
-  per-view stores, keyboard/screen-reader behavior, and responsive layouts.
-- [ ] **Phase 4 — verification.** Contract, auth/CSRF, conflict, stale/partial,
-  pagination, accessibility, browser, and Tauri tests.
+- [ ] **Phase 0 — remaining control APIs.** Add bounded revisioned proxies and typed
+  clients for issues, artifacts, silences, and later delivery operations.
+- [ ] **Phase 1c — complete issue inspection and workflow.** Add event deep links,
+  raw occurrence inspection, exception chain, grouping explanation, stack/source
+  display, actual trace navigation and nearby logs, facets/audit/monitor panels,
+  and workflow actions (resolve/ignore/assign). Basic issue metadata and recent
+  occurrence rows are implemented.
+- [ ] **Phase 2b — later Alerts views.** Add full transition history, silences, destinations,
+  outbox, and delivery diagnostics after their backend phases exist.
+- [ ] **Phase 3 — parity and accessibility.** Extract the error views from the
+  monolithic store, add completion-relative visibility-aware polling, and implement
+  keyboard/screen-reader behavior and responsive layouts. Basic list/detail reads
+  already use the shared browser/Tauri query transport.
+- [ ] **Phase 4 — verification.** Add list/detail query-handler, typed-client,
+  store, and component tests, followed by control contract, auth/CSRF, conflict,
+  stale/partial, pagination, accessibility, browser, and Tauri coverage.
 
 ## Why this exists
 
-The current SolidJS application has Explore, Dashboards, Alerts, and Fleet routes,
-but Alerts explicitly has no backend. Generic telemetry reads travel as framed
-queries returning Arrow through a deliberately protocol-blind webui relay. Error
+The SolidJS application has Explore, Dashboards, Alerts, Errors, and Fleet routes.
+The first scalar Alerts backend/UI now exists; this section records the original
+motivation for keeping its control path separate. Generic telemetry reads travel as
+framed queries returning Arrow through a deliberately protocol-blind webui relay. Error
 monitoring adds mutable issue workflow, artifacts, monitor rules, destinations,
 and retry operations that are not queries and should not be forced into that wire.
 
@@ -71,13 +88,15 @@ while preserving existing query transport for raw telemetry and trace detail.
 
 - Replacing Explore or returning generic query results as JSON.
 - Browser access to Valkey/object storage/private daemon addresses.
-- Fine-grained organization/team RBAC unless selected as a review prerequisite.
+- Fine-grained organization/team RBAC; v1 intentionally uses one shared-admin
+  authorization level for every authenticated browser session.
 - Session replay, AI diagnosis, ticket integrations, or chat-based mutation.
 - Exposing source-map objects, notifier secrets, or arbitrary server errors.
 
 ## Information architecture
 
-Add `/errors` as a first-class route; retain `/alerts` for monitors and delivery:
+Add `/errors` as a first-class route; retain `/alerts` for monitors, with delivery
+subroutes appearing only in the later delivery slice:
 
 ```text
 /errors                          issue inbox/list
@@ -139,15 +158,24 @@ separate domain types. Fix existing OTLP trace linking to recognize canonical
 correlation rather than only `trace_id`/`traceId`/`trace.id`; `otel.trace_id` remains
 a compatibility alias.
 
-Mutations include `If-Match` revision and `Idempotency-Key`, backed by the control
-plane's object ETag CAS. A 409 presents current state and asks the user to reapply;
-it never silently overwrites. Ambiguous timeout is resolved by command ID/status.
-A durable accepted but locally pending fold is shown as pending synchronization.
+Implemented alert mutations include `If-Match` revision and a UUID
+`Idempotency-Key`, backed by object ETag CAS. Create/update persist a command receipt
+containing the request digest and result identity; delete persists a command
+Tombstone, so exact ambiguous retries replay while key reuse with different input
+conflicts. A 409 asks the user to reload and reapply; it never silently overwrites.
+A general command-status endpoint and explicit locally-pending-fold presentation
+remain future control-plane work.
 Optimistic UI is limited to reversible presentation and reconciles from server truth.
 
 ## Alerts experience
 
-Replace the inert Alerts page only when backend phases exist. List shows monitor
+The first vertical slice replaces the inert Alerts page with browser CRUD for
+ungrouped restricted scalar-SQL rules and their explicit no-data/error policies,
+backed by the separate alertd service. It does not expose destinations, delivery,
+or grouped-rule authoring. The browser backend and UI are implemented; native Tauri
+control transport and the later alert surfaces remain outstanding.
+
+The eventual list shows monitor
 type, enabled, current state/groups, last/next evaluation, stale/error/no-data,
 firing since, matched issue/query, destinations, and delivery failures.
 
@@ -159,9 +187,11 @@ Editor uses typed builders:
 - schedule/jitter, `for`, recovery, no-data and execution-error policies;
 - labels/annotations, destinations, resolve/reminder behavior.
 
-A validation/test action reports query schema/value/timing and resource rejection
-without transitioning state or delivering. Raw SQL remains an Advanced field with
-server validation and a prominent bounded-execution explanation.
+The browser currently exposes structural validation only. Alertd also has a
+side-effect-free test-evaluation endpoint that reports value/no-data/error, but typed
+client/UI output for that endpoint, schema/timing details, and resource diagnostics
+remain outstanding. Raw SQL remains an Advanced field with server validation and a
+prominent bounded-execution explanation.
 
 Detail shows the state timeline, values, evaluations, errors, silences, transitions,
 and notification intents/attempts. `NoData`, `Error`, `Stale`, and `Disabled` are
@@ -169,10 +199,13 @@ not styled as healthy green. Silence creation requires scope, start/end, actor, 
 preview of affected groups. Dead letters link to redacted attempt diagnostics and
 manual retry.
 
-Destination UI lists kind/name/enabled/revision/health only. Secret fields are
-write-only reference configuration; reading never returns a resolved value. Test
-send uses the actual worker path. Payload preview is scrubbed and excludes secret-
-derived headers/signatures.
+Alerts has separate **Monitors** and **Notification targets** sections. A target shows
+kind/name/enabled/revision/health and owns its selected built-in format or complete
+custom placeholder template; formats are not independently managed or shared.
+Secret fields are write-only: the API accepts plaintext only on mutation, encrypts it
+for object storage, and never returns plaintext or ciphertext. Test-send ships with
+target CRUD and uses the actual worker path. Payload preview is scrubbed and excludes
+secret-derived headers/signatures.
 
 ## API topology
 
@@ -189,9 +222,14 @@ operator-configured allowlisted private daemons:
 /api/v1/alerts/delivery...
 ```
 
-The browser selects an opaque configured target ID, never an address. Webui strips
-hop-by-hop/credential headers, applies operation-specific body/time/admission limits,
-and translates neither domain payload nor private errors beyond a stable envelope.
+Browser alert operations use the same opaque configured target IDs already used for
+query selection; the client never learns or supplies an address. For the first
+slice, webui resolves that target ID to its configured alertd endpoint and proxies
+rule CRUD directly to alertd. Alertd independently resolves the same target ID to a
+configured queryd endpoint and connects directly to queryd for evaluation; alert
+queries never hairpin through webui. Webui strips hop-by-hop/credential headers,
+applies operation-specific body/time/admission limits, and translates neither domain
+payload nor private errors beyond a stable envelope.
 Unknown target is 400; unconfigured capability is 409; unavailable upstream is 502;
 conflict remains 409; overload is 429/503 with bounded retry guidance.
 
@@ -208,10 +246,12 @@ HTTP CRUD or expose raw addresses to frontend state.
 ## Authentication, authorization, and CSRF
 
 The existing shared password creates one HttpOnly, SameSite=Strict signed cookie.
-V1 can provide all authenticated users full issue/alert administration only if
-review explicitly accepts that limitation. UI and API state it. With no distinct
-principals, source-context access is a deployment-level on/off policy—not per-user
-authorization—or stronger identity/RBAC becomes a release prerequisite.
+V1 deliberately grants every authenticated session the `shared-admin` identity and
+full alert-rule administration; there are no per-user roles in this slice. UI and
+API state that limitation. Cookies are `Secure` by default. Plain-HTTP development
+requires an explicit insecure-cookie opt-out; startup must not infer it from the bind
+address or request scheme. With no distinct principals, source-context access is a
+deployment-level on/off policy—not per-user authorization.
 
 Before any mutation route ships, add a random per-session nonce to the signed cookie
 (the current expiry-only cookie cannot bind CSRF state), require secure cookies/TLS,
@@ -222,11 +262,15 @@ error intake is a different narrowly scoped endpoint and never grants control ac
 Audit actor is the available authenticated identity (`shared-admin` initially), not
 untrusted browser text.
 
-Private errorsd/alertd control listeners are not the unauthenticated status listener,
-bind loopback by default, and require scoped high-entropy bearer credentials or mTLS
-from Phase 0 for webui, Tauri, and CI callers. The browser session cookie is never
-forwarded as service authentication. Capabilities separate issue mutation, source-
-context read, artifact upload, rule mutation, and destination administration.
+Private errorsd/alertd control listeners are not the unauthenticated status listener
+and bind loopback by default. The first alerting slice requires a scoped high-entropy
+service bearer token supplied to webui and alertd through environment variables.
+Webui authenticates directly to alertd with that token; the browser session cookie
+is never forwarded as service authentication. Token files and live reload are not
+supported: rotation updates the environment and restarts the affected services.
+Later mTLS remains possible but is not the v1 contract. Capabilities separate issue
+mutation, source-context read, artifact upload, rule mutation, and destination
+administration.
 
 ## Frontend state architecture
 
@@ -292,11 +336,14 @@ workflow. Destructive actions require explicit confirmation and name scope.
 - Browser and Tauri integration tests exercise issue-to-occurrence-to-trace,
   resolve/regression, monitor validation, test send, dead letter, and manual retry.
 
-## Open questions for review
+## Selected first-slice decisions and remaining review
 
-- One combined control daemon endpoint or separate errorsd/alertd targets?
-- Is shared-admin authorization acceptable for first release, especially source
-  context and destination mutation?
+D-076 selects separate alertd topology, direct webui-to-alertd and alertd-to-queryd
+hops, reuse of opaque target IDs, environment-supplied service bearer auth with
+restart-based rotation and no token files, shared-admin browser CRUD, secure cookies
+by default with explicit insecure opt-out, and no delivery UI. These are decisions;
+the corresponding alerting implementation remains outstanding.
+
 - Which issue list facets are guaranteed efficiently indexed in v1?
 - Are comments/assignment/merge included in initial UI or later lifecycle phases?
 - Does artifact upload belong in this UI, CLI/CI only, or both with different auth?

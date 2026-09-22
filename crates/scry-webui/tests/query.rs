@@ -64,7 +64,10 @@ fn state_for(targets: Vec<Target>, default: String, limits: RelayLimits) -> AppS
         password: PASSWORD.to_string(),
         key: Key::from(&[9u8; 64]),
         session_ttl: 3600,
-        secure_cookie: false,
+        insecure_cookie: true,
+        alertd_token: None,
+        alertd_timeout: Duration::from_secs(15),
+        max_alertd_requests: 16,
         limits,
     })
 }
@@ -221,6 +224,7 @@ async fn targets_lists_configured_with_default() {
     assert_eq!(targets.len(), 2);
     assert_eq!(targets[0]["id"], "local");
     assert_eq!(targets[1]["id"], "gothab");
+    assert_eq!(targets[0]["alerts"], false);
     // The raw address must never reach the browser.
     assert!(targets[0].get("addr").is_none());
 }

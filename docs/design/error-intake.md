@@ -1,8 +1,8 @@
 # Error event contract and intake — Design
 
-Status: partial — D-074 occurrence foundation implemented; bounded catalog query added; browser intake and producer guidance outstanding
+Status: partial — occurrence foundation and snapshot bootstrap implemented; browser intake, clustered operation, and lifecycle cleanup outstanding
 Owner: Bart
-Last updated: 2026-09-15
+Last updated: 2026-09-22
 
 ## Implementation status
 
@@ -10,8 +10,10 @@ This document refines [Error monitoring](error-monitoring.md). D-073 accepts a
 lossless logs v2 representation. D-074's coordinated occurrence foundation is now
 implemented: producers emit canonical raw-record v1, ingest stamps trusted receipt
 time into canonical raw-record v2 before WAL, and logs Parquet/query schema v3
-exposes `received_ts_unix_nano`. Browser intake and producer guidance remain
-outstanding; this implementation has not been deployed.
+exposes `received_ts_unix_nano`. A version-checked `errors.sqlite` snapshot is
+periodically uploaded and restored on queryd cold start. Browser intake, producer
+guidance, clustered operation, and projection lifecycle cleanup remain outstanding;
+this implementation has not been deployed.
 
 ### Done
 
@@ -42,6 +44,14 @@ outstanding; this implementation has not been deployed.
   signal/schema-specific query. Wrap-around pagination ensures eventual coverage.
   Test covers signal filtering, schema_version filtering, cursor pagination,
   LIMIT, and superseded/deleted exclusion.
+- [x] **Occurrence snapshot bootstrap.** `errors.sqlite` can be saved with
+  `VACUUM INTO`, uploaded as `_scry/errors/v1/snapshot.sqlite`, schema-checked, and
+  restored on queryd cold start. Round-trip, absent-snapshot, and version-mismatch
+  behavior is tested.
+- [x] **Core intake verification.** Canonical typed-value/decoder bounds, redaction,
+  malformed inputs, HTTP protobuf/JSON/gzip/gRPC parity, gateway-to-storage query,
+  mixed-schema normalization, compaction preservation/rejection, extraction,
+  publication, and reconcile/fold idempotency have focused coverage.
 
 ### Outstanding
 
@@ -49,23 +59,27 @@ outstanding; this implementation has not been deployed.
   hints, and safe multi-writer takeover; clustered mode currently fails closed.
 - [ ] **Accepted-record low-latency hints.** Add the optional acceleration path;
   sealed-block/occurrence-commit reconciliation remains the correctness path.
-- [ ] **Occurrence snapshots and GC.** Add bounded snapshot bootstrap, generation
-  and orphan cleanup, and retention-aware garbage collection.
+- [ ] **Occurrence snapshot lifecycle and GC.** Replace the single overwritten,
+  fully materialized snapshot with bounded/generation-aware bootstrap; add orphan
+  cleanup and retention-aware garbage collection.
 - [ ] **Phase 2 — hardened browser intake.** Add public app keys, exact origin
   policy, quotas, small bounds, route-specific policy, and dedicated status.
 - [ ] **Phase 3 — trusted server guidance.** Publish per-language setup and
   independent exception-log sampling guidance.
-- [ ] **Phase 4 — verification.** Add lossless format, rejection, abuse, replay,
-  occurrence-projection, scrubbing, correlation, and end-to-end tests.
+- [ ] **Phase 4 — remaining verification.** Add browser abuse/origin/revocation/
+  decompression coverage, independent trace-sampling tests, and one end-to-end
+  canonical-byte test spanning transport, WAL, block, compaction, reconcile, and
+  query.
 
 ## Why this exists
 
-Scry Gateway accepts OTLP logs and traces over HTTP protobuf/JSON/gzip and gRPC,
-but its current log mapping drops top-level `event_name` and observed time,
-duplicates trace IDs into string attributes, and stringifies every `AnyValue`.
-Those losses are tolerable for basic log search but not for an error product that
-must preserve typed context, distinguish event schema from occurrence identity,
-and reprocess historical events.
+Before logs v2, Scry Gateway's OTLP logs mapping dropped top-level `event_name`
+and observed time, duplicated trace IDs into string attributes, and stringified
+every `AnyValue`. The implemented canonical mapping now preserves those fields;
+this design remains the contract for maintaining that fidelity and for the still-
+outstanding browser intake surface. The former losses were tolerable for basic log
+search but not for an error product that must preserve typed context, distinguish
+event schema from occurrence identity, and reprocess historical events.
 
 This design defines what producers send, what Scry accepts and retains, and how
 untrusted browser traffic differs from trusted server telemetry. Grouping begins

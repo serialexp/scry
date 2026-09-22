@@ -41,6 +41,7 @@
 pub mod bloom_cache;
 pub mod body_bloom;
 pub mod cli;
+pub mod client;
 pub mod evict;
 pub mod label_enrich;
 pub mod logs;

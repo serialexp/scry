@@ -65,6 +65,8 @@ enum Cmd {
     Retention(scry_retention::Args),
     /// Error occurrence projection and reconciliation.
     Errors(scry_errorsd::Args),
+    /// Durable scalar alert evaluation and control API.
+    Alert(scry_alertd::Args),
     /// Live log tailing (best-effort, straight off the ingest hot path).
     Tail(scry_tail::Args),
     /// Replay an OpenSearch corpus into a scry ingest server (throughput bench).
@@ -93,6 +95,7 @@ async fn main() -> Result<()> {
         Cmd::Compact(a) => scry_compactd::run(a).await,
         Cmd::Retention(a) => scry_retention::run(a).await,
         Cmd::Errors(a) => scry_errorsd::run(a).await,
+        Cmd::Alert(a) => scry_alertd::run(a).await,
         Cmd::Tail(a) => scry_tail::run(a).await,
         Cmd::ReplayOpensearch(a) => scry_replay_opensearch::run(a).await,
     }

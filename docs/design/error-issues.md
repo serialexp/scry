@@ -1,8 +1,8 @@
 # Error issue indexing and lifecycle — Design
 
-Status: partial — issue tables and grouping reconciliation implemented; workflow and clustered operation outstanding
+Status: partial — issue index, grouping reconciliation, list, and basic detail reads implemented; workflow and clustered operation outstanding
 Owner: Bart
-Last updated: 2026-09-15
+Last updated: 2026-09-22
 
 ## Implementation status
 
@@ -12,9 +12,10 @@ This document consumes the dedicated occurrence projection defined by
 [Alert evaluation](alert-evaluation.md). D-074 places the occurrence projection,
 `errors.sqlite`, and `scry errors` in an earlier full slice than grouping/issues.
 The `issues` and `occurrence_issues` SQLite tables, transactional `fold_grouped()`
-upsert, `group_occurrence_page()` reconciliation, read-only `list_issues()`, and
-read-only query-wire serving are now implemented. Human workflow state, facets,
-regressions, and durable transitions remain outstanding.
+upsert, `group_occurrence_page()` reconciliation, read-only issue listing, basic
+issue/occurrence detail reads, and query-wire serving are now implemented. Human
+workflow state, facets, regressions, durable transitions, cursor pagination, and
+rich occurrence inspection remain outstanding.
 
 ### Done
 
@@ -25,9 +26,10 @@ regressions, and durable transitions remain outstanding.
   and folds them into a deployment-bound, independently rebuildable `errors.sqlite`.
   Discovery and raw-source processing are bounded and periodic in exclusive
   single-writer mode; extraction accepts only logs schema 3/raw-record v2.
-- [x] **Phase 0a — issue index tables.** `errors.sqlite` schema v3 adds `issues`
+- [x] **Phase 0a — issue index tables.** `errors.sqlite` schema v4 contains `issues`
   (keyed by `deployment_id, issue_id`, indexed on `last_seen_unix_nano`) and
-  `occurrence_issues` (keyed by `deployment_id, app_id, event_id, issue_id`).
+  `occurrence_issues` (keyed by `deployment_id, app_id, event_id`, with the current
+  issue ID and grouping generation stored on each membership).
   `fold_grouped()` transactionally upserts issues (accumulating `occurrence_count`,
   `last_seen`, `max_severity`) and inserts occurrence-issue links with
   INSERT-OR-IGNORE idempotency. `ErrorsDb::open_read_only()` opens with
@@ -55,11 +57,13 @@ regressions, and durable transitions remain outstanding.
   orchestration, hints, snapshots/GC, reprocessing generations, compaction locator
   repair, and grouping/issue cold rebuild. Single-writer grouping reconciliation
   and the D-074 bounded cursors are already implemented.
-- [ ] **Phase 3 — issue API.** Add paginated reads and revision-checked mutations
-  through the control plane. Read-only issue list is served over the query wire;
-  mutations and detail queries remain.
-- [ ] **Phase 4 — verification.** Multi-instance, no-Valkey, retention, migration,
-  collision, workflow conflict, and rebuild tests.
+- [ ] **Phase 3 — complete issue API.** Add cursor-paginated/filterable reads,
+  server-capped limits, full occurrence detail, and revision-checked mutations
+  through the control plane. Query wire currently serves a limit-only issue list
+  and basic issue summary/recent-occurrence metadata.
+- [ ] **Phase 4 — verification.** Add focused `get_issue`/occurrence-list and
+  query-wire handler tests, then multi-instance, no-Valkey, retention, migration,
+  fingerprint-collision, workflow-conflict, and grouping cold-rebuild coverage.
 
 ## Why this exists
 
@@ -202,9 +206,15 @@ In the implemented foundation slice, for each logs schema-3 source block, `scry
 errors` applies bounded admission, accepts only server-stamped raw-record v2, selects
 eligible exception logs with valid canonical producer IDs, folds exact duplicate
 IDs/collisions, and conditionally commits the dedicated occurrence generation
-metadata-last. It never scans trace span events for occurrences. Grouping is absent.
+metadata-last. It never scans trace span events for occurrences.
 
-In the later grouping phase, for each committed occurrence generation:
+A subsequent implemented local phase reads ungrouped occurrences from SQLite,
+computes the basic type/message fingerprint, derives deterministic issue IDs, and
+folds issue aggregates/membership directly into `errors.sqlite`. It does not yet
+write the immutable grouping-generation objects described above, support concurrent
+algorithm generations, or cold-rebuild grouping state from those objects.
+
+In the later complete grouping phase, for each committed occurrence generation:
 
 1. acquire the partitioned projection lease when clustered;
 2. read canonical occurrences with bounded admission;

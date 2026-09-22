@@ -47,6 +47,12 @@ pub struct TargetInfo {
     /// whether `/api/tail` will work for it. The UI disables its Live toggle
     /// when false instead of failing at subscribe time.
     live: bool,
+    /// Whether this target has an alertd control endpoint. This capability bit
+    /// is the only alert configuration exposed; addresses and tokens stay server-side.
+    alerts: bool,
+    /// Mutations additionally require secure cookies; insecure HTTP development
+    /// remains read-only even when alertd is configured.
+    alert_mutations: bool,
 }
 
 impl From<&Target> for TargetInfo {
@@ -55,6 +61,8 @@ impl From<&Target> for TargetInfo {
             id: t.id.clone(),
             label: t.label.clone(),
             live: t.tail_addr.is_some(),
+            alerts: t.alertd_addr.is_some(),
+            alert_mutations: false,
         }
     }
 }
@@ -75,8 +83,14 @@ pub async fn targets(
     if !session_valid(&jar) {
         return Err(StatusCode::UNAUTHORIZED);
     }
+    let mut targets: Vec<TargetInfo> = state.targets().iter().map(TargetInfo::from).collect();
+    if !state.insecure_cookie() {
+        for target in &mut targets {
+            target.alert_mutations = target.alerts;
+        }
+    }
     Ok(Json(TargetsResponse {
-        targets: state.targets().iter().map(TargetInfo::from).collect(),
+        targets,
         default: state.default_target().to_string(),
     }))
 }

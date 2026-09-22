@@ -1,0 +1,29 @@
+[package]
+name = "scry-alert"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Durable alert monitor models, validation, scheduling, and state transitions."
+
+[dependencies]
+anyhow = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+object_store = { workspace = true }
+rusqlite = { version = "0.31", features = ["bundled"] }
+scry-objstore = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = "0.10"
+sqlparser = { version = "0.61", features = ["visitor"] }
+thiserror = { workspace = true }
+uuid = { workspace = true, features = ["serde", "v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true }
+
+[lints]
+workspace = true
