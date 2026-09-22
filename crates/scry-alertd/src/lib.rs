@@ -302,6 +302,14 @@ where
                 if let Err(error) = reconcile_projection(&scheduler_state).await {
                     tracing::warn!(error = %error, "alert projection reconciliation failed");
                 }
+                if let Err(error) = targets::reconcile_projection(
+                    scheduler_state.store.as_ref(),
+                    scheduler_state.db.as_ref(),
+                )
+                .await
+                {
+                    tracing::warn!(error = %error, "notification-target projection reconciliation failed");
+                }
                 passes_until_reconcile = 30;
             }
             passes_until_reconcile = passes_until_reconcile.saturating_sub(1);
@@ -683,16 +691,15 @@ fn query_error_class(error: &QueryClientError) -> &'static str {
     }
 }
 
-pub async fn serve_control_for_test(
-    listener: tokio::net::TcpListener,
+fn control_state_for_test(
     token: String,
     store: Arc<dyn ObjectStore>,
     db: AlertsDb,
     query_targets: Vec<QueryTarget>,
-) -> Result<()> {
+) -> Result<AppState> {
     let deployment_id = db.deployment_id().to_string();
     let keyring = targets::parse_keyring("test:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", None)?;
-    let state = AppState {
+    Ok(AppState {
         token: Arc::from(token),
         store,
         db: Arc::new(Mutex::new(db)),
@@ -705,10 +712,50 @@ pub async fn serve_control_for_test(
         transport: Arc::new(targets::SecureWebhookTransport),
         delivery_leases: Arc::new(DeliveryLeases::new(LocalLeaseProvider::new())),
         _local_lock: Arc::new(None),
-    };
+    })
+}
+
+pub async fn serve_control_for_test(
+    listener: tokio::net::TcpListener,
+    token: String,
+    store: Arc<dyn ObjectStore>,
+    db: AlertsDb,
+    query_targets: Vec<QueryTarget>,
+) -> Result<()> {
+    let state = control_state_for_test(token, store, db, query_targets)?;
     axum::serve(listener, router(state))
         .await
         .context("serving test alert control API")
+}
+
+pub async fn serve_control_with_reconciliation_for_test(
+    listener: tokio::net::TcpListener,
+    token: String,
+    store: Arc<dyn ObjectStore>,
+    db: AlertsDb,
+    reconciliation_interval: Duration,
+) -> Result<()> {
+    let state = control_state_for_test(token, store, db, Vec::new())?;
+    let reconcile_state = state.clone();
+    let reconcile = async move {
+        let mut interval = tokio::time::interval(reconciliation_interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            if let Err(error) = targets::reconcile_projection(
+                reconcile_state.store.as_ref(),
+                reconcile_state.db.as_ref(),
+            )
+            .await
+            {
+                tracing::warn!(error = %error, "test notification-target reconciliation failed");
+            }
+        }
+    };
+    tokio::select! {
+        result = axum::serve(listener, router(state)) => result.context("serving test alert control API"),
+        _ = reconcile => unreachable!("test reconciliation loop is infinite"),
+    }
 }
 
 fn router(state: AppState) -> Router {

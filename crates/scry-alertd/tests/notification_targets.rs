@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use object_store::{memory::InMemory, ObjectStore};
 use scry_alert::AlertsDb;
-use scry_alertd::serve_control_for_test;
+use scry_alertd::{serve_control_for_test, serve_control_with_reconciliation_for_test};
 use uuid::Uuid;
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
@@ -18,6 +18,23 @@ async fn server() -> (String, tokio::task::JoinHandle<anyhow::Result<()>>) {
         store,
         db,
         vec![],
+    ));
+    (format!("http://{address}"), task)
+}
+
+async fn reconciling_server(
+    store: Arc<dyn ObjectStore>,
+    deployment: Uuid,
+) -> (String, tokio::task::JoinHandle<anyhow::Result<()>>) {
+    let db = AlertsDb::open_in_memory(deployment).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(serve_control_with_reconciliation_for_test(
+        listener,
+        TOKEN.into(),
+        store,
+        db,
+        std::time::Duration::from_millis(10),
     ));
     (format!("http://{address}"), task)
 }
@@ -119,6 +136,97 @@ async fn crud_replay_conflict_and_redaction() {
         .unwrap();
     assert_eq!(update.status(), 409);
     task.abort();
+}
+
+#[tokio::test]
+async fn two_instances_converge_created_updated_and_deleted_targets() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let deployment = Uuid::new_v4();
+    let (first, first_task) = reconciling_server(store.clone(), deployment).await;
+    let (second, second_task) = reconciling_server(store, deployment).await;
+    let client = reqwest::Client::new();
+
+    let created: serde_json::Value = client
+        .post(format!("{first}/v1/notification-targets"))
+        .bearer_auth(TOKEN)
+        .header("idempotency-key", Uuid::new_v4().to_string())
+        .json(&write(serde_json::json!({"action":"set","value":"secret"})))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = created["id"].as_str().unwrap();
+
+    let await_target = |base: String, expected_revision: Option<&'static str>| {
+        let client = client.clone();
+        let id = id.to_owned();
+        async move {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async move {
+                loop {
+                    let list: serde_json::Value = client
+                        .get(format!("{base}/v1/notification-targets"))
+                        .bearer_auth(TOKEN)
+                        .send()
+                        .await
+                        .unwrap()
+                        .json()
+                        .await
+                        .unwrap();
+                    let found = list["targets"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|target| target["id"] == id);
+                    if match (found, expected_revision) {
+                        (Some(target), Some(revision)) => target["revision"] == revision,
+                        (None, None) => true,
+                        _ => false,
+                    } {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("peer projection did not converge");
+        }
+    };
+    await_target(second.clone(), Some("1")).await;
+
+    let mut updated = write(serde_json::json!({"action":"unchanged"}));
+    updated["name"] = serde_json::json!("updated");
+    assert_eq!(
+        client
+            .put(format!("{first}/v1/notification-targets/{id}"))
+            .bearer_auth(TOKEN)
+            .header("idempotency-key", Uuid::new_v4().to_string())
+            .header("if-match", "\"1\"")
+            .json(&updated)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    await_target(second.clone(), Some("2")).await;
+
+    assert_eq!(
+        client
+            .delete(format!("{first}/v1/notification-targets/{id}"))
+            .bearer_auth(TOKEN)
+            .header("idempotency-key", Uuid::new_v4().to_string())
+            .header("if-match", "\"2\"")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        204
+    );
+    await_target(second, None).await;
+    first_task.abort();
+    second_task.abort();
 }
 
 #[tokio::test]

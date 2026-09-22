@@ -71,7 +71,12 @@ pub fn parse_keyring(current: &str, previous: Option<&str>) -> anyhow::Result<Se
     Ok(SecretKeyring::new(current_id, current_key, previous))
 }
 
-pub async fn rebuild_projection(store: &dyn ObjectStore, db: &mut AlertsDb) -> anyhow::Result<()> {
+struct TargetProjectionEntry {
+    id: NotificationTargetId,
+    target: Option<NotificationTarget>,
+}
+
+async fn load_projection(store: &dyn ObjectStore) -> anyhow::Result<Vec<TargetProjectionEntry>> {
     let prefix = ObjectPath::from("_scry/alerts/v1/targets");
     let mut listed = store.list(Some(&prefix));
     let mut ids = Vec::new();
@@ -94,23 +99,50 @@ pub async fn rebuild_projection(store: &dyn ObjectStore, db: &mut AlertsDb) -> a
     }
     ids.sort_unstable_by_key(|id| id.0);
     let alert_store = AlertStore::new(store);
+    let mut entries = Vec::with_capacity(ids.len());
     for id in ids {
         let head = alert_store.read_target_head(id).await?;
         if head.value.target_id != id || head.value.schema_version != ALERT_RECORD_SCHEMA_VERSION {
             anyhow::bail!("notification-target head ownership mismatch");
         }
-        if head.value.deleted {
-            db.delete_notification_target(id)?;
+        let target = if head.value.deleted {
+            None
         } else {
             let target = alert_store.read_target(id).await?.value;
             if target.id != id || target.revision != head.value.revision {
                 anyhow::bail!("notification-target revision does not match head");
             }
             target.validate()?;
+            Some(target)
+        };
+        entries.push(TargetProjectionEntry { id, target });
+    }
+    Ok(entries)
+}
+
+fn fold_projection(db: &mut AlertsDb, entries: Vec<TargetProjectionEntry>) -> anyhow::Result<()> {
+    for entry in entries {
+        if let Some(target) = entry.target {
             db.fold_notification_target(&target)?;
+        } else {
+            db.delete_notification_target(entry.id)?;
         }
     }
     Ok(())
+}
+
+pub async fn rebuild_projection(store: &dyn ObjectStore, db: &mut AlertsDb) -> anyhow::Result<()> {
+    let entries = load_projection(store).await?;
+    fold_projection(db, entries)
+}
+
+pub async fn reconcile_projection(
+    store: &dyn ObjectStore,
+    db: &tokio::sync::Mutex<AlertsDb>,
+) -> anyhow::Result<()> {
+    let entries = load_projection(store).await?;
+    let mut db = db.lock().await;
+    fold_projection(&mut db, entries)
 }
 
 pub fn routes() -> Router<AppState> {
