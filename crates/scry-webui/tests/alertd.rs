@@ -175,7 +175,7 @@ async fn proxy_supplies_service_bearer_and_preserves_upstream_status() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/v1/alerts/monitors?dry=true")
+                .uri("/api/v1/alerts/notification-targets/target-id/test?dry=true")
                 .header(header::COOKIE, cookie)
                 .header(header::AUTHORIZATION, "Bearer browser-secret")
                 .header(header::HOST, "scry.example")
@@ -191,7 +191,7 @@ async fn proxy_supplies_service_bearer_and_preserves_upstream_status() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::CREATED);
     let request = captured.await.unwrap().to_ascii_lowercase();
-    assert!(request.starts_with("post /v1/monitors?dry=true "));
+    assert!(request.starts_with("post /v1/notification-targets/target-id/test?dry=true "));
     assert!(request.contains("authorization: bearer service-secret"));
     assert!(!request.contains("browser-secret"));
     assert!(!request.contains("cookie:"));

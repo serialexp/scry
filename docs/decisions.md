@@ -4013,17 +4013,18 @@ variables. Token files and live token reload are excluded; rotation changes the
 environment and restarts affected services. Browser session cookies are Secure by
 default, with an explicit insecure-cookie opt-out for plain-HTTP development.
 
-Notification destinations, intents, outbox processing, notifier workers, test sends,
-and external delivery are not part of this slice. This entry selects architecture
-and scope only; it does not record any alerting implementation as complete. The
-mechanical contracts and outstanding work remain in
+Notification targets, intents, outbox processing, delivery workers, test sends,
+and external delivery are not part of this first slice. The scalar evaluation and
+browser CRUD scope selected here is implemented; later D-077 and D-078 select the
+partially implemented notification-target and delivery contracts. The mechanical
+contracts and outstanding work remain in
 `docs/design/alert-evaluation.md`, `docs/design/notification-delivery.md`, and
 `docs/design/error-monitoring-ui.md`.
 
 ## D-077: Notification targets own formatting, encrypted secrets, and firing/resolved delivery
 
 **Date:** 2026-09-22
-**Status:** accepted; not yet implemented
+**Status:** accepted; notification-target administration/test-send implemented, monitor delivery outstanding
 
 The next alerting slice adds **notification targets** as a separate section of the
 Alerts UI. “Notification target” is the product/API term; targets are not split into
@@ -4046,7 +4047,48 @@ before landing, so key replacement cannot strand existing target revisions.
 
 A dedicated dead-letter management and manual-retry interface is deferred. Delivery
 still requires finite attempt/age bounds and a visible terminal failure outcome;
-“deferred dead-letter UI” does not permit infinite retries or silent loss. Exact
-template syntax, encryption-key rotation mechanics, retry bounds/terminal naming,
-and optional first-slice HMAC signing remain implementation-blocking decisions in
-`docs/design/notification-delivery.md`.
+“deferred dead-letter UI” does not permit infinite retries or silent loss. D-078
+selects the exact template, key-rotation, retry, terminal-state, HMAC, and endpoint
+network-policy contracts.
+
+## D-078: Notification delivery uses JSON templates, explicit key rotation, fixed retries and HMAC, and public-only HTTPS
+
+**Date:** 2026-09-22
+**Status:** accepted; target/template/encryption/HMAC/test-send policy implemented, retry worker outstanding
+
+D-077 remains the notification-target ownership decision. This follow-up resolves
+its implementation-blocking delivery choices. Its target-administration and test-send
+policy is implemented; monitor-linked delivery and retry processing remain outstanding.
+
+Custom templates produce JSON only. A template is a bounded JSON value whose string
+leaves may contain bounded placeholders; placeholder substitution is JSON-aware and
+cannot inject raw JSON syntax. Validation rejects malformed JSON, unsupported
+placeholders, excessive nesting/output, and any non-JSON custom body. Built-in formats
+remain target-owned and may implement protocol-specific JSON shapes.
+
+Target secrets use a versioned XChaCha20-Poly1305 envelope. Every alertd process is
+configured through environment variables with a required current key and, during
+rotation, one optional previous key. Operators first deploy current-plus-previous,
+then run an explicit idempotent CLI re-encryption command over every referenced target
+secret, verify no envelope still needs the previous key, and only then remove it.
+Intents pin non-secret target revisions but refer to a stable logical `latest` secret;
+re-encryption replaces that logical secret's ciphertext without changing its identity
+or rewriting queued intents.
+
+Retries have an absolute six-hour horizon measured from intent creation. The eight
+nominal attempt offsets are 0, 1, 5, 15, 30, 60, 120, and 240 minutes. Jitter and a
+bounded `Retry-After` may move an attempt within the horizon but never create a ninth
+attempt or extend eligibility beyond six hours. A permanent response, eight exhausted
+attempts, or the horizon expiring produces the user-facing terminal state
+**Delivery failed**. This is retained delivery history, not a separate dead-letter
+queue; dedicated failed-delivery management and manual retry remain deferred.
+
+Every generic webhook signs the exact transmitted body with HMAC-SHA256 using the
+target secret and one fixed, versioned signature-header contract. Signing is mandatory,
+not a per-target option, and no algorithm negotiation is exposed.
+
+Generic webhooks accept only public WebPKI-valid HTTPS endpoints. They do not support
+custom CAs, disabled certificate or hostname verification, redirects, proxy use, or
+private, loopback, link-local, multicast, metadata, or otherwise non-public resolved
+addresses. Operators cannot add hostname or CIDR exceptions. DNS is resolved and every
+A/AAAA result validated before a validated public address is pinned for the connection.

@@ -9,9 +9,12 @@ description = "Durable alert monitor models, validation, scheduling, and state t
 
 [dependencies]
 anyhow = { workspace = true }
+base64 = { workspace = true }
 bytes = { workspace = true }
+chacha20poly1305 = "0.10"
 chrono = { workspace = true }
 object_store = { workspace = true }
+rand = { workspace = true }
 rusqlite = { version = "0.31", features = ["bundled"] }
 scry-objstore = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
@@ -20,6 +23,7 @@ sha2 = "0.10"
 sqlparser = { version = "0.61", features = ["visitor"] }
 thiserror = { workspace = true }
 uuid = { workspace = true, features = ["serde", "v4"] }
+zeroize = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -1,6 +1,6 @@
 # Error monitoring — Architecture
 
-Status: partial — occurrence/basic-issue foundation and first clustered scalar alerting CRUD/evaluation slice implemented; delivery and issue workflow outstanding
+Status: partial — occurrence/basic-issue foundation, scalar alert evaluation, and notification-target administration implemented; monitor delivery and issue workflow outstanding
 Owner: Bart
 Last updated: 2026-09-22
 
@@ -14,11 +14,13 @@ bootstrap are implemented. Basic fingerprint v1 grouping (OCC1 decoder, generic-
 message normalization, digest, and quality levels), deterministic issue identity,
 issue/occurrence_issues SQLite tables with grouping reconciliation, and read-only
 issue list/basic detail visibility through the query wire protocol and browser
-`/errors` routes have landed. D-076's first ungrouped scalar alerting slice now adds
+`/errors` routes have landed. D-076's first ungrouped scalar alerting slice adds
 separate alert crates/role, clustered leases, durable state, private/browser CRUD,
-and `/alerts` state visibility without delivery. None of this has been deployed.
-Artifacts, symbolication, stack parsing, rich occurrence inspection, issue workflow,
-alert delivery/advanced monitor types, and browser SDK remain outstanding.
+and `/alerts` state visibility. D-077/D-078 notification-target administration,
+encrypted secrets, preview, and durable test-send are also implemented, without
+monitor-linked delivery. None of this has been deployed. Artifacts, symbolication,
+stack parsing, rich occurrence inspection, issue workflow, alert delivery/advanced
+monitor types, and browser SDK remain outstanding.
 
 ### Done
 
@@ -94,7 +96,7 @@ alert delivery/advanced monitor types, and browser SDK remain outstanding.
 - [ ] **Phase 4b — later alert evaluation.** Add typed issue-transition and grouped
   threshold monitors under independent resource admission.
 - [ ] **Phase 5 — notification delivery.** Deliver durable intents through bounded,
-  observable, at-least-once notifier workers.
+  observable, at-least-once notification-delivery workers.
 - [ ] **Phase 6 — browser SDK.** Ship standards-based browser capture, public
   intake controls, build integration, and source-map upload tooling.
 - [ ] **Phase 7 — qualification.** Add focused basic-detail SQLite/query-wire/UI
@@ -136,7 +138,7 @@ durability, identity, or failure semantics here.
   storms or resource starvation.
 - Remain correct from one instance without Valkey through multiple identical
   instances coordinated by Valkey.
-- Treat browser input, stack traces, source maps, and notifier secrets as
+- Treat browser input, stack traces, source maps, and notification-target secrets as
   security-sensitive data.
 - Keep all retained state bounded, observable, and testable.
 
@@ -171,7 +173,7 @@ durability, identity, or failure semantics here.
   transitions.
 - **Alert instance:** persisted evaluation state for one monitor/group.
 - **Notification intent:** immutable, durable request to deliver one transition
-  to one destination.
+  to one notification target.
 - **Projection:** replaceable local or object-store-derived state rebuildable from
   authoritative immutable records.
 
@@ -180,7 +182,7 @@ durability, identity, or failure semantics here.
 1. Object storage is durable truth. Local SQLite databases are rebuildable
    projections; Valkey is coordination, discovery, and freshness only.
 2. Accepted raw telemetry is never made dependent on symbolication, grouping,
-   issue indexing, queryd, Valkey, or a notifier being available.
+   issue indexing, queryd, Valkey, or a notification target being available.
 3. Occurrence identity, issue identity, and delivery identity are distinct.
 4. All transformations retain schema and algorithm versions plus enough inputs
    to explain and repeat their output.
@@ -218,7 +220,7 @@ scry errors -> immutable occurrence projection -> local errors.sqlite
                        issue transition event stream
                                      v
 scry alert: scheduled scalar evaluation -> durable alert state
-  -> later slice: outbox intents -> notifier workers -> external delivery
+  -> later slice: outbox intents -> delivery workers -> external delivery
 ```
 
 Bounded catalog paging plus immutable occurrence-commit discovery are the
@@ -244,10 +246,12 @@ wrapper; later phases extend them and add the alert pair:
   single-writer reconciliation, grouping reconciliation phase (`group_occurrence_page`),
   and status; clustered leases and a private product control endpoint remain
   outstanding.
-- `scry-alert`: rule/state domain and evaluator engine; later delivery work adds the
-  outbox and notifier domain without making evaluation depend on it.
+- `scry-alert`: rule/state evaluator plus the immutable notification-target,
+  encrypted-secret, template, durable-record, and SQLite-projection domains; later
+  delivery work adds the outbox without making evaluation depend on it.
 - `scry-alertd`: the separate `scry alert` role, schedules, direct queryd clients,
-  clustered leases or explicit local single-writer exclusion, APIs, and status.
+  clustered leases or explicit local single-writer exclusion, monitor and target APIs,
+  durable test-send, secret rotation, and status.
 
 This follows the existing engine/thin-role convention. It does not require four
 processes: the multicall binary can run roles separately, and a later supervised
@@ -326,8 +330,8 @@ integrity in every mode.
 - Query overload is an evaluation error, not a false recovery.
 - Artifact absence yields an unsymbolicated occurrence and bounded retry; it does
   not reject raw ingest.
-- Notification endpoint failure affects only that destination. Other destinations
-  and future transitions proceed.
+- Notification-target endpoint failure affects only that target. Other targets and
+  future transitions proceed.
 
 ## Retention and deletion
 
@@ -348,7 +352,7 @@ policy before user identifiers are enabled by default.
 Each role publishes bounded fleet status: projection lag, pending blocks,
 reprocessing queue, symbolication memory/CPU/timeouts, issue cardinality, due and
 running evaluations, query resource rejections, state staleness, outbox age,
-delivery retries/dead letters, and object-store/Valkey health. Status is never
+delivery retries/terminal failures, and object-store/Valkey health. Status is never
 correctness state.
 
 Capacity presets eventually include error intake rate/body limits, artifact
@@ -407,8 +411,12 @@ or rendered intents.
    revision, direct service hops, shared-admin browser CRUD, and no delivery.
 9. **Artifact upload authentication:** define CI/operator credentials and the
     authenticated service hop before build tooling ships.
-10. **Notifier revisions:** whether queued intents use pinned or latest destination
-    metadata, and how disable/rotation affects them.
+10. **Notification delivery (resolved by D-077 and D-078):** intents pin non-secret
+    notification-target revisions while resolving a stable logical `latest` secret;
+    D-078 fixes JSON-only templates, XChaCha20-Poly1305 current/previous environment
+    keys with explicit CLI re-encryption, an absolute six-hour/eight-attempt retry
+    policy ending in **Delivery failed**, mandatory HMAC-SHA256, and public-only WebPKI
+    HTTPS without redirects, proxies, private addresses, or exceptions.
 11. **Privacy beyond the D-074 baseline:** defaults for user identifiers, URL
    query/fragment retention, free-text treatment, `sourcesContent`, and deletion
    guarantees.
@@ -425,7 +433,7 @@ or rendered intents.
   ambiguous timeout reconciliation before any control-plane test relies on them.
 - Integration tests with object-store errors, late artifacts, catalog rebuilds,
   compaction/retention, Valkey lease loss, stale rule edits, query exhaustion,
-  notifier timeouts, and crash points around commits/sends.
+  notification-target timeouts, and crash points around commits/sends.
 - Browser tests for hostile rejection values, duplicate initialization, unload,
   CSP/CORS/origin behavior, scrubbing, and framework boundaries.
 - Multi-instance smoke tests proving one committed projection/evaluation while
@@ -456,8 +464,8 @@ editing.
   a two-release reserved-prefix deployment gate and commit-object separation; scoped
   deployment/app identity; deterministic issue IDs; aligned alert slots; persisted
   grouped-state semantics; control-service/CI authentication and real CSRF session
-  nonces; pinned non-secret notifier revisions; secret-ID/SSRF hardening; retention
-  dependency ordering; mixed log-schema migration requirements; hostile timestamp/
+  nonces; pinned non-secret notification-target revisions; secret-ID/SSRF hardening;
+  retention dependency ordering; mixed log-schema migration requirements; hostile timestamp/
   stream-fingerprint controls; and output escaping. Their Garage-driven recommendation
   to avoid conditional writes was subsequently rejected: the control plane requires
   real S3 conditional create/update semantics, and the local integration backend must
@@ -479,8 +487,8 @@ editing.
 - **Still blocking review decisions after D-076:** workflow fold conflicts;
   late-symbolication membership; lifetime count semantics; source-map/parser
   implementation; privacy defaults beyond the minimal scrub baseline; and initial
-  notification-delivery policy. These remain explicit rather than silently selected
-  by reviewers.
+  notification-delivery implementation. D-077 and D-078 resolve its policy choices;
+  no delivery phase is implemented.
 
 ## References
 

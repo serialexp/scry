@@ -9,12 +9,14 @@ description = "Clustered scalar alert evaluator and private control service for 
 
 [dependencies]
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 axum = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 fs2 = "0.4"
 futures = { workspace = true }
 object_store = { workspace = true }
+reqwest = { workspace = true }
 scry-alert = { workspace = true }
 scry-block = { workspace = true }
 scry-cluster = { workspace = true }
@@ -31,6 +33,19 @@ uuid = { workspace = true, features = ["v4"] }
 reqwest = { workspace = true }
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
+
+[dependencies.hmac]
+version = "0.12"
+
+[dependencies.sha2]
+version = "0.10"
+
+[dependencies.url]
+workspace = true
+
+[dependencies.zeroize]
+version = "1"
+features = ["serde"]
 
 [lints]
 workspace = true

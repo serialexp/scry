@@ -1,4 +1,18 @@
 
+## Notification delivery follow-ups
+
+- Before sustained monitor-linked delivery, replace per-send HTTP client construction
+  with bounded reusable policy-pinned pools and cap DNS answer collection.
+- Make the 10,000 notification-target quota a durable cluster-wide reservation rather
+  than a projection-local soft limit; clustered mutation serialization alone cannot
+  make a stale local count authoritative.
+- Define retained-secret garbage collection from revision/intent dependencies so old
+  replacements and deleted targets cannot eventually make key rotation exceed its
+  bounded secret-head scan.
+- Add transport-level DNS/TLS/redirect/proxy/rebinding tests and clustered mutation,
+  lease-takeover, crash-after-send, secret replacement/clear, deletion replay, and cold
+  projection rebuild fault-injection coverage before monitor-linked delivery ships.
+
 ## Logs v2 follow-ups
 
 - Add a typed trace-v2 representation for general observability fidelity. The

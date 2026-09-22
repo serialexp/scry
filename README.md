@@ -186,8 +186,10 @@ real. Architecture is documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.m
   `alerts.sqlite`, schedules aligned ungrouped scalar SQL through ordinary queryd
   admission, and coordinates per monitor through Valkey (or an explicit locally
   locked single-writer mode). The browser exposes shared-admin rule CRUD,
-  validation, and current Inactive/Pending/Firing/Recovering/NoData/Error state via
-  a CSRF-protected direct webui-to-alertd proxy. Notification delivery is deferred.
+  validation, current Inactive/Pending/Firing/Recovering/NoData/Error state, and
+  separate notification-target CRUD/preview/test-send administration via a
+  CSRF-protected direct webui-to-alertd proxy. Monitor-linked notification delivery
+  and retry processing are deferred.
 - **Error occurrence foundation.** Canonical logs producers emit raw-record v1;
   ingest uniformly redacts structured sensitive keys on every logs/traces path,
   stamps trusted receipt time before WAL, and stores raw-record v2 in logs Parquet/

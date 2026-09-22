@@ -4,9 +4,12 @@ use rusqlite::{params, Connection, OptionalExtension};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::{AlertState, AlertStatus, Monitor, MonitorId, StateHead, TransitionRecord};
+use crate::{
+    AlertState, AlertStatus, Monitor, MonitorId, NotificationTarget, NotificationTargetId,
+    NotificationTargetProjection, StateHead, TransitionRecord,
+};
 
-pub const ALERTS_SCHEMA_VERSION: u32 = 1;
+pub const ALERTS_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Error)]
 pub enum AlertsDbError {
@@ -124,6 +127,78 @@ impl AlertsDb {
         Ok(())
     }
 
+    pub fn fold_notification_target(
+        &mut self,
+        target: &NotificationTarget,
+    ) -> Result<(), AlertsDbError> {
+        let projection = NotificationTargetProjection::from(target);
+        let json = serde_json::to_vec(&projection)?;
+        self.conn.execute(
+            "INSERT INTO notification_targets(target_id, revision, enabled, name, updated_at_unix_nano, projection_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(target_id) DO UPDATE SET revision=excluded.revision, enabled=excluded.enabled,
+               name=excluded.name, updated_at_unix_nano=excluded.updated_at_unix_nano,
+               projection_json=excluded.projection_json
+             WHERE excluded.revision > notification_targets.revision",
+            params![target.id.0.as_bytes().as_slice(), target.revision, target.enabled, target.name, target.updated_at_unix_nano, json],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_notification_target(
+        &self,
+        id: NotificationTargetId,
+    ) -> Result<Option<NotificationTargetProjection>, AlertsDbError> {
+        let json: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT projection_json FROM notification_targets WHERE target_id=?1",
+                [id.0.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        json.as_deref()
+            .map(serde_json::from_slice)
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    pub fn notification_target_count(&self) -> Result<usize, AlertsDbError> {
+        let count: u64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM notification_targets", [], |row| {
+                    row.get(0)
+                })?;
+        Ok(count as usize)
+    }
+
+    pub fn list_notification_targets(
+        &self,
+        after: Option<NotificationTargetId>,
+        limit: usize,
+    ) -> Result<Vec<NotificationTargetProjection>, AlertsDbError> {
+        let limit = limit.clamp(1, 10_000) as u64;
+        let after = after.map(|id| id.0.as_bytes().to_vec()).unwrap_or_default();
+        let mut statement = self.conn.prepare("SELECT projection_json FROM notification_targets WHERE (?1=X'' OR target_id>?1) ORDER BY target_id LIMIT ?2")?;
+        let rows = statement.query_map(params![after, limit], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut output = Vec::with_capacity(limit.min(128) as usize);
+        for row in rows {
+            output.push(serde_json::from_slice(&row?)?);
+        }
+        Ok(output)
+    }
+
+    pub fn delete_notification_target(
+        &mut self,
+        id: NotificationTargetId,
+    ) -> Result<(), AlertsDbError> {
+        self.conn.execute(
+            "DELETE FROM notification_targets WHERE target_id=?1",
+            [id.0.as_bytes().as_slice()],
+        )?;
+        Ok(())
+    }
+
     pub fn delete_monitor(&mut self, id: MonitorId) -> Result<(), AlertsDbError> {
         let tx = self.conn.transaction()?;
         tx.execute(
@@ -194,41 +269,49 @@ impl AlertsDb {
 }
 
 fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS projection_meta (
-           singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
-           deployment_id TEXT NOT NULL
-         ) STRICT;
-         CREATE TABLE IF NOT EXISTS monitors (
-           monitor_id BLOB PRIMARY KEY CHECK(length(monitor_id) = 16),
-           revision INTEGER NOT NULL,
-           enabled INTEGER NOT NULL,
-           name TEXT NOT NULL,
-           updated_at_unix_nano INTEGER NOT NULL,
-           record_json BLOB NOT NULL
-         ) STRICT, WITHOUT ROWID;
-         CREATE TABLE IF NOT EXISTS transitions (
-           transition_key TEXT PRIMARY KEY,
-           monitor_id BLOB NOT NULL CHECK(length(monitor_id) = 16),
-           sequence INTEGER NOT NULL,
-           slot_id INTEGER NOT NULL,
-           evaluated_at_unix_nano INTEGER NOT NULL,
-           record_json BLOB NOT NULL,
-           UNIQUE(monitor_id, slot_id)
-         ) STRICT, WITHOUT ROWID;
-         CREATE TABLE IF NOT EXISTS current_state (
-           monitor_id BLOB PRIMARY KEY CHECK(length(monitor_id) = 16),
-           sequence INTEGER NOT NULL,
-           status INTEGER NOT NULL,
-           stale INTEGER NOT NULL,
-           since_unix_nano INTEGER NOT NULL,
-           last_evaluated_at_unix_nano INTEGER NOT NULL,
-           last_slot_id INTEGER NOT NULL,
-           transition_key TEXT NOT NULL,
-           state_json BLOB NOT NULL
-         ) STRICT, WITHOUT ROWID;",
-    )?;
-    conn.pragma_update(None, "user_version", ALERTS_SCHEMA_VERSION)?;
+    let mut version: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version > ALERTS_SCHEMA_VERSION {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    if version == 0 {
+        conn.execute_batch(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE projection_meta (
+               singleton INTEGER PRIMARY KEY CHECK(singleton = 1), deployment_id TEXT NOT NULL
+             ) STRICT;
+             CREATE TABLE monitors (
+               monitor_id BLOB PRIMARY KEY CHECK(length(monitor_id) = 16), revision INTEGER NOT NULL,
+               enabled INTEGER NOT NULL, name TEXT NOT NULL, updated_at_unix_nano INTEGER NOT NULL,
+               record_json BLOB NOT NULL
+             ) STRICT, WITHOUT ROWID;
+             CREATE TABLE transitions (
+               transition_key TEXT PRIMARY KEY, monitor_id BLOB NOT NULL CHECK(length(monitor_id) = 16),
+               sequence INTEGER NOT NULL, slot_id INTEGER NOT NULL, evaluated_at_unix_nano INTEGER NOT NULL,
+               record_json BLOB NOT NULL, UNIQUE(monitor_id, slot_id)
+             ) STRICT, WITHOUT ROWID;
+             CREATE TABLE current_state (
+               monitor_id BLOB PRIMARY KEY CHECK(length(monitor_id) = 16), sequence INTEGER NOT NULL,
+               status INTEGER NOT NULL, stale INTEGER NOT NULL, since_unix_nano INTEGER NOT NULL,
+               last_evaluated_at_unix_nano INTEGER NOT NULL, last_slot_id INTEGER NOT NULL,
+               transition_key TEXT NOT NULL, state_json BLOB NOT NULL
+             ) STRICT, WITHOUT ROWID;
+             PRAGMA user_version = 1;
+             COMMIT;",
+        )?;
+        version = 1;
+    }
+    if version == 1 {
+        conn.execute_batch(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE notification_targets (
+               target_id BLOB PRIMARY KEY CHECK(length(target_id) = 16), revision INTEGER NOT NULL,
+               enabled INTEGER NOT NULL, name TEXT NOT NULL, updated_at_unix_nano INTEGER NOT NULL,
+               projection_json BLOB NOT NULL
+             ) STRICT, WITHOUT ROWID;
+             PRAGMA user_version = 2;
+             COMMIT;",
+        )?;
+    }
     Ok(())
 }
 
@@ -368,6 +451,67 @@ mod tests {
                 state: Some(next_record.state)
             }
         );
+    }
+
+    fn target(id: NotificationTargetId, revision: u64) -> NotificationTarget {
+        NotificationTarget {
+            schema_version: ALERT_RECORD_SCHEMA_VERSION,
+            id,
+            revision,
+            name: format!("target-{revision}"),
+            enabled: true,
+            kind: crate::NotificationTargetKind::SlackWebhook,
+            format: crate::TargetFormat::BuiltIn {
+                format: crate::BuiltInTargetFormat::Slack,
+            },
+            timeout_millis: 1_000,
+            logical_secret_id: crate::LogicalSecretId::new(),
+            secret_generation: 9,
+            created_at_unix_nano: 1,
+            updated_at_unix_nano: revision,
+        }
+    }
+
+    #[test]
+    fn target_projection_is_redacted_revision_ordered_and_deletable() {
+        let mut db = AlertsDb::open_in_memory(Uuid::new_v4()).unwrap();
+        let id = NotificationTargetId::new();
+        let second = target(id, 2);
+        db.fold_notification_target(&second).unwrap();
+        db.fold_notification_target(&target(id, 1)).unwrap();
+        let projection = db.get_notification_target(id).unwrap().unwrap();
+        assert_eq!(projection.name, "target-2");
+        assert!(projection.has_secret);
+        let bytes = serde_json::to_vec(&projection).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("logical_secret"));
+        assert_eq!(
+            db.list_notification_targets(None, 10).unwrap(),
+            vec![projection]
+        );
+        db.delete_notification_target(id).unwrap();
+        assert!(db.get_notification_target(id).unwrap().is_none());
+    }
+
+    #[test]
+    fn migrates_schema_one_to_two_without_losing_monitors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alerts.sqlite");
+        let deployment = Uuid::new_v4();
+        {
+            let connection = Connection::open(&path).unwrap();
+            migrate(&connection).unwrap();
+            connection
+                .execute("DROP TABLE notification_targets", [])
+                .unwrap();
+            connection.pragma_update(None, "user_version", 1).unwrap();
+        }
+        let db = AlertsDb::open(&path, deployment).unwrap();
+        let version: u32 = db
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        assert_eq!(db.list_notification_targets(None, 1).unwrap(), vec![]);
     }
 
     #[test]

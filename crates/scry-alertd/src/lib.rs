@@ -1,10 +1,11 @@
 mod singleton;
+mod targets;
 
 use std::{path::PathBuf, str::FromStr, sync::Arc, time::Duration};
 
 use anyhow::{bail, Context, Result};
 use axum::{
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     routing::{get, post},
     Json, Router,
@@ -18,7 +19,7 @@ use scry_alert::{
     RuleMutationKind, RuleMutationReceipt, RuleTombstone, StateHead, TransitionRecord,
     ALERT_RECORD_SCHEMA_VERSION,
 };
-use scry_cluster::{LeaseGuard, LeaseProvider};
+use scry_cluster::{LeaseGuard, LeaseProvider, LocalGuard, LocalLeaseProvider};
 use scry_query::client::{
     QueryClientError, QueryDeadlines, QueryLimits, QueryScalar, QueryWireClient, ScalarOutcome,
 };
@@ -27,6 +28,7 @@ use tokio::sync::{Mutex, Semaphore};
 use uuid::Uuid;
 
 pub const TOKEN_ENV: &str = "SCRY_ALERTD_TOKEN";
+const MAX_CONTROL_REQUEST_BODY_BYTES: usize = 256 * 1024;
 
 #[derive(Parser, Debug)]
 #[command(about = "Durable scalar alert evaluator and control service")]
@@ -40,7 +42,8 @@ pub struct Args {
     #[arg(long, env = "SCRY_VALKEY_NAMESPACE")]
     pub valkey_namespace: Option<String>,
     /// Allowlisted queryd targets as `ID=HOST:PORT`. Monitor records retain only IDs.
-    #[arg(long, value_name = "ID=ADDR", required = true)]
+    /// Required by `serve`; maintenance commands do not connect to queryd.
+    #[arg(long, value_name = "ID=ADDR")]
     pub queryd: Vec<String>,
     #[arg(long, default_value = "127.0.0.1:4400")]
     pub control_listen: String,
@@ -68,6 +71,13 @@ pub enum Command {
         #[arg(long)]
         deployment_id: Option<String>,
     },
+    /// Re-encrypt referenced notification-target secrets with the current key.
+    RotateTargetKey {
+        #[arg(long)]
+        deployment_id: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 pub async fn run(args: Args) -> Result<()> {
@@ -75,10 +85,6 @@ pub async fn run(args: Args) -> Result<()> {
         bail!("--max-control-requests must be at least one");
     }
     let query_targets = Arc::new(parse_query_targets(&args.queryd)?);
-    let token = std::env::var(TOKEN_ENV).with_context(|| format!("{TOKEN_ENV} must be set"))?;
-    if token.len() < 32 {
-        bail!("{TOKEN_ENV} must contain at least 32 bytes");
-    }
     let object_config = scry_objstore::ObjStoreConfig::from_env()?;
     let store = scry_objstore::open(&object_config).await?;
     let probe = object_store::path::Path::from(format!("_scry/probes/alertd/{}", Uuid::new_v4()));
@@ -99,6 +105,15 @@ pub async fn run(args: Args) -> Result<()> {
             Ok(())
         }
         Command::Serve { deployment_id } => {
+            if query_targets.is_empty() {
+                bail!("serve requires at least one --queryd ID=ADDR target");
+            }
+            let token =
+                std::env::var(TOKEN_ENV).with_context(|| format!("{TOKEN_ENV} must be set"))?;
+            if token.len() < 32 {
+                bail!("{TOKEN_ENV} must contain at least 32 bytes");
+            }
+            let keyring = Arc::new(targets::load_keyring()?);
             let manifest = scry_objstore::manifest::require_deployment_manifest(
                 store.as_ref(),
                 deployment_id.as_deref(),
@@ -107,12 +122,19 @@ pub async fn run(args: Args) -> Result<()> {
             let deployment = Uuid::parse_str(&manifest.deployment_id)?;
             let mut db = AlertsDb::open(&args.alerts_db, deployment)?;
             rebuild_projection(store.as_ref(), &mut db).await?;
+            targets::rebuild_projection(store.as_ref(), &mut db).await?;
             let state = AppState {
                 token: Arc::from(token),
                 store,
                 db: Arc::new(Mutex::new(db)),
                 permits: Arc::new(Semaphore::new(args.max_control_requests)),
+                target_mutations: Arc::new(Semaphore::new(1)),
+                test_sends: Arc::new(Semaphore::new(8)),
                 query_targets,
+                deployment_id: manifest.deployment_id,
+                keyring,
+                transport: Arc::new(targets::SecureWebhookTransport),
+                delivery_leases: Arc::new(DeliveryLeases::new(LocalLeaseProvider::new())),
                 _local_lock: Arc::new(None),
             };
             match args.mode {
@@ -136,14 +158,32 @@ pub async fn run(args: Args) -> Result<()> {
                     let keys = scry_valkey::Keyspace::resolve(args.valkey_namespace.as_deref())?;
                     let client =
                         scry_valkey::ValkeyClient::connect(url, Uuid::new_v4(), keys).await?;
-                    serve_with_scheduler(
-                        &args.control_listen,
-                        state,
-                        scry_valkey::ValkeyLeaseProvider::new(client),
-                    )
-                    .await
+                    let provider = scry_valkey::ValkeyLeaseProvider::new(client);
+                    let mut state = state;
+                    state.delivery_leases = Arc::new(DeliveryLeases::Valkey(provider.clone()));
+                    serve_with_scheduler(&args.control_listen, state, provider).await
                 }
             }
+        }
+        Command::RotateTargetKey {
+            deployment_id,
+            dry_run,
+        } => {
+            let keyring = targets::load_keyring()?;
+            let manifest = scry_objstore::manifest::require_deployment_manifest(
+                store.as_ref(),
+                deployment_id.as_deref(),
+            )
+            .await?;
+            let (scanned, rotated) =
+                targets::rotate(store.as_ref(), &manifest.deployment_id, &keyring, dry_run).await?;
+            tracing::info!(
+                scanned,
+                rotated,
+                dry_run,
+                "notification-target key rotation pass complete"
+            );
+            Ok(())
         }
     }
 }
@@ -367,12 +407,64 @@ async fn scheduler_pass<L: LeaseProvider>(provider: &L, state: &AppState) -> Res
 }
 
 #[derive(Clone)]
+enum DeliveryLeases {
+    Local(LocalLeaseProvider),
+    Valkey(scry_valkey::ValkeyLeaseProvider),
+}
+
+enum DeliveryLease {
+    Local(LocalGuard),
+    Valkey(scry_valkey::ValkeyLease),
+}
+
+impl DeliveryLeases {
+    fn new(provider: LocalLeaseProvider) -> Self {
+        Self::Local(provider)
+    }
+
+    async fn try_acquire(&self, key: &str, ttl: Duration) -> Result<Option<DeliveryLease>> {
+        match self {
+            Self::Local(provider) => provider
+                .try_acquire(key, ttl)
+                .await
+                .map(|guard| guard.map(DeliveryLease::Local)),
+            Self::Valkey(provider) => provider
+                .try_acquire(key, ttl)
+                .await
+                .map(|guard| guard.map(DeliveryLease::Valkey)),
+        }
+    }
+}
+
+impl DeliveryLease {
+    fn fence(&self) -> Arc<dyn scry_block::Fence> {
+        match self {
+            Self::Local(guard) => guard.fence(),
+            Self::Valkey(guard) => guard.fence(),
+        }
+    }
+
+    async fn release(self) {
+        match self {
+            Self::Local(guard) => guard.release().await,
+            Self::Valkey(guard) => guard.release().await,
+        }
+    }
+}
+
+#[derive(Clone)]
 struct AppState {
     token: Arc<str>,
     store: Arc<dyn ObjectStore>,
     db: Arc<Mutex<AlertsDb>>,
     permits: Arc<Semaphore>,
+    target_mutations: Arc<Semaphore>,
+    test_sends: Arc<Semaphore>,
     query_targets: Arc<Vec<QueryTarget>>,
+    deployment_id: String,
+    keyring: Arc<scry_alert::SecretKeyring>,
+    transport: Arc<dyn targets::WebhookTransport>,
+    delivery_leases: Arc<DeliveryLeases>,
     _local_lock: Arc<Option<singleton::SingletonLock>>,
 }
 
@@ -598,12 +690,20 @@ pub async fn serve_control_for_test(
     db: AlertsDb,
     query_targets: Vec<QueryTarget>,
 ) -> Result<()> {
+    let deployment_id = db.deployment_id().to_string();
+    let keyring = targets::parse_keyring("test:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", None)?;
     let state = AppState {
         token: Arc::from(token),
         store,
         db: Arc::new(Mutex::new(db)),
         permits: Arc::new(Semaphore::new(16)),
+        target_mutations: Arc::new(Semaphore::new(1)),
+        test_sends: Arc::new(Semaphore::new(4)),
         query_targets: Arc::new(query_targets),
+        deployment_id,
+        keyring: Arc::new(keyring),
+        transport: Arc::new(targets::SecureWebhookTransport),
+        delivery_leases: Arc::new(DeliveryLeases::new(LocalLeaseProvider::new())),
         _local_lock: Arc::new(None),
     };
     axum::serve(listener, router(state))
@@ -620,6 +720,8 @@ fn router(state: AppState) -> Router {
         )
         .route("/v1/monitors/validate", post(validate_monitor_request))
         .route("/v1/monitors/test", post(test_monitor_request))
+        .merge(targets::routes())
+        .layer(DefaultBodyLimit::max(MAX_CONTROL_REQUEST_BODY_BYTES))
         .with_state(state)
 }
 
@@ -1035,6 +1137,7 @@ enum ApiError {
     NotFound,
     Conflict,
     Overloaded,
+    Unavailable(String),
     BadRequest(String),
     Database(scry_alert::AlertsDbError),
     Store(scry_alert::AlertStoreError),
@@ -1050,17 +1153,22 @@ impl axum::response::IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         let (status, message) = match self {
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".to_owned()),
-            Self::NotFound => (StatusCode::NOT_FOUND, "monitor not found".to_owned()),
-            Self::Conflict => (StatusCode::CONFLICT, "monitor revision conflict".to_owned()),
+            Self::NotFound => (StatusCode::NOT_FOUND, "resource not found".to_owned()),
+            Self::Conflict => (
+                StatusCode::CONFLICT,
+                "resource revision conflict".to_owned(),
+            ),
             Self::Overloaded => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "alert control API overloaded".to_owned(),
             ),
+            Self::Unavailable(message) => (StatusCode::SERVICE_UNAVAILABLE, message),
             Self::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
             Self::Database(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
-            Self::Store(scry_alert::AlertStoreError::Conflict { .. }) => {
-                (StatusCode::CONFLICT, "monitor revision conflict".to_owned())
-            }
+            Self::Store(scry_alert::AlertStoreError::Conflict { .. }) => (
+                StatusCode::CONFLICT,
+                "resource revision conflict".to_owned(),
+            ),
             Self::Store(error) => (StatusCode::BAD_GATEWAY, error.to_string()),
         };
         (status, Json(serde_json::json!({ "error": message }))).into_response()

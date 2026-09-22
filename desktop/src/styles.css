@@ -2813,4 +2813,13 @@ textarea {
 .alert-editor footer { gap: 8px; padding-top: 5px; }
 .alert-editor footer span { flex: 1; }
 .alert-editor .danger-button { color: var(--danger); }
+.alerts-page { flex: 1; min-height: 0; display: flex; flex-direction: column; background: var(--canvas-sunken); }
+.alerts-sections { display: flex; gap: 4px; padding: 16px 32px 0; border-bottom: 1px solid var(--border); }
+.alerts-sections button { padding: 8px 13px; border: 0; border-bottom: 2px solid transparent; background: transparent; color: var(--muted); cursor: pointer; }
+.alerts-sections button:hover, .alerts-sections button.active { color: var(--text); }
+.alerts-sections button.active { border-bottom-color: var(--accent); }
+.alerts-page .alerts-view { padding-top: 22px; }
+.notification-result { display: flex; flex-direction: column; gap: 8px; padding: 10px; border: 1px solid var(--border-2); border-radius: 5px; background: var(--canvas-sunken); }
+.notification-result strong { color: var(--text); }
+.notification-result pre { max-height: 240px; margin: 0; overflow: auto; color: var(--text); white-space: pre-wrap; overflow-wrap: anywhere; }
 @media (max-width: 980px) { .alerts-layout { grid-template-columns: 1fr; } }

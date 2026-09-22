@@ -8,8 +8,11 @@ use thiserror::Error;
 
 use crate::{
     canonical_json, rule_head, rule_head_key, rule_mutation_receipt_key, rule_revision_key,
-    rule_tombstone_key, state_head_key, Monitor, MonitorId, RuleHead, RuleMutationReceipt,
-    RuleTombstone, StateHead, TransitionRecord,
+    rule_tombstone_key, secret_generation_key, secret_head_key, state_head_key, target_head,
+    target_head_key, target_mutation_receipt_key, target_revision_key, target_tombstone_key,
+    LogicalSecretId, Monitor, MonitorId, NotificationTarget, NotificationTargetId, RuleHead,
+    RuleMutationReceipt, RuleTombstone, SecretGenerationRecord, SecretHead, StateHead, TargetHead,
+    TargetMutationReceipt, TargetTombstone, TransitionRecord,
 };
 
 const MAX_CONTROL_OBJECT_BYTES: u64 = 1024 * 1024;
@@ -146,6 +149,157 @@ impl<'a> AlertStore<'a> {
             Err(AlertStoreError::Missing { .. }) => Ok(None),
             Err(error) => Err(error),
         }
+    }
+
+    pub async fn create_target_revision(
+        &self,
+        target: &NotificationTarget,
+        expected_head: Option<UpdateVersion>,
+    ) -> Result<(), AlertStoreError> {
+        let revision_path = target_revision_key(target.id, target.revision);
+        self.create_identical(&revision_path, target).await?;
+        let next = target_head(target);
+        let path = target_head_key(target.id);
+        match self.read_versioned::<TargetHead>(&path).await {
+            Ok(current) if current.value == next => Ok(()),
+            Ok(_) => match expected_head {
+                Some(version) => self.update(&path, &next, version).await,
+                None => Err(AlertStoreError::Conflict { path }),
+            },
+            Err(AlertStoreError::Missing { .. }) if expected_head.is_none() => {
+                self.create_identical(&path, &next).await
+            }
+            Err(AlertStoreError::Missing { .. }) => Err(AlertStoreError::Conflict { path }),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn read_target(
+        &self,
+        id: NotificationTargetId,
+    ) -> Result<Versioned<NotificationTarget>, AlertStoreError> {
+        let head = self
+            .read_versioned::<TargetHead>(&target_head_key(id))
+            .await?;
+        if head.value.deleted {
+            return Err(AlertStoreError::Missing {
+                path: target_head_key(id),
+            });
+        }
+        self.read_versioned(&head.value.revision_key).await
+    }
+
+    pub async fn read_target_head(
+        &self,
+        id: NotificationTargetId,
+    ) -> Result<Versioned<TargetHead>, AlertStoreError> {
+        self.read_versioned(&target_head_key(id)).await
+    }
+
+    pub async fn tombstone_target(
+        &self,
+        tombstone: &TargetTombstone,
+        expected_head: UpdateVersion,
+    ) -> Result<(), AlertStoreError> {
+        let tombstone_key = target_tombstone_key(tombstone.target_id, &tombstone.command_id);
+        self.create_identical(&tombstone_key, tombstone).await?;
+        let head = TargetHead {
+            schema_version: crate::ALERT_RECORD_SCHEMA_VERSION,
+            target_id: tombstone.target_id,
+            revision: tombstone.revision,
+            revision_key: String::new(),
+            updated_at_unix_nano: tombstone.deleted_at_unix_nano,
+            deleted: true,
+            tombstone_key: Some(tombstone_key),
+        };
+        self.update(&target_head_key(tombstone.target_id), &head, expected_head)
+            .await
+    }
+
+    pub async fn read_target_tombstone(
+        &self,
+        id: NotificationTargetId,
+        command_id: &str,
+    ) -> Result<Option<TargetTombstone>, AlertStoreError> {
+        match self
+            .read_versioned(&target_tombstone_key(id, command_id))
+            .await
+        {
+            Ok(v) => Ok(Some(v.value)),
+            Err(AlertStoreError::Missing { .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+    pub async fn record_target_mutation(
+        &self,
+        receipt: &TargetMutationReceipt,
+    ) -> Result<(), AlertStoreError> {
+        self.create_identical(&target_mutation_receipt_key(&receipt.command_id), receipt)
+            .await
+    }
+    pub async fn read_target_mutation(
+        &self,
+        command_id: &str,
+    ) -> Result<Option<TargetMutationReceipt>, AlertStoreError> {
+        match self
+            .read_versioned(&target_mutation_receipt_key(command_id))
+            .await
+        {
+            Ok(v) => Ok(Some(v.value)),
+            Err(AlertStoreError::Missing { .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Persist an immutable encrypted generation, then CAS its independent secret head.
+    pub async fn commit_secret_generation(
+        &self,
+        record: &SecretGenerationRecord,
+        head: &SecretHead,
+        expected_head: Option<UpdateVersion>,
+    ) -> Result<(), AlertStoreError> {
+        let key = secret_generation_key(
+            record.target_id,
+            record.logical_secret_id,
+            record.generation,
+        );
+        if record.deployment_id != head.deployment_id
+            || record.target_id != head.target_id
+            || record.logical_secret_id != head.logical_secret_id
+            || record.generation != head.generation
+            || key != head.generation_key
+        {
+            return Err(AlertStoreError::Corrupt {
+                path: key,
+                message: "secret generation and head do not match",
+            });
+        }
+        self.create_identical(&key, record).await?;
+        let path = secret_head_key(record.target_id, record.logical_secret_id);
+        match expected_head {
+            Some(version) => self.update(&path, head, version).await,
+            None => self.create_identical(&path, head).await,
+        }
+    }
+    pub async fn read_secret_head(
+        &self,
+        target: NotificationTargetId,
+        logical: LogicalSecretId,
+    ) -> Result<Option<Versioned<SecretHead>>, AlertStoreError> {
+        match self.read_versioned(&secret_head_key(target, logical)).await {
+            Ok(v) => Ok(Some(v)),
+            Err(AlertStoreError::Missing { .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+    pub async fn read_secret_generation(
+        &self,
+        target: NotificationTargetId,
+        logical: LogicalSecretId,
+        generation: u64,
+    ) -> Result<Versioned<SecretGenerationRecord>, AlertStoreError> {
+        self.read_versioned(&secret_generation_key(target, logical, generation))
+            .await
     }
 
     pub async fn read_state_head(
@@ -421,6 +575,25 @@ mod tests {
         }
     }
 
+    fn target(id: NotificationTargetId, revision: u64) -> NotificationTarget {
+        NotificationTarget {
+            schema_version: ALERT_RECORD_SCHEMA_VERSION,
+            id,
+            revision,
+            name: format!("target {revision}"),
+            enabled: true,
+            kind: crate::NotificationTargetKind::SlackWebhook,
+            format: crate::TargetFormat::BuiltIn {
+                format: crate::BuiltInTargetFormat::Slack,
+            },
+            timeout_millis: 5_000,
+            logical_secret_id: LogicalSecretId::new(),
+            secret_generation: 1,
+            created_at_unix_nano: 1,
+            updated_at_unix_nano: revision,
+        }
+    }
+
     fn transition(
         rule: &Monitor,
         sequence: u64,
@@ -477,6 +650,124 @@ mod tests {
         assert_eq!(store.read_rule(id).await.unwrap().value, second);
         assert!(matches!(
             store.create_rule_revision(&first).await,
+            Err(AlertStoreError::Conflict { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn target_revisions_tombstones_and_receipts_are_idempotent() {
+        let backend = InMemory::new();
+        let store = AlertStore::new(&backend);
+        let id = NotificationTargetId::new();
+        let first = target(id, 1);
+        store.create_target_revision(&first, None).await.unwrap();
+        store.create_target_revision(&first, None).await.unwrap();
+        assert_eq!(store.read_target(id).await.unwrap().value, first);
+        let current = store.read_target_head(id).await.unwrap();
+        let second = target(id, 2);
+        store
+            .create_target_revision(&second, Some(current.version))
+            .await
+            .unwrap();
+        let receipt = TargetMutationReceipt {
+            schema_version: ALERT_RECORD_SCHEMA_VERSION,
+            command_id: "command".into(),
+            kind: crate::TargetMutationKind::Update,
+            target_id: id,
+            revision: 2,
+            request_sha256: "hash".into(),
+            candidate: second.clone(),
+        };
+        store.record_target_mutation(&receipt).await.unwrap();
+        store.record_target_mutation(&receipt).await.unwrap();
+        assert_eq!(
+            store.read_target_mutation("command").await.unwrap(),
+            Some(receipt)
+        );
+        let head = store.read_target_head(id).await.unwrap();
+        let tombstone = TargetTombstone {
+            schema_version: ALERT_RECORD_SCHEMA_VERSION,
+            target_id: id,
+            revision: 3,
+            command_id: "delete".into(),
+            deleted_at_unix_nano: 3,
+        };
+        store
+            .tombstone_target(&tombstone, head.version)
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.read_target(id).await,
+            Err(AlertStoreError::Missing { .. })
+        ));
+        assert!(matches!(
+            store.create_target_revision(&target(id, 4), None).await,
+            Err(AlertStoreError::Conflict { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn secret_head_uses_cas_and_generation_is_immutable() {
+        let backend = InMemory::new();
+        let store = AlertStore::new(&backend);
+        let target = NotificationTargetId::new();
+        let logical = LogicalSecretId::new();
+        let record = SecretGenerationRecord {
+            schema_version: ALERT_RECORD_SCHEMA_VERSION,
+            deployment_id: "deployment".into(),
+            target_id: target,
+            logical_secret_id: logical,
+            generation: 1,
+            envelope: crate::EncryptedSecretEnvelope {
+                version: 1,
+                key_id: "key".into(),
+                nonce_base64url: "nonce".into(),
+                ciphertext_base64url: "ciphertext".into(),
+            },
+            rotation_of_generation: None,
+            created_at_unix_nano: 1,
+        };
+        let head = SecretHead {
+            schema_version: ALERT_RECORD_SCHEMA_VERSION,
+            deployment_id: "deployment".into(),
+            target_id: target,
+            logical_secret_id: logical,
+            generation: 1,
+            generation_key: secret_generation_key(target, logical, 1),
+            updated_at_unix_nano: 1,
+        };
+        store
+            .commit_secret_generation(&record, &head, None)
+            .await
+            .unwrap();
+        let current = store
+            .read_secret_head(target, logical)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .read_secret_generation(target, logical, 1)
+                .await
+                .unwrap()
+                .value,
+            record
+        );
+        let mut next_record = record.clone();
+        next_record.generation = 2;
+        next_record.created_at_unix_nano = 2;
+        let mut next_head = head.clone();
+        next_head.generation = 2;
+        next_head.generation_key = secret_generation_key(target, logical, 2);
+        next_head.updated_at_unix_nano = 2;
+        store
+            .commit_secret_generation(&next_record, &next_head, Some(current.version.clone()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .commit_secret_generation(&next_record, &next_head, Some(current.version))
+                .await,
             Err(AlertStoreError::Conflict { .. })
         ));
     }
