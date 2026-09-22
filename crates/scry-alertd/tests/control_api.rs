@@ -61,12 +61,28 @@ async fn authenticated_create_and_list_are_revisioned_and_bounded() {
     let client = reqwest::Client::new();
     let rule = monitor();
 
-    let unauthorized = client
-        .get(format!("http://{address}/v1/monitors"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(unauthorized.status(), reqwest::StatusCode::UNAUTHORIZED);
+    for authorization in [
+        None,
+        Some("Basic 0123456789abcdef0123456789abcdef"),
+        Some("bearer 0123456789abcdef0123456789abcdef"),
+        Some("Bearer 0123456789abcdef0123456789abcdee"),
+        Some("Bearer"),
+    ] {
+        let mut request = client.get(format!("http://{address}/v1/monitors"));
+        if let Some(value) = authorization {
+            request = request.header(reqwest::header::AUTHORIZATION, value);
+        }
+        let unauthorized = request.send().await.unwrap();
+        assert_eq!(
+            unauthorized.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "authorization value {authorization:?} must be rejected"
+        );
+        assert_eq!(
+            unauthorized.json::<serde_json::Value>().await.unwrap(),
+            serde_json::json!({ "error": "unauthorized" })
+        );
+    }
 
     let command_id = Uuid::new_v4().to_string();
     let created = client
