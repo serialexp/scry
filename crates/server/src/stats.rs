@@ -25,7 +25,7 @@
 //!    the local instance is rendered from its own published snapshot, marked
 //!    only as "this instance".
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -860,6 +860,182 @@ pub struct QueryWorkerStatus {
     pub draining: bool,
 }
 
+/// Dependency-neutral telemetry shared by the cgroup memory guard and status.
+///
+/// Updates are deliberately relaxed atomics: this is operational telemetry, not
+/// synchronization for admission decisions. A snapshot can straddle concurrent
+/// updates, but every counter remains monotonic and the latest observed gauge is
+/// always available without taking a lock on the query path.
+#[derive(Debug, Default)]
+pub struct QueryMemoryPressureStats {
+    enabled: AtomicBool,
+    limit_bytes: AtomicU64,
+    reserve_bytes: AtomicU64,
+    threshold_bytes: AtomicU64,
+    current_bytes: AtomicU64,
+    reclaimable_clean_file_bytes: AtomicU64,
+    committed_bytes: AtomicU64,
+    admission_checks_total: AtomicU64,
+    admission_admitted_total: AtomicU64,
+    admission_rejected_total: AtomicU64,
+    admission_probe_failures_total: AtomicU64,
+    reclaim_attempts_total: AtomicU64,
+    reclaim_rate_limited_total: AtomicU64,
+    estimated_entries_released_total: AtomicU64,
+    estimated_bytes_released_total: AtomicU64,
+    observed_committed_reduction_bytes_total: AtomicU64,
+    runtime_probe_failures_total: AtomicU64,
+    runtime_cancellations_planning_total: AtomicU64,
+    runtime_cancellations_streaming_total: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct QueryMemoryPressureSnapshot {
+    pub enabled: bool,
+    pub limit_bytes: u64,
+    pub reserve_bytes: u64,
+    pub threshold_bytes: u64,
+    pub current_bytes: u64,
+    pub reclaimable_clean_file_bytes: u64,
+    pub committed_bytes: u64,
+    pub admission_checks_total: u64,
+    pub admission_admitted_total: u64,
+    pub admission_rejected_total: u64,
+    pub admission_probe_failures_total: u64,
+    pub reclaim_attempts_total: u64,
+    pub reclaim_rate_limited_total: u64,
+    pub estimated_entries_released_total: u64,
+    pub estimated_bytes_released_total: u64,
+    pub observed_committed_reduction_bytes_total: u64,
+    pub runtime_probe_failures_total: u64,
+    pub runtime_cancellations_planning_total: u64,
+    pub runtime_cancellations_streaming_total: u64,
+}
+
+impl QueryMemoryPressureStats {
+    pub fn new(enabled: bool, limit_bytes: u64, reserve_bytes: u64) -> Self {
+        let stats = Self::default();
+        stats.enabled.store(enabled, Ordering::Relaxed);
+        stats.observe(limit_bytes, reserve_bytes, 0, 0, 0);
+        stats
+    }
+
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Publish the latest coherent probe values. The threshold is derived here
+    /// so callers cannot accidentally report one inconsistent with the reserve.
+    pub fn observe(
+        &self,
+        limit_bytes: u64,
+        reserve_bytes: u64,
+        current_bytes: u64,
+        reclaimable_clean_file_bytes: u64,
+        committed_bytes: u64,
+    ) {
+        self.limit_bytes.store(limit_bytes, Ordering::Relaxed);
+        self.reserve_bytes.store(reserve_bytes, Ordering::Relaxed);
+        self.threshold_bytes
+            .store(limit_bytes.saturating_sub(reserve_bytes), Ordering::Relaxed);
+        self.current_bytes.store(current_bytes, Ordering::Relaxed);
+        self.reclaimable_clean_file_bytes
+            .store(reclaimable_clean_file_bytes, Ordering::Relaxed);
+        self.committed_bytes
+            .store(committed_bytes, Ordering::Relaxed);
+    }
+
+    pub fn record_admission_admitted(&self) {
+        self.admission_checks_total.fetch_add(1, Ordering::Relaxed);
+        self.admission_admitted_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_admission_rejected(&self) {
+        self.admission_checks_total.fetch_add(1, Ordering::Relaxed);
+        self.admission_rejected_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_admission_probe_failure(&self) {
+        self.admission_checks_total.fetch_add(1, Ordering::Relaxed);
+        self.admission_probe_failures_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_reclaim_attempt(&self) {
+        self.reclaim_attempts_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_reclaim_rate_limited(&self) {
+        self.reclaim_rate_limited_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_estimated_release(&self, entries: u64, bytes: u64) {
+        self.estimated_entries_released_total
+            .fetch_add(entries, Ordering::Relaxed);
+        self.estimated_bytes_released_total
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn record_observed_committed_reduction(&self, bytes: u64) {
+        self.observed_committed_reduction_bytes_total
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn record_runtime_probe_failure(&self) {
+        self.runtime_probe_failures_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_runtime_cancellation_planning(&self) {
+        self.runtime_cancellations_planning_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_runtime_cancellation_streaming(&self) {
+        self.runtime_cancellations_streaming_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> QueryMemoryPressureSnapshot {
+        QueryMemoryPressureSnapshot {
+            enabled: self.enabled.load(Ordering::Relaxed),
+            limit_bytes: self.limit_bytes.load(Ordering::Relaxed),
+            reserve_bytes: self.reserve_bytes.load(Ordering::Relaxed),
+            threshold_bytes: self.threshold_bytes.load(Ordering::Relaxed),
+            current_bytes: self.current_bytes.load(Ordering::Relaxed),
+            reclaimable_clean_file_bytes: self.reclaimable_clean_file_bytes.load(Ordering::Relaxed),
+            committed_bytes: self.committed_bytes.load(Ordering::Relaxed),
+            admission_checks_total: self.admission_checks_total.load(Ordering::Relaxed),
+            admission_admitted_total: self.admission_admitted_total.load(Ordering::Relaxed),
+            admission_rejected_total: self.admission_rejected_total.load(Ordering::Relaxed),
+            admission_probe_failures_total: self
+                .admission_probe_failures_total
+                .load(Ordering::Relaxed),
+            reclaim_attempts_total: self.reclaim_attempts_total.load(Ordering::Relaxed),
+            reclaim_rate_limited_total: self.reclaim_rate_limited_total.load(Ordering::Relaxed),
+            estimated_entries_released_total: self
+                .estimated_entries_released_total
+                .load(Ordering::Relaxed),
+            estimated_bytes_released_total: self
+                .estimated_bytes_released_total
+                .load(Ordering::Relaxed),
+            observed_committed_reduction_bytes_total: self
+                .observed_committed_reduction_bytes_total
+                .load(Ordering::Relaxed),
+            runtime_probe_failures_total: self.runtime_probe_failures_total.load(Ordering::Relaxed),
+            runtime_cancellations_planning_total: self
+                .runtime_cancellations_planning_total
+                .load(Ordering::Relaxed),
+            runtime_cancellations_streaming_total: self
+                .runtime_cancellations_streaming_total
+                .load(Ordering::Relaxed),
+        }
+    }
+}
+
 pub struct QueryMetrics {
     started: Instant,
     instance_id: String,
@@ -918,6 +1094,9 @@ pub struct QueryMetrics {
     /// Connection health of this daemon's Valkey link, if any. `None` ⇒ no
     /// Valkey configured; `Some(false)` ⇒ configured but currently down.
     valkey_health: Option<watch::Receiver<bool>>,
+    /// Optional because the guard is configured separately and existing
+    /// constructor call sites must remain source-compatible.
+    memory_pressure: Option<Arc<QueryMemoryPressureStats>>,
 }
 
 impl QueryMetrics {
@@ -977,7 +1156,21 @@ impl QueryMetrics {
             memory_pool,
             catalog_gauge,
             valkey_health,
+            memory_pressure: None,
         }
+    }
+
+    /// Attach the shared cgroup committed-memory telemetry tracker.
+    pub fn with_memory_pressure_stats(
+        mut self,
+        memory_pressure: Option<Arc<QueryMemoryPressureStats>>,
+    ) -> Self {
+        self.memory_pressure = memory_pressure;
+        self
+    }
+
+    pub fn memory_pressure_stats(&self) -> Option<&Arc<QueryMemoryPressureStats>> {
+        self.memory_pressure.as_ref()
     }
 
     /// Begin tracking one in-flight query: bumps `queries_total` and the
@@ -1158,6 +1351,7 @@ impl QueryMetrics {
             .read()
             .expect("query worker status lock poisoned")
             .clone();
+        let memory_pressure = self.memory_pressure.as_ref().map(|stats| stats.snapshot());
         serde_json::json!({
             "queries_total": queries,
             "queries_in_flight": self.queries_in_flight.load(Ordering::Relaxed),
@@ -1222,6 +1416,29 @@ impl QueryMetrics {
             },
             "memory_reserved_bytes": memory_reserved,
             "memory_observed_peak_reserved_bytes": self.memory_observed_peak_reserved_bytes.load(Ordering::Relaxed),
+            "memory_pressure": memory_pressure.map(|pressure| serde_json::json!({
+                "enabled": pressure.enabled,
+                "limit_bytes": pressure.limit_bytes,
+                "reserve_bytes": pressure.reserve_bytes,
+                "threshold_bytes": pressure.threshold_bytes,
+                "current_bytes": pressure.current_bytes,
+                "reclaimable_clean_file_bytes": pressure.reclaimable_clean_file_bytes,
+                "committed_bytes": pressure.committed_bytes,
+                "admission_checks_total": pressure.admission_checks_total,
+                "admission_admitted_total": pressure.admission_admitted_total,
+                "admission_rejected_total": pressure.admission_rejected_total,
+                "admission_probe_failures_total": pressure.admission_probe_failures_total,
+                "reclaim_attempts_total": pressure.reclaim_attempts_total,
+                "reclaim_rate_limited_total": pressure.reclaim_rate_limited_total,
+                "estimated_entries_released_total": pressure.estimated_entries_released_total,
+                "estimated_bytes_released_total": pressure.estimated_bytes_released_total,
+                "observed_committed_reduction_bytes_total": pressure.observed_committed_reduction_bytes_total,
+                "runtime_probe_failures_total": pressure.runtime_probe_failures_total,
+                "runtime_cancellations": {
+                    "planning_total": pressure.runtime_cancellations_planning_total,
+                    "streaming_total": pressure.runtime_cancellations_streaming_total,
+                },
+            })),
             "admission": {
                 "waiting": self.admission_waiting.load(Ordering::Relaxed),
                 "waited_total": waited,
@@ -1499,29 +1716,80 @@ mod tests {
     }
 
     #[test]
+    fn query_memory_pressure_stats_track_gauges_outcomes_and_phases() {
+        let stats = QueryMemoryPressureStats::new(true, 1_000, 200);
+        stats.observe(1_000, 200, 900, 250, 650);
+        stats.record_admission_admitted();
+        stats.record_admission_rejected();
+        stats.record_admission_probe_failure();
+        stats.record_reclaim_attempt();
+        stats.record_reclaim_rate_limited();
+        stats.record_estimated_release(7, 300);
+        stats.record_observed_committed_reduction(175);
+        stats.record_runtime_probe_failure();
+        stats.record_runtime_cancellation_planning();
+        stats.record_runtime_cancellation_streaming();
+
+        assert_eq!(
+            stats.snapshot(),
+            QueryMemoryPressureSnapshot {
+                enabled: true,
+                limit_bytes: 1_000,
+                reserve_bytes: 200,
+                threshold_bytes: 800,
+                current_bytes: 900,
+                reclaimable_clean_file_bytes: 250,
+                committed_bytes: 650,
+                admission_checks_total: 3,
+                admission_admitted_total: 1,
+                admission_rejected_total: 1,
+                admission_probe_failures_total: 1,
+                reclaim_attempts_total: 1,
+                reclaim_rate_limited_total: 1,
+                estimated_entries_released_total: 7,
+                estimated_bytes_released_total: 300,
+                observed_committed_reduction_bytes_total: 175,
+                runtime_probe_failures_total: 1,
+                runtime_cancellations_planning_total: 1,
+                runtime_cancellations_streaming_total: 1,
+            }
+        );
+    }
+
+    #[test]
     fn query_snapshot_reports_ranges_latency_memory_admission_and_recovery() {
         let temp = tempfile::tempdir().unwrap();
         // Never sampled: the gauge reports absent, and the flat mirrors fall
         // back to 0 rather than inventing a catalog size.
         let gauge = CatalogGauge::new(temp.path().join("catalog.sqlite"));
         let memory_pool = Arc::new(GreedyMemoryPool::new(1024 * 1024));
-        let metrics = Arc::new(QueryMetrics::new(
-            "query-id".into(),
-            "127.0.0.1:4100".into(),
-            Arc::new(PostingsCache::new(PostingsCacheConfig {
-                budget_bytes: 1024,
-                max_concurrent_fills: 1,
-            })),
-            Arc::new(LabelMetadataCoordinator::default()),
-            Arc::new(BloomCache::new(BloomCacheConfig {
-                budget_bytes: 1024,
-                max_concurrent_fills: 1,
-            })),
-            Arc::new(QueryResultCache::with_budget_bytes(1024)),
-            memory_pool,
-            gauge,
-            None,
-        ));
+        let memory_pressure = Arc::new(QueryMemoryPressureStats::new(true, 8_192, 1_024));
+        memory_pressure.observe(8_192, 1_024, 6_144, 2_048, 4_096);
+        memory_pressure.record_admission_admitted();
+        memory_pressure.record_reclaim_attempt();
+        memory_pressure.record_estimated_release(3, 512);
+        memory_pressure.record_observed_committed_reduction(256);
+        memory_pressure.record_runtime_cancellation_streaming();
+        let metrics = Arc::new(
+            QueryMetrics::new(
+                "query-id".into(),
+                "127.0.0.1:4100".into(),
+                Arc::new(PostingsCache::new(PostingsCacheConfig {
+                    budget_bytes: 1024,
+                    max_concurrent_fills: 1,
+                })),
+                Arc::new(LabelMetadataCoordinator::default()),
+                Arc::new(BloomCache::new(BloomCacheConfig {
+                    budget_bytes: 1024,
+                    max_concurrent_fills: 1,
+                })),
+                Arc::new(QueryResultCache::with_budget_bytes(1024)),
+                memory_pool,
+                gauge,
+                None,
+            )
+            .with_memory_pressure_stats(Some(memory_pressure)),
+        );
 
         metrics.record_query_range(Some(0), Some(7_200_000_000_000), false);
         metrics.record_query_range(Some(0), Some(86_400_000_000_000), true);
@@ -1572,6 +1840,19 @@ mod tests {
         assert_eq!(data["admission"]["waited_total"], serde_json::json!(1));
         assert_eq!(data["admission"]["timeouts_total"], serde_json::json!(1));
         assert_eq!(data["admission"]["rejected_total"], serde_json::json!(1));
+        assert_eq!(data["memory_pressure"]["enabled"], serde_json::json!(true));
+        assert_eq!(
+            data["memory_pressure"]["committed_bytes"],
+            serde_json::json!(4_096)
+        );
+        assert_eq!(
+            data["memory_pressure"]["estimated_entries_released_total"],
+            serde_json::json!(3)
+        );
+        assert_eq!(
+            data["memory_pressure"]["runtime_cancellations"]["streaming_total"],
+            serde_json::json!(1)
+        );
         assert_eq!(
             data["distribution_decisions"]["local_cache_hit_total"],
             serde_json::json!(1)

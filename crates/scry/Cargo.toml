@@ -14,7 +14,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow             = { workspace = true }
 clap               = { workspace = true }
-mimalloc           = { workspace = true }
+scry-alloc         = { workspace = true }
 tokio              = { workspace = true }
 tracing-subscriber = { workspace = true }
 

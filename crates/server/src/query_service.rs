@@ -63,9 +63,10 @@ use scry_proto::{
     },
     framing::{read_frame, write_frame, Framed, MAX_FRAME_BYTES},
     BatchMsgInput, EndOfStreamInput, FleetStatusResponseInput, IssueListRequestOutput,
-    IssueListResponseInput, LabelNamesRequestOutput, LabelNamesResponseInput,
-    LabelValuesRequestOutput, LabelValuesResponseInput, LiveNodeTiming, QueryFrame, QueryFrameMsg,
-    QueryStatsInput, ResponseSupersededInput, SchemaMsgInput, StreamErrorInput,
+    IssueListResponseInput, IssueOccurrencesRequestOutput, IssueOccurrencesResponseInput,
+    LabelNamesRequestOutput, LabelNamesResponseInput, LabelValuesRequestOutput,
+    LabelValuesResponseInput, LiveNodeTiming, QueryFrame, QueryFrameMsg, QueryStatsInput,
+    ResponseSupersededInput, SchemaMsgInput, StreamErrorInput,
 };
 use scry_query::{
     collect_label_names, collect_label_values, hash128, list_metrics_candidates,
@@ -86,8 +87,8 @@ use scry_query::{
 use scry_storage_layout::is_reserved_control_prefix;
 
 use crate::live_merge::{fetch_live_from_ingester, LiveDiscovery};
-use crate::memory_guard::{QueryMemoryGuard, QUERY_TOO_LARGE_MESSAGE};
-use crate::stats::{LocalQueryDecision, QueryMetrics};
+use crate::memory_guard::{MemoryAdmissionDecision, MemoryAdmissionOutcome, QueryMemoryGuard};
+use crate::stats::{LocalQueryDecision, QueryMemoryPressureStats, QueryMetrics};
 use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OnceCell, Semaphore};
@@ -750,6 +751,9 @@ impl QueryService {
             QueryFrameMsg::IssueListRequest(req) => {
                 return self.handle_issue_list(req, &mut wr, peer).await;
             }
+            QueryFrameMsg::IssueOccurrencesRequest(req) => {
+                return self.handle_issue_occurrences(req, &mut wr, peer).await;
+            }
             QueryFrameMsg::QueryRequest(q) => q,
             other => {
                 let name = match other {
@@ -762,12 +766,14 @@ impl QueryService {
                     QueryFrameMsg::LabelValuesResponse(_) => "LabelValuesResponse",
                     QueryFrameMsg::FleetStatusResponse(_) => "FleetStatusResponse",
                     QueryFrameMsg::IssueListResponse(_) => "IssueListResponse",
+                    QueryFrameMsg::IssueOccurrencesResponse(_) => "IssueOccurrencesResponse",
                     QueryFrameMsg::StreamError(_) => "StreamError",
                     QueryFrameMsg::QueryRequest(_)
                     | QueryFrameMsg::LabelNamesRequest(_)
                     | QueryFrameMsg::LabelValuesRequest(_)
                     | QueryFrameMsg::FleetStatusRequest(_)
-                    | QueryFrameMsg::IssueListRequest(_) => unreachable!(),
+                    | QueryFrameMsg::IssueListRequest(_)
+                    | QueryFrameMsg::IssueOccurrencesRequest(_) => unreachable!(),
                 };
                 let _ = emit_stream_error(
                     &mut wr,
@@ -785,10 +791,15 @@ impl QueryService {
         // admission gate. Control-plane requests above have bounded responses
         // and must remain available for diagnosis and discovery.
         if let Some(guard) = &self.memory_guard {
-            if let Err(e) = guard.check() {
-                warn!(%peer, error = %e, "refusing query at process memory safety threshold");
-                let _ =
-                    emit_stream_error(&mut wr, QUERY_ERR_RESOURCES, QUERY_TOO_LARGE_MESSAGE).await;
+            let (admission, outcome) = guard.clone().admit_new_query_with_outcome_async().await;
+            if let Some(metrics) = self.metrics.as_ref() {
+                if let Some(stats) = metrics.memory_pressure_stats() {
+                    record_memory_admission_stats(stats, outcome.as_ref(), admission.is_ok());
+                }
+            }
+            log_memory_admission(peer, outcome.as_ref(), admission.as_ref().err());
+            if let Err(error) = admission {
+                let _ = emit_stream_error(&mut wr, QUERY_ERR_RESOURCES, format!("{error:#}")).await;
                 let _ = wr.flush().await;
                 return Ok(());
             }
@@ -1203,12 +1214,21 @@ impl QueryService {
                 });
             }
             if let Some(guard) = self.memory_guard.as_ref() {
-                guard.check().map_err(|e| {
-                    (
+                if let Err(error) = guard.check() {
+                    if let Some(stats) = self
+                        .metrics
+                        .as_ref()
+                        .and_then(|metrics| metrics.memory_pressure_stats())
+                    {
+                        // Live fetch is pre-plan work; the current stats schema
+                        // has planning and streaming cancellation buckets only.
+                        stats.record_runtime_cancellation_planning();
+                    }
+                    return Err((
                         QUERY_ERR_RESOURCES,
-                        format!("{QUERY_TOO_LARGE_MESSAGE} {e:#}"),
-                    )
-                })?;
+                        format!("live fetch cancelled: {error:#}"),
+                    ));
+                }
             }
         }
         // Stable order so two consecutive queries against the same fleet render
@@ -1865,6 +1885,102 @@ impl QueryService {
         Ok(())
     }
 
+    /// `IssueOccurrencesRequest` → one `IssueOccurrencesResponse`. Returns the
+    /// issue summary and its most recent occurrences from the local errors
+    /// SQLite database.
+    async fn handle_issue_occurrences<W>(
+        &self,
+        req: IssueOccurrencesRequestOutput,
+        wr: &mut BufWriter<W>,
+        peer: SocketAddr,
+    ) -> Result<()>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        let Some(db) = &self.errors_db else {
+            let _ = emit_stream_error(
+                wr,
+                QUERY_ERR_ISSUES_UNAVAILABLE,
+                "issues unavailable: queryd was not started with --errors-db",
+            )
+            .await;
+            let _ = wr.flush().await;
+            return Ok(());
+        };
+
+        let issue_id_bytes: [u8; 16] = match req.issue_id.try_into() {
+            Ok(arr) => arr,
+            Err(_) => {
+                let _ = emit_stream_error(
+                    wr,
+                    QUERY_ERR_BAD_REQUEST,
+                    "issue_id must be exactly 16 bytes",
+                )
+                .await;
+                let _ = wr.flush().await;
+                return Ok(());
+            }
+        };
+
+        let limit = if req.limit == 0 {
+            100
+        } else {
+            req.limit as usize
+        };
+
+        // Do all synchronous SQLite + serde work under the lock, then drop
+        // the guard before any async I/O.
+        let result = {
+            let db = db.lock().unwrap();
+            let issue = db.get_issue(&issue_id_bytes);
+            let occurrences = db.list_occurrences_for_issue(&issue_id_bytes, limit);
+            match (issue, occurrences) {
+                (Ok(issue), Ok(occs)) => {
+                    let issue_json = issue
+                        .as_ref()
+                        .and_then(|i| serde_json::to_string(i).ok())
+                        .unwrap_or_default();
+                    let occurrences_json: Vec<String> = occs
+                        .iter()
+                        .filter_map(|o| serde_json::to_string(o).ok())
+                        .collect();
+                    Ok((issue_json, occurrences_json))
+                }
+                (Err(e), _) | (_, Err(e)) => Err(e),
+            }
+        };
+
+        let (issue_json, occurrences_json) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(%peer, error = %e, "issue_occurrences query failed");
+                let _ = emit_stream_error(
+                    wr,
+                    QUERY_ERR_INTERNAL,
+                    format!("errors database query failed: {e}"),
+                )
+                .await;
+                let _ = wr.flush().await;
+                return Ok(());
+            }
+        };
+
+        let frame = QueryFrame {
+            msg: QueryFrameMsg::IssueOccurrencesResponse(
+                IssueOccurrencesResponseInput {
+                    issue_json,
+                    occurrences_json,
+                }
+                .into(),
+            ),
+        };
+        if let Err(e) = write_frame(wr, &frame).await {
+            warn!(%peer, error = %e, "writing IssueOccurrencesResponse");
+        }
+        let _ = wr.flush().await;
+        Ok(())
+    }
+
     /// Resolve a metadata request's signal byte, emitting a `StreamError` +
     /// flushing on an invalid byte. `Ok(None)` means the error was already sent
     /// and the caller should return.
@@ -2137,9 +2253,17 @@ impl QueryService {
         // and beginning expensive planning (metadata requests are checked at
         // connection admission and use their projected streaming path).
         if let Some(guard) = &self.memory_guard {
-            if guard.check().is_err() {
-                let _ =
-                    emit_stream_error(&mut wr, QUERY_ERR_RESOURCES, QUERY_TOO_LARGE_MESSAGE).await;
+            if let Err(error) = guard.check() {
+                if let Some(stats) = self
+                    .metrics
+                    .as_ref()
+                    .and_then(|metrics| metrics.memory_pressure_stats())
+                {
+                    // This check guards all work before DataFusion planning;
+                    // the existing stats schema groups that work with planning.
+                    stats.record_runtime_cancellation_planning();
+                }
+                let _ = emit_stream_error(&mut wr, QUERY_ERR_RESOURCES, format!("{error:#}")).await;
                 let _ = wr.flush().await;
                 self.emit_scan_complete(
                     signal,
@@ -2225,14 +2349,36 @@ impl QueryService {
                     .collect();
                 let live_rows = if req.live && signal == Signal::Logs {
                     let live_started = Instant::now();
-                    let fetched = self
-                        .fetch_live_logs(
-                            self.live_discovery.as_ref().expect("checked above"),
-                            &req,
-                            &candidates,
-                            &persistent_watermarks,
-                        )
-                        .await;
+                    let live_fetch = self.fetch_live_logs(
+                        self.live_discovery.as_ref().expect("checked above"),
+                        &req,
+                        &candidates,
+                        &persistent_watermarks,
+                    );
+                    let fetched = if let Some(guard) = &self.memory_guard {
+                        tokio::select! {
+                            result = live_fetch => result,
+                            error = guard.wait_until_exhausted() => {
+                                if let Some(stats) = self
+                                    .metrics
+                                    .as_ref()
+                                    .and_then(|metrics| metrics.memory_pressure_stats())
+                                {
+                                    // The current stats schema has no live-fetch
+                                    // bucket, so account this pre-plan cancellation
+                                    // with planning rather than streaming.
+                                    stats.record_runtime_cancellation_planning();
+                                    record_runtime_memory_failure(stats, error.snapshot);
+                                }
+                                Err((
+                                    QUERY_ERR_RESOURCES,
+                                    format!("live fetch cancelled: {:#}", error.error),
+                                ))
+                            }
+                        }
+                    } else {
+                        live_fetch.await
+                    };
                     phases.live_fetch += live_started.elapsed();
                     match fetched {
                         Ok((rows, timings)) => {
@@ -2344,8 +2490,17 @@ impl QueryService {
                             candidates,
                             live_rows.clone(),
                         ) => result,
-                        _ = guard.wait_until_exhausted() => {
-                            Err((QUERY_ERR_RESOURCES, QUERY_TOO_LARGE_MESSAGE.to_string()))
+                        error = guard.wait_until_exhausted() => {
+                            if let Some(metrics) = self.metrics.as_ref() {
+                                if let Some(stats) = metrics.memory_pressure_stats() {
+                                    stats.record_runtime_cancellation_planning();
+                                    record_runtime_memory_failure(stats, error.snapshot);
+                                }
+                            }
+                            Err((
+                                QUERY_ERR_RESOURCES,
+                                format!("query planning cancelled: {:#}", error.error),
+                            ))
                         }
                     }
                 } else {
@@ -2516,12 +2671,18 @@ impl QueryService {
                 let next = if let Some(guard) = &self.memory_guard {
                     tokio::select! {
                         batch = stream.next() => batch,
-                        _ = guard.wait_until_exhausted() => {
+                        error = guard.wait_until_exhausted() => {
                             let _ = emit_stream_error(
                                 &mut wr,
                                 QUERY_ERR_RESOURCES,
-                                QUERY_TOO_LARGE_MESSAGE,
+                                format!("result streaming cancelled: {:#}", error.error),
                             ).await;
+                            if let Some(metrics) = self.metrics.as_ref() {
+                                if let Some(stats) = metrics.memory_pressure_stats() {
+                                    stats.record_runtime_cancellation_streaming();
+                                    record_runtime_memory_failure(stats, error.snapshot);
+                                }
+                            }
                             let _ = wr.flush().await;
                             self.emit_scan_complete(
                                 signal,
@@ -2609,17 +2770,7 @@ impl QueryService {
                                 }
                             }
                         }
-                        let code =
-                            if matches!(e.find_root(), DataFusionError::ResourcesExhausted(_)) {
-                                QUERY_ERR_RESOURCES
-                            } else {
-                                QUERY_ERR_INTERNAL
-                            };
-                        let message = if !evicted.is_empty() {
-                            format!("query attempt supersession limit exhausted: DataFusion: {e}")
-                        } else {
-                            format!("DataFusion: {e}")
-                        };
+                        let (code, message) = datafusion_stream_error(&e, !evicted.is_empty());
                         let _ = emit_stream_error(&mut wr, code, message).await;
                         let _ = wr.flush().await;
                         self.emit_scan_complete(
@@ -2986,6 +3137,140 @@ fn apply_bucketed_default_window(query: &mut Query, now: u64, window: u64) -> bo
 /// Stable, lowercase signal name for tracing fields. Matches the
 /// shape used by `crates/query/src/cli.rs::CliSignal::name`,
 /// so dashboards filtering on `signal="metrics"` agree at both ends.
+fn datafusion_stream_error(error: &DataFusionError, supersession_exhausted: bool) -> (u16, String) {
+    let resources_exhausted = matches!(error.find_root(), DataFusionError::ResourcesExhausted(_));
+    match (supersession_exhausted, resources_exhausted) {
+        (true, true) => (
+            QUERY_ERR_RESOURCES,
+            format!(
+                "query attempt supersession limit exhausted: shared DataFusion memory pool exhausted: {error}"
+            ),
+        ),
+        (false, true) => (
+            QUERY_ERR_RESOURCES,
+            format!("shared DataFusion memory pool exhausted: {error}"),
+        ),
+        (true, false) => (
+            QUERY_ERR_INTERNAL,
+            format!("query attempt supersession limit exhausted: DataFusion: {error}"),
+        ),
+        (false, false) => (QUERY_ERR_INTERNAL, format!("DataFusion: {error}")),
+    }
+}
+
+fn record_runtime_memory_failure(
+    stats: &QueryMemoryPressureStats,
+    snapshot: Option<scry_resources::CgroupMemorySnapshot>,
+) {
+    if let Some(snapshot) = snapshot {
+        stats.observe(
+            snapshot.limit_bytes,
+            stats.snapshot().reserve_bytes,
+            snapshot.current_bytes,
+            snapshot.reclaimable_clean_file_bytes,
+            snapshot.committed_bytes,
+        );
+    } else {
+        stats.record_runtime_probe_failure();
+    }
+}
+
+fn record_memory_admission_stats(
+    stats: &QueryMemoryPressureStats,
+    outcome: Option<&MemoryAdmissionOutcome>,
+    admitted: bool,
+) {
+    let snapshot = outcome.and_then(|outcome| {
+        outcome
+            .post_reclaim
+            .or(outcome.pre_reclaim)
+            .or(outcome.initial)
+    });
+    if let Some(snapshot) = snapshot {
+        stats.observe(
+            snapshot.limit_bytes,
+            stats.snapshot().reserve_bytes,
+            snapshot.current_bytes,
+            snapshot.reclaimable_clean_file_bytes,
+            snapshot.committed_bytes,
+        );
+    }
+    match outcome.map(|outcome| outcome.decision) {
+        None if admitted => stats.record_admission_admitted(),
+        Some(MemoryAdmissionDecision::ProbeUnavailable) | None => {
+            stats.record_admission_probe_failure();
+        }
+        Some(
+            MemoryAdmissionDecision::RejectedRateLimited
+            | MemoryAdmissionDecision::RejectedAfterReclaim,
+        ) => stats.record_admission_rejected(),
+        Some(
+            MemoryAdmissionDecision::Admitted
+            | MemoryAdmissionDecision::AdmittedAfterConcurrentReclaim
+            | MemoryAdmissionDecision::AdmittedAfterReclaim,
+        ) => stats.record_admission_admitted(),
+    }
+    if let Some(outcome) = outcome {
+        if outcome.pre_reclaim.is_some()
+            && !matches!(
+                outcome.decision,
+                MemoryAdmissionDecision::AdmittedAfterConcurrentReclaim
+                    | MemoryAdmissionDecision::RejectedRateLimited
+            )
+        {
+            stats.record_reclaim_attempt();
+        }
+        if outcome.decision == MemoryAdmissionDecision::RejectedRateLimited {
+            stats.record_reclaim_rate_limited();
+        }
+        if let Some(report) = outcome.reclaim_report.as_ref() {
+            stats.record_estimated_release(report.released_entries, report.released_bytes);
+        }
+        if let (Some(before), Some(after)) = (outcome.pre_reclaim, outcome.post_reclaim) {
+            stats.record_observed_committed_reduction(
+                before.committed_bytes.saturating_sub(after.committed_bytes),
+            );
+        }
+    }
+}
+
+fn log_memory_admission(
+    peer: SocketAddr,
+    outcome: Option<&MemoryAdmissionOutcome>,
+    error: Option<&anyhow::Error>,
+) {
+    let decision = outcome.map(|outcome| format!("{:?}", outcome.decision));
+    let snapshot = outcome.and_then(|outcome| {
+        outcome
+            .post_reclaim
+            .or(outcome.pre_reclaim)
+            .or(outcome.initial)
+    });
+    let allocator_error = outcome
+        .and_then(|outcome| outcome.reclaim_report.as_ref())
+        .and_then(|report| report.allocator_error.as_deref());
+    if let Some(error) = error {
+        warn!(
+            %peer,
+            ?decision,
+            committed_bytes = snapshot.map(|snapshot| snapshot.committed_bytes),
+            current_bytes = snapshot.map(|snapshot| snapshot.current_bytes),
+            reclaimable_clean_file_bytes = snapshot.map(|snapshot| snapshot.reclaimable_clean_file_bytes),
+            released_entries = outcome.and_then(|outcome| outcome.reclaim_report.as_ref()).map(|report| report.released_entries),
+            released_bytes = outcome.and_then(|outcome| outcome.reclaim_report.as_ref()).map(|report| report.released_bytes),
+            ?allocator_error,
+            reclaim_error = outcome.and_then(|outcome| outcome.reclaim_error.as_deref()),
+            error = %error,
+            "data query rejected by process memory admission"
+        );
+    } else if !matches!(
+        outcome.map(|outcome| outcome.decision),
+        Some(MemoryAdmissionDecision::Admitted)
+    ) {
+        info!(%peer, ?decision, ?allocator_error, "data query admitted after process memory pressure handling");
+    }
+}
+
 fn signal_name(s: Signal) -> &'static str {
     match s {
         Signal::Metrics => "metrics",
@@ -3374,6 +3659,7 @@ mod tests {
 
     use async_trait::async_trait;
     use bytes::Bytes;
+    use datafusion::common::DataFusionError;
     use datafusion::execution::memory_pool::GreedyMemoryPool;
     use datafusion::execution::runtime_env::RuntimeEnvBuilder;
     use futures::stream::BoxStream;
@@ -3387,6 +3673,7 @@ mod tests {
     use scry_block::BlockMeta;
     use scry_catalog::Catalog;
     use scry_objstore::BufPool;
+    use scry_proto::constants::{QUERY_ERR_INTERNAL, QUERY_ERR_RESOURCES};
     use scry_proto::{generated::LiveRecord, LabelPair};
     use scry_query::{BloomCache, PostingsCache, Query, QueryResultCache};
     use tempfile::TempDir;
@@ -3394,9 +3681,23 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        apply_bucketed_default_window, canonical_fleet_json, live_record_is_durable,
-        live_record_owned_bytes, QueryService, TargetedRepairLimits, DEFAULT_WINDOW_BUCKET_NANOS,
+        apply_bucketed_default_window, canonical_fleet_json, datafusion_stream_error,
+        live_record_is_durable, live_record_owned_bytes, QueryService, TargetedRepairLimits,
+        DEFAULT_WINDOW_BUCKET_NANOS,
     };
+
+    #[test]
+    fn datafusion_resource_errors_have_a_cause_specific_message() {
+        let error = DataFusionError::ResourcesExhausted("pool limit reached".into());
+        let (code, message) = datafusion_stream_error(&error, false);
+        assert_eq!(code, QUERY_ERR_RESOURCES);
+        assert!(message.starts_with("shared DataFusion memory pool exhausted:"));
+
+        let internal = DataFusionError::Execution("broken plan".into());
+        let (code, message) = datafusion_stream_error(&internal, false);
+        assert_eq!(code, QUERY_ERR_INTERNAL);
+        assert!(message.starts_with("DataFusion:"));
+    }
 
     #[derive(Debug)]
     struct CountingStore {

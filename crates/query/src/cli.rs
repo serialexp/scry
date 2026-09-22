@@ -746,13 +746,15 @@ async fn run_remote(
             | QueryFrameMsg::LabelNamesRequest(_)
             | QueryFrameMsg::LabelValuesRequest(_)
             | QueryFrameMsg::FleetStatusRequest(_)
-            | QueryFrameMsg::IssueListRequest(_) => {
+            | QueryFrameMsg::IssueListRequest(_)
+            | QueryFrameMsg::IssueOccurrencesRequest(_) => {
                 anyhow::bail!("server sent a request frame as response (protocol violation)");
             }
             QueryFrameMsg::LabelNamesResponse(_)
             | QueryFrameMsg::LabelValuesResponse(_)
             | QueryFrameMsg::FleetStatusResponse(_)
-            | QueryFrameMsg::IssueListResponse(_) => {
+            | QueryFrameMsg::IssueListResponse(_)
+            | QueryFrameMsg::IssueOccurrencesResponse(_) => {
                 anyhow::bail!(
                     "server sent a metadata response to a data query (protocol violation)"
                 );

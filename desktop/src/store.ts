@@ -22,10 +22,12 @@ import {
   fetchLabelValues,
   fetchFleetStatus,
   fetchIssueList,
+  fetchIssueOccurrences,
   type QuerySpec,
   type MetaScope,
   type FleetInstance,
   type Issue,
+  type OccurrenceSummary,
   type QueryTiming,
 } from "./protocol/client";
 import { LiveUnavailableError } from "./protocol/transport";
@@ -418,6 +420,41 @@ export async function refreshIssues(): Promise<void> {
     if (err instanceof UnauthorizedError) setAuthed(false);
     setIssueListError(err instanceof Error ? err.message : String(err));
     setIssueListStatus("error");
+  }
+}
+
+// ── Issue detail + occurrences ──────────────────────────────────────
+
+export type IssueDetailStatus = "idle" | "loading" | "ready" | "error";
+const [issueDetailStatus, setIssueDetailStatus] =
+  createSignal<IssueDetailStatus>("idle");
+const [currentIssue, setCurrentIssue] = createSignal<Issue | null>(null);
+const [issueOccurrences, setIssueOccurrences] = createSignal<
+  OccurrenceSummary[]
+>([]);
+const [issueDetailError, setIssueDetailError] = createSignal<string | null>(
+  null,
+);
+export { issueDetailStatus, currentIssue, issueOccurrences, issueDetailError };
+
+/** Refresh issue detail + occurrence list through the selected queryd. */
+export async function refreshIssueDetail(issueId: string): Promise<void> {
+  setIssueDetailStatus("loading");
+  setIssueDetailError(null);
+  try {
+    const transport = await getTransport();
+    const result = await fetchIssueOccurrences(
+      transport,
+      inBrowser ? state.target : state.addr,
+      issueId,
+    );
+    setCurrentIssue(result.issue);
+    setIssueOccurrences(result.occurrences);
+    setIssueDetailStatus("ready");
+  } catch (err) {
+    if (err instanceof UnauthorizedError) setAuthed(false);
+    setIssueDetailError(err instanceof Error ? err.message : String(err));
+    setIssueDetailStatus("error");
   }
 }
 

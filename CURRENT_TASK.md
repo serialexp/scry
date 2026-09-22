@@ -427,3 +427,55 @@ and `scripts/smoke-gateway.sh` (`server-stamped logs-v3 rows=40 expected=40`).
 7. Add occurrence/error projection snapshots and retention-aware orphan/generation GC.
 8. Extend typed trace fidelity as general observability work only; traces remain
    correlation data, not an error-occurrence source.
+
+---
+
+# Current task — D-075 query memory pressure
+
+## Implemented in this run
+
+- Diagnosed the selective trace-ID rejection as raw cgroup file-cache accounting,
+  not ignored trace filtering or a request-specific query estimate.
+- Replaced the production multicall binary's mimalloc allocator with shared
+  `scry-alloc` jemalloc support and a safe typed all-arena pressure purge.
+- Added coherent mount-aware cgroup-v1/v2 snapshots, ancestor and `memory.high`
+  refresh, conservative clean ordinary-file accounting, and fail-closed required
+  discovery/snapshot reads.
+- Added safe reclamation for result/postings/bloom caches, generation-fenced label
+  metadata, idle object buffers, and allocator-retained pages. Admission serializes
+  and rate-limits reclamation, runs O(cache-size) work on Tokio's blocking pool,
+  mandatorily reprobes, and trusts only the fresh kernel snapshot.
+- Added distinct queue/DataFusion/process/probe diagnostics, per-call admission
+  outcomes, runtime pressure gauges/failure counters, Fleet fields, and control-plane
+  bypass under data-query pressure.
+- Regenerated the concurrent IssueOccurrences protocol bindings and verified that
+  repeated generation is byte-stable.
+- Added `scripts/profile-query-memory.sh`, which runs selective, broad, and recovery
+  queries against one explicitly selected disposable cgroup and captures latency,
+  RSS/high-water, raw/committed/peak cgroup charge, optional queryd status, and OOM
+  event deltas.
+
+## Verification
+
+- `cargo test --workspace` passed. Live Valkey tests remained explicitly ignored by
+  their existing test configuration.
+- `cargo build --release --workspace --locked` passed.
+- Focused server query-memory tests, query E2E tests, resource/accounting tests,
+  allocator tests, query cache tests, and object-pool tests passed.
+- Desktop typecheck, all 125 Vitest tests, and production build passed.
+- `cargo fmt --all --check`, `git diff --check`, and repeated protocol regeneration
+  passed.
+- Focused `-D warnings` Clippy passed for allocator, resources, object store, and
+  query libraries. Workspace/server strict Clippy is still blocked by unrelated
+  pre-existing lints in distributed scheduling, pipeline, server/tail, and one query
+  integration-test assertion.
+- x86_64-musl check passed. Apple and aarch64-musl checks are blocked by missing
+  host SDK/cross-C toolchains before reaching Scry-specific allocator code.
+
+## Remaining work
+
+1. Run `scripts/profile-query-memory.sh` against a disposable finite-cgroup queryd
+   populated with representative cached data. No suitable disposable queryd/dataset
+   was running locally in this session, and production was not mutated.
+2. Resolve the repository-wide pre-existing strict Clippy findings separately.
+3. No deployment was performed; production changes require Bart's explicit approval.

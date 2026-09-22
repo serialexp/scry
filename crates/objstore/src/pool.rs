@@ -14,9 +14,9 @@
 //! get `munmap`'d on Drop. A single query issues hundreds of such
 //! fetches; every one paid full page-zero cost.
 //!
-//! Switching to mimalloc didn't help — for a one-shot CLI process,
-//! the allocator can't amortize across queries that don't exist.
-//! Within a *single* query though, we have ≤ 10 in-flight fetches
+//! Switching allocators alone didn't help — for a one-shot CLI process,
+//! an allocator can't amortize across queries that don't exist. Within a
+//! *single* query though, we have ≤ 10 in-flight fetches
 //! (object_store's `OBJECT_STORE_COALESCE_PARALLEL`) and many
 //! sequential ones after that. Pooling ≈ 16 buffers means only the
 //! first few fetches in a query pay full kernel-allocation cost; the
@@ -199,6 +199,13 @@ struct FreeBuffers {
     bytes: usize,
 }
 
+/// Idle allocations removed by [`BufPool::clear_idle`].
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct PoolReleaseReport {
+    pub entries: usize,
+    pub bytes: usize,
+}
+
 impl BufPool {
     /// Build a pool with default configuration. Equivalent to
     /// `BufPool::with_config(BufPoolConfig::default())`.
@@ -291,6 +298,29 @@ impl BufPool {
     /// Aggregate capacity of idle buffers currently retained by the pool.
     pub fn free_bytes(&self) -> usize {
         self.inner.free.lock().unwrap().bytes
+    }
+
+    /// Drop every currently idle buffer. Checked-out [`PooledBuf`] handles are
+    /// untouched and return through the ordinary checkin path when dropped.
+    pub fn clear_idle(&self) -> PoolReleaseReport {
+        self.try_clear_idle().expect("buffer pool mutex poisoned")
+    }
+
+    /// Fallible pressure-path variant which reports a poisoned owner lock rather
+    /// than panicking during process-wide reclamation.
+    pub fn try_clear_idle(&self) -> Result<PoolReleaseReport, &'static str> {
+        let mut free = self
+            .inner
+            .free
+            .lock()
+            .map_err(|_| "buffer pool mutex poisoned")?;
+        let report = PoolReleaseReport {
+            entries: free.buffers.len(),
+            bytes: free.bytes,
+        };
+        free.buffers.clear();
+        free.bytes = 0;
+        Ok(report)
     }
 
     /// Aggregate idle-buffer byte ceiling.
@@ -890,6 +920,30 @@ mod tests {
         // Only 2 parked, the rest dropped.
         assert_eq!(pool.free_count(), 2);
         assert_eq!(pool.misses(), 3);
+    }
+
+    #[test]
+    fn clear_idle_reports_capacity_without_touching_checked_out_buffers() {
+        let pool = BufPool::with_capacity(4);
+        let idle_a = PooledBuf::checkout(&pool, 1024);
+        let idle_b = PooledBuf::checkout(&pool, 2048);
+        let active = PooledBuf::checkout(&pool, 4096);
+        let expected_bytes = idle_a.capacity() + idle_b.capacity();
+        drop(idle_a);
+        drop(idle_b);
+
+        assert_eq!(
+            pool.clear_idle(),
+            PoolReleaseReport {
+                entries: 2,
+                bytes: expected_bytes,
+            }
+        );
+        assert_eq!(pool.free_count(), 0);
+        assert_eq!(pool.in_flight(), 1);
+        assert!(active.capacity() >= 4096);
+        drop(active);
+        assert_eq!(pool.free_count(), 1);
     }
 
     #[test]

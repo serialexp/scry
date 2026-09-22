@@ -49,7 +49,12 @@ pub mod tail;
 pub use catalog_gauge::{CatalogGauge, CATALOG_GAUGE_INTERVAL};
 pub use live_merge::{fetch_live_from_ingester, LiveDiscovery};
 pub use live_ring::{LiveLogRecord, LiveRing, RetainingLogsAppender};
-pub use memory_guard::{CgroupMemoryGuard, QueryMemoryGuard, QUERY_TOO_LARGE_MESSAGE};
+pub use memory_guard::{
+    CgroupMemoryGuard, MemoryAdmissionDecision, MemoryAdmissionOutcome, MemoryReclaimReport,
+    MemoryReclaimer, QueryMemoryGuard, RuntimeMemoryFailure, PROCESS_MEMORY_PRESSURE_MESSAGE,
+    PROCESS_MEMORY_PROBE_UNAVAILABLE_MESSAGE, PROCESS_MEMORY_RUNTIME_PRESSURE_MESSAGE,
+    QUERY_TOO_LARGE_MESSAGE, RECLAIM_INTERVAL,
+};
 pub use pipeline::{DecodeFn, Pipeline, ShardedPipeline, INGEST_SHARDS};
 pub use query_service::{LiveFetchLimits, QueryService};
 pub use scry_block::BlockBuilderConfig;

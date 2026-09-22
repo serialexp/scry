@@ -276,6 +276,9 @@ function queryFields(data: Data): FleetField[] {
   const admission = object(data.admission);
   const recovery = object(data.recovery);
   const labels = object(data.label_suggestions);
+  const pressure = object(data.memory_pressure);
+  const cancellations = object(pressure.runtime_cancellations);
+  const pressureEnabled = boolean(pressure, "enabled");
   return [
     ["queries", count(number(data, "queries_total"))],
     ["in flight", count(number(data, "queries_in_flight"))],
@@ -287,8 +290,26 @@ function queryFields(data: Data): FleetField[] {
     ["maximum range", duration(number(ranges, "max_seconds"))],
     ["defaulted ranges", count(number(ranges, "defaulted_total"))],
     ["unbounded starts", count(number(ranges, "unbounded_start_total"))],
-    ["memory reserved", bytes(number(data, "memory_reserved_bytes"))],
-    ["observed memory high-water", bytes(number(data, "memory_observed_peak_reserved_bytes"))],
+    ["DataFusion memory reserved", bytes(number(data, "memory_reserved_bytes"))],
+    ["DataFusion memory high-water", bytes(number(data, "memory_observed_peak_reserved_bytes"))],
+    ["cgroup pressure guard", pressureEnabled === null ? "—" : pressureEnabled ? "enabled" : "disabled"],
+    ["cgroup memory limit", bytes(number(pressure, "limit_bytes"))],
+    ["cgroup emergency reserve", bytes(number(pressure, "reserve_bytes"))],
+    ["cgroup committed pressure", bytes(number(pressure, "committed_bytes"))],
+    ["cgroup committed threshold", bytes(number(pressure, "threshold_bytes"))],
+    ["cgroup current charge", bytes(number(pressure, "current_bytes"))],
+    ["cgroup reclaimable clean file", bytes(number(pressure, "reclaimable_clean_file_bytes"))],
+    ["cgroup pressure checks", count(number(pressure, "admission_checks_total"))],
+    ["cgroup pressure admitted", count(number(pressure, "admission_admitted_total"))],
+    ["cgroup pressure rejected", count(number(pressure, "admission_rejected_total"))],
+    ["cgroup admission probe failures", count(number(pressure, "admission_probe_failures_total"))],
+    ["cgroup runtime probe failures", count(number(pressure, "runtime_probe_failures_total"))],
+    ["cgroup reclaim attempts", count(number(pressure, "reclaim_attempts_total"))],
+    ["cgroup reclaim rate-limited", count(number(pressure, "reclaim_rate_limited_total"))],
+    ["cgroup estimated entries released", count(number(pressure, "estimated_entries_released_total"))],
+    ["cgroup estimated release", bytes(number(pressure, "estimated_bytes_released_total"))],
+    ["cgroup observed committed reduction", bytes(number(pressure, "observed_committed_reduction_bytes_total"))],
+    ["cgroup runtime cancellations", count(sumOrMissing(number(cancellations, "planning_total"), number(cancellations, "streaming_total")))],
     ["label suggestions memory", bytes(number(labels, "resident_bytes_estimate"))],
     ["label suggestion names", count(number(labels, "names"))],
     ["label suggestion values", count(number(labels, "values"))],

@@ -35,7 +35,7 @@
 //!   verified by the manual budget-bust smoke in step 5's plan.
 
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arrow::array::{Array, FixedSizeBinaryArray, Int64Array, UInt64Array};
@@ -189,15 +189,37 @@ impl ObjectStore for OneShotParquetNotFound {
 const METRIC_TYPE_COUNTER: u8 = 1;
 const BUCKET: &str = "test";
 
-struct ToggleMemoryGuard(AtomicBool);
+struct ToggleMemoryGuard {
+    pressured: AtomicBool,
+    relieve_on_admission: AtomicBool,
+    admissions: AtomicUsize,
+}
+
+impl ToggleMemoryGuard {
+    fn new() -> Self {
+        Self {
+            pressured: AtomicBool::new(false),
+            relieve_on_admission: AtomicBool::new(false),
+            admissions: AtomicUsize::new(0),
+        }
+    }
+}
 
 #[async_trait]
 impl scry_server::QueryMemoryGuard for ToggleMemoryGuard {
     fn check(&self) -> anyhow::Result<()> {
-        if self.0.load(Ordering::Relaxed) {
-            anyhow::bail!("test memory pressure");
+        if self.pressured.load(Ordering::Relaxed) {
+            anyhow::bail!("Process memory safety pressure during query execution.");
         }
         Ok(())
+    }
+
+    fn admit_new_query(&self) -> anyhow::Result<()> {
+        self.admissions.fetch_add(1, Ordering::Relaxed);
+        if self.relieve_on_admission.swap(false, Ordering::Relaxed) {
+            self.pressured.store(false, Ordering::Relaxed);
+        }
+        self.check()
     }
 }
 
@@ -455,6 +477,27 @@ async fn fetch_label_values(addr: std::net::SocketAddr, signal: Signal, name: &s
     }
 }
 
+async fn fetch_query_error(addr: std::net::SocketAddr, req: QueryRequest) -> (u16, String) {
+    let sock = TcpStream::connect(addr).await.expect("connect");
+    let (r, w) = sock.into_split();
+    let mut r = TokioBufReader::new(r);
+    let mut w = TokioBufWriter::new(w);
+    write_frame(
+        &mut w,
+        &QueryFrame {
+            msg: QueryFrameMsg::QueryRequest(req.to_wire().into()),
+        },
+    )
+    .await
+    .expect("write query request");
+    w.flush().await.expect("flush");
+    let response: QueryFrame = read_frame(&mut r).await.expect("read query response");
+    match response.msg {
+        QueryFrameMsg::StreamError(error) => (error.code, error.message),
+        other => panic!("expected query StreamError, got {other:?}"),
+    }
+}
+
 async fn fetch_fleet_error(addr: std::net::SocketAddr) -> u16 {
     let sock = TcpStream::connect(addr).await.expect("connect");
     let (r, w) = sock.into_split();
@@ -551,7 +594,7 @@ async fn query_round_trip() {
     let postings_cache = Arc::new(PostingsCache::with_budget_bytes(16 * 1024 * 1024));
     let bloom_cache = Arc::new(BloomCache::with_budget_bytes(16 * 1024 * 1024));
     let memory_pool = Arc::new(GreedyMemoryPool::new(256 * 1024 * 1024));
-    let memory_guard = Arc::new(ToggleMemoryGuard(AtomicBool::new(false)));
+    let memory_guard = Arc::new(ToggleMemoryGuard::new());
     let runtime_env = Arc::new(
         RuntimeEnvBuilder::new()
             .with_memory_pool(memory_pool.clone())
@@ -766,7 +809,8 @@ async fn query_round_trip() {
     let reads_before = service.label_metadata_stats().projected_reads;
     // Label discovery is bounded control-plane work and must remain usable to
     // narrow queries while the data-query memory admission gate is closed.
-    memory_guard.0.store(true, Ordering::Relaxed);
+    memory_guard.pressured.store(true, Ordering::Relaxed);
+    let admissions_before_control = memory_guard.admissions.load(Ordering::Relaxed);
     let names = fetch_label_names(listen_addr, Signal::Metrics).await;
     assert_eq!(
         names,
@@ -793,6 +837,30 @@ async fn query_round_trip() {
         scry_proto::constants::QUERY_ERR_FLEET_UNAVAILABLE,
         "fleet status must reach its handler despite data-query memory pressure",
     );
+    assert_eq!(
+        memory_guard.admissions.load(Ordering::Relaxed),
+        admissions_before_control,
+        "control-plane requests must bypass data-query admission",
+    );
+    let (code, message) = fetch_query_error(
+        listen_addr,
+        QueryRequest {
+            signal: Signal::Metrics as u8,
+            query: Query {
+                matchers: vec![("__name__".into(), "foo".into())],
+                ..Query::default()
+            },
+            request_id: Some("test-persistent-pressure".into()),
+            ..QueryRequest::default()
+        },
+    )
+    .await;
+    assert_eq!(code, scry_proto::constants::QUERY_ERR_RESOURCES);
+    assert!(
+        message.contains("Process memory safety pressure"),
+        "{message}"
+    );
+    assert!(!message.contains("Query too large"), "{message}");
     let metadata_cache_after = postings_cache.stats();
     assert_eq!(
         service.label_metadata_stats().projected_reads,
@@ -804,6 +872,32 @@ async fn query_round_trip() {
     assert_eq!(
         metadata_cache_after.bytes_in,
         metadata_cache_before.bytes_in
+    );
+
+    // A would-be rejection may reclaim and reprobe during initial admission.
+    // The admitted request must then reach planning exactly once.
+    memory_guard
+        .relieve_on_admission
+        .store(true, Ordering::Relaxed);
+    let admissions_before_reclaim = memory_guard.admissions.load(Ordering::Relaxed);
+    let reclaimed = run_query(
+        listen_addr,
+        QueryRequest {
+            signal: Signal::Metrics as u8,
+            query: Query {
+                matchers: vec![("__name__".into(), "foo".into())],
+                ..Query::default()
+            },
+            request_id: Some("test-pressure-reclaim".into()),
+            ..QueryRequest::default()
+        },
+    )
+    .await;
+    assert_eq!(total_rows(&reclaimed.batches), 300);
+    assert_eq!(
+        memory_guard.admissions.load(Ordering::Relaxed),
+        admissions_before_reclaim + 1,
+        "one logical query must perform one reclaiming admission",
     );
 
     // ── Clean shutdown ─────────────────────────────────────────────

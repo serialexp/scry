@@ -19,6 +19,7 @@ import Explore from "./views/Explore";
 import Dashboards from "./views/Dashboards";
 import Alerts from "./views/Alerts";
 import Errors from "./views/Errors";
+import IssueDetail from "./views/IssueDetail";
 import Fleet from "./views/Fleet";
 import { inBrowser, authed, authChecked, checkSession, logout } from "./store";
 
@@ -83,6 +84,7 @@ const App: Component = () => {
           <Route path="/dashboards" component={Dashboards} />
           <Route path="/alerts" component={Alerts} />
           <Route path="/errors" component={Errors} />
+          <Route path="/errors/:issueId" component={IssueDetail} />
           <Route path="/fleet" component={Fleet} />
           {/* Unknown paths land on Explore. */}
           <Route path="*" component={Explore} />

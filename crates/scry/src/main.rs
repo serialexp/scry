@@ -23,16 +23,13 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-/// Swap glibc's malloc for mimalloc, process-wide.
+/// Use jemalloc process-wide for every production role.
 ///
-/// A binary may declare exactly one `#[global_allocator]`, so the
-/// allocator that the ingest/agent daemons used to declare individually
-/// lives here, once, covering every role. The ingest hot path makes
-/// ~2 M small allocations/sec in steady state; mimalloc decommits
-/// aggressively and runs the small-allocation path faster, keeping RSS
-/// smaller and less ragged. No behavioural change.
+/// A binary may declare exactly one `#[global_allocator]`, so allocator
+/// ownership lives here while `scry-alloc` provides the shared allocator type
+/// and pressure-purge control used by memory admission.
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: scry_alloc::Jemalloc = scry_alloc::Jemalloc;
 
 #[derive(Parser, Debug)]
 #[command(

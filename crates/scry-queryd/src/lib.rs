@@ -16,8 +16,8 @@
 //! 4. Construct a [`QueryService`] and serve until SIGINT or SIGTERM.
 //!
 //! The daemon's job is to amortise the cold-start cost — DataFusion
-//! init, ZSTD work areas, glibc → mimalloc reservations, and pool
-//! warmup pages — across every query that follows. The first query
+//! init, ZSTD work areas, jemalloc reservations, and pool warmup pages —
+//! across every query that follows. The first query
 //! pays the warm-up; the rest run at hot-process speed.
 //!
 //! Run (after `source docker/seaweedfs/.env`):
@@ -48,14 +48,16 @@ use datafusion::execution::memory_pool::GreedyMemoryPool;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use scry_catalog::Catalog;
 use scry_cluster::{apply_event, full_walk, poll_once};
-use scry_objstore::{open_with_pool_config, BufPoolConfig, ObjStoreConfig};
+use scry_objstore::{open_with_pool_config, BufPool, BufPoolConfig, ObjStoreConfig};
 use scry_query::{
-    BloomCache, BloomCacheConfig, LabelMetadataConfig, PostingsCache, PostingsCacheConfig,
-    QueryResultCache,
+    BloomCache, BloomCacheConfig, LabelMetadataConfig, LabelMetadataCoordinator, PostingsCache,
+    PostingsCacheConfig, QueryResultCache,
 };
+use scry_server::stats::QueryMemoryPressureStats;
 use scry_server::{
     serve_status, CatalogGauge, CgroupMemoryGuard, FleetSource, LiveDiscovery, LiveFetchLimits,
-    LocalStatus, QueryMemoryGuard, QueryMetrics, QueryService, CATALOG_GAUGE_INTERVAL,
+    LocalStatus, MemoryReclaimReport, MemoryReclaimer, QueryMemoryGuard, QueryMetrics,
+    QueryService, CATALOG_GAUGE_INTERVAL,
 };
 use scry_valkey::{
     discover_status_blobs, discover_tail_endpoints, parse_envelope, subscribe_blocks,
@@ -69,6 +71,50 @@ mod tail_relay;
 /// Fleet deregistration is advisory; a degraded Valkey must not hold a pod in
 /// Terminating until Kubernetes resorts to SIGKILL. TTLs clean up missed exits.
 const SHUTDOWN_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+
+struct QueryMemoryReclaimer {
+    result_cache: Arc<QueryResultCache>,
+    postings_cache: Arc<PostingsCache>,
+    bloom_cache: Arc<BloomCache>,
+    label_metadata: Arc<LabelMetadataCoordinator>,
+    pool: BufPool,
+}
+
+impl MemoryReclaimer for QueryMemoryReclaimer {
+    fn reclaim(&self) -> Result<MemoryReclaimReport> {
+        let result = self.result_cache.try_clear().map_err(anyhow::Error::msg)?;
+        let postings = self
+            .postings_cache
+            .try_clear_loaded()
+            .map_err(anyhow::Error::msg)?;
+        let bloom = self
+            .bloom_cache
+            .try_clear_loaded()
+            .map_err(anyhow::Error::msg)?;
+        let labels = self.label_metadata.clear();
+        let buffers = self.pool.try_clear_idle().map_err(anyhow::Error::msg)?;
+        let released_entries = result
+            .entries
+            .saturating_add(postings.entries)
+            .saturating_add(bloom.entries)
+            .saturating_add(labels.entries)
+            .saturating_add(buffers.entries);
+        let released_bytes = result
+            .bytes
+            .saturating_add(postings.bytes)
+            .saturating_add(bloom.bytes)
+            .saturating_add(labels.bytes)
+            .saturating_add(buffers.bytes);
+
+        Ok(MemoryReclaimReport {
+            released_entries: released_entries as u64,
+            released_bytes: released_bytes as u64,
+            allocator_error: scry_alloc::purge_all_arenas()
+                .err()
+                .map(|error| error.to_string()),
+        })
+    }
+}
 
 /// Valkey-backed [`LiveDiscovery`] for the D-054 merged history+live query.
 /// `scry-server` is Valkey-agnostic (it takes a `&dyn LiveDiscovery`); this is
@@ -720,22 +766,8 @@ pub async fn run(args: Args) -> Result<()> {
             .build()
             .context("building shared DataFusion RuntimeEnv")?,
     );
-    let memory_guard: Option<Arc<dyn QueryMemoryGuard>> = if args.query_memory_reserve_mib == 0 {
-        None
-    } else {
-        let reserve_bytes = args.query_memory_reserve_mib.saturating_mul(1024 * 1024);
-        CgroupMemoryGuard::detect(reserve_bytes)
-            .context("detecting Linux cgroup memory limit")?
-            .map(|guard| {
-                info!(
-                    cgroup_memory_limit_bytes = guard.limit_bytes(),
-                    query_reject_at_bytes = guard.reject_at_bytes(),
-                    query_memory_reserve_bytes = reserve_bytes,
-                    "enabled cgroup-aware query memory guard"
-                );
-                Arc::new(guard) as Arc<dyn QueryMemoryGuard>
-            })
-    };
+    // The memory guard is composed after every reclaimable owner and the label
+    // coordinator exist, immediately before metrics and the query service.
 
     // Install handlers before the Valkey connection and listener setup. As PID 1
     // in a container, queryd must explicitly catch Kubernetes SIGTERM. The watch
@@ -769,24 +801,52 @@ pub async fn run(args: Args) -> Result<()> {
     // heartbeat below; the counters themselves are free. Shares the caches /
     // memory pool the service already holds, so a snapshot is a handful of
     // live reads with no hot-path cost.
-    let label_metadata = Arc::new(scry_query::LabelMetadataCoordinator::new(
-        LabelMetadataConfig {
-            read_parallelism: args.label_warm_concurrency.max(1),
-            values_per_label: args.label_values_limit,
-            metric_names: args.label_metric_names_limit,
-        },
-    ));
-    let query_metrics: Arc<QueryMetrics> = Arc::new(QueryMetrics::new(
-        instance_uuid.to_string(),
-        args.listen.to_string(),
-        postings_cache.clone(),
-        label_metadata.clone(),
-        bloom_cache.clone(),
-        result_cache.clone(),
-        memory_pool.clone(),
-        catalog_gauge,
-        valkey.as_ref().map(|c| c.health()),
-    ));
+    let label_metadata = Arc::new(LabelMetadataCoordinator::new(LabelMetadataConfig {
+        read_parallelism: args.label_warm_concurrency.max(1),
+        values_per_label: args.label_values_limit,
+        metric_names: args.label_metric_names_limit,
+    }));
+    let reserve_bytes = args.query_memory_reserve_mib.saturating_mul(1024 * 1024);
+    let memory_pressure = Arc::new(QueryMemoryPressureStats::new(false, 0, reserve_bytes));
+    let memory_guard: Option<Arc<dyn QueryMemoryGuard>> = if reserve_bytes == 0 {
+        None
+    } else {
+        let reclaimer = Arc::new(QueryMemoryReclaimer {
+            result_cache: result_cache.clone(),
+            postings_cache: postings_cache.clone(),
+            bloom_cache: bloom_cache.clone(),
+            label_metadata: label_metadata.clone(),
+            pool: pool.clone(),
+        });
+        CgroupMemoryGuard::detect_with_reclaimer(reserve_bytes, reclaimer)
+            .context("detecting Linux cgroup memory limit")?
+            .map(|guard| {
+                let limit = guard.limit_bytes();
+                memory_pressure.set_enabled(true);
+                memory_pressure.observe(limit, reserve_bytes, 0, 0, 0);
+                info!(
+                    cgroup_memory_limit_bytes = limit,
+                    query_reject_at_bytes = guard.reject_at_bytes(),
+                    query_memory_reserve_bytes = reserve_bytes,
+                    "enabled cgroup-aware query memory guard"
+                );
+                Arc::new(guard) as Arc<dyn QueryMemoryGuard>
+            })
+    };
+    let query_metrics: Arc<QueryMetrics> = Arc::new(
+        QueryMetrics::new(
+            instance_uuid.to_string(),
+            args.listen.to_string(),
+            postings_cache.clone(),
+            label_metadata.clone(),
+            bloom_cache.clone(),
+            result_cache.clone(),
+            memory_pool.clone(),
+            catalog_gauge,
+            valkey.as_ref().map(|c| c.health()),
+        )
+        .with_memory_pressure_stats(Some(memory_pressure)),
+    );
     if let Some((_, advertise, _, admission)) = worker_listener.as_ref() {
         query_metrics.set_worker_status(Some(scry_server::QueryWorkerStatus {
             protocol_version: scry_server::query_worker::WORKER_PROTOCOL_VERSION,

@@ -20,6 +20,7 @@ path = "src/bin/probe.rs"
 [dependencies]
 anyhow             = { workspace = true }
 async-trait        = { workspace = true }
+scry-alloc         = { workspace = true }
 clap               = { workspace = true }
 datafusion         = { workspace = true }
 scry-catalog       = { workspace = true }

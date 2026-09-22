@@ -10,7 +10,7 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use crate::projection::{occurrence_keys, OccurrenceCommit};
 use crate::quarantine::{collision_id, CollisionMirror};
 
-pub const ERRORS_SCHEMA_VERSION: u32 = 3;
+pub const ERRORS_SCHEMA_VERSION: u32 = 4;
 pub const DEFAULT_MAX_ROWS_PER_TRANSACTION: usize = 4_096;
 const DEPLOYMENT_METADATA_KEY: &str = "deployment_id";
 
@@ -114,6 +114,16 @@ pub struct IssueSummary {
     pub occurrence_count: u64,
     pub max_severity: i32,
     pub fingerprint_version: u16,
+}
+
+/// An occurrence summary for API responses — the columns available directly
+/// on the `occurrences` table without OCC1 blob decode.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OccurrenceSummary {
+    pub event_id: String,
+    pub occurred_at_unix_nano: u64,
+    pub trace_id: Option<String>,
+    pub span_id: Option<String>,
 }
 
 /// Report from a grouping fold pass.
@@ -401,6 +411,95 @@ impl ErrorsDb {
         Ok(out)
     }
 
+    /// Fetch a single issue by its 16-byte UUID. Returns `None` if not found.
+    pub fn get_issue(&self, issue_id: &[u8; 16]) -> Result<Option<IssueSummary>, SqliteError> {
+        self.conn
+            .query_row(
+                "SELECT issue_id, app_id, title, grouping_quality,
+                        first_seen_unix_nano, last_seen_unix_nano,
+                        occurrence_count, max_severity, fingerprint_version
+                 FROM issues
+                 WHERE issue_id = ?1",
+                params![issue_id.as_slice()],
+                |row| {
+                    let issue_id: Vec<u8> = row.get(0)?;
+                    let app_id: Vec<u8> = row.get(1)?;
+                    Ok(IssueSummary {
+                        issue_id: uuid::Uuid::from_slice(&issue_id)
+                            .map(|u| u.to_string())
+                            .unwrap_or_else(|_| {
+                                issue_id.iter().map(|b| format!("{b:02x}")).collect()
+                            }),
+                        app_id: uuid::Uuid::from_slice(&app_id)
+                            .map(|u| u.to_string())
+                            .unwrap_or_else(|_| {
+                                app_id.iter().map(|b| format!("{b:02x}")).collect()
+                            }),
+                        title: row.get(2)?,
+                        grouping_quality: {
+                            let v: i64 = row.get(3)?;
+                            v as u8
+                        },
+                        first_seen_unix_nano: from_sql_i64(row.get(4)?),
+                        last_seen_unix_nano: from_sql_i64(row.get(5)?),
+                        occurrence_count: {
+                            let v: i64 = row.get(6)?;
+                            v as u64
+                        },
+                        max_severity: {
+                            let v: i64 = row.get(7)?;
+                            v as i32
+                        },
+                        fingerprint_version: {
+                            let v: i64 = row.get(8)?;
+                            v as u16
+                        },
+                    })
+                },
+            )
+            .optional()
+            .map_err(SqliteError::from)
+    }
+
+    /// List occurrences for a specific issue, ordered by `occurred_at_unix_nano`
+    /// descending. Joins `occurrence_issues` → `occurrences` on the composite key.
+    /// Returns only columns available directly on the `occurrences` table (no
+    /// OCC1 blob decode) for efficiency.
+    pub fn list_occurrences_for_issue(
+        &self,
+        issue_id: &[u8; 16],
+        limit: usize,
+    ) -> Result<Vec<OccurrenceSummary>, SqliteError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT o.event_id, o.occurred_at_unix_nano, o.trace_id, o.span_id
+             FROM occurrence_issues oi
+             JOIN occurrences o USING (deployment_id, app_id, event_id)
+             WHERE oi.issue_id = ?1
+             ORDER BY o.occurred_at_unix_nano DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![issue_id.as_slice(), limit as i64], |row| {
+            let event_id: Vec<u8> = row.get(0)?;
+            let trace_id: Option<Vec<u8>> = row.get(2)?;
+            let span_id: Option<Vec<u8>> = row.get(3)?;
+            Ok(OccurrenceSummary {
+                event_id: uuid::Uuid::from_slice(&event_id)
+                    .map(|u| u.to_string())
+                    .unwrap_or_else(|_| event_id.iter().map(|b| format!("{b:02x}")).collect()),
+                occurred_at_unix_nano: from_sql_i64(row.get(1)?),
+                trace_id: trace_id
+                    .map(|bytes| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()),
+                span_id: span_id
+                    .map(|bytes| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()),
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     #[cfg(test)]
     fn counts(&self) -> (u64, u64, u64) {
         let count = |table: &str| {
@@ -515,12 +614,16 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
              grouping_generation TEXT NOT NULL,
              PRIMARY KEY (deployment_id, app_id, event_id)
          ) STRICT, WITHOUT ROWID;
+         CREATE INDEX IF NOT EXISTS occurrence_issues_by_issue
+             ON occurrence_issues(issue_id);
          INSERT OR IGNORE INTO schema_migrations(version, applied_at_unix)
              VALUES (1, unixepoch());
          INSERT OR IGNORE INTO schema_migrations(version, applied_at_unix)
              VALUES (2, unixepoch());
          INSERT OR IGNORE INTO schema_migrations(version, applied_at_unix)
              VALUES (3, unixepoch());
+         INSERT OR IGNORE INTO schema_migrations(version, applied_at_unix)
+             VALUES (4, unixepoch());
          COMMIT;",
     )?;
     // Stamp user_version so snapshot restore can version-check.

@@ -24,6 +24,7 @@
             { "type": "LabelValuesRequest", "when": "value === 0x03" },
             { "type": "FleetStatusRequest", "when": "value === 0x04" },
             { "type": "IssueListRequest",  "when": "value === 0x05" },
+            { "type": "IssueOccurrencesRequest", "when": "value === 0x06" },
             { "type": "SchemaMsg",          "when": "value === 0x10" },
             { "type": "BatchMsg",           "when": "value === 0x11" },
             { "type": "ResponseSuperseded", "when": "value === 0x12" },
@@ -33,6 +34,7 @@
             { "type": "LabelValuesResponse","when": "value === 0x21" },
             { "type": "FleetStatusResponse","when": "value === 0x22" },
             { "type": "IssueListResponse", "when": "value === 0x23" },
+            { "type": "IssueOccurrencesResponse", "when": "value === 0x24" },
             { "type": "StreamError",        "when": "value === 0xF0" }
           ]
         }
@@ -142,6 +144,25 @@
       "sequence": [
         { "name": "tag", "type": "uint8", "const": 35 },
         { "name": "issues_json", "type": "array", "kind": "length_prefixed", "length_type": "uint32",
+          "items": { "type": "string", "kind": "length_prefixed", "length_type": "uint32", "encoding": "utf8" } }
+      ]
+    },
+
+    "IssueOccurrencesRequest": {
+      "description": "Client → server. Requests occurrences for a specific error issue. The issue_id is the raw 16-byte UUID. A daemon with a configured errors database replies with one IssueOccurrencesResponse; a daemon without one replies with QUERY_ERR_ISSUES_UNAVAILABLE.",
+      "sequence": [
+        { "name": "tag",      "type": "uint8", "const": 6 },
+        { "name": "issue_id", "type": "bytes", "kind": "length_prefixed", "length_type": "uint16" },
+        { "name": "limit",    "type": "uint32" }
+      ]
+    },
+
+    "IssueOccurrencesResponse": {
+      "description": "Server → client. One terminal response containing the issue metadata as a JSON string followed by occurrence summaries as JSON strings, ordered by occurred_at descending. issue_json is the IssueSummary JSON (empty string if the issue was not found); occurrences_json contains OccurrenceSummary JSONs.",
+      "sequence": [
+        { "name": "tag",        "type": "uint8", "const": 36 },
+        { "name": "issue_json", "type": "string", "kind": "length_prefixed", "length_type": "uint32", "encoding": "utf8" },
+        { "name": "occurrences_json", "type": "array", "kind": "length_prefixed", "length_type": "uint32",
           "items": { "type": "string", "kind": "length_prefixed", "length_type": "uint32", "encoding": "utf8" } }
       ]
     },

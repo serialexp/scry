@@ -25,6 +25,8 @@ import {
   type FleetStatusResponseOutput,
   type IssueListRequestInput,
   type IssueListResponseOutput,
+  type IssueOccurrencesRequestInput,
+  type IssueOccurrencesResponseOutput,
   type SchemaMsgOutput,
   type BatchMsgOutput,
   type ResponseSupersededOutput,
@@ -58,6 +60,7 @@ type TaggedFrame =
   | { type: "LabelValuesResponse"; value: LabelValuesResponseOutput }
   | { type: "FleetStatusResponse"; value: FleetStatusResponseOutput }
   | { type: "IssueListResponse"; value: IssueListResponseOutput }
+  | { type: "IssueOccurrencesResponse"; value: IssueOccurrencesResponseOutput }
   | { type: "StreamError"; value: StreamErrorOutput };
 
 /** High-level, ergonomic query description (the UI's vocabulary). */
@@ -555,4 +558,65 @@ export async function fetchIssueList(
     }
     return parsed;
   });
+}
+
+// ── Issue detail + occurrences ────────────────────────────────────
+
+/** A single occurrence summary (columns from the occurrences table, no OCC1 decode). */
+export interface OccurrenceSummary {
+  event_id: string;
+  occurred_at_unix_nano: number;
+  trace_id: string | null;
+  span_id: string | null;
+}
+
+/** Combined issue + occurrence list result. */
+export interface IssueDetailResult {
+  issue: Issue | null;
+  occurrences: OccurrenceSummary[];
+}
+
+/** Convert a UUID string ("xxxxxxxx-xxxx-…") to a 16-byte Uint8Array. */
+function uuidToBytes(uuid: string): Uint8Array {
+  const hex = uuid.replace(/-/g, "");
+  if (hex.length !== 32 || !/^[0-9a-fA-F]+$/.test(hex)) {
+    throw new Error(`invalid UUID: ${uuid}`);
+  }
+  const out = new Uint8Array(16);
+  for (let i = 0; i < 16; i++) {
+    out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  }
+  return out;
+}
+
+/** Fetch issue metadata + occurrence list from the selected queryd's errors database. */
+export async function fetchIssueOccurrences(
+  transport: Transport,
+  addr: string,
+  issueId: string,
+  limit = 100,
+): Promise<IssueDetailResult> {
+  const issueIdBytes = Array.from(uuidToBytes(issueId));
+  const value: IssueOccurrencesRequestInput = {
+    issue_id: issueIdBytes,
+    limit,
+  };
+  const frameInput = {
+    msg: { type: "IssueOccurrencesRequest", value },
+  } as unknown as QueryFrameInput;
+  const requestFrame = frame(new QueryFrameEncoder().encode(frameInput));
+  const responseBytes = await transport.query(addr, requestFrame);
+  const msg = decodeMetaResponse(responseBytes);
+  if (msg.type === "StreamError") throw new QueryError(msg.value.code, msg.value.message);
+  if (msg.type !== "IssueOccurrencesResponse") {
+    throw new Error(`expected IssueOccurrencesResponse, got ${msg.type}`);
+  }
+
+  const issue = msg.value.issue_json
+    ? (JSON.parse(msg.value.issue_json) as Issue)
+    : null;
+  const occurrences = msg.value.occurrences_json.map(
+    (json) => JSON.parse(json) as OccurrenceSummary,
+  );
+  return { issue, occurrences };
 }

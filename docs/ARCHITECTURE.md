@@ -847,49 +847,39 @@ This is ~7 orders of magnitude reduction in network bytes for
 typical aggregating queries. It's the single biggest reason for
 scatter-gather over "just run it on one instance with more cores."
 
-### Per-query memory budgets
+### Query memory budgets
 
-Every query carries a memory budget enforced at the worker, wired
-through DataFusion's `MemoryPool` abstraction. The contract:
+**Implementation status:** queryd currently enforces a shared, process-wide
+DataFusion `MemoryPool` across all in-flight queries, bounded active/waiting
+query admission, query-local live-response limits, and a cgroup-aware process
+safety guard for allocations outside DataFusion's accounting. It does **not**
+yet divide the DataFusion pool into calibrated per-query reservations or expose
+query spill configuration. The earlier per-query/spill contract below remains
+the intended worker design, not a description of shipped behavior.
 
-- Each worker is configured with a total memory budget for query
-  execution (separate from cache memory, separate from WAL
-  buffers).
-- That budget is divided among in-flight queries by the worker's
-  scheduler. New queries that would push the worker over budget
-  either wait in queue or are rejected with a clear error.
-- Within a query's allocation, DataFusion operators are aware:
-  aggregations build hash tables up to budget then **spill to
-  local disk**; sorts spill once they exceed budget; hash joins
-  do the same.
-- If spilling is exhausted or disabled, the query fails with
-  `Error: query exceeded memory budget of X MiB during <stage>`.
-  The worker continues serving other queries.
+The process guard is deliberately independent of DataFusion: Parquet decode,
+Arrow arrays, caches, SQLite, allocator-retained pages, and filesystem cache are
+not all represented by DataFusion reservations. It measures committed cgroup
+charge conservatively, excluding only clean ordinary filesystem cache, and may
+release recomputable query caches, idle object buffers, and allocator-unused
+pages before refusing new work. Runtime checks remain a final backstop. See
+[`docs/design/query-memory-pressure.md`](design/query-memory-pressure.md).
 
-This is the contract that turns "a single bad query OOMs the
-worker" into "a single bad query gets a clear error message."
-**Failing gracefully is the goal, not an exceptional case.**
+The intended per-query contract is:
 
-The coordinator's memory bound is implicit: it merges partial
-results, which by the partial-aggregation pushdown are small.
-For non-aggregating queries (raw log lines, raw spans), the
-coordinator streams results to the client as Arrow batches; it
-doesn't buffer the full result. The same per-query budget rule
-applies at the coordinator for the final merge.
+- Each worker is configured with a total memory budget for query execution
+  (separate from cache memory and WAL buffers).
+- A measured weighted scheduler divides that budget among in-flight queries.
+  New queries that would exceed it wait or receive a cause-specific error.
+- DataFusion aggregations, sorts, and joins spill within a separately bounded
+  persistent-disk envelope when spill support is enabled.
+- Exhausting a real per-query or spill bound fails that query while the worker
+  continues serving others.
 
-Spill directory and budgets are configurable:
-
-```toml
-[query]
-memory_per_worker     = "16 GiB"
-memory_per_query_max  = "4 GiB"    # one query can't grab more than this
-spill_dir             = "/var/lib/scry/spill"
-spill_disk_max        = "100 GiB"
-```
-
-If `spill_dir` is unset, queries simply fail when their budget is
-exceeded — preferable to silently degraded performance for
-deployments where spill latency would be worse than failure.
+For non-aggregating queries (raw log lines and spans), coordinators stream Arrow
+batches rather than buffering a complete result. A future per-query reservation
+must be calibrated from representative workloads; compressed candidate bytes or
+an arbitrary fixed allowance are not accepted substitutes.
 
 ### Failure modes
 
@@ -1768,17 +1758,18 @@ Each pool is enforced separately:
 | (unallocated) | Slack for OS page cache, transient allocations, jemalloc fragmentation | 6.25 % |
 
 A pool that hits its ceiling **does not steal** from another pool.
-Caches evict LRU. Query spills (or fails). Block builders apply
-backpressure to ingest. Ingest buffers reject and ask the agent to
-retry. This is what "bounded by construction" looks like in
-practice — every allocator has a named home with a known cap, so
-"out of memory" is impossible for the process even when one
-subsystem is saturated.
+Caches evict LRU. Query spills (or fails) once the intended spill contract is
+implemented. Block builders apply backpressure to ingest. Ingest buffers reject
+and ask the agent to retry. This is what "bounded by construction" aims for:
+every allocator has a named home with a known cap.
 
-We do **not** rely on `cgroups` or kernel OOM to enforce these.
-Those are useful as a final backstop, but a process that gets
-killed by the OOM killer is one that already failed at resource
-discipline.
+Cgroups and the kernel OOM killer remain the outer envelope, not substitutes for
+those internal bounds. Queryd additionally uses its finite cgroup as an active
+last-chance admission/runtime guard because DataFusion cannot account for every
+process allocation. The guard discounts only conservatively reclaimable clean
+filesystem cache, retains explicit emergency headroom, reclaims safe derived
+state before shedding new work, and never treats survival of an OOM kill as an
+acceptable control mechanism.
 
 ### Per-signal WAL segments
 

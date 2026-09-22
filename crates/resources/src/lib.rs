@@ -98,6 +98,68 @@ pub struct CgroupMemoryLimit {
     pub version: CgroupVersion,
 }
 
+/// One mount-aware cgroup directory whose finite memory limit constrains this
+/// process. Current charge, limit, and memory statistics must all be read from
+/// this directory to avoid combining unrelated cgroups.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CgroupMemoryDescriptor {
+    hierarchy: Vec<PathBuf>,
+    discovered_limiting_directory: PathBuf,
+    version: CgroupVersion,
+}
+
+impl CgroupMemoryDescriptor {
+    /// Construct a descriptor for an already-resolved effective limiting
+    /// directory. Mount-aware callers normally use
+    /// [`detect_cgroup_memory_descriptor`].
+    pub fn from_directory(directory: PathBuf, version: CgroupVersion) -> Self {
+        Self {
+            hierarchy: vec![directory.clone()],
+            discovered_limiting_directory: directory,
+            version,
+        }
+    }
+
+    /// Directory which supplied the effective limit during discovery. A fresh
+    /// snapshot rechecks the full visible hierarchy and may select another
+    /// directory after a limit change.
+    pub fn directory(&self) -> &Path {
+        &self.discovered_limiting_directory
+    }
+
+    pub fn version(&self) -> CgroupVersion {
+        self.version
+    }
+
+    pub fn current_path(&self) -> PathBuf {
+        self.discovered_limiting_directory.join(match self.version {
+            CgroupVersion::V2 => "memory.current",
+            CgroupVersion::V1 => "memory.usage_in_bytes",
+        })
+    }
+
+    pub fn stat_path(&self) -> PathBuf {
+        self.discovered_limiting_directory.join("memory.stat")
+    }
+
+    /// Read a fresh snapshot from this descriptor. Required current and limit
+    /// values fail closed; an unavailable or malformed `memory.stat` merely
+    /// disables the clean ordinary-file discount.
+    pub fn snapshot(&self) -> io::Result<CgroupMemorySnapshot> {
+        read_cgroup_memory_snapshot(self)
+    }
+}
+
+/// A coherent reading from one cgroup directory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CgroupMemorySnapshot {
+    pub limit_bytes: u64,
+    pub current_bytes: u64,
+    pub reclaimable_clean_file_bytes: u64,
+    pub committed_bytes: u64,
+    pub version: CgroupVersion,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MemoryBudgetSource {
     Explicit,
@@ -134,6 +196,86 @@ pub fn detect_cgroup_memory_limit() -> Option<CgroupMemoryLimit> {
     detect_cgroup_memory_limit_discovered_with(&CgroupDiscoveryPaths::default())
 }
 
+/// Discover the effective finite limiting cgroup directory for this process.
+/// The descriptor keeps all subsequent readings on that same cgroup.
+pub fn detect_cgroup_memory_descriptor() -> Option<CgroupMemoryDescriptor> {
+    detect_cgroup_memory_descriptor_with(&CgroupDiscoveryPaths::default())
+}
+
+/// Discover a descriptor while preserving probe failures. Callers using the
+/// descriptor as a safety boundary should use this form so malformed or
+/// unreadable cgroup controls cannot be mistaken for an unlimited host.
+pub fn try_detect_cgroup_memory_descriptor() -> io::Result<Option<CgroupMemoryDescriptor>> {
+    try_detect_cgroup_memory_descriptor_with(&CgroupDiscoveryPaths::default())
+}
+
+/// Injectable, error-preserving mount-aware descriptor discovery.
+pub fn try_detect_cgroup_memory_descriptor_with(
+    paths: &CgroupDiscoveryPaths,
+) -> io::Result<Option<CgroupMemoryDescriptor>> {
+    let cgroups = std::fs::read_to_string(&paths.proc_self_cgroup)?;
+    let mountinfo = std::fs::read_to_string(&paths.proc_self_mountinfo)?;
+    try_cgroup_memory_descriptor_from_contents(&cgroups, &mountinfo)
+}
+
+/// Injectable compatibility form. This intentionally maps discovery failures
+/// to `None`; safety-sensitive callers should use
+/// [`try_detect_cgroup_memory_descriptor_with`].
+pub fn detect_cgroup_memory_descriptor_with(
+    paths: &CgroupDiscoveryPaths,
+) -> Option<CgroupMemoryDescriptor> {
+    try_detect_cgroup_memory_descriptor_with(paths)
+        .ok()
+        .flatten()
+}
+
+/// Resolve the effective finite limiting directory from injectable procfs
+/// contents. Cgroup v2 takes precedence when it has any finite constraint.
+pub fn cgroup_memory_descriptor_from_contents(
+    cgroups: &str,
+    mountinfo: &str,
+) -> Option<CgroupMemoryDescriptor> {
+    let (v2_path, v1_memory_path) = parse_process_cgroups(cgroups);
+    let mounts = parse_mountinfo(mountinfo);
+    limiting_descriptor(
+        v2_path.as_deref(),
+        mounts.iter().filter(|mount| mount.fs_type == "cgroup2"),
+        CgroupVersion::V2,
+    )
+    .or_else(|| {
+        limiting_descriptor(
+            v1_memory_path.as_deref(),
+            mounts
+                .iter()
+                .filter(|mount| mount.fs_type == "cgroup" && mount.has_memory_controller()),
+            CgroupVersion::V1,
+        )
+    })
+}
+
+fn try_cgroup_memory_descriptor_from_contents(
+    cgroups: &str,
+    mountinfo: &str,
+) -> io::Result<Option<CgroupMemoryDescriptor>> {
+    let (v2_path, v1_memory_path) = parse_process_cgroups(cgroups);
+    let mounts = parse_mountinfo(mountinfo);
+
+    if let Some(descriptor) = limiting_descriptor_strict(
+        v2_path.as_deref(),
+        mounts.iter().filter(|mount| mount.fs_type == "cgroup2"),
+        CgroupVersion::V2,
+    )? {
+        return Ok(Some(descriptor));
+    }
+    limiting_descriptor_strict(
+        v1_memory_path.as_deref(),
+        mounts
+            .iter()
+            .filter(|mount| mount.fs_type == "cgroup" && mount.has_memory_controller()),
+        CgroupVersion::V1,
+    )
+}
+
 /// Locate the memory-usage file for the current process's cgroup. This uses the
 /// same mount-root mapping as limit discovery, avoiding assumptions that the
 /// process belongs to the cgroup mount root.
@@ -146,46 +288,8 @@ pub fn detect_cgroup_memory_usage_path() -> Option<PathBuf> {
 
 /// Injectable counterpart to [`detect_cgroup_memory_usage_path`].
 pub fn cgroup_memory_usage_path_from_contents(cgroups: &str, mountinfo: &str) -> Option<PathBuf> {
-    let (v2_path, v1_memory_path) = parse_process_cgroups(cgroups);
-    let mounts = parse_mountinfo(mountinfo);
-    if let Some(path) = v2_path.as_deref() {
-        if let Some((_, limiting_directory)) = mounts
-            .iter()
-            .filter(|mount| mount.fs_type == "cgroup2")
-            .filter_map(|mount| {
-                let directory = map_cgroup_path(&mount.mount_point, &mount.root, path)?;
-                hierarchy_directories_from(&directory, &mount.mount_point)
-                    .into_iter()
-                    .filter_map(|directory| {
-                        read_v2_effective_limit(
-                            &directory.join("memory.max"),
-                            &directory.join("memory.high"),
-                        )
-                        .map(|limit| (limit, directory))
-                    })
-                    .min_by_key(|(limit, _)| *limit)
-            })
-            .min_by_key(|(limit, _)| *limit)
-        {
-            return Some(limiting_directory.join("memory.current"));
-        }
-    }
-    let path = v1_memory_path.as_deref()?;
-    mounts
-        .iter()
-        .filter(|mount| mount.fs_type == "cgroup" && mount.has_memory_controller())
-        .filter_map(|mount| {
-            let directory = map_cgroup_path(&mount.mount_point, &mount.root, path)?;
-            hierarchy_directories_from(&directory, &mount.mount_point)
-                .into_iter()
-                .filter_map(|directory| {
-                    read_finite_limit(&directory.join("memory.limit_in_bytes"), true)
-                        .map(|limit| (limit, directory))
-                })
-                .min_by_key(|(limit, _)| *limit)
-        })
-        .min_by_key(|(limit, _)| *limit)
-        .map(|(_, directory)| directory.join("memory.usage_in_bytes"))
+    cgroup_memory_descriptor_from_contents(cgroups, mountinfo)
+        .map(|descriptor| descriptor.current_path())
 }
 
 /// Mount-aware injectable detector. Mountinfo's mount root is applied to the
@@ -318,6 +422,135 @@ impl MountInfo {
         self.super_options
             .split(',')
             .any(|option| option == "memory")
+    }
+}
+
+fn limiting_descriptor<'a>(
+    cgroup_path: Option<&Path>,
+    mounts: impl Iterator<Item = &'a MountInfo>,
+    version: CgroupVersion,
+) -> Option<CgroupMemoryDescriptor> {
+    let path = cgroup_path?;
+    mounts
+        .filter_map(|mount| {
+            let leaf = map_cgroup_path(&mount.mount_point, &mount.root, path)?;
+            let hierarchy = hierarchy_directories_from(&leaf, &mount.mount_point);
+            let (limit, directory) = effective_limiting_directory(&hierarchy, version)?;
+            Some((limit, directory, hierarchy))
+        })
+        .min_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)))
+        .map(
+            |(_, discovered_limiting_directory, hierarchy)| CgroupMemoryDescriptor {
+                hierarchy,
+                discovered_limiting_directory,
+                version,
+            },
+        )
+}
+
+fn effective_limiting_directory(
+    hierarchy: &[PathBuf],
+    version: CgroupVersion,
+) -> Option<(u64, PathBuf)> {
+    hierarchy
+        .iter()
+        .filter_map(|directory| {
+            let limit = match version {
+                CgroupVersion::V2 => read_v2_effective_limit(
+                    &directory.join("memory.max"),
+                    &directory.join("memory.high"),
+                ),
+                CgroupVersion::V1 => {
+                    read_finite_limit(&directory.join("memory.limit_in_bytes"), true)
+                }
+            }?;
+            Some((limit, directory.clone()))
+        })
+        .min_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)))
+}
+
+fn limiting_descriptor_strict<'a>(
+    cgroup_path: Option<&Path>,
+    mounts: impl Iterator<Item = &'a MountInfo>,
+    version: CgroupVersion,
+) -> io::Result<Option<CgroupMemoryDescriptor>> {
+    let Some(path) = cgroup_path else {
+        return Ok(None);
+    };
+    let mut best: Option<(u64, PathBuf, Vec<PathBuf>)> = None;
+    for mount in mounts {
+        let Some(leaf) = map_cgroup_path(&mount.mount_point, &mount.root, path) else {
+            continue;
+        };
+        let hierarchy = hierarchy_directories_from(&leaf, &mount.mount_point);
+        let Some((limit, directory)) = effective_limiting_directory_strict(&hierarchy, version)?
+        else {
+            continue;
+        };
+        let candidate = (limit, directory, hierarchy);
+        if best
+            .as_ref()
+            .is_none_or(|current| (candidate.0, &candidate.1) < (current.0, &current.1))
+        {
+            best = Some(candidate);
+        }
+    }
+    Ok(best.map(
+        |(_, discovered_limiting_directory, hierarchy)| CgroupMemoryDescriptor {
+            hierarchy,
+            discovered_limiting_directory,
+            version,
+        },
+    ))
+}
+
+fn effective_limiting_directory_strict(
+    hierarchy: &[PathBuf],
+    version: CgroupVersion,
+) -> io::Result<Option<(u64, PathBuf)>> {
+    let mut limiting: Option<(u64, PathBuf)> = None;
+    for directory in hierarchy {
+        let limit = match version {
+            CgroupVersion::V2 => {
+                let max = read_limit_for_snapshot(&directory.join("memory.max"), false)?;
+                let high = read_limit_for_snapshot(&directory.join("memory.high"), false)?;
+                match (max, high) {
+                    (Some(max), Some(high)) => Some(max.min(high)),
+                    (Some(limit), None) | (None, Some(limit)) => Some(limit),
+                    (None, None) => None,
+                }
+            }
+            CgroupVersion::V1 => {
+                read_limit_for_snapshot(&directory.join("memory.limit_in_bytes"), true)?
+            }
+        };
+        let Some(limit) = limit else { continue };
+        if limiting
+            .as_ref()
+            .is_none_or(|(best, path)| (limit, directory) < (*best, path))
+        {
+            limiting = Some((limit, directory.clone()));
+        }
+    }
+    Ok(limiting)
+}
+
+fn read_limit_for_snapshot(path: &Path, v1: bool) -> io::Result<Option<u64>> {
+    let raw = std::fs::read_to_string(path)?;
+    let value = raw.trim();
+    if value == "max" || (v1 && value.parse::<u64>().ok() == Some(0)) {
+        return Ok(None);
+    }
+    let bytes = value.parse::<u64>().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("parsing {} value {raw:?}: {error}", path.display()),
+        )
+    })?;
+    if v1 && bytes >= CGROUP_V1_UNLIMITED_THRESHOLD {
+        Ok(None)
+    } else {
+        Ok(Some(bytes))
     }
 }
 
@@ -486,6 +719,10 @@ fn hierarchy_directories_from(directory: &Path, boundary: &Path) -> Vec<PathBuf>
 
 fn read_finite_limit(path: &Path, v1: bool) -> Option<u64> {
     let raw = std::fs::read_to_string(path).ok()?;
+    parse_finite_limit(&raw, v1)
+}
+
+fn parse_finite_limit(raw: &str, v1: bool) -> Option<u64> {
     let value = raw.trim();
     if value.is_empty() || value == "max" {
         return None;
@@ -495,6 +732,123 @@ fn read_finite_limit(path: &Path, v1: bool) -> Option<u64> {
         return None;
     }
     Some(bytes)
+}
+
+/// Read a coherent memory snapshot, refreshing the effective limiting
+/// directory first so ancestor or `memory.high` shrink is observed.
+pub fn read_cgroup_memory_snapshot(
+    descriptor: &CgroupMemoryDescriptor,
+) -> io::Result<CgroupMemorySnapshot> {
+    let Some((limit_bytes, directory)) =
+        effective_limiting_directory_strict(&descriptor.hierarchy, descriptor.version)?
+    else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cgroup has no finite memory limit",
+        ));
+    };
+    let current_path = directory.join(match descriptor.version {
+        CgroupVersion::V2 => "memory.current",
+        CgroupVersion::V1 => "memory.usage_in_bytes",
+    });
+    let current_bytes = read_required_u64(&current_path)?;
+    let stat = std::fs::read_to_string(directory.join("memory.stat"));
+    let reclaimable_clean_file_bytes = stat
+        .ok()
+        .and_then(|contents| reclaimable_clean_file_bytes(&contents, descriptor.version))
+        .unwrap_or(0);
+    let committed_bytes =
+        current_bytes.saturating_sub(current_bytes.min(reclaimable_clean_file_bytes));
+    Ok(CgroupMemorySnapshot {
+        limit_bytes,
+        current_bytes,
+        reclaimable_clean_file_bytes,
+        committed_bytes,
+        version: descriptor.version,
+    })
+}
+
+fn read_required_u64(path: &Path) -> io::Result<u64> {
+    let raw = std::fs::read_to_string(path)?;
+    raw.trim().parse::<u64>().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("parsing {} value {raw:?}: {error}", path.display()),
+        )
+    })
+}
+
+#[derive(Default)]
+struct MemoryStat {
+    file: Option<u64>,
+    shmem: Option<u64>,
+    active_file: Option<u64>,
+    inactive_file: Option<u64>,
+    dirty: Option<u64>,
+    writeback: Option<u64>,
+}
+
+/// Compute the conservative clean ordinary-file cache discount from
+/// `memory.stat`. Any malformed line, duplicate relevant field, or incomplete
+/// required field set yields no discount.
+pub fn reclaimable_clean_file_bytes(contents: &str, version: CgroupVersion) -> Option<u64> {
+    let mut local = MemoryStat::default();
+    let mut total = MemoryStat::default();
+    for line in contents.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(key), Some(raw), None) = (fields.next(), fields.next(), fields.next()) else {
+            return None;
+        };
+        let target = if version == CgroupVersion::V1 {
+            key.strip_prefix("total_").map(|key| (&mut total, key))
+        } else {
+            None
+        }
+        .unwrap_or((&mut local, key));
+        let slot = match (version, target.1) {
+            (CgroupVersion::V2, "file") | (CgroupVersion::V1, "cache") => &mut target.0.file,
+            (_, "shmem") => &mut target.0.shmem,
+            (_, "active_file") => &mut target.0.active_file,
+            (_, "inactive_file") => &mut target.0.inactive_file,
+            (CgroupVersion::V2, "file_dirty") | (CgroupVersion::V1, "dirty") => &mut target.0.dirty,
+            (CgroupVersion::V2, "file_writeback") | (CgroupVersion::V1, "writeback") => {
+                &mut target.0.writeback
+            }
+            _ => continue,
+        };
+        if slot.is_some() {
+            return None;
+        }
+        *slot = Some(raw.parse::<u64>().ok()?);
+    }
+    if version == CgroupVersion::V1 && memory_stat_complete(&total) {
+        calculate_reclaimable_clean_file(&total)
+    } else {
+        calculate_reclaimable_clean_file(&local)
+    }
+}
+
+fn memory_stat_complete(stat: &MemoryStat) -> bool {
+    stat.file.is_some()
+        && stat.shmem.is_some()
+        && stat.active_file.is_some()
+        && stat.inactive_file.is_some()
+        && stat.dirty.is_some()
+        && stat.writeback.is_some()
+}
+
+fn calculate_reclaimable_clean_file(stat: &MemoryStat) -> Option<u64> {
+    let ordinary_file = stat.file?.saturating_sub(stat.shmem?);
+    let file_lru = stat
+        .active_file?
+        .saturating_add(stat.inactive_file?)
+        .saturating_sub(stat.shmem?);
+    Some(
+        ordinary_file
+            .min(file_lru)
+            .saturating_sub(stat.dirty?)
+            .saturating_sub(stat.writeback?),
+    )
 }
 
 /// Resolve the pool budget from an operator override and an optional cgroup
@@ -820,6 +1174,258 @@ mod tests {
         assert_eq!(
             classify_filesystem_from_mountinfo(Path::new("/var/spill"), mounts),
             FilesystemClass::Local
+        );
+    }
+
+    fn stat(
+        file: u64,
+        shmem: u64,
+        active: u64,
+        inactive: u64,
+        dirty: u64,
+        writeback: u64,
+    ) -> String {
+        format!(
+            "file {file}\nshmem {shmem}\nactive_file {active}\ninactive_file {inactive}\nfile_dirty {dirty}\nfile_writeback {writeback}\n"
+        )
+    }
+
+    #[test]
+    fn clean_file_accounting_uses_the_conservative_formula() {
+        assert_eq!(
+            reclaimable_clean_file_bytes(&stat(1_000, 100, 400, 500, 20, 30), CgroupVersion::V2),
+            Some(750)
+        );
+        assert_eq!(
+            reclaimable_clean_file_bytes(&stat(2_000, 100, 200, 300, 20, 30), CgroupVersion::V2),
+            Some(350),
+            "the file LRU is the tighter bound"
+        );
+    }
+
+    #[test]
+    fn clean_file_accounting_saturates_every_operation() {
+        assert_eq!(
+            reclaimable_clean_file_bytes(&stat(5, 10, 2, 3, 7, 11), CgroupVersion::V2),
+            Some(0)
+        );
+        assert_eq!(
+            reclaimable_clean_file_bytes(
+                &stat(u64::MAX, 0, u64::MAX, u64::MAX, 0, 0),
+                CgroupVersion::V2
+            ),
+            Some(u64::MAX)
+        );
+        assert_eq!(
+            reclaimable_clean_file_bytes(&stat(100, 0, 50, 50, 100, 100), CgroupVersion::V2),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn malformed_missing_and_duplicate_stats_disable_the_discount() {
+        for contents in [
+            "file 100\nshmem 0\n",
+            "file nope\nshmem 0\nactive_file 50\ninactive_file 50\nfile_dirty 0\nfile_writeback 0\n",
+            "file 100\nfile 100\nshmem 0\nactive_file 50\ninactive_file 50\nfile_dirty 0\nfile_writeback 0\n",
+            "file 100 extra\nshmem 0\nactive_file 50\ninactive_file 50\nfile_dirty 0\nfile_writeback 0\n",
+            "file 100\nshmem 0\nactive_file 50\ninactive_file 50\nfile_dirty 0\nfile_writeback 0\nbroken\n",
+        ] {
+            assert_eq!(
+                reclaimable_clean_file_bytes(contents, CgroupVersion::V2),
+                None,
+                "unexpected discount for {contents:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn v1_prefers_only_a_complete_hierarchical_stat_set() {
+        let local = "cache 100\nshmem 0\nactive_file 50\ninactive_file 50\ndirty 0\nwriteback 0\n";
+        let totals = "total_cache 1000\ntotal_shmem 100\ntotal_active_file 400\ntotal_inactive_file 500\ntotal_dirty 20\ntotal_writeback 30\n";
+        assert_eq!(
+            reclaimable_clean_file_bytes(&format!("{local}{totals}"), CgroupVersion::V1),
+            Some(750)
+        );
+        assert_eq!(
+            reclaimable_clean_file_bytes(
+                &format!("{local}total_cache 1000\ntotal_shmem 100\n"),
+                CgroupVersion::V1
+            ),
+            Some(100),
+            "an incomplete total set must not mix with local fields"
+        );
+    }
+
+    #[test]
+    fn descriptor_snapshot_is_coherent_and_observes_limit_shrink() {
+        let dir = TestDir::new();
+        let mount = dir.0.join("cgroup");
+        let leaf = mount.join("service");
+        fs::create_dir_all(&leaf).unwrap();
+        fs::write(mount.join("memory.max"), "1000\n").unwrap();
+        fs::write(mount.join("memory.high"), "max\n").unwrap();
+        fs::write(leaf.join("memory.max"), "max\n").unwrap();
+        fs::write(leaf.join("memory.high"), "900\n").unwrap();
+        fs::write(leaf.join("memory.current"), "800\n").unwrap();
+        fs::write(leaf.join("memory.stat"), stat(700, 100, 300, 400, 20, 30)).unwrap();
+        let mountinfo = format!("30 20 0:27 / {} rw - cgroup2 cgroup rw\n", mount.display());
+        let descriptor =
+            cgroup_memory_descriptor_from_contents("0::/service\n", &mountinfo).unwrap();
+        assert_eq!(descriptor.directory(), leaf);
+        assert_eq!(descriptor.current_path(), leaf.join("memory.current"));
+        assert_eq!(
+            descriptor.snapshot().unwrap(),
+            CgroupMemorySnapshot {
+                limit_bytes: 900,
+                current_bytes: 800,
+                reclaimable_clean_file_bytes: 550,
+                committed_bytes: 250,
+                version: CgroupVersion::V2,
+            }
+        );
+
+        fs::write(mount.join("memory.high"), "700\n").unwrap();
+        fs::write(mount.join("memory.current"), "650\n").unwrap();
+        fs::write(mount.join("memory.stat"), stat(600, 0, 300, 300, 0, 0)).unwrap();
+        assert_eq!(descriptor.snapshot().unwrap().limit_bytes, 700);
+        assert_eq!(descriptor.snapshot().unwrap().committed_bytes, 50);
+    }
+
+    #[test]
+    fn snapshot_clamps_discount_and_missing_stats_to_safe_values() {
+        let dir = TestDir::new();
+        fs::write(dir.0.join("memory.max"), "1000\n").unwrap();
+        fs::write(dir.0.join("memory.high"), "max\n").unwrap();
+        fs::write(dir.0.join("memory.current"), "50\n").unwrap();
+        fs::write(dir.0.join("memory.stat"), stat(500, 0, 250, 250, 0, 0)).unwrap();
+        let descriptor = CgroupMemoryDescriptor::from_directory(dir.0.clone(), CgroupVersion::V2);
+        let snapshot = descriptor.snapshot().unwrap();
+        assert_eq!(snapshot.reclaimable_clean_file_bytes, 500);
+        assert_eq!(snapshot.committed_bytes, 0);
+
+        fs::write(dir.0.join("memory.stat"), "malformed\n").unwrap();
+        let snapshot = descriptor.snapshot().unwrap();
+        assert_eq!(snapshot.reclaimable_clean_file_bytes, 0);
+        assert_eq!(snapshot.committed_bytes, 50);
+        fs::remove_file(dir.0.join("memory.stat")).unwrap();
+        assert_eq!(descriptor.snapshot().unwrap().committed_bytes, 50);
+    }
+
+    #[test]
+    fn strict_descriptor_discovery_distinguishes_unlimited_from_broken_controls() {
+        let dir = TestDir::new();
+        let mount = dir.0.join("cgroup");
+        let leaf = mount.join("service");
+        fs::create_dir_all(&leaf).unwrap();
+        let cgroup_file = dir.0.join("self.cgroup");
+        let mountinfo_file = dir.0.join("self.mountinfo");
+        fs::write(&cgroup_file, "0::/service\n").unwrap();
+        fs::write(
+            &mountinfo_file,
+            format!("30 20 0:27 / {} rw - cgroup2 cgroup rw\n", mount.display()),
+        )
+        .unwrap();
+        let paths = CgroupDiscoveryPaths {
+            proc_self_cgroup: cgroup_file,
+            proc_self_mountinfo: mountinfo_file,
+        };
+
+        fs::write(mount.join("memory.max"), "max\n").unwrap();
+        fs::write(mount.join("memory.high"), "max\n").unwrap();
+        fs::write(leaf.join("memory.max"), "max\n").unwrap();
+        fs::write(leaf.join("memory.high"), "max\n").unwrap();
+        assert_eq!(
+            try_detect_cgroup_memory_descriptor_with(&paths).unwrap(),
+            None,
+            "a readable unlimited hierarchy has no finite descriptor"
+        );
+
+        fs::write(leaf.join("memory.max"), "broken\n").unwrap();
+        assert_eq!(
+            try_detect_cgroup_memory_descriptor_with(&paths)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData,
+            "a malformed required control must not look unlimited"
+        );
+        fs::remove_file(leaf.join("memory.max")).unwrap();
+        assert_eq!(
+            try_detect_cgroup_memory_descriptor_with(&paths)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound,
+            "an unreadable required control must not disable the guard"
+        );
+    }
+
+    #[test]
+    fn required_snapshot_readings_fail_closed() {
+        let dir = TestDir::new();
+        fs::write(dir.0.join("memory.max"), "1000\n").unwrap();
+        fs::write(dir.0.join("memory.high"), "max\n").unwrap();
+        let descriptor = CgroupMemoryDescriptor::from_directory(dir.0.clone(), CgroupVersion::V2);
+        assert_eq!(
+            descriptor.snapshot().unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        fs::write(dir.0.join("memory.current"), "bad\n").unwrap();
+        assert_eq!(
+            descriptor.snapshot().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        fs::write(dir.0.join("memory.current"), "1\n").unwrap();
+        fs::write(dir.0.join("memory.max"), "bad\n").unwrap();
+        assert_eq!(
+            descriptor.snapshot().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn descriptor_discovery_is_deterministic_across_equivalent_mounts() {
+        let dir = TestDir::new();
+        let mount_a = dir.0.join("a");
+        let mount_b = dir.0.join("b");
+        fs::create_dir_all(mount_a.join("service")).unwrap();
+        fs::create_dir_all(mount_b.join("service")).unwrap();
+        for mount in [&mount_a, &mount_b] {
+            fs::write(mount.join("service/memory.max"), "1000\n").unwrap();
+            fs::write(mount.join("service/memory.high"), "max\n").unwrap();
+        }
+        let mountinfo = format!(
+            "31 20 0:27 / {} rw - cgroup2 cgroup rw\n30 20 0:27 / {} rw - cgroup2 cgroup rw\n",
+            mount_b.display(),
+            mount_a.display()
+        );
+        let descriptor =
+            cgroup_memory_descriptor_from_contents("0::/service\n", &mountinfo).unwrap();
+        assert_eq!(descriptor.directory(), mount_a.join("service"));
+    }
+
+    #[test]
+    fn v1_descriptor_uses_hierarchical_totals_and_exact_unlimited_sentinel() {
+        let dir = TestDir::new();
+        fs::write(dir.0.join("memory.limit_in_bytes"), "1000\n").unwrap();
+        fs::write(dir.0.join("memory.usage_in_bytes"), "900\n").unwrap();
+        fs::write(
+            dir.0.join("memory.stat"),
+            concat!(
+                "cache 100\nshmem 0\nactive_file 50\ninactive_file 50\ndirty 0\nwriteback 0\n",
+                "total_cache 800\ntotal_shmem 100\ntotal_active_file 350\ntotal_inactive_file 450\ntotal_dirty 20\ntotal_writeback 30\n"
+            ),
+        )
+        .unwrap();
+        let descriptor = CgroupMemoryDescriptor::from_directory(dir.0.clone(), CgroupVersion::V1);
+        assert_eq!(descriptor.snapshot().unwrap().committed_bytes, 250);
+        fs::write(
+            dir.0.join("memory.limit_in_bytes"),
+            CGROUP_V1_UNLIMITED_THRESHOLD.to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            descriptor.snapshot().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
         );
     }
 }

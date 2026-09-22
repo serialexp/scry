@@ -97,6 +97,13 @@ impl QueryResultCacheStats {
     }
 }
 
+/// Owner-estimated state removed by an explicit pressure release.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct ReleaseReport {
+    pub entries: usize,
+    pub bytes: usize,
+}
+
 struct Entry {
     bytes: Arc<[u8]>,
     weight: usize,
@@ -230,6 +237,28 @@ impl QueryResultCache {
         );
         self.inserts.fetch_add(1, Ordering::Relaxed);
         self.evict_to_budget(&mut state);
+    }
+
+    /// Remove all retained responses. Existing [`CachedResponse`] clones remain
+    /// valid until their readers drop them.
+    pub fn clear(&self) -> ReleaseReport {
+        self.try_clear().expect("result cache mutex poisoned")
+    }
+
+    /// Fallible pressure-path variant which reports a poisoned owner lock rather
+    /// than panicking the query task that requested global reclamation.
+    pub fn try_clear(&self) -> Result<ReleaseReport, &'static str> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "result cache mutex poisoned")?;
+        let report = ReleaseReport {
+            entries: state.map.len(),
+            bytes: state.bytes_in,
+        };
+        state.map.clear();
+        state.bytes_in = 0;
+        Ok(report)
     }
 
     /// Pop LRU entries (head) until within budget. The just-inserted entry sits
@@ -382,6 +411,26 @@ mod tests {
         // the bytes and two responses may legitimately share neither.
         assert_eq!(cache.get(1).expect("hit").rows, 1_000);
         assert_eq!(cache.get(2).expect("hit").rows, 0);
+    }
+
+    #[test]
+    fn clear_reports_accounting_and_preserves_active_reader() {
+        let cache = QueryResultCache::with_budget_bytes(1 << 20);
+        cache.insert(1, bytes(100, 1), 7);
+        cache.insert(2, bytes(200, 2), 9);
+        let reader = cache.get(1).unwrap();
+
+        assert_eq!(
+            cache.clear(),
+            ReleaseReport {
+                entries: 2,
+                bytes: 300 + 2 * ENTRY_OVERHEAD_BYTES,
+            }
+        );
+        assert_eq!(cache.stats().entries, 0);
+        assert_eq!(cache.stats().bytes_in, 0);
+        assert_eq!(reader.bytes.len(), 100);
+        assert_eq!(cache.clear(), ReleaseReport::default());
     }
 
     #[test]

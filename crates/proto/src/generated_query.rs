@@ -14,6 +14,7 @@ pub enum QueryFrameMsg {
     LabelValuesRequest(LabelValuesRequestOutput),
     FleetStatusRequest(FleetStatusRequestOutput),
     IssueListRequest(IssueListRequestOutput),
+    IssueOccurrencesRequest(IssueOccurrencesRequestOutput),
     SchemaMsg(SchemaMsgOutput),
     BatchMsg(BatchMsgOutput),
     ResponseSuperseded(ResponseSupersededOutput),
@@ -23,6 +24,7 @@ pub enum QueryFrameMsg {
     LabelValuesResponse(LabelValuesResponseOutput),
     FleetStatusResponse(FleetStatusResponseOutput),
     IssueListResponse(IssueListResponseOutput),
+    IssueOccurrencesResponse(IssueOccurrencesResponseOutput),
     StreamError(StreamErrorOutput),
 }
 
@@ -98,6 +100,14 @@ impl QueryFrameMsg {
             }
             QueryFrameMsg::IssueListRequest(v) => {
                 encoder.write_uint8(5);
+                encoder.write_uint32(v.limit, Endianness::BigEndian);
+            }
+            QueryFrameMsg::IssueOccurrencesRequest(v) => {
+                encoder.write_uint8(6);
+                encoder.write_uint16(v.issue_id.len() as u16, Endianness::BigEndian);
+                for item in &v.issue_id {
+                    encoder.write_uint8(*item);
+                }
                 encoder.write_uint32(v.limit, Endianness::BigEndian);
             }
             QueryFrameMsg::SchemaMsg(v) => {
@@ -196,6 +206,21 @@ impl QueryFrameMsg {
                     }
                 }
             }
+            QueryFrameMsg::IssueOccurrencesResponse(v) => {
+                encoder.write_uint8(36);
+                encoder.write_uint32(v.issue_json.len() as u32, Endianness::BigEndian);
+                let string_bytes: &[u8] = v.issue_json.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint32(v.occurrences_json.len() as u32, Endianness::BigEndian);
+                for item in &v.occurrences_json {
+                    encoder.write_uint32(item.len() as u32, Endianness::BigEndian);
+                    for b in item.as_bytes() {
+                        encoder.write_uint8(*b);
+                    }
+                }
+            }
             QueryFrameMsg::StreamError(v) => {
                 encoder.write_uint8(240);
                 encoder.write_uint16(v.code, Endianness::BigEndian);
@@ -216,6 +241,7 @@ impl QueryFrameMsg {
             QueryFrameMsg::LabelValuesRequest(_) => "LabelValuesRequest",
             QueryFrameMsg::FleetStatusRequest(_) => "FleetStatusRequest",
             QueryFrameMsg::IssueListRequest(_) => "IssueListRequest",
+            QueryFrameMsg::IssueOccurrencesRequest(_) => "IssueOccurrencesRequest",
             QueryFrameMsg::SchemaMsg(_) => "SchemaMsg",
             QueryFrameMsg::BatchMsg(_) => "BatchMsg",
             QueryFrameMsg::ResponseSuperseded(_) => "ResponseSuperseded",
@@ -225,6 +251,7 @@ impl QueryFrameMsg {
             QueryFrameMsg::LabelValuesResponse(_) => "LabelValuesResponse",
             QueryFrameMsg::FleetStatusResponse(_) => "FleetStatusResponse",
             QueryFrameMsg::IssueListResponse(_) => "IssueListResponse",
+            QueryFrameMsg::IssueOccurrencesResponse(_) => "IssueOccurrencesResponse",
             QueryFrameMsg::StreamError(_) => "StreamError",
         }
     }
@@ -255,6 +282,10 @@ impl QueryFrameMsg {
         decoder.seek(start_pos)?;
         if let Ok(v) = IssueListRequestOutput::decode_with_decoder(decoder) {
             return Ok(QueryFrameMsg::IssueListRequest(v));
+        }
+        decoder.seek(start_pos)?;
+        if let Ok(v) = IssueOccurrencesRequestOutput::decode_with_decoder(decoder) {
+            return Ok(QueryFrameMsg::IssueOccurrencesRequest(v));
         }
         decoder.seek(start_pos)?;
         if let Ok(v) = SchemaMsgOutput::decode_with_decoder(decoder) {
@@ -291,6 +322,10 @@ impl QueryFrameMsg {
         decoder.seek(start_pos)?;
         if let Ok(v) = IssueListResponseOutput::decode_with_decoder(decoder) {
             return Ok(QueryFrameMsg::IssueListResponse(v));
+        }
+        decoder.seek(start_pos)?;
+        if let Ok(v) = IssueOccurrencesResponseOutput::decode_with_decoder(decoder) {
+            return Ok(QueryFrameMsg::IssueOccurrencesResponse(v));
         }
         decoder.seek(start_pos)?;
         if let Ok(v) = StreamErrorOutput::decode_with_decoder(decoder) {
@@ -1255,6 +1290,187 @@ impl From<IssueListResponseInput> for IssueListResponseOutput {
         Self {
             tag: 35u8,
             issues_json: i.issues_json,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct IssueOccurrencesRequestInput {
+    pub issue_id: Vec<u8>,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct IssueOccurrencesRequestOutput {
+    pub tag: u8,
+    pub issue_id: Vec<u8>,
+    pub limit: u32,
+}
+
+pub type IssueOccurrencesRequest = IssueOccurrencesRequestOutput;
+
+impl IssueOccurrencesRequestInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(6);
+        encoder.write_u16_be(self.issue_id.len() as u16);
+        for item in &self.issue_id {
+            encoder.write_byte(*item);
+        }
+        encoder.write_u32_be(self.limit);
+        Ok(())
+    }
+
+}
+
+impl IssueOccurrencesRequestOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let tag = decoder.read_byte()?;
+        if tag != 6u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 6, got {}", tag)));
+        }
+        let length = decoder.read_u16_be()? as usize;
+        let mut issue_id = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = decoder.read_byte()?;
+            issue_id.push(item);
+        }
+        let limit = decoder.read_u32_be()?;
+        Ok(Self {
+            tag,
+            issue_id,
+            limit,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        IssueOccurrencesRequestInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        IssueOccurrencesRequestInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<IssueOccurrencesRequestOutput> for IssueOccurrencesRequestInput {
+    fn from(o: IssueOccurrencesRequestOutput) -> Self {
+        Self {
+            issue_id: o.issue_id,
+            limit: o.limit,
+        }
+    }
+}
+
+impl From<IssueOccurrencesRequestInput> for IssueOccurrencesRequestOutput {
+    fn from(i: IssueOccurrencesRequestInput) -> Self {
+        Self {
+            tag: 6u8,
+            issue_id: i.issue_id,
+            limit: i.limit,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct IssueOccurrencesResponseInput {
+    pub issue_json: std::string::String,
+    pub occurrences_json: Vec<std::string::String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct IssueOccurrencesResponseOutput {
+    pub tag: u8,
+    pub issue_json: std::string::String,
+    pub occurrences_json: Vec<std::string::String>,
+}
+
+pub type IssueOccurrencesResponse = IssueOccurrencesResponseOutput;
+
+impl IssueOccurrencesResponseInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(36);
+        encoder.write_u32_be(self.issue_json.len() as u32);
+        let string_bytes: &[u8] = self.issue_json.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u32_be(self.occurrences_json.len() as u32);
+        for item in &self.occurrences_json {
+            encoder.write_u32_be(item.len() as u32);
+            for b in item.as_bytes() {
+                encoder.write_byte(*b);
+            }
+        }
+        Ok(())
+    }
+
+}
+
+impl IssueOccurrencesResponseOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let tag = decoder.read_byte()?;
+        if tag != 36u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 36, got {}", tag)));
+        }
+        let length = decoder.read_u32_be()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let issue_json = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u32_be()? as usize;
+        let mut occurrences_json = Vec::with_capacity(length);
+        for _ in 0..length {
+            let str_len = decoder.read_u32_be()? as usize;
+            let str_bytes = decoder.read_bytes_vec(str_len)?;
+            let item = std::string::String::from_utf8(str_bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+            occurrences_json.push(item);
+        }
+        Ok(Self {
+            tag,
+            issue_json,
+            occurrences_json,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        IssueOccurrencesResponseInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        IssueOccurrencesResponseInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<IssueOccurrencesResponseOutput> for IssueOccurrencesResponseInput {
+    fn from(o: IssueOccurrencesResponseOutput) -> Self {
+        Self {
+            issue_json: o.issue_json,
+            occurrences_json: o.occurrences_json,
+        }
+    }
+}
+
+impl From<IssueOccurrencesResponseInput> for IssueOccurrencesResponseOutput {
+    fn from(i: IssueOccurrencesResponseInput) -> Self {
+        Self {
+            tag: 36u8,
+            issue_json: i.issue_json,
+            occurrences_json: i.occurrences_json,
         }
     }
 }

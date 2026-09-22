@@ -2329,8 +2329,9 @@ subcommand-variant payload) and a `pub async fn run(args: Args) ->
 anyhow::Result<()>` carrying the old `main` body minus the `Args::parse()` and
 the per-crate `tracing_subscriber` init. The new `crates/scry` bin owns the
 clap `Subcommand` enum, a **single** `tracing_subscriber` init, and the **single**
-process-global `#[global_allocator]` (mimalloc) — a binary may declare only one,
-so the per-daemon allocators all collapse here. Package names are unchanged
+process-global `#[global_allocator]` (jemalloc, shared through `scry-alloc`) — a
+binary may declare only one, so the per-daemon allocators all collapse here.
+Package names are unchanged
 (`scry-ingestd` is still the crate; it just no longer has a `[[bin]]`), so the
 dispatcher imports `scry_ingestd::{Args, run}` etc. **Hard replace** (Rule #8):
 no compat shims, no old binary names — the Dockerfile builds one `scry`, k8s
@@ -2344,7 +2345,7 @@ test-only and keep their own `[[bin]]` targets, built explicitly by the smoke
 scripts.
 
 **Status.** Implemented: `crates/scry/{Cargo.toml,src/main.rs}` (dispatcher);
-the nine role crates lib-ified (`Args` + `run`, `[[bin]]`→`[lib]`, mimalloc/
+the nine role crates lib-ified (`Args` + `run`, `[[bin]]`→`[lib]`, allocator/
 tracing-subscriber deps dropped where they only served the bin); `Dockerfile`
 builds/copies one `scry`; `deploy/k8s/*` commands + resource names updated;
 `scripts/smoke*.sh` + `scripts/profile-query*.sh` rewritten to subcommand form;
@@ -3946,3 +3947,39 @@ conditional create, folds a deployment-bound rebuildable `errors.sqlite`, and ca
 run bounded periodic reconciliation under an exclusive local single-writer lock.
 Clustered Valkey orchestration, browser intake, grouping/issues/UI, accepted-record
 low-latency hints, and error projection snapshots/GC remain unimplemented.
+
+## D-075: Query process pressure uses committed cgroup memory and reclaim/reprobe
+
+**Date:** 2026-09-20
+**Status:** accepted; implementation in progress
+
+Queryd's original process guard compared raw cgroup `memory.current` with
+`memory.max - reserve`. A production exact trace-id lookup was therefore refused
+before planning while most of the cgroup charge was clean filesystem cache. The
+request was reported as “too large” even though its selectivity had never been
+considered.
+
+Query process safety now distinguishes raw charge from committed pressure. Scry
+retains its mount-aware cgroup-v1/v2 discovery, namespace-root mapping, ancestor
+limits, and `memory.high`; reads a coherent current/stat snapshot from the
+effective limiting hierarchy; and discounts only clean ordinary filesystem
+cache. Anonymous memory, tmpfs/shmem, dirty/writeback pages, and kernel memory
+remain committed. Missing statistics remove the discount, while unavailable
+required probes fail closed.
+
+A new data query that would otherwise be refused gets one serialized,
+rate-limited reclamation attempt: evict recomputable result and loaded sidecar
+caches, clear derived label suggestions, drop idle object buffers, ask jemalloc
+to purge unused pages, then trust a fresh cgroup snapshot. Active readers,
+loading single-flight slots, checked-out buffers, and DataFusion execution state
+remain valid; running work is released only through cancellation/drop. Runtime
+planning and streaming checks remain a backstop but do not repeatedly destroy
+global caches.
+
+The multicall production binary aligns with Gothab on jemalloc through the
+shared `scry-alloc` crate. Queue saturation, shared DataFusion exhaustion,
+process pressure, and probe failure remain distinct operator causes under the
+existing resource error code. This decision does not invent a fixed per-query
+reservation: calibrated weighted admission and query spill remain separate
+measured work. The complete contract and qualification matrix live in
+`docs/design/query-memory-pressure.md`.

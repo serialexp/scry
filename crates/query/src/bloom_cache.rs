@@ -42,6 +42,7 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::body_bloom::fetch_body_bloom;
+use crate::result_cache::ReleaseReport;
 
 /// Default byte budget for the bloom cache: 64 MiB. Blooms run ~2% of body
 /// size (tens to hundreds of KB per block at the default 1% FPR), so this
@@ -258,6 +259,37 @@ impl BloomCache {
         }
     }
 
+    /// Remove every completed slot while preserving zero-weight single-flight
+    /// loading slots. Existing `Arc` readers retain their values safely.
+    pub fn clear_loaded(&self) -> ReleaseReport {
+        self.try_clear_loaded().expect("bloom cache mutex poisoned")
+    }
+
+    /// Fallible pressure-path variant which reports a poisoned owner lock rather
+    /// than panicking during process-wide reclamation.
+    pub fn try_clear_loaded(&self) -> Result<ReleaseReport, &'static str> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "bloom cache mutex poisoned")?;
+        let mut report = ReleaseReport::default();
+        state.map.retain(|_, slot| {
+            let accounted_weight = slot.weight.load(Ordering::Acquire);
+            let completed_weight = slot.cell.get().map(slot_weight);
+            let Some(weight) = (accounted_weight != 0)
+                .then_some(accounted_weight)
+                .or(completed_weight)
+            else {
+                return true;
+            };
+            report.entries += 1;
+            report.bytes = report.bytes.saturating_add(weight);
+            false
+        });
+        state.bytes_in = state.bytes_in.saturating_sub(report.bytes);
+        Ok(report)
+    }
+
     /// Decide whether a candidate block can be skipped for a
     /// `body_contains` query, using the cache. Same contract as
     /// [`crate::body_bloom::block_excluded_by_bloom`]: `true` means the
@@ -363,6 +395,15 @@ impl BloomCache {
         let prev = weight.swap(new_weight, Ordering::AcqRel);
         if prev == 0 {
             let mut state = self.state.lock().expect("bloom cache mutex poisoned");
+            // A pressure clear may have removed this slot after initialization
+            // completed but before accounting acquired the mutex.
+            let still_retained = state
+                .map
+                .get(&uuid)
+                .is_some_and(|slot| Arc::ptr_eq(&slot.weight, &weight));
+            if !still_retained {
+                return Ok(value);
+            }
             if new_weight > self.budget_bytes {
                 state.map.remove(&uuid);
                 debug!(
@@ -524,6 +565,58 @@ mod tests {
         let state = cache.state.lock().unwrap();
         assert!(state.map.is_empty());
         assert_eq!(state.bytes_in, 0);
+    }
+
+    #[tokio::test]
+    async fn clear_loaded_preserves_loading_slots_and_active_readers() {
+        let cache = BloomCache::with_budget_bytes(1 << 20);
+        let loaded_uuid = Uuid::new_v4();
+        let loading_uuid = Uuid::new_v4();
+        let reader = bloom_for(&["connection refused"]);
+        let weight = slot_weight(&reader);
+        install(&cache, loaded_uuid, reader.clone()).await;
+        cache
+            .state
+            .lock()
+            .unwrap()
+            .map
+            .insert(loading_uuid, CacheSlot::new_loading());
+
+        assert_eq!(
+            cache.clear_loaded(),
+            ReleaseReport {
+                entries: 1,
+                bytes: weight,
+            }
+        );
+        assert!(reader.as_ref().is_some());
+        let state = cache.state.lock().unwrap();
+        assert!(!state.map.contains_key(&loaded_uuid));
+        assert!(state.map.contains_key(&loading_uuid));
+        assert_eq!(state.bytes_in, 0);
+    }
+
+    #[tokio::test]
+    async fn clear_loaded_removes_completed_slot_before_accounting() {
+        let cache = BloomCache::with_budget_bytes(1 << 20);
+        let uuid = Uuid::new_v4();
+        let value = bloom_for(&["completed"]);
+        let slot = CacheSlot::new_loading();
+        let cell = slot.cell.clone();
+        let weight = slot.weight.clone();
+        cache.state.lock().unwrap().map.insert(uuid, slot);
+        assert!(cell.set(value.clone()).is_ok());
+
+        assert_eq!(
+            cache.clear_loaded(),
+            ReleaseReport {
+                entries: 1,
+                bytes: slot_weight(&value),
+            }
+        );
+        assert_eq!(weight.load(Ordering::Relaxed), 0);
+        assert!(cache.state.lock().unwrap().map.is_empty());
+        assert_eq!(cache.stats().bytes_in, 0);
     }
 
     #[test]

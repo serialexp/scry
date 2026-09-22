@@ -80,6 +80,26 @@ describe("fleetFields", () => {
       query_ranges: { average_seconds: 7_200, max_seconds: 86_400, defaulted_total: 4, unbounded_start_total: 1 },
       memory_reserved_bytes: 1_048_576,
       memory_observed_peak_reserved_bytes: 2_097_152,
+      memory_pressure: {
+        enabled: true,
+        limit_bytes: 8_388_608,
+        reserve_bytes: 1_048_576,
+        threshold_bytes: 7_340_032,
+        current_bytes: 6_291_456,
+        reclaimable_clean_file_bytes: 2_097_152,
+        committed_bytes: 4_194_304,
+        admission_checks_total: 12,
+        admission_admitted_total: 9,
+        admission_rejected_total: 1,
+        admission_probe_failures_total: 2,
+        runtime_probe_failures_total: 6,
+        reclaim_attempts_total: 3,
+        reclaim_rate_limited_total: 4,
+        estimated_entries_released_total: 5,
+        estimated_bytes_released_total: 524_288,
+        observed_committed_reduction_bytes_total: 262_144,
+        runtime_cancellations: { planning_total: 1, streaming_total: 2 },
+      },
       admission: { waiting: 1, max_wait_ms: 25, timeouts_total: 2, rejected_total: 3 },
       recovery: { response_resets_total: 4, repair_attempts_total: 5, repair_failures_total: 1 },
       postings_cache: { hits: 9, misses: 1 },
@@ -96,7 +116,21 @@ describe("fleetFields", () => {
     expect(fields.get("latency p95 ≤")).toBe("500 ms");
     expect(fields.get("average range")).toBe("2.0h");
     expect(fields.get("maximum range")).toBe("1.0d");
-    expect(fields.get("observed memory high-water")).toBe("2.0 MiB");
+    expect(fields.get("DataFusion memory reserved")).toBe("1.0 MiB");
+    expect(fields.get("DataFusion memory high-water")).toBe("2.0 MiB");
+    expect(fields.get("cgroup pressure guard")).toBe("enabled");
+    expect(fields.get("cgroup emergency reserve")).toBe("1.0 MiB");
+    expect(fields.get("cgroup committed pressure")).toBe("4.0 MiB");
+    expect(fields.get("cgroup committed threshold")).toBe("7.0 MiB");
+    expect(fields.get("cgroup reclaimable clean file")).toBe("2.0 MiB");
+    expect(fields.get("cgroup pressure checks")).toBe("12");
+    expect(fields.get("cgroup pressure rejected")).toBe("1");
+    expect(fields.get("cgroup admission probe failures")).toBe("2");
+    expect(fields.get("cgroup runtime probe failures")).toBe("6");
+    expect(fields.get("cgroup estimated entries released")).toBe("5");
+    expect(fields.get("cgroup estimated release")).toBe("512.0 KiB");
+    expect(fields.get("cgroup observed committed reduction")).toBe("256.0 KiB");
+    expect(fields.get("cgroup runtime cancellations")).toBe("3");
     expect(fields.get("label suggestions memory")).toBe("64.0 KiB");
     expect(fields.get("label suggestion names")).toBe("12");
     expect(fields.get("label suggestion values")).toBe("345");
@@ -142,6 +176,8 @@ describe("fleetFields", () => {
     expect(ingest.get("compaction")).toBe("—");
     expect(ingest.get("compaction failures")).toBe("—");
     expect(query.get("admission rejected")).toBe("—");
+    expect(query.get("cgroup pressure guard")).toBe("—");
+    expect(query.get("cgroup committed pressure")).toBe("—");
   });
 
   it("keeps scalar fallback fields for unknown roles", () => {

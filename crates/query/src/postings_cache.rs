@@ -68,6 +68,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::postings::{fetch_and_parse_postings, intersect_matchers};
+use crate::result_cache::ReleaseReport;
 
 /// Default byte budget for the postings cache: 256 MiB. Postings
 /// sidecars run "a few MB per block" per `ARCHITECTURE.md`, so this
@@ -356,6 +357,34 @@ impl PostingsCache {
         }
     }
 
+    /// Remove every fully loaded entry while preserving zero-weight loading
+    /// slots. Readers that already cloned an index keep it alive independently.
+    pub fn clear_loaded(&self) -> ReleaseReport {
+        self.try_clear_loaded().expect("cache mutex poisoned")
+    }
+
+    /// Fallible pressure-path variant which reports a poisoned owner lock rather
+    /// than panicking during process-wide reclamation.
+    pub fn try_clear_loaded(&self) -> Result<ReleaseReport, &'static str> {
+        let mut state = self.state.lock().map_err(|_| "cache mutex poisoned")?;
+        let mut report = ReleaseReport::default();
+        state.map.retain(|_, slot| {
+            let accounted_weight = slot.weight.load(Ordering::Acquire);
+            let completed_weight = slot.cell.get().map(|index| index.bytes_estimate());
+            let Some(weight) = (accounted_weight != 0)
+                .then_some(accounted_weight)
+                .or(completed_weight)
+            else {
+                return true;
+            };
+            report.entries += 1;
+            report.bytes = report.bytes.saturating_add(weight);
+            false
+        });
+        state.bytes_in = state.bytes_in.saturating_sub(report.bytes);
+        Ok(report)
+    }
+
     /// Resolve AND'd matchers to the fingerprint set that overlaps
     /// every matcher in the given block, using the cache where
     /// possible. Same return contract as
@@ -483,6 +512,15 @@ impl PostingsCache {
         let prev = weight.swap(new_weight, Ordering::AcqRel);
         if prev == 0 {
             let mut state = self.state.lock().expect("cache mutex poisoned");
+            // A pressure clear may have removed this slot after initialization
+            // completed but before accounting acquired the mutex.
+            let still_retained = state
+                .map
+                .get(&uuid)
+                .is_some_and(|slot| Arc::ptr_eq(&slot.weight, &weight));
+            if !still_retained {
+                return Ok(index);
+            }
             if new_weight > self.budget_bytes {
                 // The caller keeps this Arc, but the cache must not retain an
                 // entry larger than its complete budget.
@@ -742,6 +780,58 @@ mod tests {
         let state = cache.state.lock().unwrap();
         assert!(state.map.is_empty());
         assert_eq!(state.bytes_in, 0);
+    }
+
+    #[tokio::test]
+    async fn clear_loaded_preserves_loading_slots_and_active_readers() {
+        let cache = PostingsCache::with_budget_bytes(1 << 20);
+        let loaded_uuid = Uuid::new_v4();
+        let loading_uuid = Uuid::new_v4();
+        let reader = synthetic_index("env", "prod", &[1, 2, 3]);
+        install(&cache, loaded_uuid, reader.clone()).await;
+        let weight = reader.bytes_estimate();
+        cache
+            .state
+            .lock()
+            .unwrap()
+            .map
+            .insert(loading_uuid, CacheSlot::new_loading());
+
+        assert_eq!(
+            cache.clear_loaded(),
+            ReleaseReport {
+                entries: 1,
+                bytes: weight,
+            }
+        );
+        assert_eq!(reader.lookup("env", "prod").unwrap().as_slice(), &[1, 2, 3]);
+        let state = cache.state.lock().unwrap();
+        assert!(!state.map.contains_key(&loaded_uuid));
+        assert!(state.map.contains_key(&loading_uuid));
+        assert_eq!(state.bytes_in, 0);
+    }
+
+    #[tokio::test]
+    async fn clear_loaded_removes_completed_slot_before_accounting() {
+        let cache = PostingsCache::with_budget_bytes(1 << 20);
+        let uuid = Uuid::new_v4();
+        let index = synthetic_index("env", "prod", &[1]);
+        let slot = CacheSlot::new_loading();
+        let cell = slot.cell.clone();
+        let weight = slot.weight.clone();
+        cache.state.lock().unwrap().map.insert(uuid, slot);
+        assert!(cell.set(index.clone()).is_ok());
+
+        assert_eq!(
+            cache.clear_loaded(),
+            ReleaseReport {
+                entries: 1,
+                bytes: index.bytes_estimate(),
+            }
+        );
+        assert_eq!(weight.load(Ordering::Relaxed), 0);
+        assert!(cache.state.lock().unwrap().map.is_empty());
+        assert_eq!(cache.stats().bytes_in, 0);
     }
 
     #[test]

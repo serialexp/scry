@@ -2718,3 +2718,53 @@ textarea {
   font-size: 11px;
   white-space: nowrap;
 }
+
+/* ── Issue detail page ──────────────────────────────────────────── */
+
+.issue-back {
+  color: var(--muted);
+  font-size: 12px;
+  text-decoration: none;
+  margin-bottom: 8px;
+  display: inline-block;
+}
+.issue-back:hover {
+  color: var(--fg);
+}
+
+.issue-detail-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px 32px;
+  margin: 12px 0;
+  font-size: 13px;
+}
+.issue-detail-meta > div {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+}
+.issue-detail-meta dt {
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.issue-detail-meta dd {
+  margin: 0;
+  font-family: var(--mono);
+}
+
+.issue-id-mono {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--faint);
+  word-break: break-all;
+}
+
+.occ-section-heading {
+  font-size: 14px;
+  font-weight: 600;
+  margin: 24px 0 12px;
+  color: var(--fg);
+}

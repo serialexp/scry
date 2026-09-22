@@ -52,6 +52,7 @@ use scry_catalog::{Catalog, CatalogEntry};
 use scry_proto::constants::{Signal, QUERY_ERR_BAD_REQUEST, QUERY_ERR_INTERNAL};
 use uuid::Uuid;
 
+use crate::result_cache::ReleaseReport;
 use crate::traces::{
     list_traces_candidates, register_traces_table_from_candidates, TRACES_TABLE_NAME,
 };
@@ -127,6 +128,8 @@ pub struct LabelMetadataCoordinator {
     cache_hits: AtomicU64,
     fills_in_flight: AtomicUsize,
     fill_failures: AtomicU64,
+    /// Incremented under `view`'s mutex at every clear boundary.
+    generation: AtomicU64,
 }
 
 impl LabelMetadataCoordinator {
@@ -142,6 +145,7 @@ impl LabelMetadataCoordinator {
             cache_hits: AtomicU64::new(0),
             fills_in_flight: AtomicUsize::new(0),
             fill_failures: AtomicU64::new(0),
+            generation: AtomicU64::new(0),
         }
     }
 
@@ -159,16 +163,7 @@ impl LabelMetadataCoordinator {
         N: Into<String>,
         V: Into<String>,
     {
-        self.merge_persisted_pairs(signal, pairs);
-        let inserted = self
-            .view
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .blocks
-            .insert(uuid);
-        if inserted {
-            self.blocks_warmed.fetch_add(1, Ordering::Relaxed);
-        }
+        self.publish_pairs(signal, pairs, Some(uuid), None);
     }
 
     /// Merge pairs loaded by a caller from persistent storage (also useful for
@@ -179,7 +174,27 @@ impl LabelMetadataCoordinator {
         N: Into<String>,
         V: Into<String>,
     {
+        self.publish_pairs(signal, pairs, None, None);
+    }
+
+    fn publish_pairs<I, N, V>(
+        &self,
+        signal: Signal,
+        pairs: I,
+        uuid: Option<Uuid>,
+        expected_generation: Option<u64>,
+    ) -> bool
+    where
+        I: IntoIterator<Item = (N, V)>,
+        N: Into<String>,
+        V: Into<String>,
+    {
         let mut view = self.view.lock().unwrap_or_else(|e| e.into_inner());
+        if expected_generation
+            .is_some_and(|expected| self.generation.load(Ordering::Relaxed) != expected)
+        {
+            return false;
+        }
         for (name, value) in pairs {
             let name = name.into();
             let value = value.into();
@@ -243,6 +258,34 @@ impl LabelMetadataCoordinator {
                 view.saturated.insert(key);
             }
         }
+        if let Some(uuid) = uuid {
+            if view.blocks.insert(uuid) {
+                self.blocks_warmed.fetch_add(1, Ordering::Relaxed);
+                self.resident_bytes_estimate.fetch_add(
+                    size_of::<Uuid>() + estimated_hash_entry_overhead(),
+                    Ordering::Relaxed,
+                );
+            }
+        }
+        true
+    }
+
+    /// Clear the recomputable suggestion view and advance its generation. A
+    /// warm that began before this boundary may finish persistence, but cannot
+    /// publish its stale result into the new in-memory generation.
+    pub fn clear(&self) -> ReleaseReport {
+        let mut view = self.view.lock().unwrap_or_else(|e| e.into_inner());
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        let report = ReleaseReport {
+            entries: view
+                .names_count
+                .saturating_add(view.values_count)
+                .saturating_add(view.saturated.len())
+                .saturating_add(view.blocks.len()),
+            bytes: self.resident_bytes_estimate.swap(0, Ordering::Relaxed),
+        };
+        *view = MetadataView::default();
+        report
     }
 
     pub fn label_names(&self, signal: Signal) -> Vec<String> {
@@ -312,6 +355,7 @@ impl LabelMetadataCoordinator {
         entry: CatalogEntry,
     ) -> Result<(), MetaError> {
         let uuid = entry.meta.uuid;
+        let generation = self.generation.load(Ordering::Relaxed);
         if self
             .view
             .lock()
@@ -374,13 +418,7 @@ impl LabelMetadataCoordinator {
                     )
                 })?;
         }
-        self.merge_persisted_pairs(signal, pairs);
-        self.view
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .blocks
-            .insert(uuid);
-        self.blocks_warmed.fetch_add(1, Ordering::Relaxed);
+        self.publish_pairs(signal, pairs, Some(uuid), Some(generation));
         Ok(())
     }
 }
@@ -396,6 +434,12 @@ fn estimated_tree_node_overhead() -> usize {
     // not expose the allocator's exact node layout, so use a stable conservative
     // estimate and label the resulting status gauge explicitly as an estimate.
     size_of::<String>() + 3 * size_of::<usize>()
+}
+
+fn estimated_hash_entry_overhead() -> usize {
+    // HashSet bucket/control-byte layout is allocator and implementation
+    // dependent. This stable estimate deliberately includes spare bucket space.
+    2 * size_of::<usize>()
 }
 
 fn uuid_flight(uuid: Uuid) -> Arc<tokio::sync::Mutex<()>> {
@@ -715,6 +759,56 @@ mod tests {
         cache.merge_persisted_pairs(Signal::Logs, [("__name__", "z"), ("__name__", "a")]);
         assert_eq!(cache.label_values(Signal::Logs, "__name__"), vec!["a"]);
         assert_eq!(cache.stats().saturated_labels, 1);
+    }
+
+    #[test]
+    fn clear_reports_accounting_and_generation_fences_concurrent_old_publish() {
+        use std::sync::Barrier;
+
+        let cache = Arc::new(LabelMetadataCoordinator::default());
+        let warmed_uuid = Uuid::new_v4();
+        cache.merge_persisted_block(Signal::Metrics, warmed_uuid, [("env", "prod")]);
+        let expected_bytes = cache.estimated_resident_bytes();
+        let ready = Arc::new(Barrier::new(2));
+        let cleared = Arc::new(Barrier::new(2));
+        let warmer = {
+            let cache = cache.clone();
+            let ready = ready.clone();
+            let cleared = cleared.clone();
+            std::thread::spawn(move || {
+                let old_generation = cache.generation.load(Ordering::Relaxed);
+                ready.wait();
+                cleared.wait();
+                cache.publish_pairs(
+                    Signal::Metrics,
+                    [("stale", "value")],
+                    Some(Uuid::new_v4()),
+                    Some(old_generation),
+                )
+            })
+        };
+
+        ready.wait();
+        assert_eq!(
+            cache.clear(),
+            ReleaseReport {
+                entries: 3,
+                bytes: expected_bytes,
+            }
+        );
+        cleared.wait();
+        assert!(!warmer.join().unwrap());
+        assert!(cache.label_names(Signal::Metrics).is_empty());
+        assert_eq!(cache.stats().resident_bytes_estimate, 0);
+
+        let new_generation = cache.generation.load(Ordering::Relaxed);
+        assert!(cache.publish_pairs(
+            Signal::Metrics,
+            [("fresh", "value")],
+            Some(Uuid::new_v4()),
+            Some(new_generation),
+        ));
+        assert_eq!(cache.label_names(Signal::Metrics), vec!["fresh"]);
     }
 
     #[test]

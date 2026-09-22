@@ -3,6 +3,7 @@
 //! severity, and timing.
 
 import { For, Match, Show, Switch, onCleanup, onMount, type Component } from "solid-js";
+import { useNavigate } from "@solidjs/router";
 import {
   issueListStatus,
   issues,
@@ -41,9 +42,14 @@ function formatAge(nanos: number): string {
 
 const IssueRow: Component<{ issue: Issue }> = (props) => {
   const sev = () => severity(props.issue.max_severity);
+  const navigate = useNavigate();
 
   return (
-    <tr class="issue-row">
+    <tr
+      class="issue-row"
+      style={{ cursor: "pointer" }}
+      onClick={() => navigate(`/errors/${props.issue.issue_id}`)}
+    >
       <td class="issue-title" title={props.issue.issue_id}>
         {props.issue.title}
       </td>

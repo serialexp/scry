@@ -71,6 +71,8 @@ pub use generated_query::{
     FleetStatusRequest, FleetStatusRequestInput, FleetStatusRequestOutput, FleetStatusResponse,
     FleetStatusResponseInput, FleetStatusResponseOutput, IssueListRequest, IssueListRequestInput,
     IssueListRequestOutput, IssueListResponse, IssueListResponseInput, IssueListResponseOutput,
+    IssueOccurrencesRequest, IssueOccurrencesRequestInput, IssueOccurrencesRequestOutput,
+    IssueOccurrencesResponse, IssueOccurrencesResponseInput, IssueOccurrencesResponseOutput,
     LabelNamesRequest, LabelNamesRequestInput, LabelNamesRequestOutput, LabelNamesResponse,
     LabelNamesResponseInput, LabelNamesResponseOutput, LabelValuesRequest, LabelValuesRequestInput,
     LabelValuesRequestOutput, LabelValuesResponse, LabelValuesResponseInput,
