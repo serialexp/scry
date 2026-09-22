@@ -9,6 +9,7 @@ pub const MAX_RENDERED_BYTES: usize = 64 * 1024;
 
 const ALLOWED: &[&str] = &[
     "event_id",
+    "notification_id",
     "transition",
     "monitor_name",
     "status",
@@ -38,6 +39,7 @@ pub enum TemplateError {
 #[derive(Clone, Copy, Debug)]
 pub struct TemplateValues<'a> {
     pub event_id: &'a str,
+    pub notification_id: &'a str,
     pub transition: &'a str,
     pub monitor_name: &'a str,
     pub status: &'a str,
@@ -48,6 +50,7 @@ impl TemplateValues<'_> {
     fn get(&self, name: &str) -> &str {
         match name {
             "event_id" => self.event_id,
+            "notification_id" => self.notification_id,
             "transition" => self.transition,
             "monitor_name" => self.monitor_name,
             "status" => self.status,
@@ -195,6 +198,7 @@ mod tests {
     fn values<'a>(value: &'a str) -> TemplateValues<'a> {
         TemplateValues {
             event_id: value,
+            notification_id: "stable-notification",
             transition: "firing",
             monitor_name: "m",
             status: "firing",

@@ -35,8 +35,9 @@ status remain outstanding.
 - [x] **Phase 0 — notification-target model and UI.** Implemented immutable revisioned
   targets, secret-free SQLite projection, XChaCha-encrypted object-store secret
   generations, current/previous environment-key rotation CLI, bounded JSON templates
-  and built-ins, redacted CRUD/preview/test-send APIs, public-HTTPS DNS validation and
-  address pinning, mandatory HMAC, and the separate browser Notification targets UI.
+  and Generic JSON, Slack-compatible, and Cross Notifier built-ins, redacted CRUD/
+  preview/test-send APIs, public-HTTPS DNS validation and address pinning, mandatory
+  HMAC, and the separate browser Notification targets UI.
 
 ### Outstanding
 - [ ] **Phase 1 — durable outbox.** Atomically commit one Firing or Resolved intent per
@@ -95,7 +96,7 @@ without rereading mutable rule/issue state:
 ```text
 NotificationIntent {
   schema_version,
-  event_id, monitor_id, monitor_revision, alert_group, transition_seq,
+  event_id, notification_id, monitor_id, monitor_revision, alert_group, transition_seq,
   kind: Firing|Resolved|Reminder,
   notification_target_id, pinned_non_secret_target_revision,
   logical_secret: latest,
@@ -110,8 +111,11 @@ NotificationIntent {
 
 Fields and rendered sizes are bounded and scrubbed. No secret value is included.
 `event_id` is deterministic over deployment, monitor revision/group, transition
-sequence, kind, and notification target. One intent per target prevents a failed
-Slack target from blocking a webhook target. Every configured target receives both
+sequence, kind, and notification target. `notification_id` is deterministic over the
+stable alert instance (deployment, monitor, group, and target) and is shared by its
+Firing and Resolved intents so lifecycle-aware receivers such as Cross Notifier can
+replace and remove the same ongoing notification. One intent per target prevents a
+failed Slack target from blocking a webhook target. Every configured target receives both
 Firing and Resolved transitions; sending only Firing would leave operators with a noisy,
 open-ended alarm. Firing and Resolved are never coalesced. Reminder creation remains
 deferred and may later be coalesced by evaluator policy.
@@ -265,7 +269,13 @@ later target edits cannot rewrite history; protocol adapters may add framing onl
 The generic JSON built-in emits a stable schema with transition, labels, annotations,
 value/issue summary, timestamps, links, and event ID. A Slack-compatible built-in maps
 the same intent into bounded JSON blocks/text and includes the Scry link and transition,
-without owning alert logic. Every generic webhook signs the exact transmitted body
+without owning alert logic. The Cross Notifier built-in targets its `/notify` contract:
+`source` is `scry`, the stable alert-instance identity is used as `id`, Firing maps to
+`lifecycle: ongoing`/`status: error`, Resolved maps to `lifecycle: resolved`/`status:
+success`, and notifications are retained in its center. A remote Cross Notifier shared
+secret is supplied explicitly as the plaintext custom header `Authorization: Bearer
+<secret>`; it is separate from Scry's mandatory write-only HMAC signing secret. Every
+generic webhook signs the exact transmitted body
 bytes with HMAC-SHA256 using its encrypted target secret. Signing is mandatory, with
 no target-level disable switch or algorithm negotiation. The v1 wire sends
 `Idempotency-Key: <event-id>`, `X-Scry-Signature-Timestamp: <unix-seconds>`, and
@@ -299,7 +309,7 @@ Delivery begins only after the no-delivery first alerting slice is complete; non
 these phases is implied by browser rule CRUD or alert-state evaluation:
 
 1. generic public HTTPS JSON webhook with mandatory HMAC-SHA256;
-2. Slack incoming webhook formatting;
+2. Cross Notifier `/notify` and Slack incoming-webhook formatting;
 3. SMTP with TLS and stable Message-ID;
 4. PagerDuty/Opsgenie/Teams/Discord adapters after their acknowledgement,
    deduplication, and secret models are individually designed.

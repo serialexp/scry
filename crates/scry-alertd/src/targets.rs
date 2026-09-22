@@ -153,6 +153,7 @@ enum FormatDto {
 enum FormatId {
     GenericJson,
     SlackCompatible,
+    CrossNotifier,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
@@ -292,6 +293,7 @@ fn format_view(format: &TargetFormat) -> FormatDto {
             format_id: match format {
                 BuiltInTargetFormat::GenericJson => FormatId::GenericJson,
                 BuiltInTargetFormat::Slack => FormatId::SlackCompatible,
+                BuiltInTargetFormat::CrossNotifier => FormatId::CrossNotifier,
             },
         },
         TargetFormat::CustomJson { template } => FormatDto::CustomJson {
@@ -376,6 +378,7 @@ fn validate_write(
             format: match format_id {
                 FormatId::GenericJson => BuiltInTargetFormat::GenericJson,
                 FormatId::SlackCompatible => BuiltInTargetFormat::Slack,
+                FormatId::CrossNotifier => BuiltInTargetFormat::CrossNotifier,
             },
         },
         FormatDto::CustomJson { template } => TargetFormat::CustomJson {
@@ -842,11 +845,81 @@ async fn delete(
 }
 
 fn render(target: &NotificationTarget, event_id: &str) -> Result<Vec<u8>, ApiError> {
-    match &target.format {
-        TargetFormat::BuiltIn { format: BuiltInTargetFormat::GenericJson } => canonical_json(&serde_json::json!({"schema_version":1,"event_id":event_id,"transition":"test","monitor_name":"Notification target test","status":"firing","value":null,"scry_url":""})).map_err(|e| ApiError::BadRequest(e.to_string())),
-        TargetFormat::BuiltIn { format: BuiltInTargetFormat::Slack } => canonical_json(&serde_json::json!({"text":"Scry test notification: firing","blocks":[{"type":"section","text":{"type":"mrkdwn","text":"*Scry test notification* — firing"}}],"event_id":event_id})).map_err(|e| ApiError::BadRequest(e.to_string())),
-        TargetFormat::CustomJson { template } => template.render(TemplateValues { event_id, transition:"test", monitor_name:"Notification target test", status:"firing", value:"", scry_url:"" }).map_err(|e| ApiError::BadRequest(e.to_string())),
-    }
+    render_values(
+        &target.format,
+        TemplateValues {
+            event_id,
+            notification_id: event_id,
+            transition: "test",
+            monitor_name: "Notification target test",
+            status: "firing",
+            value: "",
+            scry_url: "",
+        },
+    )
+}
+
+fn render_values(format: &TargetFormat, values: TemplateValues<'_>) -> Result<Vec<u8>, ApiError> {
+    let value = match format {
+        TargetFormat::BuiltIn {
+            format: BuiltInTargetFormat::GenericJson,
+        } => serde_json::json!({
+            "schema_version": 1,
+            "event_id": values.event_id,
+            "transition": values.transition,
+            "monitor_name": values.monitor_name,
+            "status": values.status,
+            "value": if values.value.is_empty() { None } else { Some(values.value) },
+            "scry_url": values.scry_url,
+        }),
+        TargetFormat::BuiltIn {
+            format: BuiltInTargetFormat::Slack,
+        } => serde_json::json!({
+            "text": format!("Scry {}: {}", values.transition, values.monitor_name),
+            "blocks": [{
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": format!("*{}* — {}", values.monitor_name, values.status),
+                },
+            }],
+            "event_id": values.event_id,
+        }),
+        TargetFormat::BuiltIn {
+            format: BuiltInTargetFormat::CrossNotifier,
+        } => {
+            let resolved = values.transition.eq_ignore_ascii_case("resolved");
+            let mut message = if resolved {
+                "Alert resolved".to_owned()
+            } else {
+                format!("Alert status: {}", values.status)
+            };
+            if !values.value.is_empty() {
+                use std::fmt::Write;
+                write!(message, "\nValue: {}", values.value).expect("String write");
+            }
+            if !values.scry_url.is_empty() {
+                use std::fmt::Write;
+                write!(message, "\n{}", values.scry_url).expect("String write");
+            }
+            serde_json::json!({
+                "id": values.notification_id,
+                "source": "scry",
+                "title": values.monitor_name,
+                "message": message,
+                "status": if resolved { "success" } else { "error" },
+                "lifecycle": if resolved { "resolved" } else { "ongoing" },
+                "duration": if resolved { 0 } else { 5 },
+                "storeOnExpire": true,
+            })
+        }
+        TargetFormat::CustomJson { template } => {
+            return template
+                .render(values)
+                .map_err(|e| ApiError::BadRequest(e.to_string()))
+        }
+    };
+    canonical_json(&value).map_err(|e| ApiError::BadRequest(e.to_string()))
 }
 async fn checked_target(
     state: &AppState,
@@ -1635,6 +1708,63 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn cross_notifier_format_matches_its_notification_contract() {
+        let format = TargetFormat::BuiltIn {
+            format: BuiltInTargetFormat::CrossNotifier,
+        };
+        let firing: serde_json::Value = serde_json::from_slice(
+            &render_values(
+                &format,
+                TemplateValues {
+                    event_id: "delivery-1",
+                    notification_id: "monitor-1-group-default",
+                    transition: "firing",
+                    monitor_name: "API errors",
+                    status: "firing",
+                    value: "17",
+                    scry_url: "https://scry.example/alerts/monitor-1",
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            firing,
+            serde_json::json!({
+                "id": "monitor-1-group-default",
+                "source": "scry",
+                "title": "API errors",
+                "message": "Alert status: firing\nValue: 17\nhttps://scry.example/alerts/monitor-1",
+                "status": "error",
+                "lifecycle": "ongoing",
+                "duration": 5,
+                "storeOnExpire": true,
+            })
+        );
+
+        let resolved: serde_json::Value = serde_json::from_slice(
+            &render_values(
+                &format,
+                TemplateValues {
+                    event_id: "delivery-2",
+                    notification_id: "monitor-1-group-default",
+                    transition: "resolved",
+                    monitor_name: "API errors",
+                    status: "inactive",
+                    value: "",
+                    scry_url: "",
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(resolved["id"], "monitor-1-group-default");
+        assert_eq!(resolved["lifecycle"], "resolved");
+        assert_eq!(resolved["status"], "success");
+        assert_eq!(resolved["duration"], 0);
+    }
+
     #[test]
     fn hmac_covers_exact_body() {
         let a = sign(b"secret", 123, "event-1", b"{}");

@@ -188,8 +188,9 @@ real. Architecture is documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.m
   locked single-writer mode). The browser exposes shared-admin rule CRUD,
   validation, current Inactive/Pending/Firing/Recovering/NoData/Error state, and
   separate notification-target CRUD/preview/test-send administration via a
-  CSRF-protected direct webui-to-alertd proxy. Monitor-linked notification delivery
-  and retry processing are deferred.
+  CSRF-protected direct webui-to-alertd proxy. Built-in target payloads include Generic
+  JSON, Slack-compatible JSON, and Cross Notifier's `/notify` contract. Monitor-linked
+  notification delivery and retry processing are deferred.
 - **Error occurrence foundation.** Canonical logs producers emit raw-record v1;
   ingest uniformly redacts structured sensitive keys on every logs/traces path,
   stamps trusted receipt time before WAL, and stores raw-record v2 in logs Parquet/

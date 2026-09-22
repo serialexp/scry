@@ -1,6 +1,6 @@
 import { createStore, produce } from "solid-js/store";
 
-export type NotificationFormatId = "generic_json" | "slack_compatible";
+export type NotificationFormatId = "generic_json" | "slack_compatible" | "cross_notifier";
 
 export interface NotificationHeader {
   name: string;

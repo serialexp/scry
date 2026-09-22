@@ -25,6 +25,18 @@ function deferred<T>() {
 }
 
 describe("notification target form mapping", () => {
+  it("supports the Cross Notifier built-in format", () => {
+    const write = notificationTargetFromDraft({
+      ...EMPTY_NOTIFICATION_TARGET_DRAFT,
+      name: "Desktop alerts",
+      url: "https://notify.example.test/notify",
+      formatId: "cross_notifier",
+      secret: "signing-secret",
+    });
+    expect(write.format).toEqual({ type: "builtin", format_id: "cross_notifier" });
+    expect(draftFromNotificationTarget(target({ format: write.format })).formatId).toBe("cross_notifier");
+  });
+
   it("maps nested editable fields and write-only secret actions", () => {
     const write = notificationTargetFromDraft({
       ...EMPTY_NOTIFICATION_TARGET_DRAFT, name: " Ops ", url: "https://hooks.example.test/path", timeoutMs: "2500",

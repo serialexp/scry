@@ -53,6 +53,7 @@ impl std::fmt::Display for LogicalSecretId {
 pub enum BuiltInTargetFormat {
     GenericJson,
     Slack,
+    CrossNotifier,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
