@@ -3853,6 +3853,16 @@ The consequence is a narrower contract for future control-plane roles than for t
 existing data plane: "S3-compatible" alone is insufficient; the semantic probe is
 the authority. See `docs/design/conditional-object-storage.md`.
 
+**Follow-up (2026-09-25):** ETag compare-and-swap writes send the ETag without its
+surrounding double quotes. Hetzner Object Storage (Ceph RGW) compares a PutObject
+`If-Match` against the bare ETag literally, so the quoted form S3 returns, and
+`object_store` forwarded verbatim, was rejected with 412 even when current. That
+failed alertd's startup probe in production. Tested against Hetzner: an unquoted
+current ETag is accepted, an unquoted wrong ETag is still rejected, and
+conditional GETs accept either form. AWS S3 documents the unquoted form and the
+SeaweedFS compatibility test passes with it, so `update_options` normalizes for
+every backend rather than behind a per-provider switch.
+
 ## D-073: Error occurrences extend logs v2; control products use `_scry/`
 
 **Date:** 2026-09-07

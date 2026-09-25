@@ -21,11 +21,31 @@ pub fn create_options() -> PutOptions {
 }
 
 /// Options for an atomic compare-and-swap write.
-pub fn update_options(version: UpdateVersion) -> PutOptions {
+///
+/// The ETag is sent without its surrounding double quotes. S3 returns ETags
+/// quoted (`"abc…"`) and `object_store` forwards them verbatim as `If-Match`,
+/// but Hetzner Object Storage (Ceph RGW) compares a PutObject `If-Match`
+/// against the bare ETag literally: a quoted, *current* ETag is rejected with
+/// 412, while the unquoted form is accepted and a wrong unquoted ETag is still
+/// rejected. AWS S3 documents the unquoted form, so it is sent everywhere.
+/// Conditional GETs are unaffected and keep the ETag as returned.
+pub fn update_options(mut version: UpdateVersion) -> PutOptions {
+    if let Some(e_tag) = version.e_tag.as_mut() {
+        if let Some(bare) = unquote_etag(e_tag) {
+            *e_tag = bare.to_owned();
+        }
+    }
     PutOptions {
         mode: PutMode::Update(version),
         ..Default::default()
     }
+}
+
+/// The ETag inside one pair of surrounding double quotes, if it is quoted.
+fn unquote_etag(e_tag: &str) -> Option<&str> {
+    e_tag
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
 }
 
 /// Atomically create `location`, failing with [`Error::AlreadyExists`] if it
@@ -268,6 +288,41 @@ mod tests {
         assert_eq!(
             update_options(version.clone()).mode,
             PutMode::Update(version)
+        );
+    }
+
+    #[test]
+    fn update_options_send_unquoted_etag() {
+        let quoted = UpdateVersion {
+            e_tag: Some("\"b1946ac92492d2347c6235b4d2611184\"".into()),
+            version: Some("v1".into()),
+        };
+        assert_eq!(
+            update_options(quoted).mode,
+            PutMode::Update(UpdateVersion {
+                e_tag: Some("b1946ac92492d2347c6235b4d2611184".into()),
+                version: Some("v1".into()),
+            })
+        );
+        // Anything not wrapped in exactly one pair of quotes passes through.
+        for e_tag in ["\"", "\"abc", "abc\"", "W/\"abc\"", ""] {
+            let version = UpdateVersion {
+                e_tag: Some(e_tag.into()),
+                version: None,
+            };
+            assert_eq!(
+                update_options(version.clone()).mode,
+                PutMode::Update(version),
+                "{e_tag:?}"
+            );
+        }
+        let versionless = UpdateVersion {
+            e_tag: None,
+            version: Some("v1".into()),
+        };
+        assert_eq!(
+            update_options(versionless.clone()).mode,
+            PutMode::Update(versionless)
         );
     }
 
