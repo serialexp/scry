@@ -13,6 +13,29 @@
   lease-takeover, crash-after-send, secret replacement/clear, deletion replay, and cold
   projection rebuild fault-injection coverage before monitor-linked delivery ships.
 
+## Error monitoring follow-ups (found 2026-09-26)
+
+- Errors snapshots are whole-file: at one million occurrences `errors.sqlite` is
+  ~1.4 GiB, which the lease holder re-uploads (at most every
+  `--catalog-snapshot-interval`, only after a change) and every queryd re-downloads.
+  Needs a bounded/incremental or generation-aware snapshot design, plus the
+  still-open raw-occurrence retention decision (error-issues.md) so the database
+  stops growing without bound.
+- Grouping at many distinct issues is write-bound on random leaf pages of
+  `occurrence_issues_by_issue` (15k-30k rows/s at 10k uniformly hit issues vs
+  95k-118k at 50-100, `crates/errors/tests/scale.rs`). Options for a schema v6:
+  drop `deployment_id` from keys (one deployment per database), stop duplicating
+  `fingerprint_version`/`fingerprint_digest` per membership row, or make
+  `occurrence_issues` a rowid table so the issue-ordered index entry shrinks.
+  Measure before choosing.
+- A projection data object orphaned without its commit marker by an older
+  encoder, whose bytes differ from the current encoding, is quarantined every
+  cycle (the conditional create conflicts). Needs an explicit orphan-adoption or
+  GC path.
+- `fingerprint_from_decoded` still allocates the normalized message and the title
+  per occurrence; grouping could compute the title only for a page's first
+  occurrence of an issue. Measured at ~3% of grouping time, so low priority.
+
 ## Logs v2 follow-ups
 
 - Add a typed trace-v2 representation for general observability fidelity. The
@@ -197,6 +220,20 @@ work is tracked below.
 - [ ] Replay metrics/traces/profiles, not just logs (logs-only in v1).
 - [ ] Resumable checkpointing of the `search_after` cursor so an interrupted
       multi-TB run can resume instead of restarting from the oldest doc.
+
+## D-039 convergence polling (follow-ups, found 2026-09-26)
+- [ ] Prune poll cursors. `poll_cursors` keeps one row per `(signal, writer,
+      date)` ever seen and `poll_once` issues one LIST per row every poll
+      interval, so poll LIST volume grows with retained history (a 30-day,
+      8-writer, 4-signal deployment already lists ~1,000 prefixes every 5 s).
+      Candidates: drop cursors for dates older than the look-back plus a margin
+      (the full walk re-seeds a prefix that gains a late block), or drop them
+      with the partition's last block at retention.
+- [ ] `Catalog::reconcile_from_bucket` has no known-UUID filter and fetches
+      sidecars sequentially: every standalone `scry compact` / `scry retention` /
+      `scry list` / compactd startup reconcile pays one GET per block. Give it
+      the D-066 key-parse + `known_block_uuids` filter and bounded concurrency
+      the cluster full walk already has (or route those callers through it).
 
 ## D-055 catalog snapshot bootstrap (follow-ups, non-blocking)
 - [ ] Real `ALTER TABLE`-based catalog migration framework. Today

@@ -514,7 +514,17 @@ export async function fetchFleetStatus(
 
 // ── Issue list ──────────────────────────────────────────────────────
 
-/** A single error tracking issue as returned by the errors database. */
+/** Rows requested per issue-list or occurrence page. queryd applies the same
+ * default and caps any request at 1000 rows. */
+export const ISSUE_PAGE_LIMIT = 100;
+
+/** A single error tracking issue as returned by the errors database.
+ *
+ * `*_unix_nano` fields arrive as JSON numbers and parse into doubles, which
+ * keep about 256 ns of precision at current epoch values. They are only
+ * displayed and compared, never used as identities, so the loss is harmless.
+ * `grouping_quality`: 0 type + message, 1 type only, 2 fallback, 3 message
+ * only (fingerprint v2). */
 export interface Issue {
   issue_id: string;
   app_id: string;
@@ -532,7 +542,7 @@ export interface Issue {
 export async function fetchIssueList(
   transport: Transport,
   addr: string,
-  limit = 100,
+  limit = ISSUE_PAGE_LIMIT,
 ): Promise<Issue[]> {
   const value: IssueListRequestInput = { limit };
   const frameInput = {
@@ -546,18 +556,51 @@ export async function fetchIssueList(
     throw new Error(`expected IssueListResponse, got ${msg.type}`);
   }
 
-  return msg.value.issues_json.map((json) => {
-    const parsed = JSON.parse(json) as Issue;
-    if (
-      !parsed ||
-      typeof parsed.issue_id !== "string" ||
-      typeof parsed.title !== "string" ||
-      typeof parsed.occurrence_count !== "number"
-    ) {
-      throw new Error("queryd returned an invalid issue document");
-    }
-    return parsed;
-  });
+  return msg.value.issues_json.map(parseIssue);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+const ISSUE_STRING_FIELDS = ["issue_id", "app_id", "title"] as const;
+const ISSUE_NUMBER_FIELDS = [
+  "grouping_quality",
+  "first_seen_unix_nano",
+  "last_seen_unix_nano",
+  "occurrence_count",
+  "max_severity",
+  "fingerprint_version",
+] as const;
+
+/** Parse and validate one issue JSON document from queryd. */
+export function parseIssue(json: string): Issue {
+  const parsed: unknown = JSON.parse(json);
+  if (
+    !isRecord(parsed) ||
+    ISSUE_STRING_FIELDS.some((field) => typeof parsed[field] !== "string") ||
+    ISSUE_NUMBER_FIELDS.some((field) => typeof parsed[field] !== "number")
+  ) {
+    throw new Error("queryd returned an invalid issue document");
+  }
+  return parsed as unknown as Issue;
+}
+
+const optionalString = (value: unknown) => value === null || typeof value === "string";
+
+/** Parse and validate one occurrence JSON document from queryd. */
+export function parseOccurrence(json: string): OccurrenceSummary {
+  const parsed: unknown = JSON.parse(json);
+  if (
+    !isRecord(parsed) ||
+    typeof parsed.event_id !== "string" ||
+    typeof parsed.occurred_at_unix_nano !== "number" ||
+    !optionalString(parsed.trace_id) ||
+    !optionalString(parsed.span_id)
+  ) {
+    throw new Error("queryd returned an invalid occurrence document");
+  }
+  return parsed as unknown as OccurrenceSummary;
 }
 
 // ── Issue detail + occurrences ────────────────────────────────────
@@ -594,7 +637,7 @@ export async function fetchIssueOccurrences(
   transport: Transport,
   addr: string,
   issueId: string,
-  limit = 100,
+  limit = ISSUE_PAGE_LIMIT,
 ): Promise<IssueDetailResult> {
   const issueIdBytes = Array.from(uuidToBytes(issueId));
   const value: IssueOccurrencesRequestInput = {
@@ -612,11 +655,7 @@ export async function fetchIssueOccurrences(
     throw new Error(`expected IssueOccurrencesResponse, got ${msg.type}`);
   }
 
-  const issue = msg.value.issue_json
-    ? (JSON.parse(msg.value.issue_json) as Issue)
-    : null;
-  const occurrences = msg.value.occurrences_json.map(
-    (json) => JSON.parse(json) as OccurrenceSummary,
-  );
+  const issue = msg.value.issue_json ? parseIssue(msg.value.issue_json) : null;
+  const occurrences = msg.value.occurrences_json.map(parseOccurrence);
   return { issue, occurrences };
 }

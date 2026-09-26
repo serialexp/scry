@@ -184,8 +184,9 @@ real. Architecture is documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.m
 - **Scalar alert evaluation.** The separate `scry alert` role stores immutable
   monitor revisions and fenced state transitions in object storage, folds a local
   `alerts.sqlite`, schedules aligned ungrouped scalar SQL through ordinary queryd
-  admission, and coordinates per monitor through Valkey (or an explicit locally
-  locked single-writer mode). The browser exposes shared-admin rule CRUD,
+  admission after a lateness allowance (`--evaluation-delay`, default 90 s, above
+  ingest's 60 s block flush age), and coordinates per monitor through Valkey (or an
+  explicit locally locked single-writer mode). The browser exposes shared-admin rule CRUD,
   validation, current Inactive/Pending/Firing/Recovering/NoData/Error state, and
   separate notification-target CRUD/preview/test-send administration via a
   CSRF-protected direct webui-to-alertd proxy. Built-in target payloads include Generic
@@ -198,9 +199,16 @@ real. Architecture is documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.m
   `scry errors` role conditionally establishes deployment identity, extracts only
   eligible schema-3/raw-2 exception logs with strict producer IDs, publishes
   immutable metadata-last occurrence Parquet with conditional creates, and folds a
-  deployment-bound rebuildable `errors.sqlite`. This foundation is implemented but
-  not deployed; clustered Valkey orchestration, browser intake, grouping/issues/UI,
-  accepted-record hints, and error snapshots/GC remain ahead.
+  deployment-bound rebuildable `errors.sqlite`. Occurrences are grouped into issues
+  by a versioned type/message fingerprint (`fp-v2`) with a durable per-generation
+  cursor. In a cluster, the `scry ingest --mode full --errors-db` instance holding the Valkey
+  lease `lease/errors/project` does this work with fenced writes and publishes an
+  `errors.sqlite` snapshot; a new holder adopts it, and `scry query --errors-db`
+  refreshes and hot-swaps its copy (`--errors-refresh-interval`). The browser
+  `/errors` inbox and `/errors/:issueId` detail read issues over the query wire
+  (100 rows by default, clamped to 1000). This is implemented but not deployed;
+  browser intake, issue workflow, rich occurrence inspection, artifacts/
+  symbolication, accepted-record hints, and incremental snapshots/GC remain ahead.
 - **Bounded query and operations surfaces.** Queryd enforces a default one-hour
   look-back for otherwise unbounded requests, bounded DataFusion/cache budgets,
   result caching, label suggestions, and per-phase timing. Ingest/query/gateway
@@ -235,8 +243,8 @@ crates/
   valkey/              Valkey client: namespaced leases, block events, tail/status/deletion registries (scry-valkey)
   cluster/             multi-instance convergence + lease-guarded maintenance (scry-cluster)
   status/              shared local/Fleet status snapshots and HTTP dashboard (scry-status)
-  errors/              error occurrence identity, extraction, immutable projection, and SQLite fold (scry-errors)
-  scry-errorsd/        bounded `scry errors` manifest/reconciliation role; clustered mode remains fail-closed
+  errors/              error occurrence identity, extraction, immutable projection, SQLite fold, grouping, and snapshots (scry-errors)
+  scry-errorsd/        bounded single-writer `scry errors` manifest/reconciliation role; clustered processing runs in ingestd
   alert/               durable scalar monitor validation, state machine, object records, and SQLite projection (scry-alert)
   scry-alertd/         clustered/local `scry alert` scheduler and authenticated private control API
   resources/           shared bounded-resource accounting and admission helpers (scry-resources)
@@ -612,6 +620,23 @@ non-AWS services, explicit `SCRY_OBJSTORE_ACCESS_KEY_ID` and
 `SCRY_OBJSTORE_SECRET_ACCESS_KEY` remain available; temporary credentials may
 also set `SCRY_OBJSTORE_SESSION_TOKEN`.
 
+The object-store client's timeouts and retry budget are also configurable. Unset
+(or empty) variables keep the defaults shown, which are the `object_store`
+crate's own; every role that opens the bucket reads them.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SCRY_OBJSTORE_REQUEST_TIMEOUT_SECS` | `30` | Per-request timeout, from connect to the end of the response body. Raise it for slow links carrying large parts. Minimum 1. |
+| `SCRY_OBJSTORE_CONNECT_TIMEOUT_SECS` | `5` | TCP/TLS connect timeout. Minimum 1. |
+| `SCRY_OBJSTORE_MAX_RETRIES` | `10` | Retries of a failed request (5xx, 429, timeouts and connection errors); `0` disables retrying. |
+| `SCRY_OBJSTORE_RETRY_TIMEOUT_SECS` | `180` | Total time a request may spend retrying before its error is returned. Minimum 1. |
+
+Catalog snapshots (`_catalog/snapshot.sqlite`) are streamed in both directions:
+uploads use multipart parts of 8 MiB from the file on disk, and restores stream
+to a temporary file (refusing snapshots over 16 GiB), `fsync` it, and remove any
+stale SQLite `-wal`/`-shm`/`-journal` sidecars before moving it into place, so
+neither direction holds the catalog in memory.
+
 ### Object-storage bucket recommendations
 
 Scry treats the bucket as its source of truth and manages immutable blocks as
@@ -640,6 +665,12 @@ the bucket accordingly:
   multipart uploads after a few days is safe.
 - Grant the runtime identity least-privilege bucket listing and object
   get/put/delete access. With SSE-KMS, also grant the necessary KMS permissions.
+  Bucket listing (`s3:ListBucket`) is required even by roles that only read:
+  without it S3-compatible stores answer a GET or HEAD for a missing key with
+  403 instead of 404, so scry cannot tell a deleted block from a denied one.
+  Queries then fail on blocks a peer reaped instead of evicting them, and the
+  conditional-write probe fails closed. Scry logs these denials as errors naming
+  the missing permission.
 
 For AWS S3, use an HTTPS regional endpoint and virtual-hosted addressing, for
 example:
@@ -689,7 +720,11 @@ tail and status/Fleet surfaces. For **multi-instance** operation, configure the
 same `SCRY_VALKEY_URL`/namespace on every role and give each ingester a unique
 writer identity and WAL/PVC. `scry ingest --mode full` (the default) then uses
 Valkey leases for single-winner compaction/retention and pub/sub plus bucket
-polling for catalog convergence (D-038/D-039).
+polling for catalog convergence (D-038/D-039). The incremental poll
+(`--poll-interval`, default 5 s, on `scry ingest`, `scry query` and
+`scry compact`) re-lists `--poll-lookback-secs` (default 900) behind each
+cursor so blocks that commit out of UUID order are still found without waiting
+for the full walk (`--full-walk-interval`).
 
 ### The gateway
 

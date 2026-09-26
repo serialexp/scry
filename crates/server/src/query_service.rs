@@ -51,7 +51,7 @@ use futures::StreamExt;
 use object_store::{path::Path as ObjPath, ObjectMeta, ObjectStore, ObjectStoreExt};
 use scry_block::BlockMeta;
 use scry_catalog::{Catalog, CatalogEntry, TerminalResolution};
-use scry_errors::sqlite::ErrorsDb;
+use scry_errors::{handle::SharedErrorsDb, sqlite::MAX_ISSUE_PAGE_ROWS};
 use scry_objstore::{BufPool, PoolStats};
 use scry_proto::{
     constants::{
@@ -321,10 +321,10 @@ pub struct QueryService {
     /// server-level trait so this crate has no direct Valkey dependency. `None`
     /// deliberately means "fleet unavailable", not a one-instance fallback.
     fleet: Option<Arc<dyn crate::stats::FleetSource>>,
-    /// Read-only handle to the errors SQLite database for serving
-    /// `IssueListRequest`. `None` when `--errors-db` is not configured.
-    /// Wrapped in `Mutex` because `rusqlite::Connection` is `!Send`.
-    errors_db: Option<Mutex<ErrorsDb>>,
+    /// Swappable read handle to the errors SQLite database for serving issue
+    /// requests. `None` when `--errors-db` is not configured; configured but
+    /// empty until a database is installed. Queries run on the blocking pool.
+    errors_db: Option<SharedErrorsDb>,
     /// Identifier stamped into every `QueryStats` frame so a client can tell
     /// *which* daemon produced a breakdown. Empty unless the daemon sets one
     /// (`scry query` passes its ephemeral instance uuid — the same id it uses
@@ -482,9 +482,10 @@ impl QueryService {
         self
     }
 
-    /// Attach a read-only errors database for serving `IssueListRequest`.
-    pub fn with_errors_db(mut self, db: Option<ErrorsDb>) -> Self {
-        self.errors_db = db.map(Mutex::new);
+    /// Attach the errors database handle serving issue requests. The owner
+    /// (queryd's snapshot follower) may swap the connection at any time.
+    pub fn with_errors_db(mut self, db: Option<SharedErrorsDb>) -> Self {
+        self.errors_db = db;
         self
     }
 
@@ -1815,9 +1816,13 @@ impl QueryService {
         Ok(())
     }
 
-    /// `IssueListRequest` → one `IssueListResponse`. Reads from the local
-    /// errors SQLite database (opened read-only). Returns
-    /// `QUERY_ERR_ISSUES_UNAVAILABLE` when no `--errors-db` was configured.
+    /// `IssueListRequest` → one `IssueListResponse` with the active grouping
+    /// generation's issues, most recently seen first. `limit` 0 means
+    /// [`DEFAULT_ISSUE_PAGE_ROWS`]; larger limits are clamped to
+    /// [`MAX_ISSUE_PAGE_ROWS`]. Errors are terminal `StreamError`s:
+    /// `QUERY_ERR_ISSUES_UNAVAILABLE` without an errors database,
+    /// `QUERY_ERR_RESOURCES` for a response over the frame limit, and
+    /// `QUERY_ERR_INTERNAL` for query or serialization failures.
     async fn handle_issue_list<W>(
         &self,
         req: IssueListRequestOutput,
@@ -1827,54 +1832,18 @@ impl QueryService {
     where
         W: tokio::io::AsyncWrite + Unpin,
     {
-        let Some(db) = &self.errors_db else {
-            let _ = emit_stream_error(
-                wr,
-                QUERY_ERR_ISSUES_UNAVAILABLE,
-                "issues unavailable: queryd was not started with --errors-db",
-            )
-            .await;
-            let _ = wr.flush().await;
-            return Ok(());
+        let limit = issue_page_limit(req.limit);
+        let issues_json = match self
+            .read_issue_json(peer, move |db| Ok(json_strings(&db.list_issues(limit)?)))
+            .await
+        {
+            Ok(issues_json) => issues_json,
+            Err((code, message)) => return finish_issue_error(wr, code, message).await,
         };
-
-        let limit = if req.limit == 0 {
-            100
-        } else {
-            req.limit as usize
-        };
-
-        // Do all synchronous SQLite + serde work under the lock, then drop
-        // the guard before any async I/O.
-        let issues_json = {
-            let db = db.lock().unwrap();
-            match db.list_issues(limit) {
-                Ok(issues) => {
-                    let json: Vec<String> = issues
-                        .iter()
-                        .filter_map(|s| serde_json::to_string(s).ok())
-                        .collect();
-                    Ok(json)
-                }
-                Err(e) => Err(e),
-            }
-        };
-
-        let issues_json = match issues_json {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(%peer, error = %e, "list_issues failed");
-                let _ = emit_stream_error(
-                    wr,
-                    QUERY_ERR_INTERNAL,
-                    format!("errors database query failed: {e}"),
-                )
-                .await;
-                let _ = wr.flush().await;
-                return Ok(());
-            }
-        };
-
+        let payload = issue_payload_bytes(0, &issues_json);
+        if payload > MAX_FRAME_BYTES {
+            return finish_issue_error(wr, QUERY_ERR_RESOURCES, oversize_message(payload)).await;
+        }
         let frame = QueryFrame {
             msg: QueryFrameMsg::IssueListResponse(IssueListResponseInput { issues_json }.into()),
         };
@@ -1885,9 +1854,11 @@ impl QueryService {
         Ok(())
     }
 
-    /// `IssueOccurrencesRequest` → one `IssueOccurrencesResponse`. Returns the
-    /// issue summary and its most recent occurrences from the local errors
-    /// SQLite database.
+    /// `IssueOccurrencesRequest` → one `IssueOccurrencesResponse`: the issue
+    /// summary (empty string when unknown) and its most recent occurrences,
+    /// newest first with an event-ID tie-break. `limit` is defaulted and
+    /// clamped as for [`Self::handle_issue_list`]; errors map the same way,
+    /// plus `QUERY_ERR_BAD_REQUEST` for an issue ID that is not 16 bytes.
     async fn handle_issue_occurrences<W>(
         &self,
         req: IssueOccurrencesRequestOutput,
@@ -1897,74 +1868,33 @@ impl QueryService {
     where
         W: tokio::io::AsyncWrite + Unpin,
     {
-        let Some(db) = &self.errors_db else {
-            let _ = emit_stream_error(
+        let Ok(issue_id) = <[u8; 16]>::try_from(req.issue_id.as_slice()) else {
+            return finish_issue_error(
                 wr,
-                QUERY_ERR_ISSUES_UNAVAILABLE,
-                "issues unavailable: queryd was not started with --errors-db",
+                QUERY_ERR_BAD_REQUEST,
+                "issue_id must be exactly 16 bytes".to_owned(),
             )
             .await;
-            let _ = wr.flush().await;
-            return Ok(());
         };
-
-        let issue_id_bytes: [u8; 16] = match req.issue_id.try_into() {
-            Ok(arr) => arr,
-            Err(_) => {
-                let _ = emit_stream_error(
-                    wr,
-                    QUERY_ERR_BAD_REQUEST,
-                    "issue_id must be exactly 16 bytes",
-                )
-                .await;
-                let _ = wr.flush().await;
-                return Ok(());
-            }
+        let limit = issue_page_limit(req.limit);
+        let (issue_json, occurrences_json) = match self
+            .read_issue_json(peer, move |db| {
+                let issue = db
+                    .get_issue(&issue_id)?
+                    .map(|issue| serde_json::to_string(&issue))
+                    .transpose();
+                let occurrences = json_strings(&db.list_occurrences_for_issue(&issue_id, limit)?);
+                Ok(issue.and_then(|issue| Ok((issue.unwrap_or_default(), occurrences?))))
+            })
+            .await
+        {
+            Ok(response) => response,
+            Err((code, message)) => return finish_issue_error(wr, code, message).await,
         };
-
-        let limit = if req.limit == 0 {
-            100
-        } else {
-            req.limit as usize
-        };
-
-        // Do all synchronous SQLite + serde work under the lock, then drop
-        // the guard before any async I/O.
-        let result = {
-            let db = db.lock().unwrap();
-            let issue = db.get_issue(&issue_id_bytes);
-            let occurrences = db.list_occurrences_for_issue(&issue_id_bytes, limit);
-            match (issue, occurrences) {
-                (Ok(issue), Ok(occs)) => {
-                    let issue_json = issue
-                        .as_ref()
-                        .and_then(|i| serde_json::to_string(i).ok())
-                        .unwrap_or_default();
-                    let occurrences_json: Vec<String> = occs
-                        .iter()
-                        .filter_map(|o| serde_json::to_string(o).ok())
-                        .collect();
-                    Ok((issue_json, occurrences_json))
-                }
-                (Err(e), _) | (_, Err(e)) => Err(e),
-            }
-        };
-
-        let (issue_json, occurrences_json) = match result {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(%peer, error = %e, "issue_occurrences query failed");
-                let _ = emit_stream_error(
-                    wr,
-                    QUERY_ERR_INTERNAL,
-                    format!("errors database query failed: {e}"),
-                )
-                .await;
-                let _ = wr.flush().await;
-                return Ok(());
-            }
-        };
-
+        let payload = issue_payload_bytes(4 + issue_json.len(), &occurrences_json);
+        if payload > MAX_FRAME_BYTES {
+            return finish_issue_error(wr, QUERY_ERR_RESOURCES, oversize_message(payload)).await;
+        }
         let frame = QueryFrame {
             msg: QueryFrameMsg::IssueOccurrencesResponse(
                 IssueOccurrencesResponseInput {
@@ -1979,6 +1909,53 @@ impl QueryService {
         }
         let _ = wr.flush().await;
         Ok(())
+    }
+
+    /// Run one issue query (SQLite and JSON serialization) on the blocking
+    /// pool against the current errors database, mapping every failure to the
+    /// `StreamError` code and message the client receives.
+    async fn read_issue_json<T, F>(
+        &self,
+        peer: SocketAddr,
+        query: F,
+    ) -> std::result::Result<T, (u16, String)>
+    where
+        F: FnOnce(
+                &scry_errors::sqlite::ErrorsDb,
+            ) -> std::result::Result<
+                std::result::Result<T, serde_json::Error>,
+                scry_errors::sqlite::SqliteError,
+            > + Send
+            + 'static,
+        T: Send + 'static,
+    {
+        let Some(db) = self.errors_db.as_ref() else {
+            return Err((
+                QUERY_ERR_ISSUES_UNAVAILABLE,
+                "issues unavailable: queryd was not started with --errors-db".to_owned(),
+            ));
+        };
+        match db.read(query).await {
+            Ok(Some(Ok(value))) => Ok(value),
+            Ok(None) => Err((
+                QUERY_ERR_ISSUES_UNAVAILABLE,
+                "issues unavailable: no errors database has been installed yet".to_owned(),
+            )),
+            Ok(Some(Err(error))) => {
+                warn!(%peer, %error, "serializing issue response failed");
+                Err((
+                    QUERY_ERR_INTERNAL,
+                    format!("serializing issue response failed: {error}"),
+                ))
+            }
+            Err(error) => {
+                warn!(%peer, error = %format!("{error:#}"), "errors database query failed");
+                Err((
+                    QUERY_ERR_INTERNAL,
+                    format!("errors database query failed: {error:#}"),
+                ))
+            }
+        }
     }
 
     /// Resolve a metadata request's signal byte, emitting a `StreamError` +
@@ -3501,6 +3478,48 @@ where
         ),
     };
     write_frame(wr, &frame).await
+}
+
+/// Rows returned by an issue request whose `limit` is 0.
+const DEFAULT_ISSUE_PAGE_ROWS: usize = 100;
+
+/// The effective row limit of an issue request: 0 selects the default, and
+/// anything above [`MAX_ISSUE_PAGE_ROWS`] is clamped (the client pages).
+fn issue_page_limit(requested: u32) -> usize {
+    match requested {
+        0 => DEFAULT_ISSUE_PAGE_ROWS,
+        n => (n as usize).min(MAX_ISSUE_PAGE_ROWS),
+    }
+}
+
+fn json_strings<T: serde::Serialize>(
+    items: &[T],
+) -> std::result::Result<Vec<String>, serde_json::Error> {
+    items.iter().map(serde_json::to_string).collect()
+}
+
+/// Encoded payload size of an issue response: tag, `prefix_bytes` of
+/// fields before the array, then a u32-counted array of u32-prefixed strings.
+fn issue_payload_bytes(prefix_bytes: usize, strings: &[String]) -> usize {
+    strings
+        .iter()
+        .fold(1 + prefix_bytes + 4, |total, s| total + 4 + s.len())
+}
+
+fn oversize_message(payload: usize) -> String {
+    format!(
+        "issue response of {payload} bytes exceeds the {MAX_FRAME_BYTES}-byte frame limit; request fewer rows"
+    )
+}
+
+/// Send a terminal issue `StreamError` and flush.
+async fn finish_issue_error<W>(wr: &mut BufWriter<W>, code: u16, message: String) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let _ = emit_stream_error(wr, code, message).await;
+    let _ = wr.flush().await;
+    Ok(())
 }
 
 /// Walk the plan tree, merging every leaf node's `MetricsSet` into

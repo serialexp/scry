@@ -263,11 +263,76 @@ fn validate_row(row: &ProjectionRow<'_>, limits: ProjectionLimits) -> Result<(),
     Ok(())
 }
 
+/// Fixed `created_by` recorded in every occurrence projection footer.
+///
+/// Parquet's default is `parquet-rs version <crate version>`, which silently
+/// changes the bytes of an otherwise identical projection whenever the
+/// dependency is upgraded. Projection objects are published with conditional
+/// create at deterministic keys, so a byte drift would turn a retry after an
+/// upgrade into an immutable-object collision.
+pub const PROJECTION_CREATED_BY: &str = "scry-errors occurrence-projection v1";
+
+/// Writer properties for occurrence projections, pinned explicitly.
+///
+/// Every setting that influences the encoded bytes is spelled out rather than
+/// inherited from parquet defaults, which may change between releases (the
+/// same approach as `scry_block::BlockBuilderConfig::main_writer_props`). The
+/// choices favour byte stability over size:
+///
+/// * no compression — compressor output is not guaranteed stable across codec
+///   library versions;
+/// * dictionary encoding off and one explicit `PLAIN` encoding, so encoder
+///   heuristics cannot choose a different layout;
+/// * chunk-level statistics only, no page-header statistics, no bloom filters;
+/// * the row group, page, and batch limits are fixed, and one row group holds the
+///   whole bounded batch (`ProjectionLimits::max_rows` is far below the limit).
+///
+/// Readers never re-encode: a commit marker authenticates the exact stored bytes
+/// by SHA-256, so projections published before these properties were pinned
+/// remain valid and are folded unchanged. The reconciler also folds an existing
+/// commit instead of re-encoding a source whose projection is already published
+/// (see `engine::process_block`), so a future encoder difference cannot collide
+/// with an object that already exists.
+pub fn projection_writer_props() -> WriterProperties {
+    WriterProperties::builder()
+        .set_created_by(PROJECTION_CREATED_BY.to_owned())
+        .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_1_0)
+        .set_compression(parquet::basic::Compression::UNCOMPRESSED)
+        .set_dictionary_enabled(false)
+        .set_encoding(parquet::basic::Encoding::PLAIN)
+        .set_statistics_enabled(parquet::file::properties::EnabledStatistics::Chunk)
+        .set_write_page_header_statistics(false)
+        .set_bloom_filter_enabled(false)
+        .set_offset_index_disabled(false)
+        .set_column_index_truncate_length(Some(64))
+        .set_statistics_truncate_length(Some(64))
+        .set_max_row_group_row_count(Some(1024 * 1024))
+        .set_max_row_group_bytes(None)
+        .set_data_page_size_limit(1024 * 1024)
+        .set_data_page_row_count_limit(20_000)
+        .set_write_batch_size(1024)
+        .set_coerce_types(false)
+        .set_content_defined_chunking(None)
+        .set_key_value_metadata(None)
+        .set_sorting_columns(None)
+        .build()
+}
+
 /// Encodes rows in source-location order. Input order therefore cannot affect the
 /// projection, and one bounded batch prevents unbounded Arrow writer state.
 pub fn encode_occurrences(
     rows: &[ProjectionRow<'_>],
     limits: ProjectionLimits,
+) -> Result<Bytes, ProjectionError> {
+    encode_occurrences_with(rows, limits, projection_writer_props())
+}
+
+/// [`encode_occurrences`] with explicit writer properties, so tests can produce
+/// projections as an older encoder would have written them.
+pub(crate) fn encode_occurrences_with(
+    rows: &[ProjectionRow<'_>],
+    limits: ProjectionLimits,
+    properties: WriterProperties,
 ) -> Result<Bytes, ProjectionError> {
     if rows.len() > limits.max_rows {
         return Err(ProjectionError::RowLimit {
@@ -281,7 +346,6 @@ pub fn encode_occurrences(
     let batch = occurrence_batch(&sorted, limits)?;
     let mut output = Vec::new();
     {
-        let properties = WriterProperties::builder().build();
         let mut writer = ArrowWriter::try_new(&mut output, occurrence_schema(), Some(properties))
             .map_err(|error| ProjectionError::Parquet(error.to_string()))?;
         writer
@@ -848,6 +912,31 @@ mod tests {
         let reverse = encode_occurrences(&[b.as_row(), a.as_row()], limits).unwrap();
         assert_eq!(forward, reverse);
         assert_eq!(decode_occurrences(forward, limits).unwrap(), vec![b, a]);
+    }
+
+    #[test]
+    fn projection_bytes_pin_writer_identity_and_decode_legacy_encodings() {
+        let rows = [fixture(1), fixture(2)];
+        let borrowed: Vec<_> = rows.iter().map(OwnedProjectionRow::as_row).collect();
+        let limits = ProjectionLimits::default();
+        let pinned = encode_occurrences(&borrowed, limits).unwrap();
+        assert_eq!(pinned, encode_occurrences(&borrowed, limits).unwrap());
+        let reader = ParquetRecordBatchReaderBuilder::try_new(pinned.clone()).unwrap();
+        assert_eq!(
+            reader.metadata().file_metadata().created_by(),
+            Some(PROJECTION_CREATED_BY)
+        );
+        // Objects published before the properties were pinned used parquet
+        // defaults (version-stamped `created_by`, dictionary pages). They decode
+        // to the same rows, which is what keeps them valid.
+        let legacy =
+            encode_occurrences_with(&borrowed, limits, WriterProperties::builder().build())
+                .unwrap();
+        assert_ne!(legacy, pinned);
+        assert_eq!(
+            decode_occurrences(legacy, limits).unwrap(),
+            decode_occurrences(pinned, limits).unwrap()
+        );
     }
 
     #[test]

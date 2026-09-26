@@ -14,6 +14,7 @@
 //!   scry-ingestd --listen 127.0.0.1:4000 --storage --wal-dir ./wal
 
 mod agent_status;
+mod errors_worker;
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
@@ -185,6 +186,13 @@ pub struct Args {
     #[arg(long, default_value_t = 5)]
     poll_interval: u64,
 
+    /// Seconds of look-back the incremental poll re-lists before each
+    /// cursor. A block that commits later than this after its UUIDv7 time
+    /// (a slow upload, a long compaction) is found by its pub/sub event or
+    /// the full walk instead.
+    #[arg(long, default_value_t = scry_cluster::DEFAULT_POLL_LOOKBACK.as_secs())]
+    poll_lookback_secs: u64,
+
     /// Seconds between exhaustive full-walk reconciles (the ultimate
     /// convergence backstop; discovers brand-new prefixes).
     #[arg(long, default_value_t = 1800)]
@@ -302,9 +310,16 @@ pub struct Args {
 
     // ── Error processing (D-074) ─────────────────────────────────
     /// Path to the errors projection database. Enables error processing
-    /// (occurrence extraction, fingerprinting, issue grouping) as a
-    /// periodic maintenance task in `full` mode. The projection is
-    /// snapshotted to S3 alongside the catalog so queryd can restore it.
+    /// (occurrence extraction, fingerprinting, issue grouping) in `full`
+    /// mode, run by the one ingester holding the `lease/errors/project`
+    /// lease (Valkey, or the local lease with
+    /// `--allow-unfenced-maintenance`). The holder uploads the errors
+    /// snapshot at most every `--catalog-snapshot-interval`, and only after
+    /// a pass changed occurrence or issue state; an instance that
+    /// acquires the lease first adopts that snapshot when it is more
+    /// complete than its local database (or the database is missing).
+    /// Requires an object store with conditional writes; without them error
+    /// processing stays disabled while ingest continues.
     #[arg(long)]
     errors_db: Option<PathBuf>,
 
@@ -447,9 +462,9 @@ pub async fn run(args: Args) -> Result<()> {
             None
         }
     };
-    // The pub/sub event sink, injected into every ingest pipeline so each
-    // uploaded block is announced to peers. `None` (single-instance) makes
-    // `with_event_sink` a no-op.
+    // The pub/sub event sink, injected into every ingest pipeline at open so
+    // each uploaded block — WAL-recovery blocks included — is announced to
+    // peers. `None` (single-instance) announces nothing.
     let (event_sink, sink_task): (Option<Arc<dyn BlockEventSink>>, _) = match valkey.as_ref() {
         Some(c) => {
             let (sink, task) = ValkeySink::spawn(c.clone(), writer_uuid);
@@ -594,8 +609,9 @@ pub async fn run(args: Args) -> Result<()> {
             // Each signal becomes INGEST_SHARDS independent pipelines, one
             // WAL subtree per shard, all sharing store/catalog/sem and the
             // per-signal upload-stats gauge (so the endpoint aggregates
-            // across shards). When a Valkey sink is configured it's attached
-            // to every shard so each uploaded block is announced to peers.
+            // across shards). When a Valkey sink is configured every shard
+            // gets it at open, so each uploaded block — including the WAL
+            // recovery blocks uploaded during open — is announced to peers.
             let dummy = ShardedPipeline::open_with_config(
                 INGEST_SHARDS,
                 wal_dir.clone(),
@@ -607,6 +623,7 @@ pub async fn run(args: Args) -> Result<()> {
                 upload_sem.clone(),
                 stats_metrics.as_ref().map(|m| m.dummy_upload()),
                 adaptive_compression,
+                event_sink.clone(),
             )
             .await?;
             let metrics = ShardedPipeline::open_with_config(
@@ -620,6 +637,7 @@ pub async fn run(args: Args) -> Result<()> {
                 upload_sem.clone(),
                 stats_metrics.as_ref().map(|m| m.metrics_upload()),
                 adaptive_compression,
+                event_sink.clone(),
             )
             .await?;
             let logs = ShardedPipeline::open_with_config(
@@ -633,6 +651,7 @@ pub async fn run(args: Args) -> Result<()> {
                 upload_sem.clone(),
                 stats_metrics.as_ref().map(|m| m.logs_upload()),
                 adaptive_compression,
+                event_sink.clone(),
             )
             .await?;
             let traces = ShardedPipeline::open_with_config(
@@ -646,6 +665,7 @@ pub async fn run(args: Args) -> Result<()> {
                 upload_sem.clone(),
                 stats_metrics.as_ref().map(|m| m.traces_upload()),
                 adaptive_compression,
+                event_sink.clone(),
             )
             .await?;
             let profiles = ShardedPipeline::open_with_config(
@@ -659,19 +679,9 @@ pub async fn run(args: Args) -> Result<()> {
                 upload_sem.clone(),
                 stats_metrics.as_ref().map(|m| m.profiles_upload()),
                 adaptive_compression,
+                event_sink.clone(),
             )
             .await?;
-            // Attach the pub/sub event sink to every shard (no-op when None).
-            let (dummy, metrics, logs, traces, profiles) = match event_sink.as_ref() {
-                Some(s) => (
-                    dummy.with_event_sink(s.clone()).await,
-                    metrics.with_event_sink(s.clone()).await,
-                    logs.with_event_sink(s.clone()).await,
-                    traces.with_event_sink(s.clone()).await,
-                    profiles.with_event_sink(s.clone()).await,
-                ),
-                None => (dummy, metrics, logs, traces, profiles),
-            };
             (
                 Some(dummy),
                 Some(metrics),
@@ -813,33 +823,8 @@ pub async fn run(args: Args) -> Result<()> {
             }));
         }
 
-        // 0a. errors.sqlite snapshot producer — same pattern as catalog snapshot.
-        // Gated on --errors-db being set (and not --no-errors).
-        if let Some(ref errors_db_path) = args.errors_db {
-            if !args.no_errors && !args.catalog_snapshot_interval.is_zero() {
-                let store = store.clone();
-                let path = errors_db_path.clone();
-                let interval = args.catalog_snapshot_interval;
-                info!(
-                    interval_secs = interval.as_secs(),
-                    "errors snapshot producer enabled"
-                );
-                bg_tasks.push(tokio::spawn(async move {
-                    let mut tick = tokio::time::interval(interval);
-                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                    tick.tick().await;
-                    loop {
-                        tick.tick().await;
-                        match scry_errors::snapshot::save_errors_snapshot(&path, store.as_ref())
-                            .await
-                        {
-                            Ok(r) => info!(bytes = r.bytes, "errors snapshot uploaded"),
-                            Err(e) => warn!(error = %e, "errors snapshot failed"),
-                        }
-                    }
-                }));
-            }
-        }
+        // (The errors snapshot is uploaded by the lease-holding errors worker
+        // spawned with the maintenance loop below, never by every ingester.)
 
         // 0b. catalog gauge: sample block count + per-level split on a timer so
         // the status page can report which way the catalog is *moving*, not
@@ -878,12 +863,13 @@ pub async fn run(args: Args) -> Result<()> {
             let bucket = bucket.clone();
             let cat = catalog.clone();
             let interval = Duration::from_secs(args.poll_interval.max(1));
+            let lookback = Duration::from_secs(args.poll_lookback_secs);
             bg_tasks.push(tokio::spawn(async move {
                 let mut tick = tokio::time::interval(interval);
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     tick.tick().await;
-                    match poll_once(store.as_ref(), cat.as_ref(), &bucket).await {
+                    match poll_once(store.as_ref(), cat.as_ref(), &bucket, lookback).await {
                         Ok(r) if r.inserted > 0 => info!(
                             inserted = r.inserted,
                             cursors = r.cursors,
@@ -1026,43 +1012,22 @@ pub async fn run(args: Args) -> Result<()> {
             let compact_interval = Duration::from_secs(args.compact_interval.max(1));
             let retention_interval = Duration::from_secs(args.retention_interval.max(1));
 
-            // Error processing config: resolve the deployment manifest from S3
-            // and build a ReconcileConfig. Errors are an optional maintenance
-            // task — failures here are non-fatal to the rest of maintenance.
-            let errors_config = if let Some(ref errors_db_path) = args.errors_db {
-                if !args.no_errors {
-                    match scry_errors::manifest::ensure_deployment_manifest(store.as_ref(), None)
-                        .await
-                    {
-                        Ok(manifest) => {
-                            let deployment_id = scry_errors::DeploymentId::parse(
-                                &manifest.deployment_id,
-                                "deployment_id",
-                            )
-                            .context("parsing deployment ID from manifest")?;
-                            info!(
-                                deployment_id = %manifest.deployment_id,
-                                errors_db = %errors_db_path.display(),
-                                interval_secs = args.errors_interval,
-                                "error processing enabled in maintenance loop"
-                            );
-                            Some((
-                                errors_db_path.clone(),
-                                deployment_id,
-                                scry_errors::engine::ReconcileConfig::default(),
-                                Duration::from_secs(args.errors_interval.max(1)),
-                            ))
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "deployment manifest unavailable; error processing disabled");
-                            None
-                        }
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
+            // Error processing (D-074): its own lease-guarded task beside the
+            // maintenance loop, under the same lease provider. Readiness
+            // (capability probe + deployment manifest) is resolved inside the
+            // worker and fails closed without affecting ingest or maintenance.
+            let errors_worker_config = match args.errors_db.as_ref() {
+                Some(errors_db) if !args.no_errors => Some(errors_worker::ErrorsWorkerConfig {
+                    errors_db: errors_db.clone(),
+                    catalog_path: catalog_path.clone(),
+                    bucket: bucket.clone(),
+                    reconcile: scry_errors::engine::ReconcileConfig::default(),
+                    interval: Duration::from_secs(args.errors_interval.max(1)),
+                    snapshot_interval: args.catalog_snapshot_interval,
+                    lease_ttl,
+                    max_snapshot_bytes: scry_errors::snapshot::DEFAULT_MAX_SNAPSHOT_BYTES,
+                }),
+                _ => None,
             };
 
             match valkey.as_ref() {
@@ -1071,11 +1036,16 @@ pub async fn run(args: Args) -> Result<()> {
                         metrics.configure_compaction(true, compact_cfg.grace);
                     }
                     let provider = ValkeyLeaseProvider::new(c.clone());
+                    if let Some(config) = errors_worker_config {
+                        bg_tasks.push(tokio::spawn(
+                            errors_worker::ErrorsWorker::new(provider.clone(), store.clone(), config)
+                                .run(),
+                        ));
+                    }
                     bg_tasks.push(tokio::spawn(run_maintenance_loop(
                         provider,
                         store,
                         bucket,
-                        catalog_path.clone(),
                         catalog,
                         compact_cfg,
                         block_cfg,
@@ -1086,7 +1056,6 @@ pub async fn run(args: Args) -> Result<()> {
                         compact_interval,
                         retention_interval,
                         lease_ttl,
-                        errors_config.clone(),
                     )));
                 }
                 None if args.allow_unfenced_maintenance => {
@@ -1095,11 +1064,16 @@ pub async fn run(args: Args) -> Result<()> {
                     }
                     warn!("--allow-unfenced-maintenance: running maintenance under a local single-process lease; UNSAFE with >1 instance on one bucket");
                     let provider = LocalLeaseProvider::new();
+                    if let Some(config) = errors_worker_config {
+                        bg_tasks.push(tokio::spawn(
+                            errors_worker::ErrorsWorker::new(provider.clone(), store.clone(), config)
+                                .run(),
+                        ));
+                    }
                     bg_tasks.push(tokio::spawn(run_maintenance_loop(
                         provider,
                         store,
                         bucket,
-                        catalog_path.clone(),
                         catalog,
                         compact_cfg,
                         block_cfg,
@@ -1110,11 +1084,10 @@ pub async fn run(args: Args) -> Result<()> {
                         compact_interval,
                         retention_interval,
                         lease_ttl,
-                        errors_config,
                     )));
                 }
                 None => info!(
-                    "no Valkey lease and no --allow-unfenced-maintenance: maintenance paused (convergence still runs via polling)"
+                    "no Valkey lease and no --allow-unfenced-maintenance: maintenance and error processing paused (convergence still runs via polling)"
                 ),
             }
         }
@@ -1260,11 +1233,6 @@ fn record_retention_metrics(
     );
 }
 
-/// The lease-guarded maintenance loop: fire a compaction pass on
-/// `compact_interval` and (if any TTL is configured) a retention pass on
-/// `retention_interval`. Generic over the lease provider so the Valkey
-/// provider and the single-process `LocalLeaseProvider` share one body.
-#[allow(clippy::too_many_arguments)]
 fn update_compaction_resource_stats(stats: &CompactionResourceStats, resources: &CompactResources) {
     let cfg = resources.config();
     let telemetry = resources.telemetry();
@@ -1287,19 +1255,16 @@ fn update_compaction_resource_stats(stats: &CompactionResourceStats, resources: 
     );
 }
 
-/// Errors maintenance config: deployment ID, reconcile config, errors.sqlite path, interval.
-type ErrorsMaintenanceConfig = (
-    PathBuf,
-    scry_errors::DeploymentId,
-    scry_errors::engine::ReconcileConfig,
-    Duration,
-);
-
+/// The lease-guarded maintenance loop: fire a compaction pass on
+/// `compact_interval` and (if any TTL is configured) a retention pass on
+/// `retention_interval`. Generic over the lease provider so the Valkey
+/// provider and the single-process `LocalLeaseProvider` share one body.
+/// Error processing runs in its own task (`errors_worker`).
+#[allow(clippy::too_many_arguments)]
 async fn run_maintenance_loop<L: LeaseProvider>(
     provider: L,
     store: Arc<dyn ObjectStore>,
     bucket: String,
-    catalog_path: PathBuf,
     catalog: Arc<std::sync::Mutex<Catalog>>,
     compact_cfg: CompactConfig,
     block_cfg: BlockBuilderConfig,
@@ -1310,7 +1275,6 @@ async fn run_maintenance_loop<L: LeaseProvider>(
     compact_interval: Duration,
     retention_interval: Duration,
     lease_ttl: Duration,
-    errors_config: Option<ErrorsMaintenanceConfig>,
 ) {
     let noop = NoopSink;
     let compaction_progress = metrics
@@ -1322,18 +1286,8 @@ async fn run_maintenance_loop<L: LeaseProvider>(
     let mut retention_tick = tokio::time::interval(retention_interval);
     retention_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    // Errors processing ticker — only armed when errors_config is present.
-    let errors_active = errors_config.is_some();
-    let errors_interval = errors_config
-        .as_ref()
-        .map(|(_, _, _, i)| *i)
-        .unwrap_or(Duration::from_secs(30));
-    let mut errors_tick = tokio::time::interval(errors_interval);
-    errors_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
     info!(
         retention_active,
-        errors_active,
         apply = retention_cfg.apply,
         "maintenance loop started"
     );
@@ -1426,38 +1380,6 @@ async fn run_maintenance_loop<L: LeaseProvider>(
                         record_retention_metrics(metrics.as_deref(), &r, started.elapsed());
                     }
                     Err(e) => warn!(error = %e, "retention pass failed"),
-                }
-            }
-            _ = errors_tick.tick(), if errors_active => {
-                // Safety: errors_active is true only when errors_config is Some.
-                let (errors_db_path, deployment_id, reconcile_config, _) =
-                    errors_config.as_ref().unwrap();
-                match scry_errors::engine::reconcile_once(
-                    scry_errors::engine::CatalogMode::Converged {
-                        catalog_path: &catalog_path,
-                        bucket: &bucket,
-                    },
-                    store.clone(),
-                    errors_db_path,
-                    *deployment_id,
-                    reconcile_config,
-                ).await {
-                    Ok(r) => {
-                        if r.processed_blocks > 0
-                            || r.grouping.occurrences_grouped > 0
-                            || r.grouping.issues_created > 0
-                        {
-                            info!(
-                                blocks = r.processed_blocks,
-                                occurrences = r.fold.inserted,
-                                grouped = r.grouping.occurrences_grouped,
-                                issues_created = r.grouping.issues_created,
-                                issues_updated = r.grouping.issues_updated,
-                                "errors pass completed"
-                            );
-                        }
-                    }
-                    Err(e) => warn!(error = %e, "errors pass failed"),
                 }
             }
         }

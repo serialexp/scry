@@ -2,43 +2,29 @@
 //! normal query protocol. Shows grouped error issues with occurrence counts,
 //! severity, and timing.
 
-import { For, Match, Show, Switch, onCleanup, onMount, type Component } from "solid-js";
-import { useNavigate } from "@solidjs/router";
 import {
-  issueListStatus,
-  issues,
-  issueListError,
-  issueListUpdatedAt,
-  refreshIssues,
-} from "../store";
-import type { Issue } from "../protocol/client";
+  For,
+  Match,
+  Show,
+  Switch,
+  createEffect,
+  on,
+  onCleanup,
+  onMount,
+  type Component,
+} from "solid-js";
+import { A, useNavigate } from "@solidjs/router";
+import { issueStore } from "../store";
+import {
+  formatIssueAge as formatAge,
+  formatIssueTime as formatTime,
+  pollWhileVisible,
+  qualityLabel,
+} from "../issueStore";
+import { ISSUE_PAGE_LIMIT, type Issue } from "../protocol/client";
 import { severity } from "../severity";
 
 const POLL_MS = 10_000;
-
-const QUALITY_LABELS: Record<number, string> = {
-  0: "Type + Message",
-  1: "Type Only",
-  2: "Fallback",
-};
-
-function qualityLabel(q: number): string {
-  return QUALITY_LABELS[q] ?? `Q${q}`;
-}
-
-function formatTime(nanos: number): string {
-  const ms = nanos / 1_000_000;
-  return new Date(ms).toLocaleString();
-}
-
-function formatAge(nanos: number): string {
-  const ms = nanos / 1_000_000;
-  const ago = Date.now() - ms;
-  if (ago < 60_000) return "just now";
-  if (ago < 3_600_000) return `${Math.floor(ago / 60_000)}m ago`;
-  if (ago < 86_400_000) return `${Math.floor(ago / 3_600_000)}h ago`;
-  return `${Math.floor(ago / 86_400_000)}d ago`;
-}
 
 const IssueRow: Component<{ issue: Issue }> = (props) => {
   const sev = () => severity(props.issue.max_severity);
@@ -51,7 +37,15 @@ const IssueRow: Component<{ issue: Issue }> = (props) => {
       onClick={() => navigate(`/errors/${props.issue.issue_id}`)}
     >
       <td class="issue-title" title={props.issue.issue_id}>
-        {props.issue.title}
+        {/* The link makes each issue reachable by keyboard; the row click is a
+            pointer convenience. */}
+        <A
+          href={`/errors/${props.issue.issue_id}`}
+          class="issue-title-link"
+          onClick={(event) => event.stopPropagation()}
+        >
+          {props.issue.title}
+        </A>
       </td>
       <td class="issue-count">{props.issue.occurrence_count}</td>
       <td>
@@ -69,11 +63,17 @@ const IssueRow: Component<{ issue: Issue }> = (props) => {
 };
 
 const Errors: Component = () => {
+  const state = issueStore.state;
+
   onMount(() => {
-    void refreshIssues();
-    const timer = window.setInterval(() => void refreshIssues(), POLL_MS);
-    onCleanup(() => window.clearInterval(timer));
+    const stop = pollWhileVisible(issueStore.refreshList, POLL_MS);
+    onCleanup(stop);
   });
+  // A target switch clears the old target's rows; reload without waiting for
+  // the next poll.
+  createEffect(
+    on(issueStore.destination, () => void issueStore.refreshList(), { defer: true }),
+  );
 
   return (
     <main class="errors-view">
@@ -83,36 +83,39 @@ const Errors: Component = () => {
           <p>Grouped error issues from the errors database.</p>
         </div>
         <div class="fleet-toolbar-actions">
-          <Show when={issueListUpdatedAt()}>
+          <Show when={state.listUpdatedAt}>
             {(updated) => <span>Updated {new Date(updated()).toLocaleTimeString()}</span>}
           </Show>
           <button
             type="button"
-            onClick={() => void refreshIssues()}
-            disabled={issueListStatus() === "loading"}
+            onClick={() => void issueStore.refreshList()}
+            disabled={state.listStatus === "loading"}
           >
-            {issueListStatus() === "loading" ? "Refreshing..." : "Refresh"}
+            {state.listStatus === "loading" ? "Refreshing..." : "Refresh"}
           </button>
         </div>
       </header>
 
-      <Show when={issueListError()}>
+      <Show when={state.listError}>
         {(error) => <div class="fleet-error">{error()}</div>}
       </Show>
 
       <Switch>
-        <Match when={issueListStatus() === "loading" && issues().length === 0}>
+        <Match when={state.listStatus === "loading" && state.issues.length === 0}>
           <div class="fleet-empty">Loading issues...</div>
         </Match>
-        <Match when={issueListStatus() === "error" && issues().length === 0}>
-          <div class="fleet-empty">
-            Issue list is unavailable. Ensure queryd is started with --errors-db.
-          </div>
+        <Match when={state.listStatus === "error" && state.issues.length === 0}>
+          <div class="fleet-empty">The issue list is unavailable.</div>
         </Match>
-        <Match when={issues().length === 0}>
+        <Match when={state.issues.length === 0}>
           <div class="fleet-empty">No issues have been recorded yet.</div>
         </Match>
         <Match when={true}>
+          <Show when={state.issues.length >= ISSUE_PAGE_LIMIT}>
+            <p class="issue-page-note">
+              Showing the {state.issues.length} most recently seen issues.
+            </p>
+          </Show>
           <table class="issue-table">
             <thead>
               <tr>
@@ -125,7 +128,7 @@ const Errors: Component = () => {
               </tr>
             </thead>
             <tbody>
-              <For each={issues()}>{(issue) => <IssueRow issue={issue} />}</For>
+              <For each={state.issues}>{(issue) => <IssueRow issue={issue} />}</For>
             </tbody>
           </table>
         </Match>

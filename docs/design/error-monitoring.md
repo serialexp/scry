@@ -2,19 +2,20 @@
 
 Status: partial — occurrence/basic-issue foundation, scalar alert evaluation, and notification-target administration implemented; monitor delivery and issue workflow outstanding
 Owner: Bart
-Last updated: 2026-09-22
+Last updated: 2026-09-26
 
 ## Implementation status
 
 Tracking the gap between this design suite and the implementation tree. D-073
 accepts logs v2 and the `_scry/<subsystem>/` namespace. D-074's identity,
 pre-WAL scrubbing, server receipt stamping, occurrence projection, rebuildable
-`errors.sqlite`, periodic single-writer `scry errors`, and version-checked snapshot
-bootstrap are implemented. Basic fingerprint v1 grouping (OCC1 decoder, generic-token
-message normalization, digest, and quality levels), deterministic issue identity,
-issue/occurrence_issues SQLite tables with grouping reconciliation, and read-only
-issue list/basic detail visibility through the query wire protocol and browser
-`/errors` routes have landed. D-076's first ungrouped scalar alerting slice adds
+`errors.sqlite`, periodic single-writer `scry errors`, lease-guarded clustered
+processing in `scry ingestd`, and version-checked snapshot publication, adoption,
+and queryd refresh are implemented. Basic fingerprint v2 grouping (OCC1 decoder,
+typed-token message normalization, digest, and quality levels), deterministic issue
+identity, cursor-driven grouping into issue/occurrence_issues SQLite tables, and
+read-only issue list/basic detail visibility through the query wire protocol and
+browser `/errors` routes have landed. D-076's first ungrouped scalar alerting slice adds
 separate alert crates/role, clustered leases, durable state, private/browser CRUD,
 and `/alerts` state visibility. D-077/D-078 notification-target administration,
 encrypted secrets, preview, and durable test-send are also implemented, without
@@ -65,6 +66,24 @@ monitor types, and browser SDK remain outstanding.
   inspector or workflow surface.
 - [x] **Errors snapshot bootstrap.** A version-checked `errors.sqlite` snapshot can
   be saved, uploaded periodically by ingestd, and restored by queryd on cold start.
+- [x] **Clustered occurrence orchestration (2026-09-26).** `scry ingestd`
+  processes errors under the Valkey lease `lease/errors/project` (or the local
+  lease with `--allow-unfenced-maintenance`), after a conditional-write probe that
+  fails the errors worker closed while ingest continues. Publication and every
+  SQLite commit are fenced. Only the holder uploads the snapshot, only after a
+  state change; a new holder adopts a more complete bucket snapshot; queryd
+  refreshes and hot-swaps its copy (`--errors-refresh-interval`). All SQLite and
+  Parquet work runs off the async runtime. Details: [error-issues.md](error-issues.md#multi-instance-and-no-valkey-behavior).
+- [x] **Phase 1c — fingerprint v2 and grouping fidelity (2026-09-26).** See
+  [error-grouping.md](error-grouping.md#done): typed tokens, message-only quality,
+  decoded severity, clock-skew clamping, deterministic latest occurrence,
+  poison-row isolation, and a regroup of every stored occurrence.
+- [x] **Basic-detail qualification (2026-09-26).** SQLite list/detail tests with
+  `EXPLAIN QUERY PLAN` index assertions, query-wire handler tests
+  (`crates/server/tests/issues_e2e.rs`: unavailable, late-installed database,
+  ordering, default 100 and 1000 clamp, tie-break, unknown/bad IDs, oversize
+  `RESOURCES` error), frontend store/parser/polling tests, and a 1M-occurrence
+  scale harness (`crates/errors/tests/scale.rs`).
 - [x] **Phase 4a — first scalar alerting vertical slice.** Added separate
   `scry-alert`/`scry-alertd` ownership, restricted ungrouped scalar SQL, bounded
   queryd client, durable revision/state/SQLite projection, Pending/Recovering and
@@ -74,17 +93,18 @@ monitor types, and browser SDK remain outstanding.
 
 ### Outstanding
 
-- [ ] **Clustered occurrence orchestration.** Add Valkey leases/fencing, hints, and
-  multi-instance convergence; clustered `scry errors` currently fails closed.
+- [ ] **Remaining clustered orchestration.** Add block/commit hints, partitioned
+  leases, and multi-process (real Valkey) qualification; the standalone
+  `scry errors` role remains single-writer and fails closed when clustered.
 - [ ] **Occurrence freshness and lifecycle.** Add accepted-record low-latency hints,
-  bounded/generation-aware snapshot lifecycle, and projection/orphan garbage
-  collection. Basic single-object snapshot upload/restore is implemented.
+  bounded/generation-aware (incremental rather than whole-file) snapshot
+  lifecycle, and projection/orphan garbage collection. Single-object snapshot
+  publication, adoption, and refresh are implemented.
 - [ ] **Phase 1b — artifacts and symbolication.** Upload, index, and symbolize
   stacks; stack parsing for supported runtimes; explicit fingerprint overrides;
-  reprocessing after late artifacts. Basic fingerprint v1 is implemented but uses
-  one generic normalization token, discards explanation components after grouping,
-  lacks platform/policy revision and collision disambiguation, and currently folds
-  a hardcoded severity rather than the decoded OCC1 severity.
+  reprocessing after late artifacts. Basic fingerprint v2 is implemented but
+  discards explanation components after grouping and lacks platform/policy
+  revision and collision disambiguation.
 - [ ] **Phase 2 — issue lifecycle and workflow.** Add durable immutable workflow
   commands (resolve/ignore/assign), revision-checked mutations, issue facets,
   regression detection, and issue-transition event stream. The rebuildable issue
@@ -99,10 +119,10 @@ monitor types, and browser SDK remain outstanding.
   observable, at-least-once notification-delivery workers.
 - [ ] **Phase 6 — browser SDK.** Ship standards-based browser capture, public
   intake controls, build integration, and source-map upload tooling.
-- [ ] **Phase 7 — qualification.** Add focused basic-detail SQLite/query-wire/UI
-  tests; enforce server-side query limits; complete security, failure,
-  rolling-upgrade, rebuild, multi-instance, capacity, accessibility, and end-to-end
-  smoke qualification.
+- [ ] **Phase 7 — qualification.** Complete security, failure, rolling-upgrade,
+  rebuild, multi-instance, accessibility, and end-to-end smoke qualification.
+  Basic-detail SQLite/query-wire/UI tests, server-side read limits, and the
+  SQLite-level capacity harness are done.
 
 ## Why this exists
 

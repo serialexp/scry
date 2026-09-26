@@ -1451,6 +1451,33 @@ failure — only the lease winner logs actual deletes. Lease mutual exclusion,
 renew-past-TTL, and fence-on-release are also covered by gated
 `#[ignore]` integration tests against a real Valkey (`crates/valkey/tests`).
 
+**Follow-up (2026-09-26): the commit PUT is fenced for its whole duration.** One
+fence check before the `meta.json` PUT did not bound when the PUT lands. The
+object-store client retries a failing request for up to its retry budget (three
+minutes by default), so a commit begun under the lease could land after the lease
+expired, a peer acquired it, reconciled the partition, and planned the same
+inputs. The two merges would then both be live. The PUT now runs under
+`scry_block::run_fenced`, which re-checks the fence every 100 ms and **drops** the
+request, and every retry after it, when the lease is lost. The outcome is
+ambiguous: bytes already sent may still be applied. It is therefore handled like a
+failed commit PUT. It is an `Err`, the partition counts as failed, and the staged
+data objects are **kept** so that a commit that did land is complete. The next
+holder's `reconcile_partition` adopts a landed commit before it plans. No Valkey
+change is needed. The fence reports loss at `ttl − ttl/3` since the last confirmed
+renewal, a third of a TTL before the key can expire. The residual window is a
+request whose bytes were fully sent before the drop and that the server applies
+more than that margin later. Closing it fully would need a store-side fencing
+token, which S3 does not offer.
+
+`reconcile_partition` also now refuses to let compaction proceed when any committed
+sidecar in the partition could not be fetched (a non-404 GET failure), or when the
+partition listing itself failed. The unreadable sidecar may be the prior holder's
+committed output, whose inputs would otherwise look live and be merged again. An
+unparseable sidecar still does not block, because it is invisible to every reader
+and its inputs are the only live copy. The standalone `scry compact` CLI and
+`compactd`'s startup reconcile likewise refuse to stage reaps or compact after an
+incomplete `reconcile_from_bucket`.
+
 ## D-039: Three-tier catalog convergence (pub/sub + cursor poll + full walk) (v0.9)
 
 **Date:** 2026-05-31
@@ -1500,6 +1527,40 @@ lease is available). `scry-queryd` is query-only: it runs the three convergence
 tiers but never leases (no destructive work). The `writer_uuid` is persisted to
 `<wal_dir>/writer_id` so a restart reuses its prefix rather than bloating the
 per-`(signal, writer, date)` poll fan-out with a fresh UUID each restart.
+
+**Follow-up (2026-09-26): blocks commit out of UUID order.** "List only objects
+after the cursor" assumed a prefix's blocks commit in UUIDv7 order. They do not.
+Concurrent uploads finish out of order, a retried upload keeps the UUID it was
+encoded with, and a compaction output's UUID is minted when its merge starts. A
+block committing behind its prefix's cursor was invisible to the poll, and with
+its event dropped it waited for the next full walk. Four changes follow:
+
+- **Look-back window.** Each prefix is listed from `min(cursor time, now −
+  lookback)`, not from the cursor itself. The default look-back is 15 minutes
+  (`--poll-lookback-secs` on ingest, query and compact). Listed keys whose UUID
+  the catalog already holds are filtered by primary-key probe, so a converged poll
+  still costs one LIST per prefix and no GETs. A prefix whose cursor is older than
+  the window (a finished day) still lists only from its cursor, so the per-poll
+  cost does not grow with retained history beyond the pre-existing one-LIST-per-
+  cursor. A compaction merge that runs longer than the look-back is covered by its
+  `Superseded` event (which carries `by_meta`) and then the full walk.
+- **Only UUIDv7 moves a cursor.** WAL-recovery blocks are named by a v4-shaped
+  content hash so a replayed upload is idempotent. As a cursor, such a UUID usually
+  sorted above every future block in its prefix and blinded the poll to all of
+  them. `advance_cursor` ignores non-v7 UUIDs and replaces a legacy non-v7 cursor
+  on the next v7 observation. The poll lists a whole prefix once for such a
+  cursor.
+- **Recovery blocks are announced.** The event sink is now a pipeline constructor
+  argument, not attached after open, so blocks uploaded during WAL replay emit
+  `Created` like any other upload. Their hash-derived UUIDs sort randomly against
+  the look-back window, so the poll cannot be relied on to find them.
+- **Incomplete listings fail.** A LIST that errors part-way is an incomplete view
+  of the bucket. `reconcile_from_bucket`, the poll, the full walk and the
+  partition reconcile all return `Err` instead of treating it as complete.
+  `reconcile_from_bucket` also reports committed sidecars it could not fetch or
+  insert as `unapplied` (`ReconcileReport::is_complete`). Read-only callers log it,
+  retention proceeds (TTL deletion does not depend on other blocks), and
+  compaction refuses to proceed (D-038 follow-up).
 
 ## D-051: Grafana-Explore log volume + label drill-down, on a server-side result cache
 
@@ -2798,6 +2859,19 @@ full reconcile); lease-gating snapshot production to cut redundant multi-instanc
 uploads; snapshot history/GC and compression; folding restore into `scry get` /
 one-shot query paths. No wire-protocol change — object-layout + boot-path only.
 
+**Follow-up (2026-09-26): snapshots stream instead of buffering.** Both directions
+used to hold the whole database in memory, which conflicts with the bounded-memory
+principle for a catalog that grows with the bucket. Upload now streams the
+`VACUUM INTO` file as an 8 MiB-part multipart upload (a single PUT when it fits in
+one part), and verifies the size did not change. Restore streams into the
+temporary file and refuses an object larger than 16 GiB before reading it. It
+verifies the length, fsyncs, and removes stale SQLite `-wal`/`-shm`/`-journal`
+sidecars of both the temporary and the target path before the rename. A leftover
+WAL from an earlier catalog must never be replayed into the restored database. The
+parent directory is fsynced after the rename. The transfer helpers
+(`scry_objstore::upload_file` / `download_to_file`) live in `scry-objstore` so
+other snapshot producers reuse them.
+
 ---
 
 ## D-056 — `scry replay-opensearch`: high-speed OpenSearch → scry replay bench
@@ -3863,6 +3937,19 @@ conditional GETs accept either form. AWS S3 documents the unquoted form and the
 SeaweedFS compatibility test passes with it, so `update_options` normalizes for
 every backend rather than behind a per-provider switch.
 
+**Follow-up (2026-09-26):** the probe now checks every way callers obtain and use
+a version, not only the one returned by the write. CAS must reject a stale and
+accept a current version taken from a PUT response, a HEAD, and a GET; a
+conditional GET must serve the current ETag and answer a stale one with
+`Precondition`; and a 16-round update race re-reads the version with HEAD each
+round. Race rounds write round-unique bodies: an S3 ETag is the content MD5, so a
+winner rewriting identical bytes leaves the ETag unchanged and a genuinely stale
+precondition would still match. The probe also requires a never-written key to
+read back `NotFound` on HEAD and GET. A 403 there means the credentials lack
+`s3:ListBucket`; with it, "absent" and "forbidden" are indistinguishable. The
+probe fails closed and names the missing grant, because every control-plane
+create-or-read decision depends on that distinction.
+
 ## D-073: Error occurrences extend logs v2; control products use `_scry/`
 
 **Date:** 2026-09-07
@@ -3955,8 +4042,24 @@ or validates the deployment manifest, derives versioned application identity,
 publishes deterministic occurrence Parquet and metadata-last commits with
 conditional create, folds a deployment-bound rebuildable `errors.sqlite`, and can
 run bounded periodic reconciliation under an exclusive local single-writer lock.
-Clustered Valkey orchestration, browser intake, grouping/issues/UI, accepted-record
-low-latency hints, and error projection snapshots/GC remain unimplemented.
+At that date clustered Valkey orchestration, browser intake, grouping/issues/UI,
+accepted-record low-latency hints, and error projection snapshots/GC remained
+unimplemented.
+
+**Implementation note (2026-09-26):** grouping, issues, the basic issue UI,
+clustered processing, and snapshots have since landed; this decision's contracts
+are unchanged. Occurrences are grouped by fingerprint `fp-v2` through a durable
+per-generation `fold_seq` cursor in `errors.sqlite` schema v5, which regroups
+previously stored occurrences. `scry ingest --mode full --errors-db` processes
+errors only while holding the Valkey lease `lease/errors/project` (or the local
+lease under `--allow-unfenced-maintenance`), fences every publication and SQLite
+commit, uploads the `errors.sqlite` snapshot only as the holder and only after a
+state change, and adopts a more complete bucket snapshot on takeover; queryd
+refreshes and hot-swaps its read-only copy. The standalone `scry errors` role keeps
+the local single-writer lock. Browser intake, accepted-record hints, issue
+workflow, incremental snapshots, and projection GC remain unimplemented. Details
+live in [error-issues.md](design/error-issues.md#multi-instance-and-no-valkey-behavior)
+and [error-grouping.md](design/error-grouping.md).
 
 ## D-075: Query process pressure uses committed cgroup memory and reclaim/reprobe
 
@@ -4030,6 +4133,76 @@ partially implemented notification-target and delivery contracts. The mechanical
 contracts and outstanding work remain in
 `docs/design/alert-evaluation.md`, `docs/design/notification-delivery.md`, and
 `docs/design/error-monitoring-ui.md`.
+
+**Follow-up (2026-09-26): evaluator and control-plane hardening.** A review of the
+first slice found state-machine, scheduling, durability and API defects. The
+changes below alter durable formats and semantics.
+
+- **State schema v2: the head carries the state, and transitions record changes
+  only.**
+  - Before, every evaluated slot wrote a transition object and a head pointing at
+    it. That grew the transition namespace by one object per monitor per interval,
+    and a "transition" did not mean a status change.
+  - The v2 head (`_scry/alerts/v1/state/v2/<id>/head.json`) embeds the complete
+    `AlertState` and a `TransitionRef` (sequence, revision, slot, status, SHA-256)
+    to the latest transition. Every slot still CASes the head.
+  - A transition (`_scry/alerts/v1/transitions/v2/<id>/<seq>-<rev>-<slot>-<status>.json`)
+    is created only when the status changes. It records `previous_status` and
+    chains to its predecessor. `transition_sequence` now counts status changes.
+  - The head remains the visibility authority. Readers verify the referenced
+    transition's identity and digest.
+  - v1 state objects are not read. Upgrading restarts each monitor's state and
+    sequence. No v1 → v2 migration is provided: no transitions have been delivered
+    anywhere yet.
+- **Staleness is ordered by `(monitor_revision, slot_id)`.** Slot IDs are
+  `floor(t/every)`, so they are comparable only within one revision. Comparing slot
+  IDs alone let an interval edit strand a monitor, and let an older revision
+  overwrite a newer one.
+  - The status carries across revisions.
+  - Pending and Recovering hold time resets on every revision change. The design's
+    narrower rule, resetting only on semantic edits, is still outstanding.
+- **Hold semantics.** Recovering plus a breaching value returns to Firing directly.
+  A `KeepLast` execution error keeps the prior status as stale and never restarts a
+  `for` hold.
+- **Lateness allowance.** `scry alert --evaluation-delay` defaults to 90 s. That
+  exceeds ingest's 60 s `block_max_age_secs`, so a slot's single evaluation does not
+  run before its data can be flushed.
+- **Durable re-read before querying.** Under the lease, the evaluator re-reads the
+  rule head and state head before it queries:
+  - a deleted rule is tombstoned locally;
+  - a newer revision is folded, and the stale evaluation is abandoned;
+  - an already-covered slot is folded without being queried again.
+  The rule head and fence are checked again before the commit.
+- **Per-command revision keys.**
+  - Rule and target revisions are written to
+    `…/revisions/<revision:020>-<sha256(command-id)>.json` rather than
+    `…/<revision>.json`. The head's exact key is the only authority.
+  - Before, a command that wrote revision `n` and then crashed or lost the head CAS
+    left an object that made every later save of revision `n` fail as a collision.
+  - Heads written before this change still name their old keys and remain readable.
+- **Scheduler.**
+  - Evaluations run as spawned tasks under a global limit, behind an in-flight set,
+    with round-robin resume.
+  - Reconciliation runs in its own 30 s task.
+  - SIGINT/SIGTERM drains within a bounded grace and then aborts.
+- **Projection (`alerts.sqlite` schema v3).**
+  - The v2 → v3 migration drops and rebuilds the projection, keeping only the
+    deployment binding. The bucket is authoritative.
+  - The transitions table is removed; `current_state` holds the embedded state.
+  - Deleted rules and targets stay as tombstone rows until pruned, so neither a
+    reconcile racing a delete nor a late evaluation can resurrect them.
+  - A reconcile prunes only rows missing from its listing that were folded before
+    the pass began.
+  - A single unreadable or invalid record is quarantined, and the rest of the load
+    continues.
+- **Clustered startup does not require Valkey.** The API and projection start
+  immediately and Valkey connects in the background. Lease-requiring work
+  (evaluation, test-send) fails closed until it connects, and local mode is still
+  never inferred. The Valkey `SET NX PX` acquire is bounded by `min(ttl/3, 5 s)`.
+- **Secret rotation touches referenced secrets only.** Orphaned secret heads are
+  counted, not rotated. An undecryptable referenced secret is reported and makes the
+  command fail, and does not abort the pass. Secret GC is outstanding
+  (`docs/design/notification-delivery.md`).
 
 ## D-077: Notification targets own formatting, encrypted secrets, and firing/resolved delivery
 

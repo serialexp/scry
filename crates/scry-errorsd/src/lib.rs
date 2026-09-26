@@ -224,6 +224,9 @@ pub async fn run(args: Args) -> Result<()> {
     // Configuration errors are startup invariants. Serve only retries failures from an
     // otherwise valid reconciliation pass.
     engine::validate_config(&config)?;
+    // Single-writer mode is guarded by the local exclusive lock held in
+    // `foundation`, not by a distributed lease, so its fence is always valid.
+    let fence: Arc<dyn scry_block::Fence> = Arc::new(scry_block::AlwaysValid);
     if args.command == Command::Reconcile {
         let report = engine::reconcile_once(
             engine::CatalogMode::Owned {
@@ -234,6 +237,7 @@ pub async fn run(args: Args) -> Result<()> {
             &foundation.errors_db,
             deployment_id,
             &config,
+            fence,
         )
         .await?;
         info!(?report, "occurrence reconciliation completed");
@@ -285,6 +289,7 @@ pub async fn run(args: Args) -> Result<()> {
             &foundation.errors_db,
             deployment_id,
             &config,
+            fence.clone(),
         )
     })
     .await;
@@ -393,6 +398,13 @@ mod tests {
                         candidate_blocks: 3,
                         processed_blocks: 2,
                         occurrence_rows: 7,
+                        sources_already_covered: 4,
+                        grouping: scry_errors::sqlite::GroupingReport {
+                            scanned: 5,
+                            failures: 2,
+                            drained: true,
+                            ..Default::default()
+                        },
                         ..Default::default()
                     })
                 }
@@ -408,6 +420,10 @@ mod tests {
         assert_eq!(snapshot.data["last_report"]["processed_blocks"], 2);
         assert_eq!(snapshot.data["last_report"]["pending_blocks"], 1);
         assert_eq!(snapshot.data["last_report"]["occurrence_rows"], 7);
+        assert_eq!(snapshot.data["last_report"]["sources_already_covered"], 4);
+        assert_eq!(snapshot.data["last_report"]["grouping_scanned"], 5);
+        assert_eq!(snapshot.data["last_report"]["grouping_failures"], 2);
+        assert_eq!(snapshot.data["last_report"]["grouping_drained"], true);
         assert!(snapshot.data["last_failure_unix_ms"].as_u64().unwrap() > 0);
         assert!(snapshot.data["last_success_unix_ms"].as_u64().unwrap() > 0);
         assert!(snapshot.data["reconcile_lag_ms"].is_u64());

@@ -8,6 +8,8 @@
 
 pub mod engine;
 pub mod fingerprint;
+pub mod follow;
+pub mod handle;
 pub mod issue;
 pub mod manifest;
 pub mod occ1;

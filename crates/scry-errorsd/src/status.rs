@@ -32,6 +32,11 @@ pub(crate) struct ErrorsStatus {
     issues_created: AtomicU64,
     issues_updated: AtomicU64,
     occurrences_grouped: AtomicU64,
+    sources_already_covered: AtomicU64,
+    commits_already_folded: AtomicU64,
+    grouping_scanned: AtomicU64,
+    grouping_failures: AtomicU64,
+    grouping_drained: AtomicU64,
 }
 
 impl ErrorsStatus {
@@ -60,6 +65,11 @@ impl ErrorsStatus {
             issues_created: AtomicU64::new(0),
             issues_updated: AtomicU64::new(0),
             occurrences_grouped: AtomicU64::new(0),
+            sources_already_covered: AtomicU64::new(0),
+            commits_already_folded: AtomicU64::new(0),
+            grouping_scanned: AtomicU64::new(0),
+            grouping_failures: AtomicU64::new(0),
+            grouping_drained: AtomicU64::new(0),
         }
     }
 
@@ -98,6 +108,16 @@ impl ErrorsStatus {
             report.grouping.occurrences_grouped as u64,
             Ordering::Relaxed,
         );
+        self.sources_already_covered
+            .store(report.sources_already_covered as u64, Ordering::Relaxed);
+        self.commits_already_folded
+            .store(report.commits_already_folded as u64, Ordering::Relaxed);
+        self.grouping_scanned
+            .store(report.grouping.scanned as u64, Ordering::Relaxed);
+        self.grouping_failures
+            .store(report.grouping.failures as u64, Ordering::Relaxed);
+        self.grouping_drained
+            .store(u64::from(report.grouping.drained), Ordering::Relaxed);
         self.last_success_unix_ms
             .store(unix_ms_now(), Ordering::Release);
         self.reconcile_successes.fetch_add(1, Ordering::Relaxed);
@@ -156,6 +176,11 @@ impl LocalStatus for ErrorsStatus {
                     "issues_created": self.issues_created.load(Ordering::Relaxed),
                     "issues_updated": self.issues_updated.load(Ordering::Relaxed),
                     "occurrences_grouped": self.occurrences_grouped.load(Ordering::Relaxed),
+                    "sources_already_covered": self.sources_already_covered.load(Ordering::Relaxed),
+                    "commits_already_folded": self.commits_already_folded.load(Ordering::Relaxed),
+                    "grouping_scanned": self.grouping_scanned.load(Ordering::Relaxed),
+                    "grouping_failures": self.grouping_failures.load(Ordering::Relaxed),
+                    "grouping_drained": self.grouping_drained.load(Ordering::Relaxed) == 1,
                 }
             }),
         }

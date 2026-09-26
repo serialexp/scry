@@ -315,24 +315,37 @@ pub(crate) mod tests {
         exception_type: &str,
         exception_message: &str,
     ) -> crate::Occurrence {
+        make_occurrence_with(Some(exception_type), Some(exception_message), 17)
+    }
+
+    /// Build an occurrence with optional exception type/message and an explicit
+    /// severity number. At least one of type/message must be present for the
+    /// extractor to accept the record.
+    pub(crate) fn make_occurrence_with(
+        exception_type: Option<&str>,
+        exception_message: Option<&str>,
+        severity: u8,
+    ) -> crate::Occurrence {
         let resource = [Kv {
             key: "service.name",
             value: Value::String("test-service"),
         }];
-        let mut attributes = vec![
-            Kv {
+        let mut attributes = vec![Kv {
+            key: "scry.event.id",
+            value: Value::String("018f1f8e-7b2c-7a91-8123-0123456789ab"),
+        }];
+        if let Some(exception_type) = exception_type {
+            attributes.push(Kv {
                 key: "exception.type",
                 value: Value::String(exception_type),
-            },
-            Kv {
+            });
+        }
+        if let Some(exception_message) = exception_message {
+            attributes.push(Kv {
                 key: "exception.message",
                 value: Value::String(exception_message),
-            },
-            Kv {
-                key: "scry.event.id",
-                value: Value::String("018f1f8e-7b2c-7a91-8123-0123456789ab"),
-            },
-        ];
+            });
+        }
         attributes.sort_unstable_by_key(|entry| entry.key.as_bytes().to_vec());
         let input = LogRecordInput {
             resource_schema_url: "",
@@ -342,7 +355,7 @@ pub(crate) mod tests {
             scope_schema_url: "",
             time_unix_nano: 1_700_000_000_000_000_000,
             observed_time_unix_nano: 1_700_000_000_000_000_100,
-            severity: 17,
+            severity,
             severity_text: "ERROR",
             event_name: "exception",
             body: Value::String("request failed"),

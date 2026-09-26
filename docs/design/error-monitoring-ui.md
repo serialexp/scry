@@ -2,7 +2,7 @@
 
 Status: partial — issue list/basic detail and first scalar Alerts CRUD/state UI implemented; rich issue inspection and later alerting views outstanding
 Owner: Bart
-Last updated: 2026-09-22
+Last updated: 2026-09-26
 
 ## Implementation status
 
@@ -26,14 +26,30 @@ current state, and a separate notification-target CRUD/preview/test-send section
   `issueListError`, `issueListUpdatedAt`) and `refreshIssues()` action poll via
   `fetchIssueList()` over the query wire (`IssueListRequest` → `IssueListResponse`).
   The webui relay passes frames unchanged. Queryd `--errors-db` opens `errors.sqlite`
-  read-only and serves from a `Mutex<ErrorsDb>`. Nav link placed between Alerts and
-  Fleet. Error state (ISSUES_UNAVAILABLE) handled gracefully.
+  read-only and serves it through a swappable handle (`SharedErrorsDb`) on a
+  blocking thread, so snapshot refreshes never interrupt reads and SQLite never
+  blocks the async runtime. Nav link placed between Alerts and Fleet. Error state
+  (ISSUES_UNAVAILABLE) handled gracefully.
 - [x] **Phase 1b — basic issue detail read.** `/errors/:issueId` is linked from the
   inbox and polls `IssueOccurrencesRequest` over the query wire. SQLite/queryd,
   typed client/store state, and the Solid page expose the issue summary plus recent
   event IDs, occurrence timestamps, and trace IDs. The API additionally returns
   span IDs, which the page does not display. This is metadata-only, not the designed
   occurrence inspector.
+- [x] **Issue store and polling rework (2026-09-26).** Issue state moved out of
+  the Explore `store.ts` signals into a dedicated Solid store
+  (`desktop/src/issueStore.ts`, instantiated once as `issueStore` in `store.ts`).
+  List and detail requests carry generations: a late response for a previous
+  issue, an older refresh, or a previous query target is dropped; changing the
+  issue clears its data immediately, and changing the target clears everything and
+  reloads. Polling is completion-relative, stops on route cleanup, pauses while the
+  page is hidden, and refreshes on return. The detail route reacts to `issueId`
+  changes rather than reading it once on mount, and shows an explicit not-found
+  state. Client parsing validates every issue/occurrence field instead of casting.
+  Shared quality labels (including `3 = Message Only`) and time formatters replace
+  per-view copies. Views note when a page is capped (100 rows requested; queryd
+  clamps any request to 1000). Store, polling, parser, and formatter tests live in
+  `desktop/src/issueStore.test.ts`.
 - [x] **First alerting vertical slice — browser rule CRUD/state.** Added direct
   same-target webui-to-alertd proxying, environment bearer service auth, secure
   cookies by default, nonce CSRF/same-origin mutation checks, bounded proxying,
@@ -57,13 +73,15 @@ current state, and a separate notification-target CRUD/preview/test-send section
 - [ ] **Phase 2b — later Alerts views.** Add monitor-to-target selection, full
   transition history, silences, outbox, and delivery diagnostics after their backend
   phases exist. Notification-target administration and test-send are implemented.
-- [ ] **Phase 3 — parity and accessibility.** Extract the error views from the
-  monolithic store, add completion-relative visibility-aware polling, and implement
-  keyboard/screen-reader behavior and responsive layouts. Basic list/detail reads
-  already use the shared browser/Tauri query transport.
-- [ ] **Phase 4 — verification.** Add list/detail query-handler, typed-client,
-  store, and component tests, followed by control contract, auth/CSRF, conflict,
-  stale/partial, pagination, accessibility, browser, and Tauri coverage.
+- [ ] **Phase 3 — parity and accessibility.** Implement keyboard row selection,
+  stable focus across refreshes, live regions, and responsive layouts. The issue
+  store extraction, completion-relative visibility-aware polling, and a keyboard-
+  reachable title link per issue row are done; basic list/detail reads use the
+  shared browser/Tauri query transport.
+- [ ] **Phase 4 — verification.** Add component tests, followed by control
+  contract, auth/CSRF, conflict, stale/partial, pagination, accessibility, browser,
+  and Tauri coverage. List/detail query-handler, typed-client parser, and store
+  tests exist.
 
 ## Why this exists
 

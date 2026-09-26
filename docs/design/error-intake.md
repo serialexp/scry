@@ -1,8 +1,8 @@
 # Error event contract and intake — Design
 
-Status: partial — occurrence foundation and snapshot bootstrap implemented; browser intake, clustered operation, and lifecycle cleanup outstanding
+Status: partial — occurrence foundation, lease-guarded clustered processing, and snapshot publication/refresh implemented; browser intake and lifecycle cleanup outstanding
 Owner: Bart
-Last updated: 2026-09-22
+Last updated: 2026-09-26
 
 ## Implementation status
 
@@ -10,10 +10,11 @@ This document refines [Error monitoring](error-monitoring.md). D-073 accepts a
 lossless logs v2 representation. D-074's coordinated occurrence foundation is now
 implemented: producers emit canonical raw-record v1, ingest stamps trusted receipt
 time into canonical raw-record v2 before WAL, and logs Parquet/query schema v3
-exposes `received_ts_unix_nano`. A version-checked `errors.sqlite` snapshot is
-periodically uploaded and restored on queryd cold start. Browser intake, producer
-guidance, clustered operation, and projection lifecycle cleanup remain outstanding;
-this implementation has not been deployed.
+exposes `received_ts_unix_nano`. The ingester holding `lease/errors/project`
+processes occurrences and publishes a version-checked `errors.sqlite` snapshot
+that queryd refreshes in place. Browser intake, producer guidance, convergence
+hints, and projection lifecycle cleanup remain outstanding; this implementation
+has not been deployed.
 
 ### Done
 
@@ -52,11 +53,35 @@ this implementation has not been deployed.
   malformed inputs, HTTP protobuf/JSON/gzip/gRPC parity, gateway-to-storage query,
   mixed-schema normalization, compaction preservation/rejection, extraction,
   publication, and reconcile/fold idempotency have focused coverage.
+- [x] **Reconcile efficiency and safety (2026-09-26).** Source coverage is checked
+  in one batch before any source is read, and listed commit markers already in
+  `projection_commits` are skipped before their GETs, so a converged pass issues
+  no per-object reads. When a source's commit marker already exists, the pass folds
+  it instead of re-extracting and re-publishing, so a commit written by an older
+  encoder never conflicts with a fresh encoding. Projection Parquet bytes are
+  deterministic. One residual case remains: a data object orphaned without its
+  commit marker by an older encoder whose bytes differ is quarantined each cycle
+  (see TODO.md).
+  Extraction, encoding, decoding, and every SQLite call run on blocking threads.
+  Lease loss, SQLite, schema, generation, and non-NotFound object-store errors end
+  the pass; per-object failures quarantine only that object for the cycle.
+- [x] **Clustered occurrence orchestration (2026-09-26).** `scry ingestd` runs
+  processing under `lease/errors/project` with fenced writes, a fail-closed
+  conditional-write probe, snapshot adoption on takeover, and holder-only
+  snapshot uploads after state changes. See
+  [error-issues.md](error-issues.md#multi-instance-and-no-valkey-behavior).
+- [x] **Snapshot safety (2026-09-26).** Snapshots are downloaded to a sibling file
+  with a byte cap (8 GiB default), validated for schema version and deployment,
+  normalized to rollback-journal mode (a `VACUUM INTO` copy of a WAL database
+  otherwise keeps WAL header bytes), fsynced, and renamed into place after stale
+  `-wal`/`-shm`/`-journal` files are removed (a stale WAL beside a replaced file is
+  replayed into it). Any rejected download is deleted.
 
 ### Outstanding
 
-- [ ] **Clustered occurrence orchestration.** Add Valkey lease/fencing, convergence
-  hints, and safe multi-writer takeover; clustered mode currently fails closed.
+- [ ] **Remaining clustered orchestration.** Add convergence hints so peers learn
+  of new commits without polling, and multi-process takeover qualification against
+  real Valkey.
 - [ ] **Accepted-record low-latency hints.** Add the optional acceleration path;
   sealed-block/occurrence-commit reconciliation remains the correctness path.
 - [ ] **Occurrence snapshot lifecycle and GC.** Replace the single overwritten,

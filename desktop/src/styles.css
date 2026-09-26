@@ -2701,6 +2701,15 @@ textarea {
   white-space: nowrap;
 }
 
+.issue-title-link {
+  color: inherit;
+  text-decoration: none;
+}
+.issue-title-link:hover,
+.issue-title-link:focus-visible {
+  text-decoration: underline;
+}
+
 .issue-count {
   font-family: var(--mono);
   text-align: right;
@@ -2767,6 +2776,12 @@ textarea {
   font-weight: 600;
   margin: 24px 0 12px;
   color: var(--fg);
+}
+
+.issue-page-note {
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: 12px;
 }
 
 /* ── Alerts ────────────────────────────────────────────────────────── */

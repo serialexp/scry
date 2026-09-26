@@ -1,8 +1,8 @@
 # Error issue indexing and lifecycle — Design
 
-Status: partial — issue index, grouping reconciliation, list, and basic detail reads implemented; workflow and clustered operation outstanding
+Status: partial — issue index, cursor-driven grouping, lease-guarded clustered processing, snapshots, list, and basic detail reads implemented; workflow outstanding
 Owner: Bart
-Last updated: 2026-09-22
+Last updated: 2026-09-26
 
 ## Implementation status
 
@@ -11,11 +11,12 @@ This document consumes the dedicated occurrence projection defined by
 [Error grouping](error-grouping.md). Alert consumers are defined in
 [Alert evaluation](alert-evaluation.md). D-074 places the occurrence projection,
 `errors.sqlite`, and `scry errors` in an earlier full slice than grouping/issues.
-The `issues` and `occurrence_issues` SQLite tables, transactional `fold_grouped()`
-upsert, `group_occurrence_page()` reconciliation, read-only issue listing, basic
-issue/occurrence detail reads, and query-wire serving are now implemented. Human
-workflow state, facets, regressions, durable transitions, cursor pagination, and
-rich occurrence inspection remain outstanding.
+The `issues` and `occurrence_issues` SQLite tables, cursor-driven grouping
+(`ErrorsDb::group_page`), read-only issue listing, basic issue/occurrence detail
+reads, query-wire serving, lease-guarded clustered processing in ingestd, and
+snapshot publication/adoption/refresh are now implemented. Human workflow state,
+facets, regressions, durable transitions, cursor pagination, immutable grouping
+projections, and rich occurrence inspection remain outstanding.
 
 ### Done
 
@@ -42,6 +43,46 @@ rich occurrence inspection remain outstanding.
   after occurrence processing. `GroupingReport` added to `EngineReport` and
   `ErrorsStatus` (issues_created/updated, occurrences_grouped). Integration test
   asserts end-to-end grouping from log block through issue creation.
+  *Superseded in detail by the schema v5 rework below.*
+- [x] **Schema v5 grouping rework (2026-09-26).** Every newly folded occurrence
+  gets a strictly increasing `fold_seq`; grouping walks `fold_seq` from a persisted
+  per-generation cursor (`grouping_cursors`), so late-arriving occurrences (old
+  `occurred_at`, new `fold_seq`) are never skipped and each pass reads only unseen
+  rows. A page's mapping rows, issue aggregates, failure records, cursor advance,
+  and (on drain) generation activation commit in one fenced transaction.
+  `occurrence_issues` is keyed by the full occurrence identity (`deployment_id,
+  app_id, app_identity_sha256, event_id`) plus `grouping_generation`, so several
+  generations coexist and distinct application identities sharing a compact
+  `app_id` never share a membership row. Undecodable or identity-mismatched OCC1
+  rows land in `grouping_failures` and the cursor moves past them, so one poison
+  row cannot wedge grouping. Within a page, occurrences of one issue fold into a
+  single issue upsert; `first_seen` is lowered by late occurrences; `max_severity`
+  comes from the decoded occurrence; the latest occurrence is max(clamped time,
+  event ID). Readers list the *active* generation recorded in `metadata`: the first
+  generation is active immediately, a later one once its backlog drains. The v5
+  migration discards pre-v5 grouping rows (fp-v1, with the defects above) and
+  regroups every stored occurrence. The engine drains the backlog page by page
+  (`grouping_page_rows` 1024) within a per-pass row budget (262,144) and time
+  budget (5 s).
+- [x] **Indexes and bounded reads (2026-09-26).** `issues_by_generation_last_seen`
+  `(deployment_id, grouping_generation, last_seen DESC, issue_id)` serves the
+  list; `occurrence_issues_by_issue` `(deployment_id, issue_id, sort_at, event_id)`
+  serves newest-first occurrence history with an event-ID tie-break;
+  `occurrences_by_fold_seq` serves the grouping cursor. `EXPLAIN QUERY PLAN` tests
+  assert index use and no temp B-tree sort for every hot query. Reads are clamped
+  to `MAX_ISSUE_PAGE_ROWS` (1000); the query-wire default is 100. Timestamps are
+  JSON numbers; browser doubles keep ~256 ns precision, adequate for display.
+- [x] **Clustered processing and snapshots (2026-09-26).** See "Multi-instance and
+  no-Valkey behavior" below for the implemented lease, adoption, and refresh model.
+- [x] **Scale verification (2026-09-26).** `crates/errors/tests/scale.rs`
+  (ignored; run in release) folds and groups one million real OCC1 occurrences
+  across 10,000 issues (one hot issue with 100,000) and times every hot read.
+  Measured on the home development machine: fold ~145k rows/s; grouping 15k-30k
+  rows/s at 10k uniformly hit issues (bound by random leaf writes to
+  `occurrence_issues_by_issue`) and 95k-118k rows/s at 50-100 issues; slowest
+  1024-row page 0.3-1.2 s (a WAL checkpoint); list/detail read medians 1 µs-0.9 ms.
+  Before the page-level issue aggregation and 64 MiB writer page cache the same
+  run measured fold 67k rows/s, grouping 26k rows/s, slowest page 1.04 s.
 
 ### Outstanding
 
@@ -53,17 +94,20 @@ rich occurrence inspection remain outstanding.
   (resolve/ignore/assign), revision-checked mutations, regression detection,
   facets, and audit history. The rebuildable issue index and aggregates exist but
   carry no human workflow state.
-- [ ] **Phase 2 — clustered issue/grouping reconciliation.** Add Valkey
-  orchestration, hints, snapshots/GC, reprocessing generations, compaction locator
-  repair, and grouping/issue cold rebuild. Single-writer grouping reconciliation
-  and the D-074 bounded cursors are already implemented.
+- [ ] **Phase 2 — remaining clustered reconciliation.** Add hints, partitioned
+  leases, snapshot GC/history, immutable grouping projections, compaction locator
+  repair, and grouping/issue cold rebuild from objects. The single
+  `lease/errors/project` lease, snapshot adoption, and queryd refresh are
+  implemented; snapshots are whole-file uploads (see TODO.md).
 - [ ] **Phase 3 — complete issue API.** Add cursor-paginated/filterable reads,
-  server-capped limits, full occurrence detail, and revision-checked mutations
-  through the control plane. Query wire currently serves a limit-only issue list
-  and basic issue summary/recent-occurrence metadata.
-- [ ] **Phase 4 — verification.** Add focused `get_issue`/occurrence-list and
-  query-wire handler tests, then multi-instance, no-Valkey, retention, migration,
-  fingerprint-collision, workflow-conflict, and grouping cold-rebuild coverage.
+  full occurrence detail, and revision-checked mutations through the control
+  plane. Query wire currently serves a server-capped, limit-only issue list and
+  basic issue summary/recent-occurrence metadata.
+- [ ] **Phase 4 — verification.** Add multi-process (real Valkey) takeover,
+  retention, fingerprint-collision, workflow-conflict, and grouping cold-rebuild
+  coverage. Focused `get_issue`/occurrence-list, query-wire handler
+  (`crates/server/tests/issues_e2e.rs`), in-process lease failover, and migration
+  tests exist.
 
 ## Why this exists
 
@@ -344,6 +388,30 @@ named unsafe override is selected. Raw telemetry ingest and existing reads conti
 Workflow writes during a transient clustered Valkey outage fail closed rather than
 risk conflicting revision decisions. Previously durable workflow state remains
 readable. Projection age and lease state are visible.
+
+**Implemented (2026-09-26).** Clustered processing runs in `scry ingestd` (`full`
+mode with `--errors-db`) under one deployment-wide lease, `lease/errors/project`,
+rather than per-partition leases; the standalone `scry errors` role keeps its
+exclusive local single-writer lock. Without Valkey the ingester uses
+`LocalLeaseProvider` only with `--allow-unfenced-maintenance`; otherwise error
+processing pauses while ingest continues. Before its first pass the worker probes
+conditional writes and resolves the deployment manifest, failing closed and
+retrying each interval. Every durable write is fenced: publication and each SQLite
+commit re-check the lease, and a lost lease stops the pass before its next write.
+On acquiring the lease, an instance adopts the bucket snapshot
+(`_scry/errors/v1/snapshot.sqlite`) when it has folded more projection commits than
+the local database or the local database is missing; non-holders never download
+it. Only the holder uploads snapshots, at most every `--catalog-snapshot-interval`
+and only after a pass changed occurrence or issue state; the upload is a
+`VACUUM INTO` copy switched to rollback-journal mode, fence-checked before the PUT.
+A superseded holder's in-flight upload can briefly regress the bucket copy; that
+only costs catch-up time because a snapshot is a cache of committed projections.
+`scry queryd --errors-db` HEADs the snapshot every `--errors-refresh-interval`
+(default 60 s); on a new version it streams the object to a sibling file, validates
+schema version, deployment, and journal mode, removes stale `-wal`/`-shm`/`-journal`
+files, renames it into place, and swaps its read-only handle without interrupting
+in-flight reads. A database in WAL mode is owned by a colocated writer and is only
+reopened when its inode changes, never overwritten.
 
 ## API contract
 

@@ -1,20 +1,21 @@
 # Stack processing and issue grouping — Design
 
-Status: partial — basic type/message fingerprinting implemented; full fingerprint contract, symbolication, and stack parsing outstanding
+Status: partial — basic type/message fingerprinting (fp-v2) implemented; full fingerprint contract, symbolication, and stack parsing outstanding
 Owner: Bart
-Last updated: 2026-09-22
+Last updated: 2026-09-26
 
 ## Implementation status
 
 This document consumes canonical occurrences from [Error intake](error-intake.md)
-and feeds [Issue indexing and lifecycle](error-issues.md). Fingerprint v1 is
-implemented at the type+message level without parsed/symbolicated frames (no
-artifact contract, stack parsing, or source-map lookup yet). The OCC1 binary
-decoder, regex-based message normalization, SHA-256 digest, quality levels, and
-deterministic issue identity are operational and tested. This is a narrower slice
-than the full fingerprint contract below: normalization currently uses one generic
-replacement token, explanation components are not persisted, and grouping-policy,
-platform, and collision-disambiguation semantics remain outstanding.
+and feeds [Issue indexing and lifecycle](error-issues.md). The implemented
+fingerprint (`fp-v2`, `scry_errors::fingerprint`) works at the type+message level
+without parsed/symbolicated frames (no artifact contract, stack parsing, or
+source-map lookup yet). The OCC1 binary decoder, typed message normalization,
+SHA-256 digest, quality levels, and deterministic issue identity are operational
+and tested. This is a narrower slice than the full fingerprint contract below:
+explanation components are computed on demand but not persisted, and
+grouping-policy, platform, and collision-disambiguation semantics remain
+outstanding.
 
 ### Done
 
@@ -32,6 +33,28 @@ platform, and collision-disambiguation semantics remain outstanding.
   derived from domain-tagged deployment/app/fingerprint version/digest bytes. Tests
   cover normalization, quality levels, determinism, and distinctness. This is the
   implemented message-level fallback; the full contract below remains outstanding.
+- [x] **Fingerprint v2 and regroup (2026-09-26).** `fp-v2` adds
+  `GroupingQuality::MessageOnly` (code 3) for exceptions with a message but no
+  type (v1 dropped them into the body fallback), typed placeholders (`{uuid}`,
+  `{timestamp}`, `{time}`, `{url}`, `{hex}`, `{ip}`, `{float}`, `{int}`), the
+  token classes v1 missed (space-separated timestamps, bare clock times, bare hex
+  identifiers of at least 8 characters with a digit), and the quality code as a
+  digest component. Numbers under four digits stay verbatim by design. Titles are
+  bounded to `MAX_TITLE_BYTES` (512) on a character boundary; the digest always uses
+  the full normalized text. The version is part of the digest, the issue identity,
+  and the grouping generation name (`fp-v2`, compile-time tied to
+  `FINGERPRINT_VERSION`). `errors.sqlite` schema v5 discards pre-v5 grouping rows
+  (produced by fp-v1 with known aggregation defects) and regroups every stored
+  occurrence under `fp-v2`; the new generation becomes the one readers list as soon
+  as its backlog drains.
+- [x] **Grouping fold fidelity (2026-09-26).** Grouping decodes each OCC1 once and
+  takes the issue's severity from the decoded `severity_number`; identity fields
+  inside the canonical bytes must match the stored row. Decode or identity
+  failures are durable per-generation `grouping_failures` rows, not silent skips.
+  `first_seen`/`last_seen` use the occurrence time clamped to at most
+  `CLOCK_SKEW_ALLOWANCE_NANOS` (5 minutes) after server receipt, and the latest
+  occurrence is the maximum of (clamped time, event ID), so ties resolve the same
+  way in any grouping order.
 
 ### Outstanding
 
@@ -45,13 +68,13 @@ platform, and collision-disambiguation semantics remain outstanding.
   persisted canonical components/explanations, platform and grouping-policy
   revision, canonical-byte collision comparison/disambiguation, in-application
   frame selection, system/framework exclusion, recursive collapse, and explicit
-  `scry.error.fingerprint` override. Current grouping uses type/message or fallback
-  body/severity and does not preserve the explanation after reconciliation.
-- [ ] **Grouping fold fidelity.** Propagate decoded OCC1 severity into issue
-  aggregation instead of the current hardcoded value so `max_severity` reflects
-  source occurrences.
+  `scry.error.fingerprint` override. Current grouping uses type/message, message,
+  or fallback body/severity and does not preserve the explanation after
+  reconciliation.
 - [ ] **Phase 3 — reprocessing.** Add bounded late-artifact retries and explicit
-  grouping migration shadow/activation workflows.
+  grouping migration shadow/activation workflows. A new generation is already
+  built beside the active one and activated only once drained; operator-visible
+  shadow reports (split/merge/cardinality deltas) and explicit activation remain.
 - [ ] **Phase 4 — remaining verification.** Add canonical-byte/collision and
   persisted-explanation coverage plus golden stacks/maps, malicious maps, late
   uploads, cache invalidation, migration, and rebuild tests. Basic normalization,

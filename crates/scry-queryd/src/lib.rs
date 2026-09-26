@@ -353,6 +353,13 @@ pub struct Args {
     #[arg(long, default_value_t = 5)]
     poll_interval: u64,
 
+    /// Seconds of look-back the incremental poll re-lists before each
+    /// cursor. A block that commits later than this after its UUIDv7 time
+    /// (a slow upload, a long compaction) is found by its pub/sub event or
+    /// the full walk instead.
+    #[arg(long, default_value_t = scry_cluster::DEFAULT_POLL_LOOKBACK.as_secs())]
+    poll_lookback_secs: u64,
+
     /// Seconds between exhaustive full-walk reconciles (backstop that also
     /// discovers brand-new prefixes).
     #[arg(long, default_value_t = 1800)]
@@ -445,11 +452,19 @@ pub struct Args {
 
     // ── Error tracking (D-074) ───────────────────────────────────
     /// Local path for the errors projection database. When set, queryd
-    /// restores the errors snapshot from the bucket on cold boot (unless
-    /// `--no-snapshot-restore`) and serves `IssueListRequest` frames from
-    /// it. Typically set to an emptyDir path alongside the catalog.
+    /// serves issue requests from it and keeps it current: every
+    /// `--errors-refresh-interval` it HEADs the bucket errors snapshot and,
+    /// when it changed, streams it to disk, validates it, and swaps it in
+    /// without interrupting in-flight queries. A file owned by a local
+    /// writer (WAL mode, e.g. an ingester given the same path) is served
+    /// as-is and never overwritten. `--no-snapshot-restore` disables snapshot
+    /// downloads. Typically an emptyDir path alongside the catalog.
     #[arg(long)]
     errors_db: Option<PathBuf>,
+
+    /// Seconds between errors snapshot freshness checks (one HEAD each).
+    #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..))]
+    errors_refresh_interval: u64,
 }
 
 /// Run the query daemon until SIGINT or SIGTERM.
@@ -857,48 +872,29 @@ pub async fn run(args: Args) -> Result<()> {
         }));
     }
 
-    // Restore errors.sqlite from the bucket snapshot on cold boot, following
-    // the same pattern as the catalog snapshot restore above.
-    if let Some(ref errors_path) = args.errors_db {
-        if !errors_path.exists() && !args.no_snapshot_restore {
-            match scry_errors::snapshot::restore_errors_snapshot(
-                errors_path,
-                store.as_ref(),
-                scry_errors::sqlite::ERRORS_SCHEMA_VERSION,
-            )
-            .await
-            {
-                Ok(scry_errors::snapshot::RestoreOutcome::Restored { issues }) => {
-                    info!(issues, "restored errors database from bucket snapshot");
+    // Errors database (D-074): one follow pass before serving, then a
+    // background refresh loop that swaps in newer bucket snapshots.
+    let errors_db = match args.errors_db.clone() {
+        Some(path) => {
+            let handle = scry_errors::handle::SharedErrorsDb::new();
+            let mut follower = scry_errors::follow::SnapshotFollower::new(
+                path,
+                (!args.no_snapshot_restore).then(|| store.clone()),
+                handle.clone(),
+                scry_errors::snapshot::DEFAULT_MAX_SNAPSHOT_BYTES,
+            );
+            log_errors_follow(follower.tick().await);
+            let interval = Duration::from_secs(args.errors_refresh_interval);
+            bg_tasks.push(tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(interval).await;
+                    log_errors_follow(follower.tick().await);
                 }
-                Ok(scry_errors::snapshot::RestoreOutcome::NoSnapshot) => {
-                    info!("no errors snapshot in bucket; issues will be unavailable until an ingest writer produces one");
-                }
-                Ok(scry_errors::snapshot::RestoreOutcome::VersionMismatch { found, expected }) => {
-                    warn!(
-                        found,
-                        expected, "errors snapshot schema version mismatch; skipping restore"
-                    );
-                }
-                Err(e) => {
-                    warn!(error = %e, "errors snapshot restore failed");
-                }
-            }
+            }));
+            Some(handle)
         }
-    }
-
-    let errors_db = args
-        .errors_db
-        .as_ref()
-        .filter(|p| p.exists())
-        .map(|p| {
-            scry_errors::sqlite::ErrorsDb::open_read_only(p)
-                .with_context(|| format!("opening errors database at {}", p.display()))
-        })
-        .transpose()?;
-    if errors_db.is_some() {
-        info!("errors database opened (read-only) for IssueListRequest");
-    }
+        None => None,
+    };
 
     let service = Arc::new(
         QueryService::new(
@@ -1018,12 +1014,13 @@ pub async fn run(args: Args) -> Result<()> {
         let bucket = conv_bucket.clone();
         let cat = conv_catalog.clone();
         let interval = Duration::from_secs(args.poll_interval.max(1));
+        let lookback = Duration::from_secs(args.poll_lookback_secs);
         bg_tasks.push(tokio::spawn(async move {
             let mut tick = tokio::time::interval(interval);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tick.tick().await;
-                match poll_once(store.as_ref(), cat.as_ref(), &bucket).await {
+                match poll_once(store.as_ref(), cat.as_ref(), &bucket, lookback).await {
                     Ok(r) if r.inserted > 0 => info!(
                         inserted = r.inserted,
                         cursors = r.cursors,
@@ -1266,6 +1263,28 @@ pub async fn run(args: Args) -> Result<()> {
         }
     }
     serve_result
+}
+
+/// Log one errors snapshot follow pass; quiet when nothing changed.
+fn log_errors_follow(outcome: Result<scry_errors::follow::FollowOutcome>) {
+    use scry_errors::follow::FollowOutcome;
+    match outcome {
+        Ok(FollowOutcome::Refreshed { issues, bytes }) => {
+            info!(
+                issues,
+                bytes, "errors database refreshed from bucket snapshot"
+            )
+        }
+        Ok(FollowOutcome::Local { reopened: true }) => {
+            info!("errors database opened from the local file")
+        }
+        Ok(FollowOutcome::VersionMismatch { found, expected }) => warn!(
+            found,
+            expected, "errors snapshot schema version mismatch; keeping the installed database"
+        ),
+        Ok(FollowOutcome::NoSnapshot | FollowOutcome::Unchanged | FollowOutcome::Local { .. }) => {}
+        Err(error) => warn!(error = %format!("{error:#}"), "errors snapshot refresh failed"),
+    }
 }
 
 fn resolve_worker_advertise_addr(

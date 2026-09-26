@@ -26,10 +26,9 @@ import {
   type QuerySpec,
   type MetaScope,
   type FleetInstance,
-  type Issue,
-  type OccurrenceSummary,
   type QueryTiming,
 } from "./protocol/client";
+import { createIssueStore } from "./issueStore";
 import { LiveUnavailableError } from "./protocol/transport";
 import {
   TailError,
@@ -400,65 +399,26 @@ export async function refreshFleet(): Promise<void> {
 
 // ── Error tracking issues ────────────────────────────────────────────
 
-export type IssueListStatus = "idle" | "loading" | "ready" | "error";
-const [issueListStatus, setIssueListStatus] = createSignal<IssueListStatus>("idle");
-const [issues, setIssues] = createSignal<Issue[]>([]);
-const [issueListError, setIssueListError] = createSignal<string | null>(null);
-const [issueListUpdatedAt, setIssueListUpdatedAt] = createSignal<number | null>(null);
-export { issueListStatus, issues, issueListError, issueListUpdatedAt };
-
-/** Refresh the issue list through the selected queryd. Safe to call from a
- * timer: failures preserve the previous snapshot while exposing the error. */
-export async function refreshIssues(): Promise<void> {
-  setIssueListStatus("loading");
-  setIssueListError(null);
+/** Run one issue request, dropping the session on an authorization failure. */
+async function issueRequest<T>(request: (transport: Transport) => Promise<T>) {
   try {
-    const transport = await getTransport();
-    const result = await fetchIssueList(transport, inBrowser ? state.target : state.addr);
-    setIssues(result);
-    setIssueListUpdatedAt(Date.now());
-    setIssueListStatus("ready");
+    return await request(await getTransport());
   } catch (err) {
     if (err instanceof UnauthorizedError) setAuthed(false);
-    setIssueListError(err instanceof Error ? err.message : String(err));
-    setIssueListStatus("error");
+    throw err;
   }
 }
 
-// ── Issue detail + occurrences ──────────────────────────────────────
-
-export type IssueDetailStatus = "idle" | "loading" | "ready" | "error";
-const [issueDetailStatus, setIssueDetailStatus] =
-  createSignal<IssueDetailStatus>("idle");
-const [currentIssue, setCurrentIssue] = createSignal<Issue | null>(null);
-const [issueOccurrences, setIssueOccurrences] = createSignal<
-  OccurrenceSummary[]
->([]);
-const [issueDetailError, setIssueDetailError] = createSignal<string | null>(
-  null,
+/** Issue list and selected-issue state for the selected queryd target; see
+ * `issueStore.ts`. */
+export const issueStore = createIssueStore(
+  {
+    list: (dest) => issueRequest((transport) => fetchIssueList(transport, dest)),
+    detail: (dest, issueId) =>
+      issueRequest((transport) => fetchIssueOccurrences(transport, dest, issueId)),
+  },
+  () => (inBrowser ? state.target : state.addr),
 );
-export { issueDetailStatus, currentIssue, issueOccurrences, issueDetailError };
-
-/** Refresh issue detail + occurrence list through the selected queryd. */
-export async function refreshIssueDetail(issueId: string): Promise<void> {
-  setIssueDetailStatus("loading");
-  setIssueDetailError(null);
-  try {
-    const transport = await getTransport();
-    const result = await fetchIssueOccurrences(
-      transport,
-      inBrowser ? state.target : state.addr,
-      issueId,
-    );
-    setCurrentIssue(result.issue);
-    setIssueOccurrences(result.occurrences);
-    setIssueDetailStatus("ready");
-  } catch (err) {
-    if (err instanceof UnauthorizedError) setAuthed(false);
-    setIssueDetailError(err instanceof Error ? err.message : String(err));
-    setIssueDetailStatus("error");
-  }
-}
 
 function parseBigIntOpt(raw: string): bigint | undefined {
   const t = raw.trim();

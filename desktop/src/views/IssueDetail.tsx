@@ -2,64 +2,45 @@
 //!
 //! Reached via `/errors/:issueId` after clicking an issue row in the
 //! Errors list view. Polls for updates every 10 seconds (same cadence
-//! as the list view).
+//! as the list view), completion-relative and paused while the page is
+//! hidden. Navigating between issues clears the previous issue's data and
+//! discards its in-flight responses (see `issueStore.ts`).
 
-import {
-  For,
-  Match,
-  Show,
-  Switch,
-  onCleanup,
-  onMount,
-  type Component,
-} from "solid-js";
+import { For, Match, Show, Switch, createEffect, on, onCleanup, type Component } from "solid-js";
 import { useParams, A } from "@solidjs/router";
+import { issueStore } from "../store";
 import {
-  issueDetailStatus,
-  currentIssue,
-  issueOccurrences,
-  issueDetailError,
-  refreshIssueDetail,
-} from "../store";
+  formatIssueAge as formatAge,
+  formatIssueTime as formatTime,
+  pollWhileVisible,
+  qualityLabel,
+} from "../issueStore";
+import { ISSUE_PAGE_LIMIT } from "../protocol/client";
 import { severity } from "../severity";
 
 const POLL_MS = 10_000;
 
-const QUALITY_LABELS: Record<number, string> = {
-  0: "Type + Message",
-  1: "Type Only",
-  2: "Fallback",
-};
-
-function qualityLabel(q: number): string {
-  return QUALITY_LABELS[q] ?? `Q${q}`;
-}
-
-function formatTime(nanos: number): string {
-  const ms = nanos / 1_000_000;
-  return new Date(ms).toLocaleString();
-}
-
-function formatAge(nanos: number): string {
-  const ms = nanos / 1_000_000;
-  const ago = Date.now() - ms;
-  if (ago < 60_000) return "just now";
-  if (ago < 3_600_000) return `${Math.floor(ago / 60_000)}m ago`;
-  if (ago < 86_400_000) return `${Math.floor(ago / 3_600_000)}h ago`;
-  return `${Math.floor(ago / 86_400_000)}d ago`;
-}
-
 const IssueDetail: Component = () => {
   const params = useParams<{ issueId: string }>();
+  const state = issueStore.state;
 
-  onMount(() => {
-    void refreshIssueDetail(params.issueId);
-    const timer = window.setInterval(
-      () => void refreshIssueDetail(params.issueId),
-      POLL_MS,
-    );
-    onCleanup(() => window.clearInterval(timer));
-  });
+  createEffect(
+    on(
+      () => params.issueId,
+      (issueId) => {
+        issueStore.selectIssue(issueId);
+        const stop = pollWhileVisible(issueStore.refreshDetail, POLL_MS);
+        onCleanup(stop);
+      },
+    ),
+  );
+  // A target switch clears the old target's data; reload without waiting for
+  // the next poll.
+  createEffect(
+    on(issueStore.destination, () => void issueStore.refreshDetail(), { defer: true }),
+  );
+
+  const notFound = () => state.detailStatus === "ready" && state.issue === null;
 
   return (
     <main class="errors-view">
@@ -68,7 +49,7 @@ const IssueDetail: Component = () => {
           <A href="/errors" class="issue-back">
             &larr; All Issues
           </A>
-          <Show when={currentIssue()}>
+          <Show when={state.issue}>
             {(issue) => {
               const sev = () => severity(issue().max_severity);
               return (
@@ -78,9 +59,7 @@ const IssueDetail: Component = () => {
                     <div>
                       <dt>Severity</dt>
                       <dd>
-                        <span class={`log-sev ${sev().cls}`}>
-                          {sev().label}
-                        </span>
+                        <span class={`log-sev ${sev().cls}`}>{sev().label}</span>
                       </dd>
                     </div>
                     <div>
@@ -93,17 +72,13 @@ const IssueDetail: Component = () => {
                     </div>
                     <div>
                       <dt>First seen</dt>
-                      <dd
-                        title={formatTime(issue().first_seen_unix_nano)}
-                      >
+                      <dd title={formatTime(issue().first_seen_unix_nano)}>
                         {formatAge(issue().first_seen_unix_nano)}
                       </dd>
                     </div>
                     <div>
                       <dt>Last seen</dt>
-                      <dd
-                        title={formatTime(issue().last_seen_unix_nano)}
-                      >
+                      <dd title={formatTime(issue().last_seen_unix_nano)}>
                         {formatAge(issue().last_seen_unix_nano)}
                       </dd>
                     </div>
@@ -120,43 +95,44 @@ const IssueDetail: Component = () => {
         <div class="fleet-toolbar-actions">
           <button
             type="button"
-            onClick={() => void refreshIssueDetail(params.issueId)}
-            disabled={issueDetailStatus() === "loading"}
+            onClick={() => void issueStore.refreshDetail()}
+            disabled={state.detailStatus === "loading"}
           >
-            {issueDetailStatus() === "loading" ? "Refreshing..." : "Refresh"}
+            {state.detailStatus === "loading" ? "Refreshing..." : "Refresh"}
           </button>
         </div>
       </header>
 
-      <Show when={issueDetailError()}>
+      <Show when={state.detailError}>
         {(error) => <div class="fleet-error">{error()}</div>}
       </Show>
 
       <Switch>
+        <Match when={notFound()}>
+          <div class="fleet-empty">This issue does not exist in the errors database.</div>
+        </Match>
         <Match
           when={
-            issueDetailStatus() === "loading" &&
-            issueOccurrences().length === 0
+            (state.detailStatus === "idle" || state.detailStatus === "loading") &&
+            state.occurrences.length === 0
           }
         >
           <div class="fleet-empty">Loading occurrences...</div>
         </Match>
-        <Match
-          when={
-            issueDetailStatus() === "error" &&
-            issueOccurrences().length === 0
-          }
-        >
+        <Match when={state.detailStatus === "error" && state.occurrences.length === 0}>
           <div class="fleet-empty">Could not load occurrences.</div>
         </Match>
-        <Match when={issueOccurrences().length === 0}>
-          <div class="fleet-empty">
-            No occurrences found for this issue.
-          </div>
+        <Match when={state.occurrences.length === 0}>
+          <div class="fleet-empty">No occurrences found for this issue.</div>
         </Match>
         <Match when={true}>
           <h2 class="occ-section-heading">
-            Occurrences ({issueOccurrences().length})
+            <Show
+              when={state.occurrences.length >= ISSUE_PAGE_LIMIT}
+              fallback={<>Occurrences ({state.occurrences.length})</>}
+            >
+              Latest {state.occurrences.length} occurrences
+            </Show>
           </h2>
           <table class="issue-table">
             <thead>
@@ -167,14 +143,11 @@ const IssueDetail: Component = () => {
               </tr>
             </thead>
             <tbody>
-              <For each={issueOccurrences()}>
+              <For each={state.occurrences}>
                 {(occ) => (
                   <tr class="issue-row">
                     <td class="issue-title">{occ.event_id}</td>
-                    <td
-                      class="issue-time"
-                      title={formatTime(occ.occurred_at_unix_nano)}
-                    >
+                    <td class="issue-time" title={formatTime(occ.occurred_at_unix_nano)}>
                       {formatAge(occ.occurred_at_unix_nano)}
                     </td>
                     <td class="issue-time">{occ.trace_id ?? "---"}</td>
