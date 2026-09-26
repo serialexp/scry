@@ -48,13 +48,27 @@ if [[ "$ready" != true ]]; then
   exit 1
 fi
 
-if aws_s3 head-bucket --bucket "$S3_BUCKET" >/dev/null 2>&1; then
-  echo "bucket $S3_BUCKET already exists; skipping"
-else
+# The compose file's S3_BUCKET makes SeaweedFS create the bucket itself shortly
+# after startup, so our create can race it: head-bucket misses the bucket, then
+# create-bucket fails with BucketAlreadyOwnedByYou. A failed create therefore
+# only counts once the bucket is still missing after it; retry a few times.
+bucket_ready=false
+for _ in $(seq 1 10); do
+  if aws_s3 head-bucket --bucket "$S3_BUCKET" >/dev/null 2>&1; then
+    bucket_ready=true
+    break
+  fi
   echo "creating bucket $S3_BUCKET"
-  aws_s3 create-bucket --bucket "$S3_BUCKET" >/dev/null
-  aws_s3 head-bucket --bucket "$S3_BUCKET" >/dev/null
+  if ! create_error="$(aws_s3 create-bucket --bucket "$S3_BUCKET" 2>&1 >/dev/null)"; then
+    echo "create-bucket did not succeed (${create_error##*: }); re-checking" >&2
+  fi
+  sleep 1
+done
+if [[ "$bucket_ready" != true ]]; then
+  echo "bucket $S3_BUCKET is still missing after repeated create attempts" >&2
+  exit 1
 fi
+echo "bucket $S3_BUCKET is ready"
 
 # Newer AWS CLIs expose conditional headers on put-object. Exercise both the
 # create-only and compare-and-swap paths when those flags are available.
