@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
-use object_store::{memory::InMemory, ObjectStore};
+use object_store::{memory::InMemory, ObjectStore, ObjectStoreExt};
 use scry_alert::{
-    AlertsDb, Comparator, ExecutionErrorPolicy, Monitor, MonitorId, NoDataPolicy, ScalarCondition,
-    ScalarQuery, Signal, MONITOR_SCHEMA_VERSION,
+    rule_revision_key, rule_tombstone_key, AlertStore, AlertsDb, Comparator, ExecutionErrorPolicy,
+    Monitor, MonitorId, NoDataPolicy, RuleTombstone, ScalarCondition, ScalarQuery, Signal,
+    ALERT_RECORD_SCHEMA_VERSION, MONITOR_SCHEMA_VERSION,
 };
 use scry_alertd::{serve_control_for_test, QueryTarget};
 use uuid::Uuid;
@@ -186,4 +187,203 @@ async fn authenticated_create_and_list_are_revisioned_and_bounded() {
     assert_eq!(replayed_delete.status(), reqwest::StatusCode::NO_CONTENT);
 
     server.abort();
+}
+
+struct Api {
+    address: std::net::SocketAddr,
+    client: reqwest::Client,
+    store: Arc<dyn ObjectStore>,
+    server: tokio::task::JoinHandle<anyhow::Result<()>>,
+}
+
+impl Api {
+    async fn start() -> Self {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db = AlertsDb::open_in_memory(Uuid::new_v4()).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_control_for_test(
+            listener,
+            TOKEN.into(),
+            store.clone(),
+            db,
+            vec![QueryTarget {
+                id: "local".into(),
+                address: "127.0.0.1:9".into(),
+            }],
+        ));
+        Self {
+            address,
+            client: reqwest::Client::new(),
+            store,
+            server,
+        }
+    }
+
+    async fn create(&self, rule: &Monitor) {
+        let response = self
+            .client
+            .post(format!("http://{}/v1/monitors", self.address))
+            .bearer_auth(TOKEN)
+            .header("idempotency-key", Uuid::new_v4().to_string())
+            .json(rule)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+    }
+
+    async fn update(&self, rule: &Monitor, command: &str, if_match: u64) -> reqwest::StatusCode {
+        self.client
+            .put(format!("http://{}/v1/monitors/{}", self.address, rule.id))
+            .bearer_auth(TOKEN)
+            .header("idempotency-key", command)
+            .header("if-match", format!("\"{if_match}\""))
+            .json(rule)
+            .send()
+            .await
+            .unwrap()
+            .status()
+    }
+
+    async fn delete(&self, id: MonitorId, command: &str, if_match: u64) -> reqwest::StatusCode {
+        self.client
+            .delete(format!("http://{}/v1/monitors/{id}", self.address))
+            .bearer_auth(TOKEN)
+            .header("idempotency-key", command)
+            .header("if-match", format!("\"{if_match}\""))
+            .send()
+            .await
+            .unwrap()
+            .status()
+    }
+
+    async fn get(&self, id: MonitorId) -> reqwest::StatusCode {
+        self.client
+            .get(format!("http://{}/v1/monitors/{id}", self.address))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .status()
+    }
+}
+
+#[tokio::test]
+async fn delete_replay_resumes_a_staged_tombstone_and_statuses_are_meaningful() {
+    use reqwest::StatusCode;
+
+    let api = Api::start().await;
+    let rule = monitor();
+    api.create(&rule).await;
+
+    // Missing monitors are 404, not an upstream error.
+    let missing = MonitorId::new();
+    assert_eq!(
+        api.delete(missing, &Uuid::new_v4().to_string(), 1).await,
+        StatusCode::NOT_FOUND
+    );
+    let mut ghost = monitor();
+    ghost.id = missing;
+    ghost.revision = 2;
+    assert_eq!(
+        api.update(&ghost, &Uuid::new_v4().to_string(), 1).await,
+        StatusCode::NOT_FOUND
+    );
+
+    // A delete that staged its tombstone record but crashed before the head
+    // CAS: a replay of the same command completes it.
+    let command = Uuid::new_v4().to_string();
+    AlertStore::new(api.store.as_ref())
+        .create_record(
+            &rule_tombstone_key(rule.id, &command),
+            &RuleTombstone {
+                schema_version: ALERT_RECORD_SCHEMA_VERSION,
+                monitor_id: rule.id,
+                revision: 1,
+                command_id: command.clone(),
+                deleted_at_unix_nano: 7,
+            },
+        )
+        .await
+        .unwrap();
+    // The staged tombstone pins its revision.
+    assert_eq!(api.delete(rule.id, &command, 2).await, StatusCode::CONFLICT);
+    assert_eq!(
+        api.delete(rule.id, &command, 1).await,
+        StatusCode::NO_CONTENT
+    );
+    let head = AlertStore::new(api.store.as_ref())
+        .read_rule_head(rule.id)
+        .await
+        .unwrap()
+        .value;
+    assert!(head.deleted);
+    assert_eq!(
+        head.tombstone_key.as_deref(),
+        Some(rule_tombstone_key(rule.id, &command).as_str())
+    );
+    assert_eq!(api.get(rule.id).await, StatusCode::NOT_FOUND);
+    // Replays stay successful; another command against the deleted head conflicts.
+    assert_eq!(
+        api.delete(rule.id, &command, 1).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        api.delete(rule.id, &Uuid::new_v4().to_string(), 1).await,
+        StatusCode::CONFLICT
+    );
+    let mut revived = rule.clone();
+    revived.revision = 2;
+    assert_eq!(
+        api.update(&revived, &Uuid::new_v4().to_string(), 1).await,
+        StatusCode::CONFLICT
+    );
+
+    api.server.abort();
+}
+
+#[tokio::test]
+async fn an_unpublished_revision_left_by_a_crashed_command_never_blocks_a_save() {
+    use reqwest::StatusCode;
+
+    let api = Api::start().await;
+    let rule = monitor();
+    api.create(&rule).await;
+
+    // A command wrote revision 2 but crashed before advancing the head.
+    let mut abandoned = rule.clone();
+    abandoned.revision = 2;
+    abandoned.name = "abandoned edit".into();
+    api.store
+        .put(
+            &object_store::path::Path::from(rule_revision_key(rule.id, 2, "crashed-command")),
+            serde_json::to_vec(&abandoned).unwrap().into(),
+        )
+        .await
+        .unwrap();
+
+    let mut edit = rule.clone();
+    edit.revision = 2;
+    edit.name = "the edit that should win".into();
+    edit.updated_at_unix_nano = 2;
+    let command = Uuid::new_v4().to_string();
+    assert_eq!(api.update(&edit, &command, 1).await, StatusCode::OK);
+    assert_eq!(api.update(&edit, &command, 1).await, StatusCode::OK);
+    let durable = AlertStore::new(api.store.as_ref())
+        .read_rule(rule.id)
+        .await
+        .unwrap()
+        .value;
+    assert_eq!(durable, edit);
+
+    // The same revision from a different command is a conflict, not a 5xx.
+    let mut late = edit.clone();
+    late.name = "late competitor".into();
+    assert_eq!(
+        api.update(&late, &Uuid::new_v4().to_string(), 1).await,
+        StatusCode::CONFLICT
+    );
+
+    api.server.abort();
 }

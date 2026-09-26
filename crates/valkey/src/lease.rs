@@ -76,6 +76,9 @@ end
 /// maintenance path, so it must not hang (fred has no default command timeout).
 const RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Upper bound on the acquiring `SET NX PX`; see [`acquire_timeout`].
+const MAX_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Delete the lease iff we still own it. KEYS[1]=key, ARGV[1]=token.
 /// Returns 1 if deleted, 0 if it wasn't ours (already expired / taken over).
 const RELEASE_LUA: &str = r#"
@@ -242,18 +245,37 @@ impl LeaseProvider for ValkeyLeaseProvider {
         let sent = Instant::now();
 
         // SET key token NX PX ttl. Null reply ⇒ key already held ⇒ not ours.
-        let res: Value = self
-            .client
-            .inner()
-            .set(
+        // Bounded like renew and release: fred's default command timeout is
+        // disabled and it buffers across reconnects, so an unbounded acquire
+        // would stall every caller (maintenance, alert scheduling) behind a
+        // hung connection.
+        let timeout = acquire_timeout(ttl);
+        let res: Value = match tokio::time::timeout(
+            timeout,
+            self.client.inner().set(
                 key.as_str(),
                 token.clone(),
                 Some(Expiration::PX(ttl_ms)),
                 Some(SetOptions::NX),
                 false,
-            )
-            .await
-            .with_context(|| format!("SET NX for lease {key}"))?;
+            ),
+        )
+        .await
+        {
+            Ok(result) => result.with_context(|| format!("SET NX for lease {key}"))?,
+            Err(_) => {
+                // The buffered SET may still land after we give up. Nobody
+                // renews it, so it expires within `ttl`; queue a best-effort
+                // compare-and-DEL behind it so it usually goes away sooner.
+                // The token is ours alone, so this can never delete a peer's
+                // lease.
+                spawn_abandoned_release(self.client.inner().clone(), key.clone(), token);
+                anyhow::bail!(
+                    "SET NX for lease {key} timed out after {}ms",
+                    timeout.as_millis()
+                );
+            }
+        };
         if res.is_null() {
             return Ok(None);
         }
@@ -276,6 +298,28 @@ impl LeaseProvider for ValkeyLeaseProvider {
             renew,
         }))
     }
+}
+
+/// Bound on the acquiring `SET NX PX`: at most [`MAX_ACQUIRE_TIMEOUT`], and
+/// never more than one renew period, so a lease won just before the timeout
+/// still has at least one renew period of fence validity left (the fence is
+/// anchored at the send).
+fn acquire_timeout(ttl: Duration) -> Duration {
+    renew_period(ttl).min(MAX_ACQUIRE_TIMEOUT)
+}
+
+/// Best-effort compare-and-DEL for an acquire we abandoned on timeout.
+fn spawn_abandoned_release(client: Client, key: String, token: String) {
+    tokio::spawn(async move {
+        let released = tokio::time::timeout(
+            RELEASE_TIMEOUT,
+            client.eval::<i64, _, _, _>(RELEASE_LUA, vec![key.clone()], vec![token]),
+        )
+        .await;
+        if !matches!(released, Ok(Ok(_))) {
+            tracing::debug!(key = %key, "abandoned lease acquire not cleaned up; it expires via TTL");
+        }
+    });
 }
 
 /// Renewal cadence: `ttl/3` gives two renewal attempts before expiry under a
@@ -433,6 +477,20 @@ mod tests {
         // An out-of-order/late reply reporting an older send time.
         f.mark_renewed(f.origin + Duration::from_millis(1_000));
         assert_eq!(f.last_ok_millis.load(Ordering::SeqCst), 5_000);
+    }
+
+    #[test]
+    fn acquire_timeout_is_bounded_and_leaves_fence_headroom() {
+        assert_eq!(acquire_timeout(TTL), MAX_ACQUIRE_TIMEOUT);
+        // Above the 50ms floors, where the backstop exceeds one renew period.
+        for ms in [100u64, 3_000, 45_000, 600_000] {
+            let ttl = Duration::from_millis(ms);
+            let timeout = acquire_timeout(ttl);
+            assert!(timeout > Duration::ZERO, "ttl={ms}ms");
+            assert!(timeout <= MAX_ACQUIRE_TIMEOUT, "ttl={ms}ms");
+            // A lease won at the last moment must not start already fenced.
+            assert!(timeout < backstop_for(ttl), "ttl={ms}ms");
+        }
     }
 
     #[test]

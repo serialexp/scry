@@ -14,29 +14,32 @@ use axum::{
 };
 use futures::TryStreamExt;
 use hmac::{Hmac, Mac};
-use object_store::{path::Path as ObjectPath, ObjectStore, ObjectStoreExt, PutPayload};
+use object_store::{path::Path as ObjectPath, ObjectStore};
 use scry_alert::{
-    canonical_json, sha256_hex, AlertStore, AlertsDb, BuiltInTargetFormat, CompiledJsonTemplate,
-    LogicalSecretId, NotificationTarget, NotificationTargetId, NotificationTargetKind,
-    NotificationTargetProjection, SecretBinding, SecretGenerationRecord, SecretHead, SecretKey,
-    SecretKeyring, TargetFormat, TargetHeader, TargetMutationKind, TargetMutationReceipt,
-    TargetTombstone, TemplateValues, ALERT_RECORD_SCHEMA_VERSION, MAX_ENDPOINT_BYTES, MAX_HEADERS,
-    MAX_HEADER_BYTES, MAX_SECRET_BYTES, MAX_TARGET_NAME_BYTES, MAX_TIMEOUT_MILLIS,
+    canonical_json, is_reserved_header, sha256_hex, AlertStore, AlertStoreError,
+    BuiltInTargetFormat, CompiledJsonTemplate, LogicalSecretId, NotificationTarget,
+    NotificationTargetId, NotificationTargetKind, NotificationTargetProjection, SecretBinding,
+    SecretGenerationRecord, SecretHead, SecretKey, SecretKeyring, TargetFormat, TargetHeader,
+    TargetMutationKind, TargetMutationReceipt, TargetTombstone, TemplateValues,
+    ALERT_RECORD_SCHEMA_VERSION, MAX_ENDPOINT_BYTES, MAX_HEADERS, MAX_HEADER_BYTES,
+    MAX_SECRET_BYTES, MAX_TARGET_NAME_BYTES, MAX_TIMEOUT_MILLIS, SIGNATURE_HEADER,
+    SIGNATURE_TIMESTAMP_HEADER,
 };
+use scry_cluster::{LeaseGuard, LeaseProvider};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use url::Url;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::{admit_control, authenticate, require_idempotency, ApiError, AppState, PageQuery};
+use crate::{
+    admit_control, authenticate, leases::Lease, require_idempotency, ApiError, AppState, PageQuery,
+};
 
 pub const CURRENT_KEY_ENV: &str = "SCRY_ALERTD_TARGET_KEY_CURRENT";
 pub const PREVIOUS_KEY_ENV: &str = "SCRY_ALERTD_TARGET_KEY_PREVIOUS";
 const MAX_TARGETS: usize = 10_000;
 const MAX_SECRET_LINEAGE: usize = 10_000;
-const SIGNATURE_HEADER: &str = "x-scry-signature";
-const SIGNATURE_TIMESTAMP_HEADER: &str = "x-scry-signature-timestamp";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -69,80 +72,6 @@ pub fn parse_keyring(current: &str, previous: Option<&str>) -> anyhow::Result<Se
         anyhow::bail!("current and previous target key IDs must differ");
     }
     Ok(SecretKeyring::new(current_id, current_key, previous))
-}
-
-struct TargetProjectionEntry {
-    id: NotificationTargetId,
-    target: Option<NotificationTarget>,
-}
-
-async fn load_projection(store: &dyn ObjectStore) -> anyhow::Result<Vec<TargetProjectionEntry>> {
-    let prefix = ObjectPath::from("_scry/alerts/v1/targets");
-    let mut listed = store.list(Some(&prefix));
-    let mut ids = Vec::new();
-    while let Some(meta) = listed.try_next().await? {
-        let key = meta.location.as_ref();
-        if let Some(id) = key
-            .strip_prefix("_scry/alerts/v1/targets/")
-            .and_then(|v| v.strip_suffix("/head.json"))
-            .and_then(|v| Uuid::parse_str(v).ok())
-        {
-            ids.push(NotificationTargetId(id));
-        }
-    }
-    if ids.len() > MAX_TARGETS {
-        tracing::warn!(
-            target_count = ids.len(),
-            limit = MAX_TARGETS,
-            "notification-target count exceeds the create limit; rebuilding all targets and refusing further creates"
-        );
-    }
-    ids.sort_unstable_by_key(|id| id.0);
-    let alert_store = AlertStore::new(store);
-    let mut entries = Vec::with_capacity(ids.len());
-    for id in ids {
-        let head = alert_store.read_target_head(id).await?;
-        if head.value.target_id != id || head.value.schema_version != ALERT_RECORD_SCHEMA_VERSION {
-            anyhow::bail!("notification-target head ownership mismatch");
-        }
-        let target = if head.value.deleted {
-            None
-        } else {
-            let target = alert_store.read_target(id).await?.value;
-            if target.id != id || target.revision != head.value.revision {
-                anyhow::bail!("notification-target revision does not match head");
-            }
-            target.validate()?;
-            Some(target)
-        };
-        entries.push(TargetProjectionEntry { id, target });
-    }
-    Ok(entries)
-}
-
-fn fold_projection(db: &mut AlertsDb, entries: Vec<TargetProjectionEntry>) -> anyhow::Result<()> {
-    for entry in entries {
-        if let Some(target) = entry.target {
-            db.fold_notification_target(&target)?;
-        } else {
-            db.delete_notification_target(entry.id)?;
-        }
-    }
-    Ok(())
-}
-
-pub async fn rebuild_projection(store: &dyn ObjectStore, db: &mut AlertsDb) -> anyhow::Result<()> {
-    let entries = load_projection(store).await?;
-    fold_projection(db, entries)
-}
-
-pub async fn reconcile_projection(
-    store: &dyn ObjectStore,
-    db: &tokio::sync::Mutex<AlertsDb>,
-) -> anyhow::Result<()> {
-    let entries = load_projection(store).await?;
-    let mut db = db.lock().await;
-    fold_projection(&mut db, entries)
 }
 
 pub fn routes() -> Router<AppState> {
@@ -260,7 +189,7 @@ struct TestIntent {
     created_at_unix_nano: u64,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct TestResult {
     event_id: String,
     outcome: String,
@@ -459,31 +388,18 @@ fn validate_headers(headers: &[TargetHeader]) -> Result<(), ApiError> {
     {
         return Err(ApiError::BadRequest("webhook headers exceed bounds".into()));
     }
-    const BLOCKED: &[&str] = &[
-        "host",
-        "content-length",
-        "connection",
-        "transfer-encoding",
-        "upgrade",
-        "proxy-authorization",
-        "proxy-authenticate",
-        "te",
-        "trailer",
-        "cookie",
-        "idempotency-key",
-        SIGNATURE_HEADER,
-        SIGNATURE_TIMESTAMP_HEADER,
-    ];
     for item in headers {
         let name = HeaderName::from_bytes(item.name.as_bytes())
             .map_err(|_| ApiError::BadRequest("invalid header name".into()))?;
         HeaderValue::from_str(&item.value)
             .map_err(|_| ApiError::BadRequest("invalid header value".into()))?;
-        if BLOCKED
-            .iter()
-            .any(|blocked| name.as_str().eq_ignore_ascii_case(blocked))
-        {
-            return Err(ApiError::BadRequest("reserved webhook header".into()));
+        // The same list `NotificationTarget::validate` enforces on stored
+        // records, so API validation and projection loading cannot disagree.
+        if is_reserved_header(name.as_str()) {
+            return Err(ApiError::BadRequest(format!(
+                "webhook header `{}` is reserved",
+                name.as_str()
+            )));
         }
     }
     Ok(())
@@ -603,15 +519,21 @@ async fn persist(
             Ok(head) if !head.value.deleted && head.value.revision + 1 == candidate.revision => {
                 Some(head.version)
             }
+            // This command already published: the head names its revision.
             Ok(head)
                 if !head.value.deleted
                     && head.value.revision == candidate.revision
                     && head.value.revision_key
-                        == scry_alert::target_revision_key(candidate.id, candidate.revision) =>
+                        == scry_alert::target_revision_key(
+                            candidate.id,
+                            candidate.revision,
+                            command,
+                        ) =>
             {
                 None
             }
-            Err(scry_alert::AlertStoreError::Missing { .. }) if candidate.revision == 1 => None,
+            Err(AlertStoreError::Missing { .. }) if candidate.revision == 1 => None,
+            Err(error) if error.is_transient() => return Err(ApiError::Store(error)),
             _ => return Err(ApiError::Conflict),
         };
         (candidate, expected_head)
@@ -698,7 +620,7 @@ async fn persist(
         .await
         .map_err(ApiError::Store)?;
     store
-        .create_target_revision(&target, expected_head)
+        .create_target_revision(&target, command, expected_head)
         .await
         .map_err(ApiError::Store)?;
     state.db.lock().await.fold_notification_target(&target)?;
@@ -719,14 +641,21 @@ async fn commit_secret(
         generation,
     };
     let alert_store = AlertStore::new(state.store.as_ref());
-    if let Ok(existing) = alert_store
+    let existing = match alert_store
         .read_secret_generation(id, logical, generation)
         .await
     {
+        Ok(existing) => Some(existing),
+        Err(AlertStoreError::Missing { .. }) => None,
+        Err(error) => return Err(ApiError::Store(error)),
+    };
+    if let Some(existing) = existing {
+        // The generation is keyed by this command; failing to decrypt it is a
+        // server keyring problem, not a client conflict.
         let decrypted = state
             .keyring
             .decrypt(&binding, &existing.value.envelope)
-            .map_err(|_| ApiError::Conflict)?;
+            .map_err(|_| undecryptable_secret())?;
         if decrypted.as_slice() != plaintext || existing.value.rotation_of_generation.is_some() {
             return Err(ApiError::Conflict);
         }
@@ -762,7 +691,7 @@ async fn commit_secret(
                     },
                     &latest.envelope,
                 )
-                .map_err(|_| ApiError::Conflict)?;
+                .map_err(|_| undecryptable_secret())?;
             return Ok(());
         }
         let timestamp = now();
@@ -786,7 +715,7 @@ async fn commit_secret(
     let envelope = state
         .keyring
         .encrypt(&binding, plaintext)
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        .map_err(|error| ApiError::Internal(format!("encrypting target secret: {error}")))?;
     let timestamp = now();
     let record = SecretGenerationRecord {
         schema_version: ALERT_RECORD_SCHEMA_VERSION,
@@ -842,7 +771,11 @@ async fn delete(
             && head.value.tombstone_key.as_deref()
                 == Some(scry_alert::target_tombstone_key(id, command).as_str())
         {
-            state.db.lock().await.delete_notification_target(id)?;
+            state.db.lock().await.tombstone_notification_target(
+                id,
+                old.revision,
+                old.deleted_at_unix_nano,
+            )?;
             return Ok(StatusCode::NO_CONTENT);
         }
         if head.value.deleted || head.value.revision != expected {
@@ -852,27 +785,33 @@ async fn delete(
             .tombstone_target(&old, head.version)
             .await
             .map_err(ApiError::Store)?;
-        state.db.lock().await.delete_notification_target(id)?;
+        state.db.lock().await.tombstone_notification_target(
+            id,
+            old.revision,
+            old.deleted_at_unix_nano,
+        )?;
         return Ok(StatusCode::NO_CONTENT);
     }
     let head = store.read_target_head(id).await.map_err(map_missing)?;
     if head.value.deleted || head.value.revision != expected {
         return Err(ApiError::Conflict);
     }
+    let tombstone = TargetTombstone {
+        schema_version: ALERT_RECORD_SCHEMA_VERSION,
+        target_id: id,
+        revision: expected,
+        command_id: command.into(),
+        deleted_at_unix_nano: now(),
+    };
     store
-        .tombstone_target(
-            &TargetTombstone {
-                schema_version: ALERT_RECORD_SCHEMA_VERSION,
-                target_id: id,
-                revision: expected,
-                command_id: command.into(),
-                deleted_at_unix_nano: now(),
-            },
-            head.version,
-        )
+        .tombstone_target(&tombstone, head.version)
         .await
         .map_err(ApiError::Store)?;
-    state.db.lock().await.delete_notification_target(id)?;
+    state.db.lock().await.tombstone_notification_target(
+        id,
+        tombstone.revision,
+        tombstone.deleted_at_unix_nano,
+    )?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1029,7 +968,7 @@ async fn test_send(
     let lease_key = format!("lease/alert/deliver/{event_id}");
     let lease_ttl = Duration::from_millis(u64::from(target.timeout_millis) + 30_000);
     let Some(lease) = state
-        .delivery_leases
+        .leases
         .try_acquire(&lease_key, lease_ttl)
         .await
         .map_err(|error| ApiError::Unavailable(error.to_string()))?
@@ -1046,9 +985,21 @@ async fn test_send(
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     };
-    if let Some(existing) = read_test_result(state.store.as_ref(), &event_id).await? {
-        lease.release().await;
-        return Ok(Json(existing));
+    // Every outcome, success or error, releases the lease before returning.
+    let outcome = send_under_lease(&state, &lease, &target, &event_id, &body).await;
+    lease.release().await;
+    outcome.map(Json)
+}
+
+async fn send_under_lease(
+    state: &AppState,
+    lease: &Lease,
+    target: &NotificationTarget,
+    event_id: &str,
+    body: &[u8],
+) -> Result<TestResult, ApiError> {
+    if let Some(existing) = read_test_result(state.store.as_ref(), event_id).await? {
+        return Ok(existing);
     }
     let _send = state
         .test_sends
@@ -1058,15 +1009,16 @@ async fn test_send(
         .fence()
         .check()
         .map_err(|error| ApiError::Unavailable(error.to_string()))?;
-    let secret = read_secret(&state, &target).await?;
+    let secret = read_secret(state, target).await?;
+    let event_id = event_id.to_owned();
     let timestamp = chrono::Utc::now().timestamp().max(0) as u64;
-    let signature = sign(&secret, timestamp, &event_id, &body);
+    let signature = sign(&secret, timestamp, &event_id, body);
     let started = Instant::now();
     let result = tokio::time::timeout(
         Duration::from_millis(target.timeout_millis.into()),
         state
             .transport
-            .send(&target, &event_id, timestamp, &body, &signature),
+            .send(target, &event_id, timestamp, body, &signature),
     )
     .await
     .unwrap_or(Err("timeout"));
@@ -1105,107 +1057,51 @@ async fn test_send(
         .fence()
         .check()
         .map_err(|error| ApiError::Unavailable(error.to_string()))?;
-    persist_test_record(state.store.as_ref(), &event_id, "result", &response).await?;
-    lease.release().await;
-    Ok(Json(response))
+    AlertStore::new(state.store.as_ref())
+        .create_record(&test_record_key(&event_id, "result"), &response)
+        .await
+        .map_err(ApiError::Store)?;
+    Ok(response)
 }
 
+fn test_record_key(event_id: &str, kind: &str) -> String {
+    format!("_scry/alerts/v1/test-deliveries/{event_id}/{kind}.json")
+}
+
+/// Stage the intent, or return the one an earlier attempt of the same
+/// command staged (its creation time differs, so bytes are not compared).
 async fn stage_test_intent(
     store: &dyn ObjectStore,
     intent: TestIntent,
 ) -> Result<TestIntent, ApiError> {
-    let path = ObjectPath::from(format!(
-        "_scry/alerts/v1/test-deliveries/{}/intent.json",
-        intent.event_id
-    ));
-    let bytes = canonical_json(&intent).map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    match scry_objstore::put_create(store, &path, PutPayload::from(bytes)).await {
-        Ok(_) => Ok(intent),
-        Err(object_store::Error::AlreadyExists { .. }) => {
-            let existing = store.get(&path).await.map_err(|source| {
-                ApiError::Store(scry_alert::AlertStoreError::Object {
-                    path: path.to_string(),
-                    source,
-                })
-            })?;
-            let bytes = existing.bytes().await.map_err(|source| {
-                ApiError::Store(scry_alert::AlertStoreError::Object {
-                    path: path.to_string(),
-                    source,
-                })
-            })?;
-            serde_json::from_slice(&bytes).map_err(|error| ApiError::BadRequest(error.to_string()))
-        }
-        Err(source) => Err(ApiError::Store(scry_alert::AlertStoreError::Object {
-            path: path.to_string(),
-            source,
-        })),
+    let alerts = AlertStore::new(store);
+    let key = test_record_key(&intent.event_id, "intent");
+    if let Some(existing) = alerts.read_record(&key).await.map_err(ApiError::Store)? {
+        return Ok(existing);
+    }
+    match alerts.create_record(&key, &intent).await {
+        Ok(()) => Ok(intent),
+        Err(AlertStoreError::Collision { .. }) => alerts
+            .read_record(&key)
+            .await
+            .map_err(ApiError::Store)?
+            .ok_or(ApiError::Conflict),
+        Err(error) => Err(ApiError::Store(error)),
     }
 }
 
-async fn persist_test_record(
-    store: &dyn ObjectStore,
-    event: &str,
-    kind: &str,
-    value: &impl Serialize,
-) -> Result<(), ApiError> {
-    let path = ObjectPath::from(format!(
-        "_scry/alerts/v1/test-deliveries/{event}/{kind}.json"
-    ));
-    let bytes = canonical_json(value).map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    match scry_objstore::put_create(store, &path, PutPayload::from(bytes.clone())).await {
-        Ok(_) => Ok(()),
-        Err(object_store::Error::AlreadyExists { .. }) => {
-            let result = store.get(&path).await.map_err(|source| {
-                ApiError::Store(scry_alert::AlertStoreError::Object {
-                    path: path.to_string(),
-                    source,
-                })
-            })?;
-            let existing = result.bytes().await.map_err(|source| {
-                ApiError::Store(scry_alert::AlertStoreError::Object {
-                    path: path.to_string(),
-                    source,
-                })
-            })?;
-            if existing.as_ref() == bytes.as_slice() {
-                Ok(())
-            } else {
-                Err(ApiError::Conflict)
-            }
-        }
-        Err(source) => Err(ApiError::Store(scry_alert::AlertStoreError::Object {
-            path: path.to_string(),
-            source,
-        })),
-    }
-}
 async fn read_test_result(
     store: &dyn ObjectStore,
-    event: &str,
+    event_id: &str,
 ) -> Result<Option<TestResult>, ApiError> {
-    let path = ObjectPath::from(format!(
-        "_scry/alerts/v1/test-deliveries/{event}/result.json"
-    ));
-    let result = match store.get(&path).await {
-        Ok(result) => result,
-        Err(object_store::Error::NotFound { .. }) => return Ok(None),
-        Err(source) => {
-            return Err(ApiError::Store(scry_alert::AlertStoreError::Object {
-                path: path.to_string(),
-                source,
-            }))
-        }
-    };
-    let bytes = result.bytes().await.map_err(|source| {
-        ApiError::Store(scry_alert::AlertStoreError::Object {
-            path: path.to_string(),
-            source,
-        })
-    })?;
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(|error| ApiError::BadRequest(error.to_string()))
+    AlertStore::new(store)
+        .read_record(&test_record_key(event_id, "result"))
+        .await
+        .map_err(ApiError::Store)
+}
+
+fn undecryptable_secret() -> ApiError {
+    ApiError::Internal("notification target secret cannot be decrypted".into())
 }
 async fn resolve_secret_lineage(
     store: &AlertStore<'_>,
@@ -1304,7 +1200,7 @@ async fn read_secret(
     state
         .keyring
         .decrypt(&binding, &record.envelope)
-        .map_err(|_| ApiError::BadRequest("notification target secret cannot be decrypted".into()))
+        .map_err(|_| undecryptable_secret())
 }
 fn sign(secret: &[u8], timestamp: u64, event_id: &str, body: &[u8]) -> String {
     use std::fmt::Write as _;
@@ -1447,124 +1343,219 @@ fn map_missing(error: scry_alert::AlertStoreError) -> ApiError {
     }
 }
 
+/// Outcome of a key-rotation pass.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RotationReport {
+    /// Live (non-deleted) target heads examined.
+    pub targets: usize,
+    /// Distinct secrets those targets reference.
+    pub referenced: usize,
+    /// Referenced secrets re-encrypted (or that would be, on a dry run).
+    pub rotated: usize,
+    /// Referenced secrets already under the current key.
+    pub current: usize,
+    /// Secret heads no live target references (replaced credentials and
+    /// deleted targets). They are skipped, never decrypted or failed on;
+    /// `None` when they could not be counted.
+    pub orphaned: Option<usize>,
+    /// Referenced secrets (or unreadable targets) that could not be rotated
+    /// or verified, with the reason. Non-empty means some targets cannot
+    /// deliver under the current key.
+    pub failed: Vec<String>,
+}
+
+/// Re-encrypt, under the current key, every secret referenced by a current
+/// non-deleted target head. Work is bounded by the target count; orphaned
+/// secrets are only counted. A failure on one secret is recorded in the
+/// report and does not stop the others.
 pub async fn rotate(
     store: &dyn ObjectStore,
     deployment_id: &str,
     keyring: &SecretKeyring,
     dry_run: bool,
-) -> anyhow::Result<(usize, usize)> {
-    let prefix = ObjectPath::from("_scry/alerts/v1/target-secrets");
-    let mut listed = store.list(Some(&prefix));
-    let mut heads = Vec::new();
-    while let Some(meta) = listed.try_next().await? {
-        let parts: Vec<_> = meta.location.as_ref().split('/').collect();
-        if parts.len() == 7 && parts[6] == "head.json" {
-            if let (Ok(target), Ok(logical)) =
-                (Uuid::parse_str(parts[4]), Uuid::parse_str(parts[5]))
-            {
-                heads.push((NotificationTargetId(target), LogicalSecretId(logical)));
+) -> anyhow::Result<RotationReport> {
+    let alert_store = AlertStore::new(store);
+    let mut report = RotationReport::default();
+    let mut referenced = std::collections::BTreeSet::new();
+    for id in crate::projection::list_target_ids(store).await? {
+        let head = match alert_store.read_target_head(id).await {
+            Ok(head) => head.value,
+            Err(AlertStoreError::Missing { .. }) => continue,
+            Err(error) => {
+                report.failed.push(format!("target {id}: {error}"));
+                continue;
             }
+        };
+        if head.deleted {
+            continue;
         }
-        if heads.len() > MAX_TARGETS {
-            anyhow::bail!("target rotation exceeds {MAX_TARGETS} retained secret heads");
+        report.targets += 1;
+        match alert_store.read_target_revision(&head).await {
+            Ok(target) if target.value.secret_generation > 0 => {
+                referenced.insert((target.value.id.0, target.value.logical_secret_id.0));
+            }
+            Ok(_) => {}
+            Err(error) => report.failed.push(format!("target {id}: {error}")),
         }
     }
-    let alert_store = AlertStore::new(store);
-    let mut scanned = 0;
-    let mut rotated = 0;
-    for &(id, logical) in &heads {
-        scanned += 1;
-        let Some(old_head) = alert_store.read_secret_head(id, logical).await? else {
-            anyhow::bail!("listed target secret head disappeared")
-        };
-        let old = alert_store
-            .read_secret_generation(id, logical, old_head.value.generation)
-            .await?
-            .value;
-        if old.envelope.key_id == keyring.current_key_id() {
-            continue;
+    report.referenced = referenced.len();
+    report.orphaned = match count_orphaned_secret_heads(store, &referenced).await {
+        Ok(count) => Some(count),
+        Err(error) => {
+            tracing::warn!(error = %error, "could not count orphaned target secrets");
+            None
         }
-        let old_binding = SecretBinding {
-            deployment_id,
-            target_id: id,
-            logical_secret_id: logical,
-            generation: old.generation,
-        };
-        let plaintext = keyring.decrypt(&old_binding, &old.envelope)?;
-        rotated += 1;
-        if dry_run {
-            continue;
+    };
+    for &(target, logical) in &referenced {
+        let (id, logical) = (NotificationTargetId(target), LogicalSecretId(logical));
+        match rotate_secret(&alert_store, deployment_id, keyring, id, logical, dry_run).await {
+            Ok(true) => report.rotated += 1,
+            Ok(false) => report.current += 1,
+            Err(error) => report
+                .failed
+                .push(format!("secret {id}/{logical}: {error:#}")),
         }
-        let generation = old.generation + 1;
-        let binding = SecretBinding {
-            deployment_id,
-            target_id: id,
-            logical_secret_id: logical,
-            generation,
-        };
-        let record = match alert_store
-            .read_secret_generation(id, logical, generation)
-            .await
-        {
-            Ok(existing) => {
-                let record = existing.value;
-                if record.deployment_id != deployment_id
-                    || record.target_id != id
-                    || record.logical_secret_id != logical
-                    || record.generation != generation
-                    || record.rotation_of_generation != Some(old.generation)
-                    || record.envelope.key_id != keyring.current_key_id()
-                    || keyring.decrypt(&binding, &record.envelope)?.as_slice()
-                        != plaintext.as_slice()
-                {
-                    anyhow::bail!("existing next secret generation is not the resumable rotation");
-                }
-                record
+    }
+    if !dry_run {
+        for &(target, logical) in &referenced {
+            let (id, logical) = (NotificationTargetId(target), LogicalSecretId(logical));
+            if let Err(error) = verify_current_key(&alert_store, keyring, id, logical).await {
+                report
+                    .failed
+                    .push(format!("secret {id}/{logical}: {error:#}"));
             }
-            Err(scry_alert::AlertStoreError::Missing { .. }) => {
-                let envelope = keyring.encrypt(&binding, &plaintext)?;
-                SecretGenerationRecord {
-                    schema_version: ALERT_RECORD_SCHEMA_VERSION,
-                    deployment_id: deployment_id.into(),
-                    target_id: id,
-                    logical_secret_id: logical,
-                    generation,
-                    envelope,
-                    rotation_of_generation: Some(old.generation),
-                    created_at_unix_nano: now(),
-                }
-            }
-            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(report)
+}
+
+/// Stream the secret namespace once, counting heads outside `referenced`.
+async fn count_orphaned_secret_heads(
+    store: &dyn ObjectStore,
+    referenced: &std::collections::BTreeSet<(Uuid, Uuid)>,
+) -> anyhow::Result<usize> {
+    let prefix = ObjectPath::from("_scry/alerts/v1/target-secrets");
+    let mut listed = store.list(Some(&prefix));
+    let mut orphaned = 0;
+    while let Some(meta) = listed.try_next().await? {
+        let mut parts = meta.location.as_ref().rsplit('/');
+        let (Some("head.json"), Some(logical), Some(target)) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
         };
-        let head = SecretHead {
+        if let (Ok(target), Ok(logical)) = (Uuid::parse_str(target), Uuid::parse_str(logical)) {
+            if !referenced.contains(&(target, logical)) {
+                orphaned += 1;
+            }
+        }
+    }
+    Ok(orphaned)
+}
+
+async fn verify_current_key(
+    alert_store: &AlertStore<'_>,
+    keyring: &SecretKeyring,
+    id: NotificationTargetId,
+    logical: LogicalSecretId,
+) -> anyhow::Result<()> {
+    let head = alert_store
+        .read_secret_head(id, logical)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("secret head disappeared"))?;
+    let record = alert_store
+        .read_secret_generation(id, logical, head.value.generation)
+        .await?
+        .value;
+    if record.envelope.key_id != keyring.current_key_id() {
+        anyhow::bail!("previous-key secret remains after rotation");
+    }
+    Ok(())
+}
+
+/// Rotate one referenced secret; `Ok(true)` if it was (or would be) rotated.
+async fn rotate_secret(
+    alert_store: &AlertStore<'_>,
+    deployment_id: &str,
+    keyring: &SecretKeyring,
+    id: NotificationTargetId,
+    logical: LogicalSecretId,
+    dry_run: bool,
+) -> anyhow::Result<bool> {
+    let Some(old_head) = alert_store.read_secret_head(id, logical).await? else {
+        anyhow::bail!("referenced secret has no head");
+    };
+    let old = alert_store
+        .read_secret_generation(id, logical, old_head.value.generation)
+        .await?
+        .value;
+    if old.envelope.key_id == keyring.current_key_id() {
+        return Ok(false);
+    }
+    let old_binding = SecretBinding {
+        deployment_id,
+        target_id: id,
+        logical_secret_id: logical,
+        generation: old.generation,
+    };
+    let plaintext = keyring
+        .decrypt(&old_binding, &old.envelope)
+        .map_err(|_| anyhow::anyhow!("cannot be decrypted with the configured keys"))?;
+    if dry_run {
+        return Ok(true);
+    }
+    let generation = old.generation + 1;
+    let binding = SecretBinding {
+        deployment_id,
+        target_id: id,
+        logical_secret_id: logical,
+        generation,
+    };
+    let record = match alert_store
+        .read_secret_generation(id, logical, generation)
+        .await
+    {
+        // Resume a rotation that wrote the next generation but crashed before
+        // its head CAS: reuse those exact authenticated bytes.
+        Ok(existing) => {
+            let record = existing.value;
+            if record.deployment_id != deployment_id
+                || record.target_id != id
+                || record.logical_secret_id != logical
+                || record.generation != generation
+                || record.rotation_of_generation != Some(old.generation)
+                || record.envelope.key_id != keyring.current_key_id()
+                || keyring.decrypt(&binding, &record.envelope)?.as_slice() != plaintext.as_slice()
+            {
+                anyhow::bail!("existing next secret generation is not the resumable rotation");
+            }
+            record
+        }
+        Err(AlertStoreError::Missing { .. }) => SecretGenerationRecord {
             schema_version: ALERT_RECORD_SCHEMA_VERSION,
             deployment_id: deployment_id.into(),
             target_id: id,
             logical_secret_id: logical,
             generation,
-            generation_key: scry_alert::secret_generation_key(id, logical, generation),
-            updated_at_unix_nano: record.created_at_unix_nano,
-        };
-        alert_store
-            .commit_secret_generation(&record, &head, Some(old_head.version))
-            .await?;
-    }
-    if !dry_run {
-        for (id, logical) in &heads {
-            let head = alert_store
-                .read_secret_head(*id, *logical)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("retained secret head disappeared"))?;
-            let record = alert_store
-                .read_secret_generation(*id, *logical, head.value.generation)
-                .await?
-                .value;
-            if record.envelope.key_id != keyring.current_key_id() {
-                anyhow::bail!("previous-key target secret remains after rotation");
-            }
-        }
-    }
-    Ok((scanned, rotated))
+            envelope: keyring.encrypt(&binding, &plaintext)?,
+            rotation_of_generation: Some(old.generation),
+            created_at_unix_nano: now(),
+        },
+        Err(error) => return Err(error.into()),
+    };
+    let head = SecretHead {
+        schema_version: ALERT_RECORD_SCHEMA_VERSION,
+        deployment_id: deployment_id.into(),
+        target_id: id,
+        logical_secret_id: logical,
+        generation,
+        generation_key: scry_alert::secret_generation_key(id, logical, generation),
+        updated_at_unix_nano: record.created_at_unix_nano,
+    };
+    alert_store
+        .commit_secret_generation(&record, &head, Some(old_head.version))
+        .await?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -1574,7 +1565,8 @@ mod tests {
         Arc,
     };
 
-    use scry_cluster::LocalLeaseProvider;
+    use object_store::PutPayload;
+    use scry_alert::AlertsDb;
 
     use super::*;
 
@@ -1624,7 +1616,7 @@ mod tests {
             deployment_id: deployment.to_string(),
             keyring,
             transport: transport.clone(),
-            delivery_leases: Arc::new(crate::DeliveryLeases::new(LocalLeaseProvider::new())),
+            leases: crate::Leases::local(),
             _local_lock: Arc::new(None),
         };
         let target = NotificationTarget {
@@ -1656,10 +1648,110 @@ mod tests {
         .await
         .unwrap();
         AlertStore::new(state.store.as_ref())
-            .create_target_revision(&target, None)
+            .create_target_revision(&target, &Uuid::new_v4().to_string(), None)
             .await
             .unwrap();
         (state, target, transport)
+    }
+
+    fn test_send_headers(command: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer 0123456789abcdef0123456789abcdef"),
+        );
+        headers.insert("idempotency-key", HeaderValue::from_str(command).unwrap());
+        headers.insert(header::IF_MATCH, HeaderValue::from_static("\"1\""));
+        headers
+    }
+
+    #[tokio::test]
+    async fn test_send_failures_release_the_lease_and_undecryptable_secrets_are_internal() {
+        let (mut state, target, transport) = test_send_state().await;
+        // A keyring that cannot decrypt the stored secret.
+        state.keyring = Arc::new(
+            parse_keyring("other:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE", None).unwrap(),
+        );
+        let command = Uuid::new_v4().to_string();
+        let error = test_send(
+            State(state.clone()),
+            test_send_headers(&command),
+            Path(target.id.to_string()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.status_and_message().0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(transport.calls.load(Ordering::SeqCst), 0);
+        let event_id = format!(
+            "test-{}",
+            command_uuid(&command, b"notification-target-test")
+        );
+        assert!(
+            state
+                .leases
+                .try_acquire(
+                    &format!("lease/alert/deliver/{event_id}"),
+                    Duration::from_secs(1)
+                )
+                .await
+                .unwrap()
+                .is_some(),
+            "the delivery lease must be released on the error path"
+        );
+
+        // Saturated send permits are also an error path under the lease.
+        let (state, target, _transport) = test_send_state().await;
+        let _all = state.test_sends.try_acquire_many(4).unwrap();
+        let command = Uuid::new_v4().to_string();
+        let error = test_send(
+            State(state.clone()),
+            test_send_headers(&command),
+            Path(target.id.to_string()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.status_and_message().0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let event_id = format!(
+            "test-{}",
+            command_uuid(&command, b"notification-target-test")
+        );
+        assert!(state
+            .leases
+            .try_acquire(
+                &format!("lease/alert/deliver/{event_id}"),
+                Duration::from_secs(1)
+            )
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn api_header_validation_matches_record_validation() {
+        for name in [
+            "content-type",
+            "Keep-Alive",
+            "proxy-connection",
+            "Expect",
+            "X-Scry-Signature",
+        ] {
+            let headers = vec![TargetHeader {
+                name: name.into(),
+                value: "v".into(),
+            }];
+            assert!(validate_headers(&headers).is_err(), "{name}");
+        }
+        validate_headers(&[TargetHeader {
+            name: "Authorization".into(),
+            value: "Bearer receiver-token".into(),
+        }])
+        .unwrap();
     }
 
     #[tokio::test]
@@ -1684,16 +1776,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let headers = || {
-            let mut headers = HeaderMap::new();
-            headers.insert(
-                header::AUTHORIZATION,
-                HeaderValue::from_static("Bearer 0123456789abcdef0123456789abcdef"),
-            );
-            headers.insert("idempotency-key", HeaderValue::from_str(&command).unwrap());
-            headers.insert(header::IF_MATCH, HeaderValue::from_static("\"1\""));
-            headers
-        };
+        let headers = || test_send_headers(&command);
         let first = test_send(State(state.clone()), headers(), Path(target.id.to_string()));
         let second = test_send(State(state.clone()), headers(), Path(target.id.to_string()));
         let (first, second) = tokio::join!(first, second);
@@ -1873,12 +1956,14 @@ mod tests {
             .commit_secret_generation(&record, &head, None)
             .await
             .unwrap();
-        alerts.create_target_revision(&target, None).await.unwrap();
+        alerts
+            .create_target_revision(&target, &Uuid::new_v4().to_string(), None)
+            .await
+            .unwrap();
 
-        assert_eq!(
-            rotate(&store, &deployment, &keys, true).await.unwrap(),
-            (1, 1)
-        );
+        let dry = rotate(&store, &deployment, &keys, true).await.unwrap();
+        assert_eq!((dry.targets, dry.referenced, dry.rotated), (1, 1, 1));
+        assert!(dry.failed.is_empty());
         assert_eq!(
             alerts
                 .read_secret_head(target_id, logical_id)
@@ -1918,10 +2003,9 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(
-            rotate(&store, &deployment, &keys, false).await.unwrap(),
-            (1, 1)
-        );
+        let report = rotate(&store, &deployment, &keys, false).await.unwrap();
+        assert_eq!((report.rotated, report.current), (1, 0));
+        assert!(report.failed.is_empty());
         let rotated = alerts
             .read_secret_head(target_id, logical_id)
             .await
@@ -1935,10 +2019,8 @@ mod tests {
             .value;
         assert_eq!(generation.envelope.key_id, "new");
         assert_eq!(generation, staged_generation_two);
-        assert_eq!(
-            rotate(&store, &deployment, &keys, false).await.unwrap(),
-            (1, 0)
-        );
+        let report = rotate(&store, &deployment, &keys, false).await.unwrap();
+        assert_eq!((report.rotated, report.current), (0, 1));
 
         // A later key rotation creates a second lineage hop. Revisions still
         // pinned to generation one must resolve the latest authenticated bytes.
@@ -1947,10 +2029,8 @@ mod tests {
             Some("new:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"),
         )
         .unwrap();
-        assert_eq!(
-            rotate(&store, &deployment, &newest, false).await.unwrap(),
-            (1, 1)
-        );
+        let report = rotate(&store, &deployment, &newest, false).await.unwrap();
+        assert_eq!((report.rotated, report.failed.len()), (1, 0));
         let latest_head = alerts
             .read_secret_head(target_id, logical_id)
             .await
@@ -1980,5 +2060,133 @@ mod tests {
             )
             .unwrap();
         assert_eq!(plaintext.as_slice(), b"secret");
+    }
+
+    /// Seed one secret generation (with its head) encrypted by `keyring`.
+    async fn seed_secret(
+        alerts: &AlertStore<'_>,
+        deployment: &str,
+        keyring: &SecretKeyring,
+        target_id: NotificationTargetId,
+        logical_id: LogicalSecretId,
+    ) {
+        let binding = SecretBinding {
+            deployment_id: deployment,
+            target_id,
+            logical_secret_id: logical_id,
+            generation: 1,
+        };
+        alerts
+            .commit_secret_generation(
+                &SecretGenerationRecord {
+                    schema_version: ALERT_RECORD_SCHEMA_VERSION,
+                    deployment_id: deployment.into(),
+                    target_id,
+                    logical_secret_id: logical_id,
+                    generation: 1,
+                    envelope: keyring.encrypt(&binding, b"secret").unwrap(),
+                    rotation_of_generation: None,
+                    created_at_unix_nano: 1,
+                },
+                &SecretHead {
+                    schema_version: ALERT_RECORD_SCHEMA_VERSION,
+                    deployment_id: deployment.into(),
+                    target_id,
+                    logical_secret_id: logical_id,
+                    generation: 1,
+                    generation_key: scry_alert::secret_generation_key(target_id, logical_id, 1),
+                    updated_at_unix_nano: 1,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    fn secret_target(id: NotificationTargetId, logical: LogicalSecretId) -> NotificationTarget {
+        NotificationTarget {
+            schema_version: ALERT_RECORD_SCHEMA_VERSION,
+            id,
+            revision: 1,
+            name: "target".into(),
+            enabled: true,
+            kind: NotificationTargetKind::GenericWebhook {
+                url: "https://example.com".into(),
+                headers: vec![],
+            },
+            format: TargetFormat::BuiltIn {
+                format: BuiltInTargetFormat::GenericJson,
+            },
+            timeout_millis: 1_000,
+            logical_secret_id: logical,
+            secret_generation: 1,
+            created_at_unix_nano: 1,
+            updated_at_unix_nano: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn rotation_skips_orphans_and_reports_undecryptable_referenced_secrets() {
+        use object_store::memory::InMemory;
+
+        let deployment = Uuid::new_v4().to_string();
+        let store = InMemory::new();
+        let alerts = AlertStore::new(&store);
+        let old = parse_keyring("old:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", None).unwrap();
+        let lost = parse_keyring("lost:AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM", None).unwrap();
+        let keys = parse_keyring(
+            "new:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
+            Some("old:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+        )
+        .unwrap();
+
+        // A healthy referenced secret.
+        let healthy = NotificationTargetId::new();
+        let healthy_secret = LogicalSecretId::new();
+        seed_secret(&alerts, &deployment, &old, healthy, healthy_secret).await;
+        alerts
+            .create_target_revision(
+                &secret_target(healthy, healthy_secret),
+                &Uuid::new_v4().to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+        // A replaced credential of the same target, under a retired key: an
+        // orphan that must be neither decrypted nor failed on.
+        seed_secret(&alerts, &deployment, &lost, healthy, LogicalSecretId::new()).await;
+        // A referenced secret nobody can decrypt any more.
+        let broken = NotificationTargetId::new();
+        let broken_secret = LogicalSecretId::new();
+        seed_secret(&alerts, &deployment, &lost, broken, broken_secret).await;
+        alerts
+            .create_target_revision(
+                &secret_target(broken, broken_secret),
+                &Uuid::new_v4().to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let report = rotate(&store, &deployment, &keys, false).await.unwrap();
+        assert_eq!(report.targets, 2);
+        assert_eq!(report.referenced, 2);
+        assert_eq!(report.rotated, 1, "the healthy secret still rotates");
+        assert_eq!(report.orphaned, Some(1));
+        assert_eq!(report.failed.len(), 2, "{:?}", report.failed);
+        assert!(report
+            .failed
+            .iter()
+            .all(|failure| failure.contains(&broken_secret.to_string())));
+        assert_eq!(
+            alerts
+                .read_secret_head(healthy, healthy_secret)
+                .await
+                .unwrap()
+                .unwrap()
+                .value
+                .generation,
+            2
+        );
     }
 }

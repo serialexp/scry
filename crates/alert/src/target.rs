@@ -9,6 +9,46 @@ pub const MAX_HEADERS: usize = 32;
 pub const MAX_HEADER_BYTES: usize = 1_024;
 pub const MAX_TIMEOUT_MILLIS: u32 = 120_000;
 
+/// Header carrying the v1 HMAC-SHA256 webhook signature.
+pub const SIGNATURE_HEADER: &str = "x-scry-signature";
+/// Header carrying the signed Unix timestamp.
+pub const SIGNATURE_TIMESTAMP_HEADER: &str = "x-scry-signature-timestamp";
+
+/// Request headers a target's custom headers may never set, compared
+/// case-insensitively. They are framing, hop-by-hop, proxy, or ambient
+/// credential headers, or headers Scry itself owns: the body is always JSON
+/// (`content-type`), and idempotency and signing are fixed protocol headers.
+///
+/// `authorization` is deliberately *not* reserved: the design supplies a
+/// remote receiver's own shared secret (e.g. Cross Notifier's
+/// `Authorization: Bearer`) as a visible, non-secret custom header.
+pub const RESERVED_HEADERS: &[&str] = &[
+    "host",
+    "content-length",
+    "content-type",
+    "connection",
+    "keep-alive",
+    "transfer-encoding",
+    "upgrade",
+    "expect",
+    "proxy-authorization",
+    "proxy-authenticate",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "cookie",
+    "idempotency-key",
+    SIGNATURE_HEADER,
+    SIGNATURE_TIMESTAMP_HEADER,
+];
+
+/// Whether a custom header name is reserved; see [`RESERVED_HEADERS`].
+pub fn is_reserved_header(name: &str) -> bool {
+    RESERVED_HEADERS
+        .iter()
+        .any(|reserved| name.eq_ignore_ascii_case(reserved))
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct NotificationTargetId(pub Uuid);
@@ -141,6 +181,8 @@ pub enum TargetValidationError {
     InvalidTimeout,
     #[error("target endpoint or headers exceed their bounds")]
     Bounds,
+    #[error("target header `{0}` is reserved")]
+    ReservedHeader(String),
 }
 
 impl NotificationTarget {
@@ -160,7 +202,69 @@ impl NotificationTarget {
             {
                 return Err(TargetValidationError::Bounds);
             }
+            if let Some(reserved) = headers.iter().find(|h| is_reserved_header(&h.name)) {
+                return Err(TargetValidationError::ReservedHeader(reserved.name.clone()));
+            }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn target(headers: Vec<TargetHeader>) -> NotificationTarget {
+        NotificationTarget {
+            schema_version: 1,
+            id: NotificationTargetId::new(),
+            revision: 1,
+            name: "target".into(),
+            enabled: true,
+            kind: NotificationTargetKind::GenericWebhook {
+                url: "https://example.com/hook".into(),
+                headers,
+            },
+            format: TargetFormat::BuiltIn {
+                format: BuiltInTargetFormat::GenericJson,
+            },
+            timeout_millis: 1_000,
+            logical_secret_id: LogicalSecretId::new(),
+            secret_generation: 1,
+            created_at_unix_nano: 1,
+            updated_at_unix_nano: 1,
+        }
+    }
+
+    fn header(name: &str) -> TargetHeader {
+        TargetHeader {
+            name: name.into(),
+            value: "v".into(),
+        }
+    }
+
+    #[test]
+    fn reserved_headers_are_rejected_case_insensitively() {
+        for name in [
+            "Content-Type",
+            "keep-alive",
+            "Proxy-Connection",
+            "EXPECT",
+            "X-Scry-Signature",
+            "Idempotency-Key",
+        ] {
+            assert_eq!(
+                target(vec![header(name)]).validate(),
+                Err(TargetValidationError::ReservedHeader(name.into())),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_and_receiver_auth_headers_are_allowed() {
+        target(vec![header("x-team"), header("Authorization")])
+            .validate()
+            .unwrap();
     }
 }

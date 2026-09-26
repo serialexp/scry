@@ -2,7 +2,7 @@
 
 Status: partial — notification-target CRUD, encrypted secrets, preview/test-send, and browser UI implemented; monitor intents and delivery worker outstanding
 Owner: Bart
-Last updated: 2026-09-22
+Last updated: 2026-09-26
 
 ## Implementation status
 
@@ -38,8 +38,23 @@ status remain outstanding.
   and Generic JSON, Slack-compatible, and Cross Notifier built-ins, redacted CRUD/
   preview/test-send APIs, public-HTTPS DNS validation and address pinning, mandatory
   HMAC, and the separate browser Notification targets UI.
+- [x] **Phase 0b — target hardening (D-076 follow-up, 2026-09-26).**
+  - Revision objects are keyed per command, so a crashed command's unpublished
+    revision cannot block later saves.
+  - Rotation re-encrypts only secrets referenced by live target heads. It reports
+    orphaned secret heads and undecryptable referenced secrets instead of aborting.
+  - Test-send always releases its delivery lease.
+  - An undecryptable stored secret is an internal error (500), not a client 400.
+  - The reserved-header list is enforced by record validation, so the API and
+    projection loads agree. Stored targets that violate it are quarantined on load.
 
 ### Outstanding
+- [ ] **Secret GC.** Rotation only counts orphaned secret heads: logical secrets with
+  no live target referencing them, left by deleted targets or by commands that
+  crashed before their head CAS. It neither deletes nor re-encrypts them. A
+  retention-ordered sweep is needed (see the dependency graph below). Until then,
+  orphaned ciphertext under a retired key stays in the bucket and cannot be
+  decrypted.
 - [ ] **Phase 1 — durable outbox.** Atomically commit one Firing or Resolved intent per
   selected target and project at-least-once delivery state with bounded retries.
 - [ ] **Phase 2 — webhook worker.** Add bounded pooled HTTP delivery, response
@@ -167,6 +182,18 @@ secret. Re-encryption replaces ciphertext behind that logical identity, so queue
 intents need not be rewritten and do not remain pinned to retired key material.
 Referenced revisions, logical secrets, and tombstones outlive every dependent intent.
 
+*Implemented:* `scry alert rotate-target-key` walks the live target heads and
+re-encrypts each distinct logical secret they reference that still uses the previous
+key. It then verifies that every referenced secret decrypts under the current key.
+It prints a report with:
+
+- `targets`, `referenced`, `rotated` and `current` counts;
+- the number of `orphaned` secret heads (not re-encrypted);
+- the referenced secrets that `failed` to decrypt under either key.
+
+Any failure makes the command exit non-zero, so the previous key must not be removed
+yet. The command is idempotent and safe to re-run after a crash.
+
 A generic webhook accepts only an absolute `https` URL with no userinfo or fragment,
 uses public WebPKI roots, caps headers, and does not permit arbitrary `Host`,
 `Content-Length`, hop-by-hop, idempotency, or signature header overrides. Custom CAs,
@@ -178,6 +205,20 @@ hostname or CIDR exceptions in startup configuration or API input. No ambient co
 proxy/cloud credentials, or browser headers are attached. Phase 0 test-send constructs
 a policy-pinned client per request under a small concurrency bound; the delivery worker
 must add bounded reusable client pools before it handles sustained delivery volume.
+
+The reserved custom-header names are `scry_alert::RESERVED_HEADERS`, matched
+case-insensitively and enforced by `NotificationTarget::validate()`:
+
+- `Host`, `Content-Length`, `Content-Type`;
+- `Connection`, `Keep-Alive`, `Transfer-Encoding`, `Upgrade`, `Expect`, `TE`,
+  `Trailer`;
+- `Proxy-Authorization`, `Proxy-Authenticate`, `Proxy-Connection`;
+- `Cookie`;
+- `Idempotency-Key`, `X-Scry-Signature`, `X-Scry-Signature-Timestamp`.
+
+`Authorization` is intentionally *not* reserved, because the Cross Notifier contract
+below supplies its shared secret that way. That value is therefore visible plaintext
+target metadata.
 
 ## Durable outbox projection
 

@@ -1,3 +1,7 @@
+mod evaluator;
+mod leases;
+mod projection;
+mod scheduler;
 mod singleton;
 mod targets;
 
@@ -11,24 +15,30 @@ use axum::{
     Json, Router,
 };
 use clap::{Parser, Subcommand, ValueEnum};
-use futures::{StreamExt, TryStreamExt};
 use object_store::ObjectStore;
 use scry_alert::{
-    canonical_json, evaluate, sha256_hex, transition_key, validate_monitor, AlertState, AlertStore,
-    AlertsDb, DurableObservation, Monitor, MonitorId, MonitorSummary, Observation,
-    RuleMutationKind, RuleMutationReceipt, RuleTombstone, StateHead, TransitionRecord,
-    ALERT_RECORD_SCHEMA_VERSION,
+    canonical_json, rule_tombstone_key, sha256_hex, validate_monitor, AlertStore, AlertStoreError,
+    AlertsDb, Monitor, MonitorId, MonitorSummary, RuleMutationKind, RuleMutationReceipt,
+    RuleTombstone, ALERT_RECORD_SCHEMA_VERSION,
 };
-use scry_cluster::{LeaseGuard, LeaseProvider, LocalGuard, LocalLeaseProvider};
-use scry_query::client::{
-    QueryClientError, QueryDeadlines, QueryLimits, QueryScalar, QueryWireClient, ScalarOutcome,
-};
+use scry_query::client::{QueryScalar, QueryWireClient, ScalarOutcome};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{watch, Mutex, Semaphore};
 use uuid::Uuid;
+
+pub use evaluator::{
+    evaluate_monitor_slot, EvaluationContext, EvaluationError, QueryWireExecutor, ScalarExecutor,
+    SlotOutcome,
+};
+pub use leases::{Lease, Leases};
+pub use scheduler::{SchedulerConfig, MAX_CONCURRENT_EVALUATIONS};
 
 pub const TOKEN_ENV: &str = "SCRY_ALERTD_TOKEN";
 const MAX_CONTROL_REQUEST_BODY_BYTES: usize = 256 * 1024;
+const EVALUATION_LEASE_TTL: Duration = Duration::from_secs(45);
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+const VALKEY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const VALKEY_RETRY_MAX: Duration = Duration::from_secs(30);
 
 #[derive(Parser, Debug)]
 #[command(about = "Durable scalar alert evaluator and control service")]
@@ -49,6 +59,20 @@ pub struct Args {
     pub control_listen: String,
     #[arg(long, default_value_t = 64)]
     pub max_control_requests: usize,
+    /// Lateness allowance: seconds after a slot ends before it is evaluated.
+    ///
+    /// Ingest makes a record queryable only once its block is flushed, which
+    /// can take up to ingestd's `--block-max-age-secs` (default 60) plus
+    /// upload time. A slot evaluated sooner would miss its own final records
+    /// and, because an evaluated slot is never revised, keep that wrong
+    /// result. Keep this above the ingest flush age plus upload latency.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        default_value_t = 90,
+        value_parser = clap::value_parser!(u64).range(0..=3_600)
+    )]
+    pub evaluation_delay: u64,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -104,7 +128,7 @@ pub async fn run(args: Args) -> Result<()> {
             tracing::info!(deployment_id = %manifest.deployment_id, "alert control storage initialized");
             Ok(())
         }
-        Command::Serve { deployment_id } => {
+        Command::Serve { ref deployment_id } => {
             if query_targets.is_empty() {
                 bail!("serve requires at least one --queryd ID=ADDR target");
             }
@@ -114,56 +138,87 @@ pub async fn run(args: Args) -> Result<()> {
                 bail!("{TOKEN_ENV} must contain at least 32 bytes");
             }
             let keyring = Arc::new(targets::load_keyring()?);
+            // Validate clustered configuration before touching local state;
+            // the connection itself is established in the background.
+            let valkey = match args.mode {
+                Mode::SingleWriter => None,
+                Mode::Clustered => {
+                    let url = args
+                        .valkey_url
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .context("clustered alert mode requires --valkey-url or SCRY_VALKEY_URL")?
+                        .to_owned();
+                    let keys = scry_valkey::Keyspace::resolve(args.valkey_namespace.as_deref())?;
+                    Some((url, keys))
+                }
+            };
+            let local_lock = match args.mode {
+                Mode::SingleWriter => Some(singleton::SingletonLock::acquire(&args.alerts_db)?),
+                Mode::Clustered => None,
+            };
             let manifest = scry_objstore::manifest::require_deployment_manifest(
                 store.as_ref(),
                 deployment_id.as_deref(),
             )
             .await?;
             let deployment = Uuid::parse_str(&manifest.deployment_id)?;
-            let mut db = AlertsDb::open(&args.alerts_db, deployment)?;
-            rebuild_projection(store.as_ref(), &mut db).await?;
-            targets::rebuild_projection(store.as_ref(), &mut db).await?;
+            let db = Arc::new(Mutex::new(AlertsDb::open(&args.alerts_db, deployment)?));
+            // Per-record failures are quarantined or retried; only a failed
+            // listing prevents startup.
+            projection::reconcile_all(store.as_ref(), &db, &manifest.deployment_id).await?;
+
+            let shutdown = shutdown_channel();
+            let leases = match valkey {
+                None => Leases::local(),
+                Some((url, keys)) => {
+                    let (leases, cell) = Leases::valkey_pending();
+                    tokio::spawn(connect_valkey_in_background(
+                        url,
+                        keys,
+                        cell,
+                        shutdown.clone(),
+                    ));
+                    leases
+                }
+            };
             let state = AppState {
                 token: Arc::from(token),
-                store,
-                db: Arc::new(Mutex::new(db)),
+                store: store.clone(),
+                db: db.clone(),
                 permits: Arc::new(Semaphore::new(args.max_control_requests)),
                 target_mutations: Arc::new(Semaphore::new(1)),
                 test_sends: Arc::new(Semaphore::new(8)),
-                query_targets,
-                deployment_id: manifest.deployment_id,
+                query_targets: query_targets.clone(),
+                deployment_id: manifest.deployment_id.clone(),
                 keyring,
                 transport: Arc::new(targets::SecureWebhookTransport),
-                delivery_leases: Arc::new(DeliveryLeases::new(LocalLeaseProvider::new())),
-                _local_lock: Arc::new(None),
+                leases: leases.clone(),
+                _local_lock: Arc::new(local_lock),
             };
-            match args.mode {
-                Mode::SingleWriter => {
-                    let lock = singleton::SingletonLock::acquire(&args.alerts_db)?;
-                    let mut state = state;
-                    state._local_lock = Arc::new(Some(lock));
-                    serve_with_scheduler(
-                        &args.control_listen,
-                        state,
-                        scry_cluster::LocalLeaseProvider::new(),
-                    )
-                    .await
-                }
-                Mode::Clustered => {
-                    let url = args
-                        .valkey_url
-                        .as_deref()
-                        .filter(|value| !value.trim().is_empty())
-                        .context("clustered alert mode requires --valkey-url or SCRY_VALKEY_URL")?;
-                    let keys = scry_valkey::Keyspace::resolve(args.valkey_namespace.as_deref())?;
-                    let client =
-                        scry_valkey::ValkeyClient::connect(url, Uuid::new_v4(), keys).await?;
-                    let provider = scry_valkey::ValkeyLeaseProvider::new(client);
-                    let mut state = state;
-                    state.delivery_leases = Arc::new(DeliveryLeases::Valkey(provider.clone()));
-                    serve_with_scheduler(&args.control_listen, state, provider).await
-                }
-            }
+            let context = Arc::new(EvaluationContext {
+                store,
+                db,
+                deployment_id: manifest.deployment_id,
+                query_targets,
+                executor: Arc::new(QueryWireExecutor),
+                lease_ttl: EVALUATION_LEASE_TTL,
+            });
+            let config = SchedulerConfig {
+                evaluation_delay: Duration::from_secs(args.evaluation_delay),
+                max_concurrent: MAX_CONCURRENT_EVALUATIONS,
+                shutdown_grace: scheduler::SHUTDOWN_GRACE,
+            };
+            serve(
+                &args.control_listen,
+                state,
+                context,
+                leases,
+                config,
+                shutdown,
+            )
+            .await
         }
         Command::RotateTargetKey {
             deployment_id,
@@ -175,287 +230,171 @@ pub async fn run(args: Args) -> Result<()> {
                 deployment_id.as_deref(),
             )
             .await?;
-            let (scanned, rotated) =
+            let report =
                 targets::rotate(store.as_ref(), &manifest.deployment_id, &keyring, dry_run).await?;
             tracing::info!(
-                scanned,
-                rotated,
+                targets = report.targets,
+                referenced = report.referenced,
+                rotated = report.rotated,
+                current = report.current,
+                orphaned_skipped = ?report.orphaned,
+                failed = report.failed.len(),
                 dry_run,
                 "notification-target key rotation pass complete"
             );
+            for failure in &report.failed {
+                tracing::error!(%failure, "notification-target secret not rotated");
+            }
+            if !report.failed.is_empty() {
+                bail!(
+                    "{} referenced notification-target secret(s) could not be rotated or verified",
+                    report.failed.len()
+                );
+            }
             Ok(())
         }
     }
 }
 
-struct ProjectionEntry {
-    monitor_id: MonitorId,
-    live: Option<ProjectionLiveEntry>,
-}
-
-struct ProjectionLiveEntry {
-    monitor: Monitor,
-    state: Option<(String, TransitionRecord, StateHead)>,
-}
-
-async fn load_projection(
-    store: &dyn ObjectStore,
-    deployment_id: Uuid,
-) -> Result<Vec<ProjectionEntry>> {
-    let prefix = object_store::path::Path::from("_scry/alerts/v1/rules");
-    let mut listed = store.list(Some(&prefix));
-    let mut heads = Vec::new();
-    while let Some(meta) = listed.try_next().await? {
-        if meta.location.as_ref().ends_with("/head.json") {
-            heads.push(meta.location.to_string());
-            if heads.len() > 100_000 {
-                bail!("alert rule-head rebuild exceeds 100000 monitors");
-            }
-        }
-    }
-    heads.sort_unstable();
-    let alert_store = AlertStore::new(store);
-    let mut entries = Vec::with_capacity(heads.len());
-    for key in heads {
-        let Some(id) = key
-            .strip_prefix("_scry/alerts/v1/rules/")
-            .and_then(|tail| tail.strip_suffix("/head.json"))
-            .and_then(|id| Uuid::parse_str(id).ok())
-            .map(MonitorId)
-        else {
-            continue;
-        };
-        let rule_head = alert_store.read_rule_head(id).await?;
-        if rule_head.value.schema_version != ALERT_RECORD_SCHEMA_VERSION
-            || rule_head.value.monitor_id != id
-        {
-            bail!("alert rule head `{key}` does not match its object key");
-        }
-        if rule_head.value.deleted {
-            entries.push(ProjectionEntry {
-                monitor_id: id,
-                live: None,
-            });
-            continue;
-        }
-        let monitor = alert_store.read_rule(id).await?.value;
-        if monitor.id != id
-            || monitor.revision != rule_head.value.revision
-            || scry_alert::rule_revision_key(id, monitor.revision) != rule_head.value.revision_key
-        {
-            bail!("alert rule revision for `{id}` does not match its head");
-        }
-        validate_monitor(&monitor)?;
-        let state = if let Some(head) = alert_store.read_state_head(id).await? {
-            if head.value.monitor_id != id || head.value.deployment_id != deployment_id.to_string()
-            {
-                bail!("alert state head for `{id}` has invalid ownership");
-            }
-            let transition = alert_store
-                .read_current_transition(&head.value)
-                .await?
-                .value;
-            Some((head.value.transition_key.clone(), transition, head.value))
-        } else {
-            None
-        };
-        entries.push(ProjectionEntry {
-            monitor_id: id,
-            live: Some(ProjectionLiveEntry { monitor, state }),
-        });
-    }
-    Ok(entries)
-}
-
-fn fold_projection(db: &mut AlertsDb, entries: Vec<ProjectionEntry>) -> Result<()> {
-    for entry in entries {
-        let Some(live) = entry.live else {
-            db.delete_monitor(entry.monitor_id)?;
-            continue;
-        };
-        db.fold_rule(&live.monitor)?;
-        if let Some((key, transition, head)) = live.state {
-            db.fold_transition(&key, &transition, &head)?;
-        }
-    }
-    Ok(())
-}
-
-async fn rebuild_projection(store: &dyn ObjectStore, db: &mut AlertsDb) -> Result<()> {
-    let entries = load_projection(store, db.deployment_id()).await?;
-    fold_projection(db, entries)
-}
-
-async fn serve_with_scheduler<L>(listen: &str, state: AppState, provider: L) -> Result<()>
-where
-    L: LeaseProvider + Clone + Send + Sync + 'static,
-    L::Guard: Send,
-{
-    let scheduler_state = state.clone();
-    let scheduler = async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut passes_until_reconcile = 0u8;
-        loop {
-            interval.tick().await;
-            if passes_until_reconcile == 0 {
-                if let Err(error) = reconcile_projection(&scheduler_state).await {
-                    tracing::warn!(error = %error, "alert projection reconciliation failed");
-                }
-                if let Err(error) = targets::reconcile_projection(
-                    scheduler_state.store.as_ref(),
-                    scheduler_state.db.as_ref(),
-                )
-                .await
-                {
-                    tracing::warn!(error = %error, "notification-target projection reconciliation failed");
-                }
-                passes_until_reconcile = 30;
-            }
-            passes_until_reconcile = passes_until_reconcile.saturating_sub(1);
-            if let Err(error) = scheduler_pass(&provider, &scheduler_state).await {
-                tracing::warn!(error = %error, "alert scheduler pass failed");
-            }
-        }
-    };
-    let app = router(state);
+/// Serve the control API, the scheduler, and periodic reconciliation until
+/// `shutdown`, then stop accepting requests and drain evaluations.
+async fn serve(
+    listen: &str,
+    state: AppState,
+    context: Arc<EvaluationContext>,
+    leases: Leases,
+    config: SchedulerConfig,
+    shutdown: watch::Receiver<bool>,
+) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .with_context(|| format!("binding alert control API {listen}"))?;
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let scheduler = tokio::spawn(
+        scheduler::Scheduler::new(context.clone(), leases, config).run(stop_rx.clone()),
+    );
+    let reconcile = tokio::spawn(reconcile_loop(context, RECONCILE_INTERVAL, stop_rx));
     tracing::info!(%listen, "scry alert control API ready");
-    tokio::select! {
-        result = axum::serve(listener, app) => result.context("serving alert control API"),
-        _ = scheduler => unreachable!("alert scheduler loop is infinite"),
+    let served = axum::serve(listener, router(state))
+        .with_graceful_shutdown(wait_for_shutdown(shutdown))
+        .await
+        .context("serving alert control API");
+    let _ = stop_tx.send(true);
+    if let Err(error) = scheduler.await {
+        tracing::error!(error = %error, "alert scheduler task failed");
     }
+    if let Err(error) = reconcile.await {
+        tracing::error!(error = %error, "alert reconciliation task failed");
+    }
+    served
 }
 
-async fn reconcile_projection(state: &AppState) -> Result<()> {
-    let deployment_id = state.db.lock().await.deployment_id();
-    let entries = load_projection(state.store.as_ref(), deployment_id).await?;
-    let mut db = state.db.lock().await;
-    fold_projection(&mut db, entries)
-}
-
-async fn scheduler_pass<L: LeaseProvider>(provider: &L, state: &AppState) -> Result<()> {
-    let now = chrono::Utc::now()
-        .timestamp_nanos_opt()
-        .unwrap_or_default()
-        .max(0) as u64;
-    const MAX_CONCURRENT_EVALUATIONS: usize = 8;
-    let mut jobs = futures::stream::FuturesUnordered::new();
-    let mut cursor = None;
+/// Periodic full reconciliation, independent of the scheduler so a slow
+/// object-store listing never delays due evaluations.
+async fn reconcile_loop(
+    context: Arc<EvaluationContext>,
+    period: Duration,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut interval = tokio::time::interval(period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Startup already reconciled.
+    interval.tick().await;
     loop {
-        let rules = state.db.lock().await.list_monitors(cursor, 500)?;
-        if rules.is_empty() {
-            break;
+        tokio::select! {
+            _ = interval.tick() => {}
+            _ = shutdown.changed() => return,
         }
-        let page_len = rules.len();
-        cursor = rules.last().map(|summary| summary.monitor.id);
-        for summary in rules {
-            let monitor = summary.monitor;
-            let interval_nanos = monitor.every_seconds.saturating_mul(1_000_000_000);
-            let Some(slot) = scry_alert::slot_at(
-                monitor.id,
-                now.saturating_sub(interval_nanos),
-                monitor.every_seconds,
-                monitor.jitter_seconds,
-            ) else {
-                continue;
-            };
-            if now < slot.execute_at_unix_nano
-                || summary
-                    .state
-                    .as_ref()
-                    .is_some_and(|current| current.last_slot_id >= slot.id)
-            {
-                continue;
-            }
-            let Some(target) = state
-                .query_targets
-                .iter()
-                .find(|target| target.id == monitor.query.target_id)
-                .cloned()
-            else {
-                tracing::warn!(monitor_id = %monitor.id, target = %monitor.query.target_id, "alert monitor references unknown target");
-                continue;
-            };
-            while jobs.len() >= MAX_CONCURRENT_EVALUATIONS {
-                if let Some((monitor_id, due_slot, Err(error))) = jobs.next().await {
-                    tracing::warn!(%monitor_id, slot = due_slot, error = %error, "alert evaluation failed");
+        tokio::select! {
+            result = projection::reconcile_all(context.store.as_ref(), &context.db, &context.deployment_id) => {
+                if let Err(error) = result {
+                    tracing::warn!(error = %error, "alert projection reconciliation failed");
                 }
             }
-            let context = EvaluationContext {
-                store: state.store.clone(),
-                db: state.db.clone(),
-                target,
-                lease_ttl: Duration::from_secs(45),
-            };
-            jobs.push(async move {
-                let result = evaluate_monitor_slot(
-                    provider,
-                    &context,
-                    &monitor,
-                    slot.id,
-                    slot.end_unix_nano,
-                )
-                .await;
-                (monitor.id, slot.id, result)
-            });
-        }
-        if page_len < 500 {
-            break;
-        }
-    }
-    while let Some((monitor_id, slot, result)) = jobs.next().await {
-        if let Err(error) = result {
-            tracing::warn!(%monitor_id, slot, error = %error, "alert evaluation failed");
-        }
-    }
-    Ok(())
-}
-
-#[derive(Clone)]
-enum DeliveryLeases {
-    Local(LocalLeaseProvider),
-    Valkey(scry_valkey::ValkeyLeaseProvider),
-}
-
-enum DeliveryLease {
-    Local(LocalGuard),
-    Valkey(scry_valkey::ValkeyLease),
-}
-
-impl DeliveryLeases {
-    fn new(provider: LocalLeaseProvider) -> Self {
-        Self::Local(provider)
-    }
-
-    async fn try_acquire(&self, key: &str, ttl: Duration) -> Result<Option<DeliveryLease>> {
-        match self {
-            Self::Local(provider) => provider
-                .try_acquire(key, ttl)
-                .await
-                .map(|guard| guard.map(DeliveryLease::Local)),
-            Self::Valkey(provider) => provider
-                .try_acquire(key, ttl)
-                .await
-                .map(|guard| guard.map(DeliveryLease::Valkey)),
+            _ = shutdown.changed() => return,
         }
     }
 }
 
-impl DeliveryLease {
-    fn fence(&self) -> Arc<dyn scry_block::Fence> {
-        match self {
-            Self::Local(guard) => guard.fence(),
-            Self::Valkey(guard) => guard.fence(),
+/// Connect to Valkey with capped exponential backoff and install the lease
+/// provider once connected. Until then clustered evaluation fails closed
+/// while the control API serves normally.
+async fn connect_valkey_in_background(
+    url: String,
+    keys: scry_valkey::Keyspace,
+    cell: Arc<std::sync::OnceLock<scry_valkey::ValkeyLeaseProvider>>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let holder = Uuid::new_v4();
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        match tokio::time::timeout(
+            VALKEY_CONNECT_TIMEOUT,
+            scry_valkey::ValkeyClient::connect(&url, holder, keys.clone()),
+        )
+        .await
+        {
+            Ok(Ok(client)) => {
+                let _ = cell.set(scry_valkey::ValkeyLeaseProvider::new(client));
+                tracing::info!("alert evaluation leases available");
+                return;
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(error = %error, retry_in = ?backoff, "Valkey unavailable; alert evaluation paused");
+            }
+            Err(_) => {
+                tracing::warn!(retry_in = ?backoff, "Valkey connect timed out; alert evaluation paused");
+            }
         }
+        tokio::select! {
+            _ = tokio::time::sleep(backoff) => {}
+            _ = shutdown.changed() => return,
+        }
+        backoff = (backoff * 2).min(VALKEY_RETRY_MAX);
     }
+}
 
-    async fn release(self) {
-        match self {
-            Self::Local(guard) => guard.release().await,
-            Self::Valkey(guard) => guard.release().await,
+/// SIGINT/SIGTERM fan-out. Mirrors `scry_server::shutdown` without making the
+/// alert role depend on the server crate.
+fn shutdown_channel() -> watch::Receiver<bool> {
+    let (tx, rx) = watch::channel(false);
+    tokio::spawn(async move {
+        let ctrl_c = async {
+            if let Err(error) = tokio::signal::ctrl_c().await {
+                tracing::warn!(error = %error, "failed to install SIGINT handler");
+                std::future::pending::<()>().await;
+            }
+        };
+        #[cfg(unix)]
+        let terminate = async {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut signal) => {
+                    signal.recv().await;
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "failed to install SIGTERM handler");
+                    std::future::pending::<()>().await;
+                }
+            }
+        };
+        #[cfg(not(unix))]
+        let terminate = std::future::pending::<()>();
+        tokio::select! {
+            _ = ctrl_c => {}
+            _ = terminate => {}
+        }
+        tracing::info!("alert service shutdown requested");
+        let _ = tx.send(true);
+    });
+    rx
+}
+
+async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
+    while !*shutdown.borrow_and_update() {
+        if shutdown.changed().await.is_err() {
+            // The signal task never exits without sending; treat a dropped
+            // sender as "never shut down" rather than an immediate stop.
+            std::future::pending::<()>().await;
         }
     }
 }
@@ -472,7 +411,7 @@ struct AppState {
     deployment_id: String,
     keyring: Arc<scry_alert::SecretKeyring>,
     transport: Arc<dyn targets::WebhookTransport>,
-    delivery_leases: Arc<DeliveryLeases>,
+    leases: Leases,
     _local_lock: Arc<Option<singleton::SingletonLock>>,
 }
 
@@ -480,215 +419,6 @@ struct AppState {
 pub struct QueryTarget {
     pub id: String,
     pub address: String,
-}
-
-pub struct EvaluationContext {
-    pub store: Arc<dyn ObjectStore>,
-    pub db: Arc<Mutex<AlertsDb>>,
-    pub target: QueryTarget,
-    pub lease_ttl: Duration,
-}
-
-/// Evaluate and durably commit one monitor slot while holding its cluster lease.
-///
-/// The generic lease provider keeps the engine testable with `LocalLeaseProvider`
-/// while production passes `ValkeyLeaseProvider`.
-pub async fn evaluate_monitor_slot<L: LeaseProvider>(
-    provider: &L,
-    context: &EvaluationContext,
-    monitor: &Monitor,
-    slot_id: u64,
-    slot_end_unix_nano: u64,
-) -> Result<Option<AlertState>> {
-    if context.target.id != monitor.query.target_id {
-        bail!(
-            "query target `{}` does not match monitor target `{}`",
-            context.target.id,
-            monitor.query.target_id
-        );
-    }
-    let key = format!("lease/alert/eval/{}", monitor.id);
-    let Some(guard) = provider.try_acquire(&key, context.lease_ttl).await? else {
-        return Ok(None);
-    };
-    let fence = guard.fence();
-    let outcome = evaluate_under_guard(
-        fence.as_ref(),
-        context.store.clone(),
-        context.db.clone(),
-        &context.target,
-        monitor,
-        slot_id,
-        slot_end_unix_nano,
-    )
-    .await;
-    guard.release().await;
-    outcome.map(Some)
-}
-
-async fn evaluate_under_guard(
-    fence: &dyn scry_block::Fence,
-    store: Arc<dyn ObjectStore>,
-    db: Arc<Mutex<AlertsDb>>,
-    target: &QueryTarget,
-    monitor: &Monitor,
-    slot_id: u64,
-    slot_end_unix_nano: u64,
-) -> Result<AlertState> {
-    fence
-        .check()
-        .context("alert evaluation lease lost before query")?;
-    let lookback = monitor.query.lookback_seconds.saturating_mul(1_000_000_000);
-    let start = slot_end_unix_nano.saturating_sub(lookback);
-    // Query wire bounds are inclusive. Exclude the slot end by sending end-1,
-    // yielding the design's half-open [start, end) event-time window.
-    let inclusive_end = slot_end_unix_nano.saturating_sub(1);
-    let request = scry_query::QueryRequest {
-        signal: signal_byte(monitor.query.signal),
-        query: scry_query::Query {
-            matchers: monitor
-                .query
-                .matchers
-                .iter()
-                .map(|matcher| (matcher.name.clone(), matcher.value.clone()))
-                .collect(),
-            ts_min: Some(start),
-            ts_max: Some(inclusive_end),
-            ..Default::default()
-        },
-        sql: Some(monitor.query.sql.clone()),
-        limit: None,
-        request_id: Some(format!("alert:{}:{slot_id}", monitor.id)),
-        live: false,
-    };
-    let observation = if monitor.enabled {
-        let client = QueryWireClient::new(&target.address)
-            .with_deadlines(QueryDeadlines {
-                connect: Duration::from_secs(5),
-                write: Duration::from_secs(5),
-                total: Duration::from_secs(30),
-            })
-            .with_limits(QueryLimits {
-                max_frames: 64,
-                max_bytes: 1024 * 1024,
-                max_rows: 1,
-            });
-        match client.scalar(request).await {
-            Ok(ScalarOutcome::Value(QueryScalar::Number(value))) => Observation::Value(value),
-            Ok(ScalarOutcome::Value(QueryScalar::Boolean(value))) => {
-                Observation::Value(if value { 1.0 } else { 0.0 })
-            }
-            Ok(ScalarOutcome::NoData) => Observation::NoData,
-            Err(error) => Observation::Error {
-                class: query_error_class(&error).to_owned(),
-            },
-        }
-    } else {
-        Observation::NoData
-    };
-
-    let alert_store = AlertStore::new(store.as_ref());
-    let latest_rule = alert_store.read_rule(monitor.id).await?;
-    if latest_rule.value.revision != monitor.revision {
-        bail!("monitor revision changed during evaluation");
-    }
-    let current_head = alert_store.read_state_head(monitor.id).await?;
-    let current_transition = if let Some(head) = &current_head {
-        Some(
-            alert_store
-                .read_current_transition(&head.value)
-                .await?
-                .value,
-        )
-    } else {
-        None
-    };
-    let prior = current_transition
-        .as_ref()
-        .map(|record| record.state.clone());
-    let (next, _) = evaluate(
-        monitor,
-        prior.as_ref(),
-        observation.clone(),
-        slot_id,
-        slot_end_unix_nano,
-    );
-    if prior
-        .as_ref()
-        .is_some_and(|state| state.last_slot_id >= slot_id)
-    {
-        if let (Some(head), Some(transition)) = (&current_head, &current_transition) {
-            db.lock()
-                .await
-                .fold_transition(&head.value.transition_key, transition, &head.value)?;
-        }
-        return Ok(next);
-    }
-
-    fence
-        .check()
-        .context("alert evaluation lease lost before commit")?;
-    let latest_rule = alert_store.read_rule(monitor.id).await?;
-    if latest_rule.value.revision != monitor.revision {
-        bail!("monitor revision changed before commit");
-    }
-    let transition_key = transition_key(monitor.id, next.transition_sequence, slot_id);
-    let transition = TransitionRecord {
-        schema_version: ALERT_RECORD_SCHEMA_VERSION,
-        deployment_id: db.lock().await.deployment_id().to_string(),
-        monitor_id: monitor.id,
-        monitor_revision: monitor.revision,
-        slot_id,
-        evaluated_at_unix_nano: slot_end_unix_nano,
-        observation: DurableObservation::from(observation),
-        state: next.clone(),
-        previous_transition_key: current_head
-            .as_ref()
-            .map(|head| head.value.transition_key.clone()),
-        notification_intents: vec![],
-    };
-    let transition_bytes = canonical_json(&transition)?;
-    let head = StateHead {
-        schema_version: ALERT_RECORD_SCHEMA_VERSION,
-        deployment_id: transition.deployment_id.clone(),
-        monitor_id: monitor.id,
-        transition_sequence: next.transition_sequence,
-        transition_key: transition_key.clone(),
-        transition_sha256: sha256_hex(&transition_bytes),
-        updated_at_unix_nano: slot_end_unix_nano,
-    };
-    alert_store
-        .commit_transition(
-            &transition_key,
-            &transition,
-            &head,
-            current_head.map(|head| head.version),
-        )
-        .await?;
-    db.lock()
-        .await
-        .fold_transition(&transition_key, &transition, &head)?;
-    Ok(next)
-}
-
-fn signal_byte(signal: scry_alert::Signal) -> u8 {
-    match signal {
-        scry_alert::Signal::Metrics => 1,
-        scry_alert::Signal::Logs => 2,
-        scry_alert::Signal::Traces => 3,
-        scry_alert::Signal::Profiles => 4,
-    }
-}
-
-fn query_error_class(error: &QueryClientError) -> &'static str {
-    match error {
-        QueryClientError::Resource { .. } => "resource",
-        QueryClientError::Timeout { .. } => "timeout",
-        QueryClientError::Transport(_) => "transport",
-        QueryClientError::Stream { .. } => "query",
-        QueryClientError::Protocol(_) => "protocol",
-        QueryClientError::Bounds { .. } => "bounds",
-    }
 }
 
 fn control_state_for_test(
@@ -710,7 +440,7 @@ fn control_state_for_test(
         deployment_id,
         keyring: Arc::new(keyring),
         transport: Arc::new(targets::SecureWebhookTransport),
-        delivery_leases: Arc::new(DeliveryLeases::new(LocalLeaseProvider::new())),
+        leases: Leases::local(),
         _local_lock: Arc::new(None),
     })
 }
@@ -742,13 +472,14 @@ pub async fn serve_control_with_reconciliation_for_test(
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            if let Err(error) = targets::reconcile_projection(
+            if let Err(error) = projection::reconcile_all(
                 reconcile_state.store.as_ref(),
                 reconcile_state.db.as_ref(),
+                &reconcile_state.deployment_id,
             )
             .await
             {
-                tracing::warn!(error = %error, "test notification-target reconciliation failed");
+                tracing::warn!(error = %error, "test alert projection reconciliation failed");
             }
         }
     };
@@ -872,21 +603,13 @@ async fn update_monitor(
             "path and body monitor IDs differ".into(),
         ));
     }
-    let expected = headers
-        .get(header::IF_MATCH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim_matches('"').parse::<u64>().ok())
-        .ok_or_else(|| ApiError::BadRequest("If-Match revision is required".into()))?;
+    let expected = expected_revision(&headers)?;
     if monitor.revision != expected.saturating_add(1) {
         return Err(ApiError::Conflict);
     }
     let durable_head = AlertStore::new(state.store.as_ref())
         .read_rule_head(id)
-        .await
-        .map_err(|error| match error {
-            scry_alert::AlertStoreError::Missing { .. } => ApiError::NotFound,
-            other => ApiError::Store(other),
-        })?;
+        .await?;
     if durable_head.value.deleted
         || (durable_head.value.revision != expected
             && durable_head.value.revision != monitor.revision)
@@ -898,6 +621,10 @@ async fn update_monitor(
         .map(Json)
 }
 
+/// Delete (tombstone) a monitor. A replayed command resumes exactly like a
+/// target delete: success if the head already carries this command's
+/// tombstone, otherwise finish the tombstone CAS from the expected revision,
+/// otherwise a conflict.
 async fn delete_monitor(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -907,48 +634,48 @@ async fn delete_monitor(
     let _permit = admit_control(&state)?;
     let command_id = require_idempotency(&headers)?;
     let id = parse_id(&id)?;
-    let expected = headers
-        .get(header::IF_MATCH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim_matches('"').parse::<u64>().ok())
-        .ok_or_else(|| ApiError::BadRequest("If-Match revision is required".into()))?;
+    let expected = expected_revision(&headers)?;
     let alert_store = AlertStore::new(state.store.as_ref());
-    if let Some(existing) = alert_store
-        .read_tombstone(id, command_id)
-        .await
-        .map_err(ApiError::Store)?
+    let staged = alert_store.read_tombstone(id, command_id).await?;
+    if staged
+        .as_ref()
+        .is_some_and(|tombstone| tombstone.revision != expected)
     {
-        return if existing.revision == expected {
-            Ok(StatusCode::NO_CONTENT)
-        } else {
-            Err(ApiError::Conflict)
-        };
-    }
-    let deleted_at = chrono::Utc::now()
-        .timestamp_nanos_opt()
-        .unwrap_or_default()
-        .max(0) as u64;
-    let durable_head = alert_store
-        .read_rule_head(id)
-        .await
-        .map_err(ApiError::Store)?;
-    if durable_head.value.revision != expected || durable_head.value.deleted {
         return Err(ApiError::Conflict);
     }
-    alert_store
-        .tombstone_rule(
-            &RuleTombstone {
-                schema_version: ALERT_RECORD_SCHEMA_VERSION,
-                monitor_id: id,
-                revision: expected,
-                command_id: command_id.to_owned(),
-                deleted_at_unix_nano: deleted_at,
-            },
-            durable_head.version,
-        )
-        .await
-        .map_err(ApiError::Store)?;
-    state.db.lock().await.delete_monitor(id)?;
+    let head = alert_store.read_rule_head(id).await?;
+    if let Some(tombstone) = &staged {
+        if head.value.deleted
+            && head.value.tombstone_key.as_deref()
+                == Some(rule_tombstone_key(id, command_id).as_str())
+        {
+            state.db.lock().await.tombstone_monitor(
+                id,
+                tombstone.revision,
+                tombstone.deleted_at_unix_nano,
+            )?;
+            return Ok(StatusCode::NO_CONTENT);
+        }
+    }
+    if head.value.deleted || head.value.revision != expected {
+        return Err(ApiError::Conflict);
+    }
+    let tombstone = staged.unwrap_or_else(|| RuleTombstone {
+        schema_version: ALERT_RECORD_SCHEMA_VERSION,
+        monitor_id: id,
+        revision: expected,
+        command_id: command_id.to_owned(),
+        deleted_at_unix_nano: chrono::Utc::now()
+            .timestamp_nanos_opt()
+            .unwrap_or_default()
+            .max(0) as u64,
+    });
+    alert_store.tombstone_rule(&tombstone, head.version).await?;
+    state.db.lock().await.tombstone_monitor(
+        id,
+        tombstone.revision,
+        tombstone.deleted_at_unix_nano,
+    )?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -985,31 +712,9 @@ async fn test_monitor_request(
         .timestamp_nanos_opt()
         .unwrap_or_default()
         .max(0) as u64;
-    let lookback = monitor.query.lookback_seconds.saturating_mul(1_000_000_000);
-    let request = scry_query::QueryRequest {
-        signal: signal_byte(monitor.query.signal),
-        query: scry_query::Query {
-            matchers: monitor
-                .query
-                .matchers
-                .iter()
-                .map(|matcher| (matcher.name.clone(), matcher.value.clone()))
-                .collect(),
-            ts_min: Some(now.saturating_sub(lookback)),
-            ts_max: Some(now.saturating_sub(1)),
-            ..Default::default()
-        },
-        sql: Some(monitor.query.sql.clone()),
-        limit: None,
-        request_id: Some(format!("alert-test:{}", monitor.id)),
-        live: false,
-    };
+    let request = evaluator::scalar_request(&monitor, now, format!("alert-test:{}", monitor.id));
     let result = QueryWireClient::new(&target.address)
-        .with_limits(QueryLimits {
-            max_frames: 64,
-            max_bytes: 1024 * 1024,
-            max_rows: 1,
-        })
+        .with_limits(evaluator::scalar_limits())
         .scalar(request)
         .await;
     let response = match result {
@@ -1031,7 +736,7 @@ async fn test_monitor_request(
         Err(error) => TestEvaluation {
             outcome: "error",
             value: None,
-            error_class: Some(query_error_class(&error)),
+            error_class: Some(evaluator::query_error_class(&error)),
         },
     };
     Ok(Json(response))
@@ -1045,11 +750,7 @@ async fn persist_monitor(
 ) -> Result<MonitorSummaryDto, ApiError> {
     validate_monitor(&monitor).map_err(|error| ApiError::BadRequest(error.to_string()))?;
     require_known_target(state, &monitor)?;
-    let request_sha256 = sha256_hex(
-        &canonical_json(&monitor)
-            .map_err(scry_alert::AlertStoreError::from)
-            .map_err(ApiError::Store)?,
-    );
+    let request_sha256 = sha256_hex(&canonical_json(&monitor).map_err(AlertStoreError::from)?);
     let receipt = RuleMutationReceipt {
         schema_version: ALERT_RECORD_SCHEMA_VERSION,
         command_id: command_id.to_owned(),
@@ -1059,18 +760,11 @@ async fn persist_monitor(
         request_sha256,
     };
     let alert_store = AlertStore::new(state.store.as_ref());
-    if let Some(existing) = alert_store
-        .read_rule_mutation(command_id)
-        .await
-        .map_err(ApiError::Store)?
-    {
+    if let Some(existing) = alert_store.read_rule_mutation(command_id).await? {
         if existing != receipt {
             return Err(ApiError::Conflict);
         }
-        let durable = alert_store
-            .read_rule(monitor.id)
-            .await
-            .map_err(ApiError::Store)?;
+        let durable = alert_store.read_rule(monitor.id).await?;
         state.db.lock().await.fold_rule(&durable.value)?;
         return state
             .db
@@ -1080,16 +774,14 @@ async fn persist_monitor(
             .map(MonitorSummaryDto::from)
             .ok_or(ApiError::NotFound);
     }
+    // The revision object is keyed by this command, so a revision left behind
+    // by another command that never published cannot block this one.
     alert_store
-        .create_rule_revision(&monitor)
-        .await
-        .map_err(ApiError::Store)?;
+        .create_rule_revision(&monitor, command_id)
+        .await?;
     // Publish the command receipt only after the rule head is durable. A crash in
     // between is repaired by the idempotent immutable rule write on retry.
-    alert_store
-        .record_rule_mutation(&receipt)
-        .await
-        .map_err(ApiError::Store)?;
+    alert_store.record_rule_mutation(&receipt).await?;
     state.db.lock().await.fold_rule(&monitor)?;
     state
         .db
@@ -1135,6 +827,14 @@ fn parse_id(value: &str) -> Result<MonitorId, ApiError> {
     Uuid::from_str(value)
         .map(MonitorId)
         .map_err(|_| ApiError::BadRequest("invalid monitor ID".into()))
+}
+
+fn expected_revision(headers: &HeaderMap) -> Result<u64, ApiError> {
+    headers
+        .get(header::IF_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim_matches('"').parse::<u64>().ok())
+        .ok_or_else(|| ApiError::BadRequest("If-Match revision is required".into()))
 }
 
 fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
@@ -1186,8 +886,11 @@ enum ApiError {
     Overloaded,
     Unavailable(String),
     BadRequest(String),
+    /// A server-side fault the client cannot fix (keyring, local database,
+    /// or a corrupt durable record).
+    Internal(String),
     Database(scry_alert::AlertsDbError),
-    Store(scry_alert::AlertStoreError),
+    Store(AlertStoreError),
 }
 
 impl From<scry_alert::AlertsDbError> for ApiError {
@@ -1196,28 +899,102 @@ impl From<scry_alert::AlertsDbError> for ApiError {
     }
 }
 
-impl axum::response::IntoResponse for ApiError {
-    fn into_response(self) -> axum::response::Response {
-        let (status, message) = match self {
+impl From<AlertStoreError> for ApiError {
+    fn from(value: AlertStoreError) -> Self {
+        Self::Store(value)
+    }
+}
+
+impl ApiError {
+    fn status_and_message(self) -> (StatusCode, String) {
+        match self {
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".to_owned()),
-            Self::NotFound => (StatusCode::NOT_FOUND, "resource not found".to_owned()),
-            Self::Conflict => (
-                StatusCode::CONFLICT,
-                "resource revision conflict".to_owned(),
-            ),
+            Self::NotFound | Self::Store(AlertStoreError::Missing { .. }) => {
+                (StatusCode::NOT_FOUND, "resource not found".to_owned())
+            }
+            Self::Conflict
+            | Self::Store(AlertStoreError::Conflict { .. } | AlertStoreError::Collision { .. }) => {
+                (
+                    StatusCode::CONFLICT,
+                    "resource revision conflict".to_owned(),
+                )
+            }
             Self::Overloaded => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "alert control API overloaded".to_owned(),
             ),
             Self::Unavailable(message) => (StatusCode::SERVICE_UNAVAILABLE, message),
             Self::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
+            Self::Internal(message) => (StatusCode::INTERNAL_SERVER_ERROR, message),
             Self::Database(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
-            Self::Store(scry_alert::AlertStoreError::Conflict { .. }) => (
-                StatusCode::CONFLICT,
-                "resource revision conflict".to_owned(),
-            ),
-            Self::Store(error) => (StatusCode::BAD_GATEWAY, error.to_string()),
-        };
+            // Only a failed object-store call is an upstream (gateway) error;
+            // an invalid durable record is an internal fault.
+            Self::Store(error @ AlertStoreError::Object { .. }) => {
+                (StatusCode::BAD_GATEWAY, error.to_string())
+            }
+            Self::Store(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+        }
+    }
+}
+
+impl axum::response::IntoResponse for ApiError {
+    fn into_response(self) -> axum::response::Response {
+        let (status, message) = self.status_and_message();
         (status, Json(serde_json::json!({ "error": message }))).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn store_errors_map_to_client_meaningful_statuses() {
+        let path = || "p".to_owned();
+        let status = |error| ApiError::Store(error).status_and_message().0;
+        assert_eq!(
+            status(AlertStoreError::Missing { path: path() }),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            status(AlertStoreError::Conflict { path: path() }),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            status(AlertStoreError::Collision { path: path() }),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            status(AlertStoreError::Corrupt {
+                path: path(),
+                message: "m"
+            }),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            status(AlertStoreError::Oversized { path: path() }),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            status(AlertStoreError::Object {
+                path: path(),
+                source: object_store::Error::NotImplemented {
+                    operation: "x".into(),
+                    implementer: "y".into(),
+                },
+            }),
+            StatusCode::BAD_GATEWAY
+        );
+    }
+
+    #[test]
+    fn evaluation_delay_defaults_above_the_ingest_flush_age() {
+        let args = Args::try_parse_from(["alert", "serve"]).unwrap();
+        assert_eq!(args.evaluation_delay, 90);
+        assert!(
+            args.evaluation_delay > 60,
+            "must exceed ingestd's default --block-max-age-secs"
+        );
+        assert!(Args::try_parse_from(["alert", "--evaluation-delay", "3601", "serve"]).is_err());
     }
 }
