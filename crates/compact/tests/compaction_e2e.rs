@@ -168,7 +168,27 @@ async fn run_metrics_query(
     store: Arc<dyn ObjectStore>,
     q: &Query,
 ) -> Vec<arrow::record_batch::RecordBatch> {
-    let ctx = SessionContext::new();
+    run_metrics_query_with(catalog, store, q, SessionContext::new()).await
+}
+
+/// `run_metrics_query` on a single-partition context, for the same reason as
+/// [`run_logs_query_ordered`]: only then is the collected row order the merged
+/// block's on-disk order.
+async fn run_metrics_query_ordered(
+    catalog: &Catalog,
+    store: Arc<dyn ObjectStore>,
+    q: &Query,
+) -> Vec<arrow::record_batch::RecordBatch> {
+    let cfg = datafusion::execution::config::SessionConfig::new().with_target_partitions(1);
+    run_metrics_query_with(catalog, store, q, SessionContext::new_with_config(cfg)).await
+}
+
+async fn run_metrics_query_with(
+    catalog: &Catalog,
+    store: Arc<dyn ObjectStore>,
+    q: &Query,
+    ctx: SessionContext,
+) -> Vec<arrow::record_batch::RecordBatch> {
     register_metrics_table(&ctx, catalog, store, q)
         .await
         .unwrap();
@@ -455,7 +475,8 @@ async fn metrics_compaction_is_lossless() {
     assert_eq!(by_fp.get(&fp_c), Some(&3));
 
     // Lossless: same (fp, ts, value) multiset before and after.
-    let post = run_metrics_query(&catalog, store.clone(), &q_all).await;
+    // Single partition: the ordering check below must see on-disk order.
+    let post = run_metrics_query_ordered(&catalog, store.clone(), &q_all).await;
     assert_eq!(total_rows(&post), 120);
     let post_fps = collect_u64(&post, "series_fingerprint");
     let post_ts = collect_u64(&post, "ts_unix_nano");
