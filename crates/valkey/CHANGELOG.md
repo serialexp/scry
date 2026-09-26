@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.24.1 (2026-09-26)
+
+### Bug Fixes
+
+- harden clustered evaluation, state, and control store
+
 ## 0.23.4 (2026-09-18)
 
 ### Bug Fixes
