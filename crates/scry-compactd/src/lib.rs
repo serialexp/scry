@@ -138,6 +138,13 @@ pub struct Args {
     #[arg(long, default_value_t = 5)]
     pub poll_interval: u64,
 
+    /// Seconds of look-back the incremental poll re-lists before each
+    /// cursor. A block that commits later than this after its UUIDv7 time
+    /// (a slow upload, a long compaction) is found by its pub/sub event or
+    /// the full walk instead.
+    #[arg(long, default_value_t = scry_cluster::DEFAULT_POLL_LOOKBACK.as_secs())]
+    pub poll_lookback_secs: u64,
+
     /// Seconds between full catalog reconciliation walks (measured from
     /// the end of the previous walk, not on a fixed timer — D-066).
     #[arg(long, default_value_t = 1800)]
@@ -573,12 +580,13 @@ async fn run_leased(
         let bucket = bucket.clone();
         let cat = conv_catalog.clone();
         let interval = Duration::from_secs(args.poll_interval.max(1));
+        let lookback = Duration::from_secs(args.poll_lookback_secs);
         bg_tasks.push(tokio::spawn(async move {
             let mut tick = tokio::time::interval(interval);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tick.tick().await;
-                match poll_once(store.as_ref(), cat.as_ref(), &bucket).await {
+                match poll_once(store.as_ref(), cat.as_ref(), &bucket, lookback).await {
                     Ok(r) if r.inserted > 0 => {
                         info!(inserted = r.inserted, "convergence poll applied new blocks")
                     }
@@ -809,9 +817,13 @@ async fn reconcile(catalog: &Catalog, store: &Arc<dyn ObjectStore>) -> Result<()
         inserted = report.inserted,
         already_present = report.already_present,
         failed = report.failed,
+        unapplied = report.unapplied,
         "reconcile complete"
     );
-    Ok(())
+    // Staging recovered reaps and compacting both trust this catalog: a
+    // committed merge output it missed leaves its inputs looking live, and
+    // merging them again would publish a second copy of their rows.
+    report.ensure_complete("stage reaps or compact")
 }
 
 async fn run_unfenced_pass(

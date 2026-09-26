@@ -28,7 +28,9 @@ pub mod traces;
 pub use bloom::{BodyBloom, BodyBloomBuilder};
 pub use dummy::DummyBlockBuilder;
 pub use events::{BlockEvent, BlockEventSink, Envelope, NoopSink};
-pub use fence::{AlwaysValid, CompactionProgress, Fence};
+pub use fence::{
+    run_fenced, AlwaysValid, CompactionProgress, Fence, LeaseLost, FENCE_POLL_INTERVAL,
+};
 pub use logs::{
     logs_physical_schema_v1, logs_physical_schema_v2, logs_physical_schema_v3, LogsBlockBuilder,
 };
@@ -408,6 +410,19 @@ pub async fn delete_block_objects(store: &dyn ObjectStore, meta: &BlockMeta) -> 
             Ok(()) => {}
             Err(object_store::Error::NotFound { .. }) => {
                 tracing::debug!(%path, "object already absent during delete");
+            }
+            // Retried every pass and never self-heals, so name the fix in the
+            // top-level message the reapers log.
+            Err(
+                e @ (object_store::Error::PermissionDenied { .. }
+                | object_store::Error::Unauthenticated { .. }),
+            ) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "delete {path}: the object store denied it — the credentials need \
+                         s3:DeleteObject on the bucket"
+                    )
+                })
             }
             Err(e) => return Err(e).with_context(|| format!("delete {path}")),
         }

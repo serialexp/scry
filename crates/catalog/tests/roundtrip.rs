@@ -589,6 +589,205 @@ async fn reconcile_walks_bucket_and_upserts_sidecars() {
     assert_eq!(again.failed, 1);
 }
 
+/// An `InMemory` store that can end its listing with an error after `n`
+/// entries — exactly how a paginated `object_store` listing fails: the stream
+/// yields what it has, then one error, then ends — and can fail GETs of one
+/// path with a chosen error.
+#[derive(Debug)]
+struct FaultyStore {
+    inner: InMemory,
+    list_error_after: Option<usize>,
+    get_error: Option<(String, MakeError)>,
+}
+
+/// Builds the injected error for a failing GET from its path.
+type MakeError = fn(String) -> object_store::Error;
+
+impl FaultyStore {
+    fn new(inner: InMemory) -> Self {
+        Self {
+            inner,
+            list_error_after: None,
+            get_error: None,
+        }
+    }
+}
+
+impl std::fmt::Display for FaultyStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FaultyStore")
+    }
+}
+
+fn generic_error(path: String) -> object_store::Error {
+    object_store::Error::Generic {
+        store: "FaultyStore",
+        source: format!("injected failure for {path}").into(),
+    }
+}
+
+fn not_found_error(path: String) -> object_store::Error {
+    object_store::Error::NotFound {
+        path,
+        source: "injected 404".into(),
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for FaultyStore {
+    async fn put_opts(
+        &self,
+        p: &ObjPath,
+        v: PutPayload,
+        o: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(p, v, o).await
+    }
+    async fn put_multipart_opts(
+        &self,
+        p: &ObjPath,
+        o: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(p, o).await
+    }
+    async fn get_opts(
+        &self,
+        p: &ObjPath,
+        o: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        if let Some((path, make)) = &self.get_error {
+            if path == p.as_ref() {
+                return Err(make(path.clone()));
+            }
+        }
+        self.inner.get_opts(p, o).await
+    }
+    fn delete_stream(
+        &self,
+        p: futures::stream::BoxStream<'static, object_store::Result<ObjPath>>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<ObjPath>> {
+        self.inner.delete_stream(p)
+    }
+    fn list(
+        &self,
+        p: Option<&ObjPath>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        use futures::StreamExt;
+        let inner = self.inner.list(p);
+        match self.list_error_after {
+            None => inner,
+            Some(n) => inner
+                .take(n)
+                .chain(futures::stream::once(async {
+                    Err(generic_error("list page 2".into()))
+                }))
+                .boxed(),
+        }
+    }
+    async fn list_with_delimiter(
+        &self,
+        p: Option<&ObjPath>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(p).await
+    }
+    async fn copy_opts(
+        &self,
+        f: &ObjPath,
+        t: &ObjPath,
+        o: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(f, t, o).await
+    }
+    async fn rename_opts(
+        &self,
+        f: &ObjPath,
+        t: &ObjPath,
+        o: object_store::RenameOptions,
+    ) -> object_store::Result<()> {
+        self.inner.rename_opts(f, t, o).await
+    }
+}
+
+async fn upload_meta(store: &InMemory, m: &BlockMeta) -> String {
+    let path = scry_block::block_path(
+        &m.signal,
+        m.ts_min_unix_nano,
+        m.writer_id,
+        m.uuid,
+        "meta.json",
+    );
+    store
+        .put(
+            &ObjPath::from(path.as_str()),
+            PutPayload::from(serde_json::to_vec(m).unwrap()),
+        )
+        .await
+        .unwrap();
+    path
+}
+
+#[tokio::test]
+async fn reconcile_fails_when_the_listing_fails_part_way() {
+    let tmp = TempDir::new().unwrap();
+    let cat = Catalog::open(&tmp.path().join("cat.sqlite"), "scry-dev").unwrap();
+    let inner = InMemory::new();
+    let writer = Uuid::now_v7();
+    for i in 0..3u64 {
+        upload_meta(
+            &inner,
+            &meta(Uuid::now_v7(), writer, 1_700_000_000_000_000_000 + i, 10),
+        )
+        .await;
+    }
+    let mut store = FaultyStore::new(inner);
+    // The first "page" arrives, then the listing fails. Before the fix this
+    // logged a warning and returned Ok, reporting a truncated bucket as a
+    // complete one to callers that then compact and stage deletions.
+    store.list_error_after = Some(1);
+    let error = cat.reconcile_from_bucket(&store).await.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("listing is incomplete"),
+        "{error:#}"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_reports_unfetchable_sidecars_as_incomplete_but_not_vanished_ones() {
+    let tmp = TempDir::new().unwrap();
+    let cat = Catalog::open(&tmp.path().join("cat.sqlite"), "scry-dev").unwrap();
+    let inner = InMemory::new();
+    let writer = Uuid::now_v7();
+    let good = meta(Uuid::now_v7(), writer, 1_700_000_000_000_000_000, 10);
+    let flaky = meta(Uuid::now_v7(), writer, 1_700_000_000_000_000_001, 10);
+    upload_meta(&inner, &good).await;
+    let flaky_path = upload_meta(&inner, &flaky).await;
+    let mut store = FaultyStore::new(inner);
+
+    // A transient GET failure: listed, committed, but not applied.
+    store.get_error = Some((flaky_path.clone(), generic_error));
+    let report = cat.reconcile_from_bucket(&store).await.unwrap();
+    assert_eq!(report.inserted, 1);
+    assert_eq!(report.unapplied, 1);
+    assert_eq!(report.failed, 0);
+    assert!(!report.is_complete());
+    let refusal = report.ensure_complete("compact").unwrap_err().to_string();
+    assert!(refusal.contains("refusing to compact"), "{refusal}");
+
+    // A 404 means a peer deleted it between LIST and GET: gone, not a gap.
+    store.get_error = Some((flaky_path, not_found_error));
+    let report = cat.reconcile_from_bucket(&store).await.unwrap();
+    assert_eq!(report.unapplied, 0);
+    assert!(report.is_complete());
+    report.ensure_complete("compact").unwrap();
+
+    // Healthy again: the block lands.
+    store.get_error = None;
+    let report = cat.reconcile_from_bucket(&store).await.unwrap();
+    assert_eq!(report.inserted, 1);
+    assert!(report.is_complete());
+    assert!(cat.has_block(flaky.uuid).unwrap());
+}
+
 fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
     items
         .iter()
@@ -835,6 +1034,81 @@ fn poll_cursors_are_keyed_per_signal_writer_date_and_listed() {
     cursors.sort();
     assert!(cursors.contains(&("logs".to_string(), w1, "2026-05-30".to_string())));
     assert!(cursors.contains(&("metrics".to_string(), w2, "2026-05-30".to_string())));
+
+    // list_cursor_heads carries the same keys plus each high-water UUID.
+    let heads = cat.list_cursor_heads().unwrap();
+    assert_eq!(heads.len(), 4);
+    for head in heads {
+        assert_eq!(
+            cat.get_cursor(&head.signal, head.writer_id, &head.date)
+                .unwrap(),
+            Some(head.highest)
+        );
+    }
+}
+
+/// A WAL-recovery block's UUID is a content hash in v4 shape. It must never
+/// become a cursor's high-water mark: it usually sorts after every v7 UUID the
+/// writer will mint, so the cursor would jump past all of them.
+#[test]
+fn only_v7_uuids_move_a_cursor_and_a_legacy_v4_cursor_heals() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("cat.sqlite");
+    let cat = Catalog::open(&path, "scry-dev").unwrap();
+    let writer = Uuid::now_v7();
+    let v4_high = Uuid::parse_str("f0000000-0000-4000-8000-000000000000").unwrap();
+
+    cat.advance_cursor("logs", writer, "2026-05-30", v4_high)
+        .unwrap();
+    assert_eq!(
+        cat.get_cursor("logs", writer, "2026-05-30").unwrap(),
+        None,
+        "a v4 UUID does not create a cursor"
+    );
+    let v7 = Uuid::now_v7();
+    cat.advance_cursor("logs", writer, "2026-05-30", v7)
+        .unwrap();
+    cat.advance_cursor("logs", writer, "2026-05-30", v4_high)
+        .unwrap();
+    assert_eq!(
+        cat.get_cursor("logs", writer, "2026-05-30").unwrap(),
+        Some(v7),
+        "a v4 UUID does not advance one either, though it sorts higher"
+    );
+
+    // A catalog written before the rule may already hold a v4 high-water
+    // mark. The next v7 observation replaces it despite sorting lower.
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE poll_cursors SET highest_uuid = ?1",
+            [v4_high.to_string()],
+        )
+        .unwrap();
+    let next = Uuid::now_v7();
+    assert!(next < v4_high);
+    cat.advance_cursor("logs", writer, "2026-05-30", next)
+        .unwrap();
+    assert_eq!(
+        cat.get_cursor("logs", writer, "2026-05-30").unwrap(),
+        Some(next)
+    );
+}
+
+#[test]
+fn has_block_sees_every_row_regardless_of_liveness() {
+    let tmp = TempDir::new().unwrap();
+    let cat = Catalog::open(&tmp.path().join("cat.sqlite"), "scry-dev").unwrap();
+    let writer = Uuid::now_v7();
+    let live = meta(Uuid::now_v7(), writer, 1_700_000_000_000_000_000, 10);
+    let hidden = meta(Uuid::now_v7(), writer, 1_700_000_000_000_000_001, 10);
+    cat.insert_block(&live).unwrap();
+    cat.insert_block(&hidden).unwrap();
+    cat.mark_deleted(&[hidden.uuid], 1, 2).unwrap();
+
+    assert!(cat.has_block(live.uuid).unwrap());
+    assert!(cat.has_block(hidden.uuid).unwrap(), "soft-deleted is known");
+    assert!(!cat.has_block(Uuid::now_v7()).unwrap());
 }
 
 /// Lineage learned from the *bucket* (a merged block's `compacted_from`, as

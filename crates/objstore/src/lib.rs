@@ -12,6 +12,13 @@
 //!   time in kernel page-fault servicing for fresh response Vecs).
 //! - **`PooledStore` + `BufPool`** as a reusable `ObjectStore`
 //!   adapter, in case future code wants to wrap a non-S3 store too.
+//! - **Client tuning** ([`ObjStoreClientConfig`]): request/connect
+//!   timeouts and the retry budget, from `SCRY_OBJSTORE_*` env with the
+//!   `object_store` defaults preserved.
+//! - **File transfer** ([`upload_file`], [`download_to_file`]): stream a
+//!   large local file (a SQLite snapshot) to or from the bucket without
+//!   holding it in memory — multipart upload in [`transfer::UPLOAD_PART_BYTES`]
+//!   parts, and a size-capped, fsynced streaming download.
 //!
 //! Everything else — `put`, `get`, `list`, `delete`, multipart, range
 //! reads — is reached by calling the underlying `dyn ObjectStore`
@@ -23,11 +30,14 @@
 //! expose and verify the atomic conditional-write contract required by
 //! control-plane data. Backends must pass the probe before callers rely
 //! on that contract; accepting but ignoring preconditions is not enough.
+//! The probe also requires a missing key to read back `NotFound` (not a
+//! 403), which is what the credentials' `s3:ListBucket` grant controls.
 
 pub mod conditional;
 pub mod manifest;
 mod pool;
 mod store;
+pub mod transfer;
 
 pub use conditional::{
     create_options, probe_conditional_writes, put_create, put_update, update_options,
@@ -38,8 +48,10 @@ pub use pool::{
     DEFAULT_POOL_WARMUP_SIZE,
 };
 pub use store::PooledStore;
+pub use transfer::{download_to_file, upload_file};
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
@@ -47,7 +59,7 @@ use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvid
 use object_store::{
     aws::{AmazonS3Builder, AmazonS3ConfigKey, AwsCredential, AwsCredentialProvider},
     client::CredentialProvider,
-    ObjectStore,
+    BackoffConfig, ClientOptions, ObjectStore, RetryConfig,
 };
 
 /// Connection details for an S3-compatible bucket.
@@ -71,6 +83,106 @@ pub struct ObjStoreConfig {
     /// (false, `bucket.endpoint/key`). SeaweedFS and most homelab S3s
     /// want path-style; AWS prefers virtual-hosted but accepts either.
     pub path_style: bool,
+    /// HTTP timeouts and retry policy for every request to this bucket.
+    pub client: ObjStoreClientConfig,
+}
+
+/// HTTP timeouts and retry policy of the object-store client.
+///
+/// The defaults are `object_store`'s own, which scry used implicitly before
+/// these became configurable: a 30 s per-request timeout, a 5 s connect
+/// timeout, and up to 10 retries within 180 s of the first attempt. Read from
+/// `SCRY_OBJSTORE_*` by [`ObjStoreClientConfig::from_env`].
+///
+/// These bound how long one logical operation can keep a caller waiting. They
+/// are not a correctness mechanism for lease-guarded commits; those bound
+/// their own commit point against the lease (see `scry_block::fence`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjStoreClientConfig {
+    /// Per-attempt deadline, covering connect through the complete response
+    /// body. Must fit the largest single request: raise it for slow links
+    /// rather than lowering part sizes. `SCRY_OBJSTORE_REQUEST_TIMEOUT_SECS`.
+    pub request_timeout: Duration,
+    /// TCP/TLS connect deadline. `SCRY_OBJSTORE_CONNECT_TIMEOUT_SECS`.
+    pub connect_timeout: Duration,
+    /// Retries of a failed idempotent request (0 disables retries).
+    /// `SCRY_OBJSTORE_MAX_RETRIES`.
+    pub max_retries: usize,
+    /// No retry starts later than this after the first attempt.
+    /// `SCRY_OBJSTORE_RETRY_TIMEOUT_SECS`.
+    pub retry_timeout: Duration,
+}
+
+impl Default for ObjStoreClientConfig {
+    fn default() -> Self {
+        Self {
+            request_timeout: Duration::from_secs(30),
+            connect_timeout: Duration::from_secs(5),
+            max_retries: 10,
+            retry_timeout: Duration::from_secs(180),
+        }
+    }
+}
+
+impl ObjStoreClientConfig {
+    /// Read the client policy from `SCRY_OBJSTORE_REQUEST_TIMEOUT_SECS`,
+    /// `SCRY_OBJSTORE_CONNECT_TIMEOUT_SECS`, `SCRY_OBJSTORE_MAX_RETRIES`, and
+    /// `SCRY_OBJSTORE_RETRY_TIMEOUT_SECS`, defaulting any that are unset.
+    pub fn from_env() -> Result<Self> {
+        Self::from_lookup(|key| std::env::var(key).ok())
+    }
+
+    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self> {
+        let defaults = Self::default();
+        let parse = |key: &str, default: u64| -> Result<u64> {
+            match lookup(key).filter(|value| !value.is_empty()) {
+                Some(value) => value
+                    .parse::<u64>()
+                    .map_err(|e| anyhow::anyhow!("env var {key}=`{value}` failed to parse: {e}")),
+                None => Ok(default),
+            }
+        };
+        let positive_secs = |key: &str, default: Duration| -> Result<Duration> {
+            let secs = parse(key, default.as_secs())?;
+            if secs == 0 {
+                bail!("env var {key} must be at least 1 second");
+            }
+            Ok(Duration::from_secs(secs))
+        };
+        Ok(Self {
+            request_timeout: positive_secs(
+                "SCRY_OBJSTORE_REQUEST_TIMEOUT_SECS",
+                defaults.request_timeout,
+            )?,
+            connect_timeout: positive_secs(
+                "SCRY_OBJSTORE_CONNECT_TIMEOUT_SECS",
+                defaults.connect_timeout,
+            )?,
+            max_retries: usize::try_from(parse(
+                "SCRY_OBJSTORE_MAX_RETRIES",
+                defaults.max_retries as u64,
+            )?)
+            .context("SCRY_OBJSTORE_MAX_RETRIES does not fit in usize")?,
+            retry_timeout: Duration::from_secs(parse(
+                "SCRY_OBJSTORE_RETRY_TIMEOUT_SECS",
+                defaults.retry_timeout.as_secs(),
+            )?),
+        })
+    }
+
+    fn client_options(&self) -> ClientOptions {
+        ClientOptions::default()
+            .with_timeout(self.request_timeout)
+            .with_connect_timeout(self.connect_timeout)
+    }
+
+    fn retry_config(&self) -> RetryConfig {
+        RetryConfig {
+            backoff: BackoffConfig::default(),
+            max_retries: self.max_retries,
+            retry_timeout: self.retry_timeout,
+        }
+    }
 }
 
 impl ObjStoreConfig {
@@ -110,6 +222,7 @@ impl ObjStoreConfig {
             path_style: std::env::var("SCRY_OBJSTORE_PATH_STYLE")
                 .map(|v| v != "false")
                 .unwrap_or(true),
+            client: ObjStoreClientConfig::from_env()?,
         })
     }
 }
@@ -253,7 +366,11 @@ pub async fn open_with_pool_config(
 ) -> Result<(Arc<dyn ObjectStore>, BufPool)> {
     let allow_http = cfg.endpoint.starts_with("http://");
     let credentials = credential_provider(cfg).await?;
+    // Client options first: `with_client_options` replaces the whole set,
+    // including `allow_http`, which is applied on top below.
     let s3 = AmazonS3Builder::new()
+        .with_client_options(cfg.client.client_options())
+        .with_retry(cfg.client.retry_config())
         .with_config(AmazonS3ConfigKey::Endpoint, &cfg.endpoint)
         .with_config(AmazonS3ConfigKey::Region, &cfg.region)
         .with_config(AmazonS3ConfigKey::Bucket, &cfg.bucket)
@@ -300,12 +417,67 @@ mod tests {
             secret_access_key: Some("secret".into()),
             session_token: Some("token".into()),
             path_style: false,
+            client: super::ObjStoreClientConfig::default(),
         };
         let provider = super::credential_provider(&cfg).await.unwrap();
         let credential = provider.get_credential().await.unwrap();
         assert_eq!(credential.key_id, "key");
         assert_eq!(credential.secret_key, "secret");
         assert_eq!(credential.token.as_deref(), Some("token"));
+    }
+
+    fn client_config(vars: &[(&str, &str)]) -> anyhow::Result<super::ObjStoreClientConfig> {
+        super::ObjStoreClientConfig::from_lookup(|key| {
+            vars.iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.to_string())
+        })
+    }
+
+    #[test]
+    fn client_config_defaults_match_object_store_defaults() {
+        use std::time::Duration;
+        let cfg = client_config(&[]).unwrap();
+        assert_eq!(cfg, super::ObjStoreClientConfig::default());
+        assert_eq!(cfg.request_timeout, Duration::from_secs(30));
+        assert_eq!(cfg.connect_timeout, Duration::from_secs(5));
+        assert_eq!(cfg.max_retries, 10);
+        assert_eq!(cfg.retry_timeout, Duration::from_secs(180));
+        // And they are exactly what object_store would have used unasked.
+        let retry = object_store::RetryConfig::default();
+        assert_eq!(cfg.max_retries, retry.max_retries);
+        assert_eq!(cfg.retry_timeout, retry.retry_timeout);
+    }
+
+    #[test]
+    fn client_config_reads_overrides_and_rejects_bad_values() {
+        use std::time::Duration;
+        let cfg = client_config(&[
+            ("SCRY_OBJSTORE_REQUEST_TIMEOUT_SECS", "120"),
+            ("SCRY_OBJSTORE_CONNECT_TIMEOUT_SECS", "2"),
+            ("SCRY_OBJSTORE_MAX_RETRIES", "0"),
+            ("SCRY_OBJSTORE_RETRY_TIMEOUT_SECS", "20"),
+        ])
+        .unwrap();
+        assert_eq!(cfg.request_timeout, Duration::from_secs(120));
+        assert_eq!(cfg.connect_timeout, Duration::from_secs(2));
+        assert_eq!(cfg.max_retries, 0, "0 disables retries");
+        assert_eq!(cfg.retry_timeout, Duration::from_secs(20));
+
+        // An empty value means unset, like the other SCRY_OBJSTORE_* vars.
+        assert_eq!(
+            client_config(&[("SCRY_OBJSTORE_MAX_RETRIES", "")]).unwrap(),
+            super::ObjStoreClientConfig::default()
+        );
+        for (key, value) in [
+            ("SCRY_OBJSTORE_REQUEST_TIMEOUT_SECS", "0"),
+            ("SCRY_OBJSTORE_CONNECT_TIMEOUT_SECS", "0"),
+            ("SCRY_OBJSTORE_MAX_RETRIES", "-1"),
+            ("SCRY_OBJSTORE_RETRY_TIMEOUT_SECS", "soon"),
+        ] {
+            let error = client_config(&[(key, value)]).unwrap_err().to_string();
+            assert!(error.contains(key), "{key}={value}: {error}");
+        }
     }
 
     #[test]

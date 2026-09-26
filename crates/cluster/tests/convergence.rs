@@ -6,8 +6,8 @@
 //!   block's `Created` still satisfies the foreign key (the event carries
 //!   `by_meta`); a `Deleted` removes the row and is a no-op when re-applied.
 //! - **poll_once** recovers blocks pub/sub dropped: a block on the bucket but
-//!   missing from the catalog is found by the incremental list, and a second
-//!   poll (cursor advanced) lists nothing new.
+//!   missing from the catalog is found by the incremental list — including one
+//!   that committed *behind* the cursor — and a second poll fetches nothing.
 //! - **run_compaction_pass** under a shared [`LocalLeaseProvider`] yields a
 //!   single winner: two concurrent passes over the same partition produce one
 //!   merged block, never duplicate rows.
@@ -25,7 +25,8 @@ use scry_block::{
 use scry_catalog::{date_dir, Catalog};
 use scry_cluster::{
     apply_event, full_walk, poll_once, reconcile_partition, run_compaction_pass,
-    run_retention_pass, LeaseGuard, LeaseProvider, LocalLeaseProvider, RETENTION_LEASE_KEY,
+    run_retention_pass, LeaseGuard, LeaseProvider, LocalLeaseProvider, DEFAULT_POLL_LOOKBACK,
+    RETENTION_LEASE_KEY,
 };
 use scry_compact::CompactConfig;
 use scry_proto::streaming::LogsAppender;
@@ -255,7 +256,9 @@ async fn poll_recovers_dropped_block_then_finds_nothing_new() {
     assert_eq!(catalog.block_count().unwrap(), 1);
 
     // First poll finds exactly the dropped b2.
-    let r1 = poll_once(store.as_ref(), &catalog, BUCKET).await.unwrap();
+    let r1 = poll_once(store.as_ref(), &catalog, BUCKET, DEFAULT_POLL_LOOKBACK)
+        .await
+        .unwrap();
     assert_eq!(r1.inserted, 1, "poll recovers the dropped block");
     assert!(catalog.get_block(b2.uuid).unwrap().is_some());
     assert_eq!(
@@ -264,7 +267,9 @@ async fn poll_recovers_dropped_block_then_finds_nothing_new() {
     );
 
     // Second poll: cursor advanced past b2, nothing new.
-    let r2 = poll_once(store.as_ref(), &catalog, BUCKET).await.unwrap();
+    let r2 = poll_once(store.as_ref(), &catalog, BUCKET, DEFAULT_POLL_LOOKBACK)
+        .await
+        .unwrap();
     assert_eq!(r2.inserted, 0, "no new blocks on a healthy re-poll");
 }
 
@@ -291,7 +296,9 @@ async fn full_walk_discovers_untracked_prefixes() {
     // Empty catalog with no cursors at all — incremental poll would find
     // nothing (no prefixes known). A full walk discovers both.
     let (catalog, _tmp) = open_catalog();
-    let poll = poll_once(store.as_ref(), &catalog, BUCKET).await.unwrap();
+    let poll = poll_once(store.as_ref(), &catalog, BUCKET, DEFAULT_POLL_LOOKBACK)
+        .await
+        .unwrap();
     assert_eq!(poll.inserted, 0, "no cursors ⇒ incremental poll is blind");
 
     let walk = full_walk(store.as_ref(), &catalog, BUCKET).await.unwrap();
@@ -864,12 +871,16 @@ async fn a_reaped_deletion_is_no_longer_re_announced() {
 // starved live queries of object-store throughput. These tests pin the three
 // properties that fix it.
 
-/// An `InMemory` store that records every `get` and can be told to fail one.
+/// An `InMemory` store that records every `get`, can be told to fail one, and
+/// can be told to cut every listing short with an error.
 #[derive(Debug)]
 struct ProbeStore {
     inner: InMemory,
     gets: Mutex<Vec<String>>,
     fail_path: Mutex<Option<String>>,
+    /// When set, a listing yields this many entries and then an error — the
+    /// shape of a paginated LIST whose second page fails.
+    list_fails_after: Mutex<Option<usize>>,
 }
 
 impl ProbeStore {
@@ -878,6 +889,30 @@ impl ProbeStore {
             inner: InMemory::new(),
             gets: Mutex::new(Vec::new()),
             fail_path: Mutex::new(None),
+            list_fails_after: Mutex::new(None),
+        }
+    }
+
+    fn fail_lists_after(&self, entries: Option<usize>) {
+        *self.list_fails_after.lock().unwrap() = entries;
+    }
+
+    fn maybe_truncate(
+        &self,
+        stream: futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        use futures::StreamExt;
+        match *self.list_fails_after.lock().unwrap() {
+            None => stream,
+            Some(n) => stream
+                .take(n)
+                .chain(futures::stream::once(async {
+                    Err(object_store::Error::Generic {
+                        store: "ProbeStore",
+                        source: "injected listing failure".into(),
+                    })
+                }))
+                .boxed(),
         }
     }
 
@@ -962,7 +997,7 @@ impl ObjectStore for ProbeStore {
         &self,
         prefix: Option<&object_store::path::Path>,
     ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
-        self.inner.list(prefix)
+        self.maybe_truncate(self.inner.list(prefix))
     }
 
     fn list_with_offset(
@@ -970,7 +1005,7 @@ impl ObjectStore for ProbeStore {
         prefix: Option<&object_store::path::Path>,
         offset: &object_store::path::Path,
     ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
-        self.inner.list_with_offset(prefix, offset)
+        self.maybe_truncate(self.inner.list_with_offset(prefix, offset))
     }
 
     async fn list_with_delimiter(
@@ -1190,4 +1225,264 @@ async fn converged_partition_reconcile_fetches_no_sidecars() {
         0,
         "a converged partition reconcile must not fetch a single sidecar"
     );
+}
+
+// ── Incremental poll: out-of-order commits and the look-back window ─────────
+//
+// Blocks do not commit in UUID order. Concurrent uploads finish out of order,
+// a retried upload keeps the UUID it was encoded with, and a compaction output
+// is named when its merge starts. A poll that lists only past the high-water
+// UUID never sees a block that lands behind it, so the poll re-lists a bounded
+// look-back window and filters out what the catalog already has.
+
+/// Upload `meta` as a bare sidecar — the poll reads nothing else.
+async fn put_sidecar(store: &dyn ObjectStore, meta: &BlockMeta) {
+    let path = scry_block::block_path(
+        &meta.signal,
+        meta.ts_min_unix_nano,
+        meta.writer_id,
+        meta.uuid,
+        "meta.json",
+    );
+    store
+        .put(
+            &object_store::path::Path::from(path),
+            PutPayload::from(serde_json::to_vec(meta).unwrap()),
+        )
+        .await
+        .unwrap();
+}
+
+/// A UUIDv7 minted `ago` before now.
+fn v7_ago(ago: Duration) -> Uuid {
+    let at = std::time::SystemTime::now() - ago;
+    let since = at.duration_since(std::time::UNIX_EPOCH).unwrap();
+    Uuid::new_v7(uuid::Timestamp::from_unix(
+        uuid::NoContext,
+        since.as_secs(),
+        since.subsec_nanos(),
+    ))
+}
+
+#[tokio::test]
+async fn poll_finds_a_block_that_committed_behind_the_cursor() {
+    let probe = Arc::new(ProbeStore::new());
+    let store: Arc<dyn ObjectStore> = probe.clone();
+    let writer = Uuid::now_v7();
+    let slow = fake_meta("logs", writer, NOW);
+    let fast = fake_meta("logs", writer, NOW + 100);
+    assert!(slow.uuid < fast.uuid, "UUIDv7 is monotonic");
+
+    // `fast` commits first and reaches this catalog, moving the cursor to it.
+    put_sidecar(store.as_ref(), &fast).await;
+    let (catalog, _tmp) = open_catalog();
+    apply_event(&catalog, &BlockEvent::Created { meta: fast.clone() }).unwrap();
+    let date = date_dir(NOW);
+    assert_eq!(
+        catalog.get_cursor("logs", writer, &date).unwrap(),
+        Some(fast.uuid)
+    );
+
+    // `slow` was encoded first but its upload retried; it commits afterwards
+    // and its event is dropped. It now sits *below* the cursor.
+    put_sidecar(store.as_ref(), &slow).await;
+
+    probe.reset();
+    let r1 = poll_once(store.as_ref(), &catalog, BUCKET, DEFAULT_POLL_LOOKBACK)
+        .await
+        .unwrap();
+    assert_eq!(r1.inserted, 1, "the late block is found by the next poll");
+    assert!(catalog.get_block(slow.uuid).unwrap().is_some());
+    assert_eq!(r1.skipped, 1, "the known block is filtered from the key");
+    assert_eq!(probe.meta_gets(), 1, "only the unknown sidecar is fetched");
+    assert_eq!(
+        catalog.get_cursor("logs", writer, &date).unwrap(),
+        Some(fast.uuid),
+        "the cursor never moves backwards"
+    );
+
+    // Converged: re-listing the window costs no GETs at all.
+    probe.reset();
+    let r2 = poll_once(store.as_ref(), &catalog, BUCKET, DEFAULT_POLL_LOOKBACK)
+        .await
+        .unwrap();
+    assert_eq!(r2.inserted, 0);
+    assert_eq!(r2.skipped, 2);
+    assert_eq!(probe.meta_gets(), 0, "a converged poll fetches nothing");
+}
+
+#[tokio::test]
+async fn a_finished_prefix_lists_only_past_its_cursor() {
+    // Cursors are never dropped, so every past day is polled. Re-listing each
+    // one's last `lookback` every few seconds would scale the poll's work with
+    // history; a prefix whose head is older than the window lists from its
+    // cursor. A block that lands that far behind is the full walk's to find.
+    let probe = Arc::new(ProbeStore::new());
+    let store: Arc<dyn ObjectStore> = probe.clone();
+    let writer = Uuid::now_v7();
+    let mut straggler = fake_meta("logs", writer, NOW);
+    straggler.uuid = v7_ago(Duration::from_secs(3 * 3600));
+    let mut head = fake_meta("logs", writer, NOW + 100);
+    head.uuid = v7_ago(Duration::from_secs(2 * 3600));
+    put_sidecar(store.as_ref(), &straggler).await;
+    put_sidecar(store.as_ref(), &head).await;
+
+    let (catalog, _tmp) = open_catalog();
+    apply_event(&catalog, &BlockEvent::Created { meta: head.clone() }).unwrap();
+
+    probe.reset();
+    let poll = poll_once(store.as_ref(), &catalog, BUCKET, DEFAULT_POLL_LOOKBACK)
+        .await
+        .unwrap();
+    assert_eq!(poll.seen, 1, "only the cursor's own key is re-listed");
+    assert_eq!(poll.inserted, 0);
+    assert_eq!(probe.meta_gets(), 0);
+
+    let walk = full_walk(store.as_ref(), &catalog, BUCKET).await.unwrap();
+    assert_eq!(walk.inserted, 1, "the full walk is the backstop for it");
+    assert!(catalog.get_block(straggler.uuid).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn a_recovery_block_uuid_does_not_capture_the_cursor() {
+    // WAL-recovery blocks are named by a v4-shaped content hash so a replayed
+    // upload is idempotent. It sorts at random against the prefix's v7 keys;
+    // as a cursor it would usually sit above every future block and the poll
+    // would list past all of them.
+    let probe = Arc::new(ProbeStore::new());
+    let store: Arc<dyn ObjectStore> = probe.clone();
+    let writer = Uuid::now_v7();
+    let before = fake_meta("logs", writer, NOW);
+    let mut recovered = fake_meta("logs", writer, NOW + 10);
+    recovered.uuid = Uuid::parse_str("ffffffff-ffff-4fff-bfff-ffffffffffff").unwrap();
+    put_sidecar(store.as_ref(), &before).await;
+    put_sidecar(store.as_ref(), &recovered).await;
+
+    let (catalog, _tmp) = open_catalog();
+    let walk = full_walk(store.as_ref(), &catalog, BUCKET).await.unwrap();
+    assert_eq!(walk.inserted, 2, "the recovery block is still catalogued");
+    let date = date_dir(NOW);
+    assert_eq!(
+        catalog.get_cursor("logs", writer, &date).unwrap(),
+        Some(before.uuid),
+        "only a v7 UUID is a cursor"
+    );
+
+    let after = fake_meta("logs", writer, NOW + 20);
+    put_sidecar(store.as_ref(), &after).await;
+    let poll = poll_once(store.as_ref(), &catalog, BUCKET, DEFAULT_POLL_LOOKBACK)
+        .await
+        .unwrap();
+    assert_eq!(
+        poll.inserted, 1,
+        "a block after the recovery block is found"
+    );
+    assert_eq!(
+        catalog.get_cursor("logs", writer, &date).unwrap(),
+        Some(after.uuid)
+    );
+}
+
+#[tokio::test]
+async fn partition_reconcile_refuses_to_proceed_on_an_unfetchable_sidecar() {
+    // Compaction runs on the strength of this reconcile. The sidecar it could
+    // not read may be a prior lease holder's committed output, whose inputs
+    // would then look live and be merged a second time.
+    let probe = Arc::new(ProbeStore::new());
+    let store: Arc<dyn ObjectStore> = probe.clone();
+    let writer = Uuid::now_v7();
+    let metas = [
+        fake_meta("logs", writer, NOW),
+        fake_meta("logs", writer, NOW + 10),
+    ];
+    for meta in &metas {
+        put_sidecar(store.as_ref(), meta).await;
+    }
+    probe.fail(Some(scry_block::block_path(
+        "logs",
+        NOW + 10,
+        writer,
+        metas[1].uuid,
+        "meta.json",
+    )));
+
+    let (catalog, _tmp) = open_catalog();
+    let err = reconcile_partition(
+        store.as_ref(),
+        &catalog,
+        BUCKET,
+        "logs",
+        &date_dir(NOW),
+        Duration::ZERO,
+    )
+    .await
+    .expect_err("an incomplete reconcile must not report success");
+    assert!(
+        format!("{err:#}").contains("refusing to compact"),
+        "unexpected error: {err:#}"
+    );
+
+    probe.fail(None);
+    let ok = reconcile_partition(
+        store.as_ref(),
+        &catalog,
+        BUCKET,
+        "logs",
+        &date_dir(NOW),
+        Duration::ZERO,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        ok.inserted, 1,
+        "the retry fetches exactly the missing block"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_listing_fails_every_convergence_pass() {
+    // A LIST that errors part-way is a partial view of the bucket. Treating it
+    // as complete would let the reconcile vouch for a partition it never saw.
+    let probe = Arc::new(ProbeStore::new());
+    let store: Arc<dyn ObjectStore> = probe.clone();
+    let writer = Uuid::now_v7();
+    let first = fake_meta("logs", writer, NOW);
+    put_sidecar(store.as_ref(), &first).await;
+    put_sidecar(store.as_ref(), &fake_meta("logs", writer, NOW + 10)).await;
+
+    let (catalog, _tmp) = open_catalog();
+    apply_event(
+        &catalog,
+        &BlockEvent::Created {
+            meta: first.clone(),
+        },
+    )
+    .unwrap();
+    probe.fail_lists_after(Some(1));
+
+    reconcile_partition(
+        store.as_ref(),
+        &catalog,
+        BUCKET,
+        "logs",
+        &date_dir(NOW),
+        Duration::ZERO,
+    )
+    .await
+    .expect_err("partition reconcile over a failed listing");
+    full_walk(store.as_ref(), &catalog, BUCKET)
+        .await
+        .expect_err("full walk over a failed listing");
+    poll_once(store.as_ref(), &catalog, BUCKET, DEFAULT_POLL_LOOKBACK)
+        .await
+        .expect_err("poll over a failed listing");
+    assert_eq!(
+        catalog.block_count().unwrap(),
+        1,
+        "nothing from a failed listing is applied"
+    );
+
+    probe.fail_lists_after(None);
+    let walk = full_walk(store.as_ref(), &catalog, BUCKET).await.unwrap();
+    assert_eq!(walk.inserted, 1);
 }

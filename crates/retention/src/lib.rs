@@ -148,8 +148,19 @@ pub async fn run(args: Args) -> Result<()> {
             inserted = report.inserted,
             already_present = report.already_present,
             failed = report.failed,
+            unapplied = report.unapplied,
             "reconcile complete"
         );
+        // Unlike compaction, retention stays safe on an incomplete catalog:
+        // it deletes only blocks it knows about, each on its own TTL, so a
+        // block it missed is merely not reaped until a later run sees it.
+        if !report.is_complete() {
+            tracing::warn!(
+                unapplied = report.unapplied,
+                "reconcile could not apply every committed block; retention proceeds, but \
+                 those blocks are not reaped this run"
+            );
+        }
     }
 
     if args.apply {

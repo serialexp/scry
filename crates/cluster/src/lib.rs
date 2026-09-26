@@ -14,7 +14,9 @@
 //!    [`BlockEvent`](scry_block::BlockEvent)s and each applies them
 //!    idempotently to its catalog.
 //! 2. **incremental poll** ([`poll_once`]) — backstop for dropped events:
-//!    list only what's newer than each `(signal, writer, date)` cursor.
+//!    list each known `(signal, writer, date)` prefix from a bounded look-back
+//!    before its cursor (blocks commit out of UUID order), fetching only
+//!    sidecars the catalog does not already hold.
 //! 3. **full walk** ([`full_walk`]) — exhaustive periodic re-derivation that
 //!    also discovers brand-new prefixes.
 //!
@@ -37,5 +39,5 @@ pub mod staged;
 pub use consume::{apply_event, apply_event_with_grace, ApplyOutcome};
 pub use lease::{LeaseGuard, LeaseProvider, LocalGuard, LocalLeaseProvider};
 pub use maintain::{run_compaction_pass, run_retention_pass, RETENTION_LEASE_KEY};
-pub use poll::{full_walk, poll_once, reconcile_partition, PollReport};
+pub use poll::{full_walk, poll_once, reconcile_partition, PollReport, DEFAULT_POLL_LOOKBACK};
 pub use staged::{apply_staged_deletions, StagedDeletion};

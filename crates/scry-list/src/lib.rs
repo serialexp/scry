@@ -85,12 +85,23 @@ pub async fn run(args: Args) -> Result<()> {
         );
         loop {
             match catalog.reconcile_from_bucket(store.as_ref()).await {
-                Ok(report) => tracing::info!(
+                Ok(report) if report.is_complete() => tracing::info!(
                     seen = report.seen,
                     inserted = report.inserted,
                     already_present = report.already_present,
                     failed = report.failed,
                     "reconcile cycle complete"
+                ),
+                // Read-only: nothing destructive trusts this catalog, so an
+                // incomplete cycle is reported and retried, not fatal.
+                Ok(report) => tracing::warn!(
+                    seen = report.seen,
+                    inserted = report.inserted,
+                    already_present = report.already_present,
+                    failed = report.failed,
+                    unapplied = report.unapplied,
+                    "reconcile cycle incomplete: some committed blocks could not be \
+                     fetched or applied; will retry next tick"
                 ),
                 // A transient bucket/network error must not kill the sidecar;
                 // log it and retry on the next tick.
@@ -106,9 +117,16 @@ pub async fn run(args: Args) -> Result<()> {
         let store = open_objstore(&cfg).await?;
         let report = catalog.reconcile_from_bucket(store.as_ref()).await?;
         eprintln!(
-            "reconcile: seen={} inserted={} already_present={} failed={}",
-            report.seen, report.inserted, report.already_present, report.failed
+            "reconcile: seen={} inserted={} already_present={} failed={} unapplied={}",
+            report.seen, report.inserted, report.already_present, report.failed, report.unapplied
         );
+        if !report.is_complete() {
+            eprintln!(
+                "reconcile: incomplete — {} committed block(s) could not be fetched or \
+                 applied; the listing below may be missing them",
+                report.unapplied
+            );
+        }
     }
 
     let blocks = catalog.list_blocks()?;

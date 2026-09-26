@@ -10,8 +10,15 @@
 //! The snapshot is a plain SQLite file produced with `VACUUM INTO` (a
 //! consistent, defragmented copy taken through a read transaction, safe against
 //! concurrent WAL readers/writers on the live catalog). It is uploaded as a
-//! single object, so a reader always sees a whole, valid catalog — a torn read
-//! is impossible.
+//! single object — one PUT, or a multipart upload that becomes visible only on
+//! completion — so a reader always sees a whole, valid catalog; a torn read is
+//! impossible.
+//!
+//! Neither direction holds the snapshot in memory: it is streamed from the
+//! temporary file on upload and to a temporary file on restore
+//! ([`scry_objstore::transfer`]), so a catalog of any size costs a few upload
+//! parts of RAM. A restore refuses objects over [`MAX_SNAPSHOT_BYTES`] before
+//! writing anything.
 //!
 //! ## Cross-version safety
 //!
@@ -27,7 +34,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use object_store::{path::Path as ObjPath, ObjectStore, ObjectStoreExt, PutPayload};
+use object_store::{path::Path as ObjPath, ObjectStore};
 use rusqlite::{Connection, OpenFlags};
 
 /// Object key of the canonical catalog snapshot in the bucket. The `_catalog/`
@@ -42,6 +49,15 @@ pub const SNAPSHOT_KEY: &str = "_catalog/snapshot.sqlite";
 /// rejected by a newer consumer (which then rebuilds via reconcile) rather than
 /// opened with missing columns.
 pub const CATALOG_SCHEMA_VERSION: u32 = 5;
+
+/// Largest snapshot [`restore_snapshot`] will download: 16 GiB.
+///
+/// A catalog costs well under 1 KiB per block row, so this admits tens of
+/// millions of blocks — two orders of magnitude past the largest deployment
+/// measured (~350k blocks). It exists so a wrong or corrupt object fails the
+/// restore cleanly (the caller then reconciles from the bucket) instead of
+/// filling the catalog's disk.
+pub const MAX_SNAPSHOT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
 /// Result of [`save_snapshot`].
 #[derive(Debug, Clone)]
@@ -67,12 +83,14 @@ pub enum RestoreOutcome {
 }
 
 /// Take a consistent copy of the catalog at `catalog_path` and upload it to
-/// [`SNAPSHOT_KEY`], overwriting any previous snapshot (a single atomic PUT).
+/// [`SNAPSHOT_KEY`], overwriting any previous snapshot atomically (readers see
+/// the old object or the new one, never a mix).
 ///
 /// Non-destructive: it only reads the catalog (via a separate read-only
 /// connection, never the shared one) and overwrites one object. Safe to run
 /// without any lease — concurrent writers just last-writer-win on the key, and
-/// every copy is a valid full catalog.
+/// every copy is a valid full catalog. The copy is streamed from disk, so
+/// memory use does not grow with the catalog.
 pub async fn save_snapshot(catalog_path: &Path, store: &dyn ObjectStore) -> Result<SaveReport> {
     let src = catalog_path.to_path_buf();
     let tmp = tmp_sibling(catalog_path, "snapshot.tmp");
@@ -81,14 +99,11 @@ pub async fn save_snapshot(catalog_path: &Path, store: &dyn ObjectStore) -> Resu
         .await
         .context("joining snapshot VACUUM INTO task")??;
 
-    let data =
-        std::fs::read(&tmp).with_context(|| format!("reading snapshot temp {}", tmp.display()))?;
-    let bytes = data.len() as u64;
     let key = ObjPath::from(SNAPSHOT_KEY);
-    let put_res = store.put(&key, PutPayload::from(data)).await;
-    // Best-effort cleanup regardless of PUT outcome.
+    let uploaded = scry_objstore::upload_file(store, &tmp, &key).await;
+    // Best-effort cleanup regardless of the upload outcome.
     let _ = std::fs::remove_file(&tmp);
-    put_res.with_context(|| format!("PUT {SNAPSHOT_KEY}"))?;
+    let bytes = uploaded.with_context(|| format!("uploading {SNAPSHOT_KEY}"))?;
     Ok(SaveReport { bytes })
 }
 
@@ -115,24 +130,36 @@ fn vacuum_into(src: &Path, tmp: &Path) -> Result<()> {
 ///
 /// Returns without touching `catalog_path` when there is no snapshot or the
 /// version doesn't match — the caller falls back to a full reconcile.
+///
+/// The object is streamed to a temporary sibling file (refused up front if
+/// larger than [`MAX_SNAPSHOT_BYTES`]) and fsynced before it is renamed into
+/// place. Any `-wal`/`-shm`/`-journal` files left next to `catalog_path` are
+/// removed first: SQLite would otherwise replay a previous database's
+/// journal into the restored one.
 pub async fn restore_snapshot(
     catalog_path: &Path,
     store: &dyn ObjectStore,
     expected_version: u32,
 ) -> Result<RestoreOutcome> {
-    let key = ObjPath::from(SNAPSHOT_KEY);
-    let data = match store.get(&key).await {
-        Ok(g) => g
-            .bytes()
-            .await
-            .with_context(|| format!("reading {SNAPSHOT_KEY} body"))?,
-        Err(object_store::Error::NotFound { .. }) => return Ok(RestoreOutcome::NoSnapshot),
-        Err(e) => return Err(e).with_context(|| format!("GET {SNAPSHOT_KEY}")),
-    };
+    restore_snapshot_capped(catalog_path, store, expected_version, MAX_SNAPSHOT_BYTES).await
+}
 
+async fn restore_snapshot_capped(
+    catalog_path: &Path,
+    store: &dyn ObjectStore,
+    expected_version: u32,
+    max_bytes: u64,
+) -> Result<RestoreOutcome> {
+    let key = ObjPath::from(SNAPSHOT_KEY);
     let tmp = tmp_sibling(catalog_path, "restore.tmp");
-    std::fs::write(&tmp, &data)
-        .with_context(|| format!("writing snapshot to {}", tmp.display()))?;
+    remove_sqlite_sidecars(&tmp)?;
+    match scry_objstore::download_to_file(store, &key, &tmp, max_bytes)
+        .await
+        .with_context(|| format!("downloading {SNAPSHOT_KEY}"))?
+    {
+        Some(_) => {}
+        None => return Ok(RestoreOutcome::NoSnapshot),
+    }
 
     let tmp_for_check = tmp.clone();
     let found = tokio::task::spawn_blocking(move || read_user_version(&tmp_for_check))
@@ -140,6 +167,7 @@ pub async fn restore_snapshot(
         .context("joining snapshot version-check task")??;
     if found != expected_version {
         let _ = std::fs::remove_file(&tmp);
+        let _ = remove_sqlite_sidecars(&tmp);
         return Ok(RestoreOutcome::VersionMismatch {
             found,
             expected: expected_version,
@@ -152,13 +180,46 @@ pub async fn restore_snapshot(
         .context("joining snapshot block-count task")?
         .unwrap_or(0);
 
+    remove_sqlite_sidecars(&tmp)?;
+    remove_sqlite_sidecars(catalog_path)?;
     std::fs::rename(&tmp, catalog_path).with_context(|| {
         format!(
             "moving restored snapshot into place at {}",
             catalog_path.display()
         )
     })?;
+    sync_parent_dir(catalog_path)?;
     Ok(RestoreOutcome::Restored { blocks })
+}
+
+/// Remove the `-wal`, `-shm` and `-journal` files SQLite keeps beside `db`.
+/// Missing files are fine; any other failure is an error, because a stale
+/// journal left beside a freshly restored database would be replayed into it.
+fn remove_sqlite_sidecars(db: &Path) -> Result<()> {
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut name = db.as_os_str().to_os_string();
+        name.push(suffix);
+        let sidecar = PathBuf::from(name);
+        match std::fs::remove_file(&sidecar) {
+            Ok(()) => tracing::info!(path = %sidecar.display(), "removed stale SQLite sidecar"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e).with_context(|| format!("removing stale {}", sidecar.display()))
+            }
+        }
+    }
+    Ok(())
+}
+
+/// fsync the directory containing `path`, making a completed rename durable.
+fn sync_parent_dir(path: &Path) -> Result<()> {
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    std::fs::File::open(parent)
+        .and_then(|dir| dir.sync_all())
+        .with_context(|| format!("fsync directory {}", parent.display()))
 }
 
 fn read_user_version(path: &Path) -> Result<u32> {
@@ -262,6 +323,62 @@ mod tests {
         let restored = Catalog::open(&dst_path, "scry-dev").unwrap();
         assert_eq!(restored.list_blocks().unwrap().len(), 5);
         assert_eq!(restored.get_watermark(writer, "logs", 2).unwrap(), Some(7));
+    }
+
+    #[tokio::test]
+    async fn restore_removes_stale_sqlite_sidecars_before_moving_into_place() {
+        let dir = TempDir::new().unwrap();
+        let src_path = dir.path().join("src.sqlite");
+        {
+            let cat = Catalog::open(&src_path, "scry-dev").unwrap();
+            cat.insert_block(&meta(
+                Uuid::now_v7(),
+                Uuid::now_v7(),
+                1_700_000_000_000_000_000,
+                10,
+            ))
+            .unwrap();
+        }
+        let store = InMemory::new();
+        save_snapshot(&src_path, &store).await.unwrap();
+
+        // Journal files of some earlier database at the target path. SQLite
+        // would try to replay these into the restored file.
+        let dst = dir.path().join("restored.sqlite");
+        let sidecars: Vec<PathBuf> = ["-wal", "-shm", "-journal"]
+            .into_iter()
+            .map(|suffix| dir.path().join(format!("restored.sqlite{suffix}")))
+            .collect();
+        for sidecar in &sidecars {
+            std::fs::write(sidecar, b"stale journal from another database").unwrap();
+        }
+
+        let outcome = restore_snapshot(&dst, &store, CATALOG_SCHEMA_VERSION)
+            .await
+            .unwrap();
+        assert_eq!(outcome, RestoreOutcome::Restored { blocks: 1 });
+        for sidecar in &sidecars {
+            assert!(!sidecar.exists(), "{} must be removed", sidecar.display());
+        }
+        let restored = Catalog::open(&dst, "scry-dev").unwrap();
+        assert_eq!(restored.list_blocks().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn oversize_snapshot_is_refused_without_touching_the_target() {
+        let dir = TempDir::new().unwrap();
+        let src_path = dir.path().join("src.sqlite");
+        Catalog::open(&src_path, "scry-dev").unwrap();
+        let store = InMemory::new();
+        let saved = save_snapshot(&src_path, &store).await.unwrap();
+
+        let dst = dir.path().join("restored.sqlite");
+        let error = restore_snapshot_capped(&dst, &store, CATALOG_SCHEMA_VERSION, saved.bytes - 1)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("download limit"), "{error:#}");
+        assert!(!dst.exists());
+        assert!(!tmp_sibling(&dst, "restore.tmp").exists());
     }
 
     #[tokio::test]

@@ -18,7 +18,9 @@
 //! without taking a dependency on Valkey. The single-instance path
 //! ([`AlwaysValid`]) and tests pass a fence that never fails.
 
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use anyhow::Result;
 
@@ -47,6 +49,68 @@ impl Fence for AlwaysValid {
     #[inline]
     fn check(&self) -> Result<()> {
         Ok(())
+    }
+}
+
+/// How often [`run_fenced`] re-checks its fence while the guarded future is
+/// pending. A check is an atomic load, so this costs nothing measurable; it
+/// bounds how long an irreversible request keeps being driven — and retried
+/// — after the lease is known lost.
+pub const FENCE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// The lease was lost while a fenced step was in flight; the step's future
+/// was dropped before it completed. See [`run_fenced`].
+#[derive(Debug)]
+pub struct LeaseLost(pub anyhow::Error);
+
+impl std::fmt::Display for LeaseLost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "lease lost while a fenced step was in flight: {:#}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for LeaseLost {}
+
+/// Drive `step` — one irreversible request, such as a commit PUT — only while
+/// `fence` holds, re-checking every `poll_every`.
+///
+/// A single fence check before the request is not enough: an object-store
+/// client retries a failing request for minutes (three by default), so a
+/// commit that began under the lease can otherwise land long after it was
+/// lost and a peer has taken over. Here the fence is re-checked on every
+/// tick while `step` is pending; when it fails, `step` is **dropped** —
+/// cancelling any in-flight attempt and every retry after it — and
+/// [`LeaseLost`] is returned.
+///
+/// The fence is **not** checked before `step` is first polled. Check it
+/// yourself at the last point where aborting is still clean (before any
+/// irreversible preparation, such as disarming cleanup of staged data): a
+/// loss found there is unambiguous, whereas any loss reported here is not.
+///
+/// `LeaseLost` does **not** mean the step had no effect. A request whose
+/// bytes were already sent can still be applied by the server after the
+/// drop, so the caller must treat the outcome as ambiguous and keep whatever
+/// a successful step would need (e.g. a commit's staged data). If `step`
+/// completes on the same wake-up that the fence fails, its result wins: the
+/// step is known to have happened.
+pub async fn run_fenced<F: Future>(
+    fence: &dyn Fence,
+    poll_every: Duration,
+    step: F,
+) -> std::result::Result<F::Output, LeaseLost> {
+    let mut step = std::pin::pin!(step);
+    let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + poll_every, poll_every);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            out = &mut step => return Ok(out),
+            _ = tick.tick() => fence.check().map_err(LeaseLost)?,
+        }
     }
 }
 
@@ -115,5 +179,88 @@ mod tests {
         // Usable as a trait object, the way the engines consume it.
         let f: &dyn Fence = &AlwaysValid;
         assert!(f.check().is_ok());
+    }
+
+    /// A fence that can be tripped from outside.
+    #[derive(Default)]
+    struct Toggle(std::sync::atomic::AtomicBool);
+
+    impl Fence for Toggle {
+        fn check(&self) -> Result<()> {
+            if self.0.load(Ordering::Acquire) {
+                anyhow::bail!("tripped")
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn run_fenced_returns_the_step_while_the_fence_holds() {
+        let fence = Toggle::default();
+        let out = run_fenced(&fence, Duration::from_millis(1), async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            7
+        })
+        .await
+        .unwrap();
+        assert_eq!(out, 7);
+    }
+
+    #[tokio::test]
+    async fn run_fenced_prefers_a_completed_step_over_a_lost_lease() {
+        // A step that has completed has happened; reporting it as abandoned
+        // would make the caller treat a known commit as ambiguous.
+        let fence = Toggle::default();
+        fence.0.store(true, Ordering::Release);
+        let out = run_fenced(&fence, Duration::from_millis(1), async { 7 })
+            .await
+            .unwrap();
+        assert_eq!(out, 7);
+    }
+
+    #[tokio::test]
+    async fn run_fenced_reports_a_lease_lost_before_a_pending_step_finishes() {
+        let fence = Toggle::default();
+        fence.0.store(true, Ordering::Release);
+        let err = run_fenced(
+            &fence,
+            Duration::from_millis(1),
+            std::future::pending::<()>(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("tripped"));
+    }
+
+    #[tokio::test]
+    async fn run_fenced_drops_a_pending_step_when_the_lease_is_lost() {
+        let fence = std::sync::Arc::new(Toggle::default());
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        struct SetOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for SetOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let guard = SetOnDrop(dropped.clone());
+        let tripper = {
+            let fence = fence.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                fence.0.store(true, Ordering::Release);
+            })
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_fenced(fence.as_ref(), Duration::from_millis(5), async move {
+                let _guard = guard;
+                std::future::pending::<()>().await
+            }),
+        )
+        .await
+        .expect("a lost lease ends the step promptly");
+        tripper.await.unwrap();
+        assert!(result.is_err(), "the step must not be reported complete");
+        assert!(dropped.load(Ordering::Acquire), "the step was cancelled");
     }
 }

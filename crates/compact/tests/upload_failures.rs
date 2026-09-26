@@ -371,3 +371,101 @@ async fn meta_put_failure_intentionally_retains_staged_data_due_to_ambiguous_com
     assert_eq!(catalog.lock().unwrap().list_blocks().unwrap().len(), 2);
     assert_eq!(resources.telemetry().weighted_running_bytes, 0);
 }
+
+/// A lease fence the test trips by hand.
+#[derive(Default)]
+struct ToggleFence(AtomicBool);
+
+impl scry_block::Fence for ToggleFence {
+    fn check(&self) -> anyhow::Result<()> {
+        if self.0.load(Ordering::Acquire) {
+            anyhow::bail!("test lease lost")
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn lease_lost_during_meta_put_abandons_the_commit_and_retains_staged_data() {
+    // The commit PUT can hang or be retried by the client for minutes. It must
+    // not be allowed to land after the lease is gone and a peer has taken the
+    // partition over; but whatever was sent may still be applied, so the
+    // staged data it would point at has to stay.
+    let (inner, catalog, _tmp) = fixture().await;
+    let before = paths(&inner).await;
+    let resources = resources();
+    let (script, reached, _gate) = Script::gate("meta.json", Stage::Put);
+    let store = scripted(inner.clone(), script);
+    let fence = Arc::new(ToggleFence::default());
+    let live = catalog.lock().unwrap().list_blocks().unwrap();
+    let plan = scry_compact::plan_merges(&live, &compact_cfg())
+        .merges
+        .pop()
+        .expect("the two fixture blocks form one merge");
+
+    let task = tokio::spawn({
+        let catalog = catalog.clone();
+        let resources = resources.clone();
+        let fence = fence.clone();
+        async move {
+            scry_compact::compact_partition(
+                &plan,
+                store,
+                &catalog,
+                BUCKET,
+                Uuid::now_v7(),
+                &compact_cfg(),
+                &block_cfg(),
+                fence.as_ref(),
+                &scry_block::NoopSink,
+                &resources,
+            )
+            .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(10), reached.notified())
+        .await
+        .expect("merge reached the meta.json PUT");
+    fence.0.store(true, Ordering::Release);
+
+    // The gate is never opened: only the fence can end this PUT.
+    let result = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("a lost lease ends the in-flight commit promptly")
+        .unwrap();
+    let err = result.expect_err("an abandoned commit is not a merge");
+    assert!(
+        format!("{err:#}").contains("commit is ambiguous"),
+        "unexpected error: {err:#}"
+    );
+
+    let after = paths(&inner).await;
+    assert_eq!(
+        after.iter().filter(|p| p.ends_with("meta.json")).count(),
+        2,
+        "the cancelled PUT never reached the store"
+    );
+    assert!(
+        after.len() > before.len(),
+        "staged data objects are kept in case the commit landed"
+    );
+    assert_eq!(
+        catalog.lock().unwrap().list_blocks().unwrap().len(),
+        2,
+        "the inputs stay live for the next lease holder"
+    );
+    assert_eq!(resources.telemetry().weighted_running_bytes, 0);
+
+    // The next holder merges normally.
+    let recovered = compact_once(
+        inner,
+        &catalog,
+        BUCKET,
+        &compact_cfg(),
+        &block_cfg(),
+        resources.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(recovered.merges, 1);
+}

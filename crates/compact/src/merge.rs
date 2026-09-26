@@ -41,7 +41,7 @@ use parquet::arrow::AsyncArrowWriter;
 use scry_block::postings::{postings_record_batch, postings_schema, PostingsEntry};
 use scry_block::{
     block_path, compacted_ancestor_closure, logs_physical_schema_v1, logs_physical_schema_v2,
-    BlockBuilderConfig, BlockMeta, BodyBloomBuilder, Fence,
+    run_fenced, BlockBuilderConfig, BlockMeta, BodyBloomBuilder, Fence, FENCE_POLL_INTERVAL,
 };
 use scry_catalog::CatalogEntry;
 use uuid::Uuid;
@@ -293,6 +293,16 @@ fn spec_for(signal: &str) -> Result<SignalSpec> {
 /// leaked bytes (reclaimable by a future orphan-GC / full walk), there is no
 /// catalog row, no events, and the inputs are untouched for the rightful
 /// lease holder to re-merge.
+///
+/// The `meta.json` PUT itself also runs under the fence
+/// ([`scry_block::run_fenced`]), so a lease lost while it is in flight —
+/// including while the object-store client is retrying it — cancels the
+/// request instead of letting it land minutes later. That outcome is
+/// ambiguous (bytes already sent may still be applied), so it returns `Err`
+/// and keeps the staged data objects, exactly like a failed commit PUT. The
+/// residual window is a request the server applies after the fence tripped;
+/// the fence reports loss a third of a TTL before the lease can expire, so a
+/// peer can only race it when the server holds a fully sent PUT that long.
 #[allow(clippy::too_many_arguments)]
 pub async fn merge_blocks(
     store: Arc<dyn ObjectStore>,
@@ -784,10 +794,38 @@ async fn merge_blocks_inner(
         block_uuid,
         "meta.json",
     ));
-    store
-        .put(&meta_path, meta_bytes.into())
-        .await
-        .with_context(|| format!("upload merged meta {meta_path}"))?;
+    // The PUT itself stays under the fence. The client retries a failing
+    // request for minutes; unfenced, a commit begun under the lease could land
+    // long after a peer took the partition over and reconciled it, and the
+    // peer would then merge the same inputs again. Losing the lease drops the
+    // request and its retries. What was already sent may still be applied, so
+    // that outcome is ambiguous exactly like a failed PUT: the staged data
+    // objects stay (cleanup is disarmed) so a landed commit is complete, and
+    // the next holder's partition reconcile adopts it before planning.
+    match run_fenced(
+        fence,
+        FENCE_POLL_INTERVAL,
+        store.put(&meta_path, meta_bytes.into()),
+    )
+    .await
+    {
+        Ok(put) => {
+            put.with_context(|| format!("upload merged meta {meta_path}"))?;
+        }
+        Err(lost) => {
+            tracing::warn!(
+                block_uuid = %block_uuid,
+                signal,
+                out_level,
+                error = %lost,
+                "lease lost while the merged meta.json PUT was in flight; abandoned the \
+                 commit, keeping its staged objects in case it landed"
+            );
+            return Err(anyhow::Error::new(lost).context(format!(
+                "merged meta {meta_path} commit is ambiguous: the lease was lost mid-PUT"
+            )));
+        }
+    }
 
     tracing::info!(
         block_uuid = %meta.uuid,

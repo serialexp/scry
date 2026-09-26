@@ -270,9 +270,13 @@ async fn reconcile(
         inserted = report.inserted,
         already_present = report.already_present,
         failed = report.failed,
+        unapplied = report.unapplied,
         "reconcile complete"
     );
-    Ok(())
+    // Staging recovered reaps and compacting both trust this catalog: a
+    // committed merge output it missed leaves its inputs looking live, and
+    // merging them again would publish a second copy of their rows.
+    report.ensure_complete("stage reaps or compact")
 }
 
 async fn run_pass(

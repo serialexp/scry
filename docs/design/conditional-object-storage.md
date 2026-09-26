@@ -2,7 +2,7 @@
 
 Status: complete
 Owner: Bart
-Last updated: 2026-09-07
+Last updated: 2026-09-26
 
 ## Implementation status
 
@@ -10,6 +10,7 @@ Last updated: 2026-09-07
 
 - [x] **Conditional primitives.** `scry-objstore` exposes atomic create and ETag/version compare-and-swap helpers through `object_store::PutMode`.
 - [x] **Semantic capability probe.** The probe verifies rejected creates/updates preserve bytes, current-version update works, and concurrent create and ETag-CAS races each have exactly one winner.
+- [x] **Probe hardening (D-072 follow-up).** The probe also requires: a never-written key to read back `NotFound` on both HEAD and GET (a 403 fails closed, naming the missing `s3:ListBucket` grant); stale-rejected and current-accepted CAS with versions taken from the PUT response, a HEAD, **and** a GET, since callers derive versions from all three; conditional GET honouring `If-Match` (current ETag served, stale ETag → `Precondition`); and a 16-round update race, each round re-reading the version with HEAD and writing round-unique bodies (an S3 ETag is the content MD5, so identical bodies would make a stale ETag look current). Cleanup of every probe key is attempted on every outcome.
 - [x] **Conforming development backend.** Pinned SeaweedFS 4.45 replaces Garage as the canonical local S3 harness.
 - [x] **Live integration coverage.** The backend-neutral `s3_compat` test exercises ordinary CRUD and conditional semantics through `PooledStore`.
 - [x] **CI coverage.** A dedicated SeaweedFS job runs the live S3 contract.
@@ -32,6 +33,8 @@ This contract makes conditional behavior an explicit opt-in storage capability. 
 - Callers preserve both ETag and version when returned, because object-store implementations may use either.
 - Ambiguous transport failure is resolved by reading the key/version and comparing the expected content digest before retrying.
 - A backend is conforming only if the semantic probe passes, including concurrent create and ETag-CAS races. Header acceptance alone is insufficient.
+- A version read back by HEAD or GET is as valid a CAS precondition as one returned by the write, and a conditional GET with a stale `If-Match` returns `Precondition` rather than serving the newer bytes.
+- A missing key reads back `NotFound`. The credentials therefore need `s3:ListBucket`: without it S3-compatible stores answer 403 for missing keys, and "absent" becomes indistinguishable from "forbidden".
 
 AWS S3 provides the required operations. SeaweedFS 4.45 routes `If-None-Match: *` and strong ETag `If-Match` to filer write conditions evaluated atomically under the owning path lock, and is the pinned local/CI implementation. The conforming SeaweedFS bucket keeps object versioning/object lock disabled. Upstream issue #8073 recorded a versioning-plus-locking bug fixed in SeaweedFS 4.09; the semantic probe remains authoritative for any future configuration.
 
@@ -45,7 +48,7 @@ Garage remains relevant historical context in old decisions and measurements, bu
 
 ## Verification
 
-Hermetic tests use `InMemory`, `PooledStore`, and a deliberately non-conforming store that strips preconditions. The live `s3_compat` test runs against SeaweedFS locally and is required—not skippable—by the dedicated CI job. Newer AWS CLI versions additionally let the harness check rejected create/stale update behavior before producing its environment file.
+Hermetic tests use `InMemory`, `PooledStore`, and a quirk-injecting store that models each non-conformance the probe must reject — ignored write preconditions, 403 for missing keys, HEAD ETags that writes do not honour, and ignored read preconditions — plus the RGW-style ETag quoting it must accept. The live `s3_compat` test runs against SeaweedFS locally and is required—not skippable—by the dedicated CI job. Newer AWS CLI versions additionally let the harness check rejected create/stale update behavior before producing its environment file.
 
 ## References
 

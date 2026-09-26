@@ -73,6 +73,7 @@ async fn rich_otlp_log_crosses_gateway_and_real_ingest_into_queryable_v2_block()
         Arc::new(Semaphore::new(1)),
         None,
         false,
+        None,
     )
     .await
     .unwrap();

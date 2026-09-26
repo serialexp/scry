@@ -25,6 +25,7 @@
 
 use std::collections::HashSet;
 use std::ops::Range;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -44,6 +45,9 @@ use uuid::Uuid;
 pub struct EvictOnNotFound {
     inner: Arc<dyn ObjectStore>,
     evicted: Arc<Mutex<HashSet<Uuid>>>,
+    /// Whether a denied read has already been reported through this wrapper,
+    /// so a query touching many blocks logs the misconfiguration once.
+    denial_reported: Arc<AtomicBool>,
 }
 
 impl EvictOnNotFound {
@@ -52,6 +56,7 @@ impl EvictOnNotFound {
         Self {
             inner,
             evicted: Arc::new(Mutex::new(HashSet::new())),
+            denial_reported: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -75,18 +80,46 @@ impl EvictOnNotFound {
 
     /// If `result` is `NotFound`, parse the block UUID from `location` and
     /// record it. The error is left untouched for the caller to propagate.
+    ///
+    /// A denied read (403/401) is reported, not evicted. S3-compatible
+    /// stores answer a GET for a *missing* key with 403 when the credentials
+    /// lack `s3:ListBucket`, so on such a deployment a peer's deletion never
+    /// looks like a deletion: the stale row is never evicted and every query
+    /// touching it fails. Evicting on 403 would be wrong — the object may
+    /// well exist — so say plainly what the operator has to fix instead.
     fn note_if_missing<T>(&self, location: &Path, result: &OsResult<T>) {
-        if let Err(OsError::NotFound { .. }) = result {
-            if let Some(uuid) = block_uuid_from_path(location) {
-                self.evicted
-                    .lock()
-                    .expect("eviction set poisoned")
-                    .insert(uuid);
-                tracing::debug!(%uuid, location = %location, "block object 404'd; queued for catalog eviction");
-            } else {
-                tracing::warn!(location = %location, "404 on a path with no parseable block UUID; cannot evict");
+        match result {
+            Err(OsError::NotFound { .. }) => {
+                if let Some(uuid) = block_uuid_from_path(location) {
+                    self.evicted
+                        .lock()
+                        .expect("eviction set poisoned")
+                        .insert(uuid);
+                    tracing::debug!(%uuid, location = %location, "block object 404'd; queued for catalog eviction");
+                } else {
+                    tracing::warn!(location = %location, "404 on a path with no parseable block UUID; cannot evict");
+                }
             }
+            Err(error @ (OsError::PermissionDenied { .. } | OsError::Unauthenticated { .. }))
+                if !self.denial_reported.swap(true, Ordering::Relaxed) =>
+            {
+                tracing::error!(
+                    location = %location,
+                    %error,
+                    "object store denied a block read. If the object was deleted, the \
+                     credentials lack s3:ListBucket, so the store reports a missing key as \
+                     403 instead of 404 and deleted blocks can never be evicted from the \
+                     catalog; otherwise they lack s3:GetObject. Grant both on the bucket"
+                );
+            }
+            _ => {}
         }
+    }
+
+    /// Whether a denied read has been reported through this wrapper.
+    #[cfg(test)]
+    fn denial_reported(&self) -> bool {
+        self.denial_reported.load(Ordering::Relaxed)
     }
 }
 
@@ -229,5 +262,26 @@ mod tests {
         let got = store.get_opts(&p, GetOptions::default()).await;
         assert!(got.is_ok());
         assert!(!store.has_evictions());
+    }
+
+    #[test]
+    fn a_denied_read_is_reported_but_never_evicted() {
+        // Without s3:ListBucket a deleted block reads back 403, not 404. The
+        // object may equally exist, so evicting would be wrong; the operator
+        // has to hear about it instead.
+        let store = EvictOnNotFound::new(Arc::new(InMemory::new()));
+        let uuid = Uuid::now_v7();
+        let p = Path::from(format!(
+            "metrics/2026/05/31/{}/{uuid}.parquet",
+            Uuid::now_v7()
+        ));
+        let denied: OsResult<()> = Err(OsError::PermissionDenied {
+            path: p.to_string(),
+            source: "403 Forbidden".into(),
+        });
+        assert!(!store.denial_reported());
+        store.note_if_missing(&p, &denied);
+        assert!(store.denial_reported(), "the denial is surfaced");
+        assert!(!store.has_evictions(), "a 403 is not proof of deletion");
     }
 }

@@ -92,6 +92,37 @@ async fn conditional_create_and_update_are_atomic() {
         .expect("S3 backend must enforce conditional create and ETag update");
 }
 
+#[tokio::test]
+async fn streaming_file_transfer_round_trips_through_multipart() {
+    let cfg = match cfg_or_skip() {
+        Some(c) => c,
+        None => return,
+    };
+    let store = open(&cfg).await.expect("open objstore");
+    let key = Path::from(format!(
+        "test/transfer/{}/object",
+        uuid_like(std::time::SystemTime::now())
+    ));
+    let dir = tempfile::TempDir::new().unwrap();
+    let source = dir.path().join("source");
+    // Two full parts and a tail: exercises the real multipart path.
+    let len = 2 * scry_objstore::transfer::UPLOAD_PART_BYTES + 4099;
+    let data: Vec<u8> = (0..len).map(|i| (i * 7 % 253) as u8).collect();
+    std::fs::write(&source, &data).unwrap();
+
+    let sent = scry_objstore::upload_file(store.as_ref(), &source, &key)
+        .await
+        .expect("multipart upload");
+    assert_eq!(sent, len as u64);
+    let dest = dir.path().join("dest");
+    let got = scry_objstore::download_to_file(store.as_ref(), &key, &dest, len as u64)
+        .await
+        .expect("streaming download");
+    assert_eq!(got, Some(len as u64));
+    assert!(std::fs::read(&dest).unwrap() == data, "bytes differ");
+    store.delete(&key).await.expect("delete transfer object");
+}
+
 // Cheap monotonic-ish suffix without pulling in uuid as a dev-dep.
 fn uuid_like(t: std::time::SystemTime) -> String {
     let nanos = t

@@ -37,7 +37,7 @@ use uuid::Uuid;
 pub mod snapshot;
 pub use snapshot::{
     restore_snapshot, save_snapshot, RestoreOutcome, SaveReport, CATALOG_SCHEMA_VERSION,
-    SNAPSHOT_KEY,
+    MAX_SNAPSHOT_BYTES, SNAPSHOT_KEY,
 };
 
 /// Live blocks and rows at one compaction level.
@@ -89,6 +89,13 @@ pub struct CatalogEntry {
 }
 
 /// Report returned by [`Catalog::reconcile_from_bucket`].
+///
+/// A report only exists for a pass whose bucket listing completed: a listing
+/// error fails the whole reconcile. Within a complete listing, a sidecar is
+/// either applied, gone (deleted between LIST and GET — not counted), counted
+/// in [`failed`](Self::failed) (it is permanently unreadable as a block), or
+/// counted in [`unapplied`](Self::unapplied) (it exists but could not be
+/// fetched or inserted this pass).
 #[derive(Debug, Clone, Default)]
 pub struct ReconcileReport {
     /// Total `*.meta.json` objects observed in the bucket.
@@ -99,8 +106,51 @@ pub struct ReconcileReport {
     /// alone. Blocks are immutable, so we never overwrite.
     pub already_present: usize,
     /// Sidecars that failed to parse — counted, logged, and skipped.
-    /// A noisy bucket shouldn't fail reconcile.
+    /// A noisy bucket shouldn't fail reconcile, and an unparseable sidecar is
+    /// invisible to every reader, so skipping it hides nothing they can see.
     pub failed: usize,
+    /// Committed sidecars that were listed but could not be fetched (a
+    /// non-404 GET error) or inserted into the catalog. The catalog may be
+    /// missing these blocks — including a compaction output whose inputs
+    /// would then look live — so see [`is_complete`](Self::is_complete).
+    pub unapplied: usize,
+}
+
+impl ReconcileReport {
+    /// Whether the catalog now holds every committed block the listing saw.
+    ///
+    /// Destructive follow-ups — staging reaps, compacting, applying retention
+    /// — must not run after an incomplete reconcile: a missed compaction
+    /// output leaves its inputs looking live, and merging them again creates
+    /// a second live copy of the same rows.
+    pub fn is_complete(&self) -> bool {
+        self.unapplied == 0
+    }
+
+    /// `Err` unless [`is_complete`](Self::is_complete), naming `follow_up` as
+    /// the work being refused.
+    pub fn ensure_complete(&self, follow_up: &str) -> Result<()> {
+        anyhow::ensure!(
+            self.is_complete(),
+            "bucket reconcile left {} committed block(s) unapplied (fetch or catalog insert \
+             failed); refusing to {follow_up} against an incomplete catalog — retry once the \
+             object store is healthy",
+            self.unapplied
+        );
+        Ok(())
+    }
+}
+
+/// One incremental-poll cursor: the high-water block UUID seen for a
+/// `(signal, writer_id, date)` object prefix. See
+/// [`Catalog::advance_cursor`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorHead {
+    pub signal: String,
+    pub writer_id: Uuid,
+    /// `yyyy-mm-dd`.
+    pub date: String,
+    pub highest: Uuid,
 }
 
 /// Result of resolving a block UUID through durable compaction ancestry.
@@ -1430,6 +1480,16 @@ impl Catalog {
     /// Implemented as an UPSERT whose `DO UPDATE` is gated on
     /// `excluded.highest_uuid > poll_cursors.highest_uuid`, so an
     /// out-of-order (older) observation can never roll the cursor backward.
+    ///
+    /// **Only UUIDv7 moves a cursor.** A WAL-recovery block's UUID is a
+    /// content hash in v4 shape (retry-stable, not time-ordered), so it sorts
+    /// at a random position: most of the time *after* every v7 UUID the
+    /// writer will ever mint. Letting it set the high-water mark would park
+    /// the cursor past all of that writer's later blocks for the rest of the
+    /// day. Such a block is discovered by its `Created` event, by the poll's
+    /// look-back listing when it happens to sort inside the window, and by
+    /// the full walk. A stored non-v7 cursor (written before this rule) is
+    /// replaced by the next v7 observation, whatever its lexical order.
     pub fn advance_cursor(
         &self,
         signal: &str,
@@ -1437,17 +1497,66 @@ impl Catalog {
         date: &str,
         uuid: Uuid,
     ) -> Result<()> {
+        if uuid.get_version_num() != 7 {
+            return Ok(());
+        }
+        // `substr(…, 15, 1)` is the version nibble of a hyphenated UUID.
         self.conn
             .execute(
                 "INSERT INTO poll_cursors (signal, writer_id, date, highest_uuid) \
                  VALUES (?1, ?2, ?3, ?4) \
                  ON CONFLICT(signal, writer_id, date) DO UPDATE SET \
                    highest_uuid = excluded.highest_uuid \
-                 WHERE excluded.highest_uuid > poll_cursors.highest_uuid",
+                 WHERE excluded.highest_uuid > poll_cursors.highest_uuid \
+                    OR substr(poll_cursors.highest_uuid, 15, 1) <> '7'",
                 params![signal, writer_id.to_string(), date, uuid.to_string()],
             )
             .context("UPSERT poll_cursor")?;
         Ok(())
+    }
+
+    /// Every known cursor with its high-water UUID, in one query. The
+    /// incremental poll reads this once per pass rather than a
+    /// [`get_cursor`](Self::get_cursor) per prefix.
+    pub fn list_cursor_heads(&self) -> Result<Vec<CursorHead>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT signal, writer_id, date, highest_uuid FROM poll_cursors")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (signal, writer_id, date, highest) = row?;
+            out.push(CursorHead {
+                signal,
+                writer_id: Uuid::parse_str(&writer_id)
+                    .with_context(|| format!("parsing cursor writer_id {writer_id}"))?,
+                date,
+                highest: Uuid::parse_str(&highest)
+                    .with_context(|| format!("parsing cursor uuid {highest}"))?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Whether the catalog has a row for `uuid`, regardless of liveness —
+    /// the per-block form of [`known_block_uuids`](Self::known_block_uuids),
+    /// for callers that check a handful of listed keys and must not load a
+    /// catalog-sized set to do it. An indexed primary-key probe with no
+    /// allocation.
+    pub fn has_block(&self, uuid: Uuid) -> Result<bool> {
+        let mut buf = Uuid::encode_buffer();
+        let text: &str = uuid.hyphenated().encode_lower(&mut buf);
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT 1 FROM blocks WHERE uuid = ?1")?;
+        Ok(stmt.exists([text])?)
     }
 
     /// Every known cursor as `(signal, writer_id, date)`. Used by the
@@ -1476,20 +1585,24 @@ impl Catalog {
     /// [`BlockMeta`], and `INSERT OR IGNORE` into the catalog. Used to
     /// bootstrap an empty catalog and to re-derive after corruption.
     ///
-    /// Sidecars that fail to parse are logged and counted in
-    /// [`ReconcileReport::failed`] but do not abort the reconcile;
-    /// one bad sidecar shouldn't poison the rest of the bucket.
+    /// A listing error fails the reconcile. A paginated listing stream ends
+    /// after yielding its first error, so treating the error as skippable
+    /// would silently report a truncated bucket as complete — and callers
+    /// compact, stage reaps, or apply retention on the strength of it.
+    ///
+    /// Per-sidecar problems do not abort the pass: an unparseable sidecar is
+    /// counted in [`ReconcileReport::failed`], a sidecar deleted between LIST
+    /// and GET is skipped, and one that could not be fetched or inserted is
+    /// counted in [`ReconcileReport::unapplied`]. Callers about to do
+    /// destructive work must check [`ReconcileReport::is_complete`].
     pub async fn reconcile_from_bucket(&self, store: &dyn ObjectStore) -> Result<ReconcileReport> {
         let mut report = ReconcileReport::default();
         let mut stream = store.list(None);
         while let Some(item) = stream.next().await {
-            let obj = match item {
-                Ok(o) => o,
-                Err(e) => {
-                    tracing::warn!(error = %e, "list error during reconcile, continuing");
-                    continue;
-                }
-            };
+            let obj = item.context(
+                "listing the bucket during reconcile failed; the listing is incomplete, \
+                 so the reconcile is abandoned",
+            )?;
             let path_str = obj.location.as_ref();
             // Control namespaces are never telemetry. Classify before checking
             // the suffix so a control-plane `*.meta.json` is not fetched or
@@ -1502,18 +1615,31 @@ impl Catalog {
             }
             report.seen += 1;
 
-            let bytes = match store.get(&obj.location).await {
-                Ok(g) => match g.bytes().await {
-                    Ok(b) => b,
-                    Err(e) => {
-                        report.failed += 1;
-                        tracing::warn!(path = %path_str, error = %e, "sidecar get-body failed");
-                        continue;
-                    }
-                },
+            let fetched = match store.get(&obj.location).await {
+                Ok(g) => g.bytes().await,
+                Err(e) => Err(e),
+            };
+            let bytes = match fetched {
+                Ok(b) => b,
+                // Deleted between LIST and GET (a peer's reap): the block is
+                // gone, which is not a gap in the catalog.
+                Err(object_store::Error::NotFound { .. }) => continue,
                 Err(e) => {
-                    report.failed += 1;
-                    tracing::warn!(path = %path_str, error = %e, "sidecar get failed");
+                    report.unapplied += 1;
+                    if matches!(
+                        e,
+                        object_store::Error::PermissionDenied { .. }
+                            | object_store::Error::Unauthenticated { .. }
+                    ) {
+                        tracing::error!(
+                            path = %path_str,
+                            error = %e,
+                            "object store denied a sidecar GET the listing returned; \
+                             the credentials need s3:GetObject on the bucket"
+                        );
+                    } else {
+                        tracing::warn!(path = %path_str, error = %e, "sidecar get failed");
+                    }
                     continue;
                 }
             };
@@ -1530,7 +1656,7 @@ impl Catalog {
                 Ok(true) => report.inserted += 1,
                 Ok(false) => report.already_present += 1,
                 Err(e) => {
-                    report.failed += 1;
+                    report.unapplied += 1;
                     tracing::warn!(path = %path_str, error = %e, "catalog insert failed");
                 }
             }
@@ -1540,6 +1666,7 @@ impl Catalog {
             inserted = report.inserted,
             already_present = report.already_present,
             failed = report.failed,
+            unapplied = report.unapplied,
             "reconcile complete"
         );
         Ok(report)

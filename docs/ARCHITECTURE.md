@@ -1388,19 +1388,32 @@ each instance keeps a `poll_cursors` table in its SQLite catalog
 A poll for `(signal, writer_id, date)` is:
 
 ```
-LIST prefix=<signal>/<date>/<writer_id>/  start-after=<highest_uuid>
+LIST prefix=<signal>/<date>/<writer_id>/  start-after=<uuid floor of min(cursor time, now − lookback)>
 ```
 
 Because block UUIDs are v7 (time-prefixed and lexically sortable by
-creation time), `start-after` returns only blocks newer than what
-we've already ingested. Each cursor is updated whenever we observe a
-block via *either* pub/sub or polling — both paths converge on the
-same state.
+creation time), `start-after` skips everything older than the listed window.
+The window reaches a bounded **look-back** (`--poll-lookback-secs`, 15 minutes
+by default) behind the cursor because blocks do not commit in UUID order:
+concurrent uploads finish out of order, a retried upload keeps its UUID, and a
+compaction output is named when its merge starts. Listing strictly after the
+cursor would miss every such block until the full walk. Listed keys whose UUID
+the catalog already holds are filtered by a primary-key probe before any GET, so
+a converged poll costs one LIST per prefix and no GETs. A prefix whose cursor is
+older than the window (a finished day) lists only from its cursor.
 
-**Crucially, poll cost does not grow with bucket size.** A bucket
-five years old polls at the same speed as one started yesterday,
-because we only scan today's and yesterday's per-writer prefixes
-(yesterday is included to catch late uploads near day boundaries).
+Each cursor is updated whenever we observe a block via *either* pub/sub or
+polling — both paths converge on the same state. Only UUIDv7 moves a cursor:
+WAL-recovery blocks are named by a v4-shaped content hash so that replay is
+idempotent, and such a UUID would usually sort above every later block in the
+prefix. Recovery blocks are announced by a `Created` event instead, with the
+full walk as backstop (D-039 follow-up).
+
+**Poll cost does not grow with bucket population.** Each LIST is scoped to one
+per-writer prefix, and within it to the look-back window. The number of prefixes
+polled is the number of cursors, however. Cursors are never pruned, so today a
+poll issues one (usually empty) LIST per `(signal, writer, date)` ever seen, and
+that count grows with retained history (tracked in `TODO.md`).
 
 #### Polling cadence
 
@@ -1609,8 +1622,10 @@ deployment size with no design changes:
 - **Cache hit rates.** Block immutability means cache entries are
   valid for their full lifetime; hit rates stay high as catalog
   grows.
-- **Cursor-driven polling cost.** Bounded by recent write rate, not
-  by bucket lifetime or population.
+- **Cursor-driven polling cost.** GETs are bounded by the recent write rate,
+  and each LIST by one prefix's look-back window. The number of LISTs is one
+  per cursor, which grows with retained history until cursors are pruned
+  (`TODO.md`).
 - **Bucket pool size.** Auto-provisioning + retention together cap
   the live pool size at `ceil(retention_days / bucket_fill_days) +
   small_constant`, regardless of deployment age.

@@ -262,8 +262,10 @@ pub struct Pipeline<B: BlockBuilder> {
     /// Optional block-lifecycle event sink. When set (multi-instance mode),
     /// every successful block upload emits a [`BlockEvent::Created`] so peers
     /// converge their catalogs via pub/sub. `None` (single-instance / tests)
-    /// means uploads emit nothing — convergence isn't needed. Set via
-    /// [`Pipeline::set_event_sink`] / [`ShardedPipeline::with_event_sink`].
+    /// means uploads emit nothing — convergence isn't needed. Supplied at
+    /// open ([`ShardedPipeline::open_with_config`]) rather than attached
+    /// afterwards, because WAL recovery uploads blocks *during* open and
+    /// they must be announced too.
     event_sink: Option<Arc<dyn BlockEventSink>>,
     /// When the current (open) block first received a record, or `None`
     /// when the builder is empty. Drives the time-based flush
@@ -333,9 +335,15 @@ impl<B: BlockBuilder> Pipeline<B> {
         decode: DecodeFn<B>,
         cfg: BlockBuilderConfig,
     ) -> Result<Self> {
-        Self::open_with_config_and_shard(wal_dir, store, catalog, writer_uuid, decode, cfg, 0).await
+        Self::open_with_config_and_shard(wal_dir, store, catalog, writer_uuid, decode, cfg, 0, None)
+            .await
     }
 
+    /// `event_sink` receives a [`BlockEvent::Created`] for every block this
+    /// pipeline uploads, WAL-recovery blocks included. A recovery block is
+    /// named by a content hash, not a UUIDv7, so the incremental poll —
+    /// which lists by UUID time — cannot be relied on to find it; without
+    /// the event peers would learn of it only at the next full walk.
     #[allow(clippy::too_many_arguments)]
     async fn open_with_config_and_shard(
         wal_dir: PathBuf,
@@ -345,6 +353,7 @@ impl<B: BlockBuilder> Pipeline<B> {
         decode: DecodeFn<B>,
         cfg: BlockBuilderConfig,
         shard_index: u32,
+        event_sink: Option<Arc<dyn BlockEventSink>>,
     ) -> Result<Self> {
         let wal = Wal::open(WalConfig::new(wal_dir, B::SIGNAL))
             .await
@@ -397,6 +406,7 @@ impl<B: BlockBuilder> Pipeline<B> {
                     cfg,
                     store.as_ref(),
                     catalog.as_ref(),
+                    event_sink.as_ref(),
                     None,
                     shard_index,
                     recovery_block_uuid(
@@ -427,6 +437,7 @@ impl<B: BlockBuilder> Pipeline<B> {
                     cfg,
                     store.as_ref(),
                     catalog.as_ref(),
+                    event_sink.as_ref(),
                     None,
                     shard_index,
                     recovery_block_uuid(
@@ -447,6 +458,7 @@ impl<B: BlockBuilder> Pipeline<B> {
                 cfg,
                 store.as_ref(),
                 catalog.as_ref(),
+                event_sink.as_ref(),
                 replay_high,
                 shard_index,
                 recovery_block_uuid(
@@ -507,7 +519,7 @@ impl<B: BlockBuilder> Pipeline<B> {
             upload_sem: Arc::new(Semaphore::new(MAX_INFLIGHT_UPLOADS)),
             upload_stats: None,
             adaptive_compression: false,
-            event_sink: None,
+            event_sink,
             block_started_at: None,
             shard_index,
             block_low_seg: next_live_segment,
@@ -563,13 +575,6 @@ impl<B: BlockBuilder> Pipeline<B> {
     pub fn with_adaptive_compression(mut self, on: bool) -> Self {
         self.adaptive_compression = on;
         self
-    }
-
-    /// Attach a block-lifecycle event sink (multi-instance convergence). Every
-    /// successful upload thereafter emits a [`BlockEvent::Created`]. Off by
-    /// default, so the single-instance path is byte-for-byte unchanged.
-    pub fn set_event_sink(&mut self, sink: Arc<dyn BlockEventSink>) {
-        self.event_sink = Some(sink);
     }
 
     /// Choose the ZSTD level for the block about to be encoded, from the
@@ -985,6 +990,7 @@ impl<B: BlockBuilder> ShardedPipeline<B> {
             upload_sem,
             upload_stats,
             false,
+            None,
         )
         .await
     }
@@ -999,6 +1005,12 @@ impl<B: BlockBuilder> ShardedPipeline<B> {
     /// signal's totals aggregated across shards). `adaptive_compression`
     /// (from `--compression auto`) is applied to every shard so each picks
     /// its closing block's ZSTD level from live load.
+    ///
+    /// `event_sink` (multi-instance convergence) receives a
+    /// [`BlockEvent::Created`] for every block any shard uploads — including
+    /// the WAL-recovery blocks uploaded while this call replays, which is
+    /// why it is a constructor argument rather than something attached once
+    /// the shards are open. `None` for single-instance.
     #[allow(clippy::too_many_arguments)]
     pub async fn open_with_config(
         n: usize,
@@ -1011,6 +1023,7 @@ impl<B: BlockBuilder> ShardedPipeline<B> {
         upload_sem: Arc<Semaphore>,
         upload_stats: Option<Arc<UploadStats>>,
         adaptive_compression: bool,
+        event_sink: Option<Arc<dyn BlockEventSink>>,
     ) -> Result<Self> {
         assert!(n >= 1, "ShardedPipeline needs at least one shard");
         let mut shards = Vec::with_capacity(n);
@@ -1024,6 +1037,7 @@ impl<B: BlockBuilder> ShardedPipeline<B> {
                 decode,
                 cfg,
                 k as u32,
+                event_sink.clone(),
             )
             .await
             .with_context(|| format!("opening {} shard {k}", B::SIGNAL))?
@@ -1037,17 +1051,6 @@ impl<B: BlockBuilder> ShardedPipeline<B> {
         Ok(Self {
             shards: Arc::new(shards),
         })
-    }
-
-    /// Attach a block-lifecycle event sink to every shard (multi-instance
-    /// convergence). Call once at startup, before serving. Async because the
-    /// shards are behind `tokio::sync::Mutex`; there's no contention yet, so
-    /// this is just N uncontended locks. Off by default (single-instance).
-    pub async fn with_event_sink(self, sink: Arc<dyn BlockEventSink>) -> Self {
-        for shard in self.shards.iter() {
-            shard.lock().await.set_event_sink(sink.clone());
-        }
-        self
     }
 
     /// The shard a connection's batches for this signal go to. Pinned by
@@ -1088,12 +1091,14 @@ fn recovery_block_uuid(writer: Uuid, signal: &str, shard: u32, prefix_digest: &[
 /// the next restart. As with a crash between a normal block PUT and WAL release,
 /// retrying may create duplicate blocks, preferring at-least-once recovery over
 /// acknowledged data loss.
+#[allow(clippy::too_many_arguments)]
 async fn upload_replay_block<B: BlockBuilder>(
     builder: &mut B,
     writer_uuid: Uuid,
     cfg: BlockBuilderConfig,
     store: &dyn ObjectStore,
     catalog: Option<&Arc<std::sync::Mutex<Catalog>>>,
+    event_sink: Option<&Arc<dyn BlockEventSink>>,
     replay_high: Option<SegmentId>,
     shard_index: u32,
     block_uuid: Uuid,
@@ -1126,6 +1131,12 @@ async fn upload_replay_block<B: BlockBuilder>(
                 "catalog insert failed for WAL recovery block; bucket has the data"
             );
         }
+    }
+    // Announce it exactly as a live upload is announced. Peers cannot count on
+    // the incremental poll here: the recovery UUID is a content hash, not a
+    // UUIDv7, so it sorts at random against the look-back window.
+    if let Some(sink) = event_sink {
+        sink.emit(BlockEvent::Created { meta });
     }
     Ok(())
 }
@@ -1635,6 +1646,80 @@ mod tests {
                 .len(),
             0,
             "source WAL is released only after every recovery block uploads"
+        );
+    }
+
+    /// Captures every emitted event.
+    #[derive(Default)]
+    struct CapturingSink(std::sync::Mutex<Vec<BlockEvent>>);
+
+    impl BlockEventSink for CapturingSink {
+        fn emit(&self, event: BlockEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    #[tokio::test]
+    async fn wal_recovery_blocks_are_announced_to_peers() {
+        // Recovery blocks are named by a content hash rather than a UUIDv7, so
+        // a peer's incremental poll cannot be relied on to find them. Unless
+        // the sink sees them, peers learn of them only at the next full walk.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut wal = Wal::open(WalConfig::new(tmp.path(), "metrics"))
+            .await
+            .unwrap();
+        wal.append(&structured_batch("requests", 100))
+            .await
+            .unwrap();
+        wal.append(&structured_batch("errors", 200)).await.unwrap();
+        wal.rotate().await.unwrap();
+        drop(wal);
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let sink = Arc::new(CapturingSink::default());
+        let pipeline = Pipeline::<MetricsBlockBuilder>::open_with_config_and_shard(
+            tmp.path().to_path_buf(),
+            store.clone(),
+            None,
+            Uuid::now_v7(),
+            crate::decode::metrics,
+            BlockBuilderConfig {
+                max_rows: 1,
+                ..BlockBuilderConfig::default()
+            },
+            0,
+            Some(sink.clone()),
+        )
+        .await
+        .unwrap();
+        assert!(pipeline.builder.is_empty());
+
+        let mut announced: Vec<Uuid> = sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|event| match event {
+                BlockEvent::Created { meta } => meta.uuid,
+                other => panic!("recovery emits only Created, got {other:?}"),
+            })
+            .collect();
+        announced.sort();
+        let mut uploaded: Vec<Uuid> = store
+            .list(None)
+            .filter_map(|entry| async move {
+                let location = entry.ok()?.location;
+                let stem = location.as_ref().strip_suffix(".meta.json")?;
+                Uuid::parse_str(stem.rsplit_once('/')?.1).ok()
+            })
+            .collect()
+            .await;
+        uploaded.sort();
+        assert_eq!(uploaded.len(), 2, "two recovery blocks were uploaded");
+        assert_eq!(announced, uploaded, "every recovery block is announced");
+        assert!(
+            announced.iter().all(|uuid| uuid.get_version_num() == 4),
+            "recovery blocks carry hash-derived v4-shaped UUIDs"
         );
     }
 
