@@ -693,7 +693,7 @@ impl HelloOutput {
         let signals = decoder.read_byte()?;
         let capabilities = decoder.read_u32_be()?;
         let length = decoder.read_u16_be()? as usize;
-        let mut resource_attrs = Vec::with_capacity(length);
+        let mut resource_attrs = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = LabelPair::decode_with_decoder(decoder)?;
             resource_attrs.push(item);
@@ -939,11 +939,7 @@ impl BatchOutput {
         let compression = decoder.read_byte()?;
         let uncompressed_size = decoder.read_u32_be()?;
         let length = decoder.read_u32_be()? as usize;
-        let mut payload = Vec::with_capacity(length);
-        for _ in 0..length {
-            let item = decoder.read_byte()?;
-            payload.push(item);
-        }
+        let payload = decoder.read_bytes_vec(length)?;
         Ok(Self {
             tag,
             session_id,
@@ -1650,7 +1646,7 @@ impl SubscribeOutput {
         }
         let signal = decoder.read_byte()?;
         let length = decoder.read_u16_be()? as usize;
-        let mut matchers = Vec::with_capacity(length);
+        let mut matchers = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = MatcherSpec::decode_with_decoder(decoder)?;
             matchers.push(item);
@@ -1792,7 +1788,7 @@ impl TailRecordOutput {
         let ts_unix_nano = decoder.read_u64_be()?;
         let severity = decoder.read_byte()?;
         let length = decoder.read_u16_be()? as usize;
-        let mut labels = Vec::with_capacity(length);
+        let mut labels = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = LabelPair::decode_with_decoder(decoder)?;
             labels.push(item);
@@ -1801,7 +1797,7 @@ impl TailRecordOutput {
         let bytes = decoder.read_bytes_vec(length)?;
         let body = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
         let length = decoder.read_u16_be()? as usize;
-        let mut attributes = Vec::with_capacity(length);
+        let mut attributes = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = LabelPair::decode_with_decoder(decoder)?;
             attributes.push(item);
@@ -1914,7 +1910,7 @@ impl TailSampleOutput {
         let series_fingerprint = decoder.read_u64_be()?;
         let value = f64::from_bits(decoder.read_u64_be()?);
         let length = decoder.read_u16_be()? as usize;
-        let mut labels = Vec::with_capacity(length);
+        let mut labels = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = LabelPair::decode_with_decoder(decoder)?;
             labels.push(item);
@@ -2021,7 +2017,7 @@ impl TailMetricPointV2Output {
         let signal = decoder.read_byte()?;
         let series_fingerprint = decoder.read_u64_be()?;
         let length = decoder.read_u16_be()? as usize;
-        let mut labels = Vec::with_capacity(length);
+        let mut labels = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = LabelPair::decode_with_decoder(decoder)?;
             labels.push(item);
@@ -2130,7 +2126,7 @@ impl LiveQueryOutput {
         }
         let signal = decoder.read_byte()?;
         let length = decoder.read_u16_be()? as usize;
-        let mut matchers = Vec::with_capacity(length);
+        let mut matchers = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = MatcherSpec::decode_with_decoder(decoder)?;
             matchers.push(item);
@@ -2231,7 +2227,7 @@ impl LiveBatchOutput {
         }
         let writer_uuid = decoder.read_bytes_vec(16)?;
         let length = decoder.read_u32_be()? as usize;
-        let mut records = Vec::with_capacity(length);
+        let mut records = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = LiveRecord::decode_with_decoder(decoder)?;
             records.push(item);
@@ -2319,7 +2315,7 @@ impl LiveRecord {
         let ts_unix_nano = decoder.read_u64_be()?;
         let severity = decoder.read_byte()?;
         let length = decoder.read_u16_be()? as usize;
-        let mut labels = Vec::with_capacity(length);
+        let mut labels = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = LabelPair::decode_with_decoder(decoder)?;
             labels.push(item);
@@ -2328,7 +2324,7 @@ impl LiveRecord {
         let bytes = decoder.read_bytes_vec(length)?;
         let body = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
         let length = decoder.read_u16_be()? as usize;
-        let mut attributes = Vec::with_capacity(length);
+        let mut attributes = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = LabelPair::decode_with_decoder(decoder)?;
             attributes.push(item);
@@ -2423,13 +2419,13 @@ impl MetricsBatch {
 
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let length = decoder.read_u32_be()? as usize;
-        let mut series = Vec::with_capacity(length);
+        let mut series = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = SeriesDictEntry::decode_with_decoder(decoder)?;
             series.push(item);
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut samples = Vec::with_capacity(length);
+        let mut samples = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = MetricSample::decode_with_decoder(decoder)?;
             samples.push(item);
@@ -2474,7 +2470,7 @@ impl SeriesDictEntry {
         let fingerprint = decoder.read_u64_be()?;
         let metric_type = decoder.read_byte()?;
         let length = decoder.read_u16_be()? as usize;
-        let mut labels = Vec::with_capacity(length);
+        let mut labels = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = LabelPair::decode_with_decoder(decoder)?;
             labels.push(item);
@@ -2552,7 +2548,7 @@ impl LogsBatch {
 
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let length = decoder.read_u32_be()? as usize;
-        let mut streams = Vec::with_capacity(length);
+        let mut streams = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = LogStream::decode_with_decoder(decoder)?;
             streams.push(item);
@@ -2612,7 +2608,7 @@ impl LogsBatchV2Output {
             return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 1, got {}", raw_version)));
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut records = Vec::with_capacity(length);
+        let mut records = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = OpaqueLogRecordV2::decode_with_decoder(decoder)?;
             records.push(item);
@@ -2676,11 +2672,7 @@ impl OpaqueLogRecordV2 {
 
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let length = decoder.read_u32_be()? as usize;
-        let mut value = Vec::with_capacity(length);
-        for _ in 0..length {
-            let item = decoder.read_byte()?;
-            value.push(item);
-        }
+        let value = decoder.read_bytes_vec(length)?;
         Ok(Self {
             value,
         })
@@ -2722,13 +2714,13 @@ impl LogStream {
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let fingerprint = decoder.read_u64_be()?;
         let length = decoder.read_u16_be()? as usize;
-        let mut labels = Vec::with_capacity(length);
+        let mut labels = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = LabelPair::decode_with_decoder(decoder)?;
             labels.push(item);
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut entries = Vec::with_capacity(length);
+        let mut entries = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = LogEntry::decode_with_decoder(decoder)?;
             entries.push(item);
@@ -2783,7 +2775,7 @@ impl LogEntry {
         let bytes = decoder.read_bytes_vec(length)?;
         let body = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
         let length = decoder.read_u16_be()? as usize;
-        let mut attributes = Vec::with_capacity(length);
+        let mut attributes = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = LabelPair::decode_with_decoder(decoder)?;
             attributes.push(item);
@@ -2834,19 +2826,19 @@ impl TracesBatch {
 
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let length = decoder.read_u16_be()? as usize;
-        let mut resources = Vec::with_capacity(length);
+        let mut resources = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = ResourceEntry::decode_with_decoder(decoder)?;
             resources.push(item);
         }
         let length = decoder.read_u16_be()? as usize;
-        let mut scopes = Vec::with_capacity(length);
+        let mut scopes = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = ScopeEntry::decode_with_decoder(decoder)?;
             scopes.push(item);
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut spans = Vec::with_capacity(length);
+        let mut spans = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = Span::decode_with_decoder(decoder)?;
             spans.push(item);
@@ -2886,7 +2878,7 @@ impl ResourceEntry {
 
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let length = decoder.read_u16_be()? as usize;
-        let mut labels = Vec::with_capacity(length);
+        let mut labels = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = LabelPair::decode_with_decoder(decoder)?;
             labels.push(item);
@@ -3027,11 +3019,7 @@ impl Span {
         let has_value = decoder.read_uint8()? != 0;
         let parent_span_id = if has_value {
             {
-                let mut buf: Vec<u8> = Vec::with_capacity(8);
-                for _ in 0..8 {
-                    buf.push(decoder.read_byte()?);
-                }
-                Some(buf)
+                Some(decoder.read_bytes_vec(8)?)
             }
         } else {
             None
@@ -3047,19 +3035,19 @@ impl Span {
         let bytes = decoder.read_bytes_vec(length)?;
         let status_message = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
         let length = decoder.read_u16_be()? as usize;
-        let mut attributes = Vec::with_capacity(length);
+        let mut attributes = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = LabelPair::decode_with_decoder(decoder)?;
             attributes.push(item);
         }
         let length = decoder.read_u16_be()? as usize;
-        let mut events = Vec::with_capacity(length);
+        let mut events = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = SpanEvent::decode_with_decoder(decoder)?;
             events.push(item);
         }
         let length = decoder.read_byte()? as usize;
-        let mut links = Vec::with_capacity(length);
+        let mut links = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = SpanLink::decode_with_decoder(decoder)?;
             links.push(item);
@@ -3122,7 +3110,7 @@ impl SpanEvent {
         let bytes = decoder.read_bytes_vec(length)?;
         let name = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
         let length = decoder.read_byte()? as usize;
-        let mut attributes = Vec::with_capacity(length);
+        let mut attributes = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = LabelPair::decode_with_decoder(decoder)?;
             attributes.push(item);
@@ -3172,7 +3160,7 @@ impl SpanLink {
         let trace_id = decoder.read_bytes_vec(16)?;
         let span_id = decoder.read_bytes_vec(8)?;
         let length = decoder.read_byte()? as usize;
-        let mut attributes = Vec::with_capacity(length);
+        let mut attributes = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = LabelPair::decode_with_decoder(decoder)?;
             attributes.push(item);
@@ -3212,7 +3200,7 @@ impl ProfilesBatch {
 
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let length = decoder.read_u32_be()? as usize;
-        let mut samples = Vec::with_capacity(length);
+        let mut samples = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = ProfileBlob::decode_with_decoder(decoder)?;
             samples.push(item);
@@ -3263,18 +3251,14 @@ impl ProfileBlob {
         let ts_unix_nano = decoder.read_u64_be()?;
         let duration_nano = decoder.read_u64_be()?;
         let length = decoder.read_u16_be()? as usize;
-        let mut labels = Vec::with_capacity(length);
+        let mut labels = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = LabelPair::decode_with_decoder(decoder)?;
             labels.push(item);
         }
         let format = decoder.read_byte()?;
         let length = decoder.read_u32_be()? as usize;
-        let mut data = Vec::with_capacity(length);
-        for _ in 0..length {
-            let item = decoder.read_byte()?;
-            data.push(item);
-        }
+        let data = decoder.read_bytes_vec(length)?;
         Ok(Self {
             ts_unix_nano,
             duration_nano,
@@ -3312,7 +3296,7 @@ impl DummyBatch {
 
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let length = decoder.read_u32_be()? as usize;
-        let mut records = Vec::with_capacity(length);
+        let mut records = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = DummyRecord::decode_with_decoder(decoder)?;
             records.push(item);
@@ -3362,11 +3346,7 @@ impl DummyRecord {
         let bytes = decoder.read_bytes_vec(length)?;
         let key = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
         let length = decoder.read_u32_be()? as usize;
-        let mut value = Vec::with_capacity(length);
-        for _ in 0..length {
-            let item = decoder.read_byte()?;
-            value.push(item);
-        }
+        let value = decoder.read_bytes_vec(length)?;
         Ok(Self {
             ts_unix_nano,
             key,
@@ -3424,13 +3404,13 @@ impl MetricsBatchV2Output {
             return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 1397568000, got {}", magic)));
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut descriptors = Vec::with_capacity(length);
+        let mut descriptors = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = MetricDescriptorV2::decode_with_decoder(decoder)?;
             descriptors.push(item);
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut points = Vec::with_capacity(length);
+        let mut points = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = MetricPointV2::decode_with_decoder(decoder)?;
             points.push(item);
@@ -3551,7 +3531,7 @@ impl MetricDescriptorV2 {
         let temporality = decoder.read_byte()?;
         let monotonic = decoder.read_byte()?;
         let length = decoder.read_u16_be()? as usize;
-        let mut resource_attrs = Vec::with_capacity(length);
+        let mut resource_attrs = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = LabelPair::decode_with_decoder(decoder)?;
             resource_attrs.push(item);
@@ -3563,7 +3543,7 @@ impl MetricDescriptorV2 {
         let bytes = decoder.read_bytes_vec(length)?;
         let scope_version = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
         let length = decoder.read_u16_be()? as usize;
-        let mut scope_attrs = Vec::with_capacity(length);
+        let mut scope_attrs = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = LabelPair::decode_with_decoder(decoder)?;
             scope_attrs.push(item);
@@ -3682,13 +3662,13 @@ impl ScalarPointV2Output {
         let ts_unix_nano = decoder.read_u64_be()?;
         let flags = decoder.read_u32_be()?;
         let length = decoder.read_u16_be()? as usize;
-        let mut attributes = Vec::with_capacity(length);
+        let mut attributes = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = LabelPair::decode_with_decoder(decoder)?;
             attributes.push(item);
         }
         let length = decoder.read_u16_be()? as usize;
-        let mut exemplars = Vec::with_capacity(length);
+        let mut exemplars = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = MetricExemplarV2::decode_with_decoder(decoder)?;
             exemplars.push(item);
@@ -3840,13 +3820,13 @@ impl HistogramPointV2Output {
         let ts_unix_nano = decoder.read_u64_be()?;
         let flags = decoder.read_u32_be()?;
         let length = decoder.read_u16_be()? as usize;
-        let mut attributes = Vec::with_capacity(length);
+        let mut attributes = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = LabelPair::decode_with_decoder(decoder)?;
             attributes.push(item);
         }
         let length = decoder.read_u16_be()? as usize;
-        let mut exemplars = Vec::with_capacity(length);
+        let mut exemplars = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = MetricExemplarV2::decode_with_decoder(decoder)?;
             exemplars.push(item);
@@ -3859,13 +3839,13 @@ impl HistogramPointV2Output {
         let has_max = decoder.read_byte()?;
         let max = f64::from_bits(decoder.read_u64_be()?);
         let length = decoder.read_u32_be()? as usize;
-        let mut explicit_bounds = Vec::with_capacity(length);
+        let mut explicit_bounds = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = f64::from_bits(decoder.read_u64_be()?);
             explicit_bounds.push(item);
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut bucket_counts = Vec::with_capacity(length);
+        let mut bucket_counts = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = decoder.read_u64_be()?;
             bucket_counts.push(item);
@@ -4052,13 +4032,13 @@ impl ExponentialHistogramPointV2Output {
         let ts_unix_nano = decoder.read_u64_be()?;
         let flags = decoder.read_u32_be()?;
         let length = decoder.read_u16_be()? as usize;
-        let mut attributes = Vec::with_capacity(length);
+        let mut attributes = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = LabelPair::decode_with_decoder(decoder)?;
             attributes.push(item);
         }
         let length = decoder.read_u16_be()? as usize;
-        let mut exemplars = Vec::with_capacity(length);
+        let mut exemplars = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = MetricExemplarV2::decode_with_decoder(decoder)?;
             exemplars.push(item);
@@ -4076,7 +4056,7 @@ impl ExponentialHistogramPointV2Output {
         let positive = SparseBucketsV2::decode_with_decoder(decoder)?;
         let negative = SparseBucketsV2::decode_with_decoder(decoder)?;
         let length = decoder.read_u32_be()? as usize;
-        let mut custom_bounds = Vec::with_capacity(length);
+        let mut custom_bounds = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = f64::from_bits(decoder.read_u64_be()?);
             custom_bounds.push(item);
@@ -4246,13 +4226,13 @@ impl SummaryPointV2Output {
         let ts_unix_nano = decoder.read_u64_be()?;
         let flags = decoder.read_u32_be()?;
         let length = decoder.read_u16_be()? as usize;
-        let mut attributes = Vec::with_capacity(length);
+        let mut attributes = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = LabelPair::decode_with_decoder(decoder)?;
             attributes.push(item);
         }
         let length = decoder.read_u16_be()? as usize;
-        let mut exemplars = Vec::with_capacity(length);
+        let mut exemplars = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = MetricExemplarV2::decode_with_decoder(decoder)?;
             exemplars.push(item);
@@ -4260,7 +4240,7 @@ impl SummaryPointV2Output {
         let count = decoder.read_u64_be()?;
         let sum = f64::from_bits(decoder.read_u64_be()?);
         let length = decoder.read_u16_be()? as usize;
-        let mut quantiles = Vec::with_capacity(length);
+        let mut quantiles = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = QuantileValueV2::decode_with_decoder(decoder)?;
             quantiles.push(item);
@@ -4694,13 +4674,13 @@ impl SparseBucketsV2 {
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let offset = decoder.read_u32_be()? as i32;
         let length = decoder.read_u32_be()? as usize;
-        let mut deltas = Vec::with_capacity(length);
+        let mut deltas = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = decoder.read_u32_be()? as i32;
             deltas.push(item);
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut counts = Vec::with_capacity(length);
+        let mut counts = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = MetricCountV2::decode_with_decoder(decoder)?;
             counts.push(item);
@@ -4788,7 +4768,7 @@ impl MetricExemplarV2 {
         let ts_unix_nano = decoder.read_u64_be()?;
         let number = MetricNumberV2::decode_with_decoder(decoder)?;
         let length = decoder.read_u16_be()? as usize;
-        let mut filtered_attrs = Vec::with_capacity(length);
+        let mut filtered_attrs = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = LabelPair::decode_with_decoder(decoder)?;
             filtered_attrs.push(item);

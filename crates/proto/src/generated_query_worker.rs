@@ -621,11 +621,7 @@ impl WorkerAuthenticatedOutput {
         }
         let sequence = decoder.read_u64_be()?;
         let length = decoder.read_u32_be()? as usize;
-        let mut payload = Vec::with_capacity(length);
-        for _ in 0..length {
-            let item = decoder.read_byte()?;
-            payload.push(item);
-        }
+        let payload = decoder.read_bytes_vec(length)?;
         let mac = decoder.read_bytes_vec(32)?;
         Ok(Self {
             tag,
@@ -831,7 +827,7 @@ impl WorkerBidRequestOutput {
         let deadline_unix_ms = decoder.read_u64_be()?;
         let signal = decoder.read_byte()?;
         let length = decoder.read_u16_be()? as usize;
-        let mut required_columns = Vec::with_capacity(length);
+        let mut required_columns = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let str_len = decoder.read_byte()? as usize;
             let str_bytes = decoder.read_bytes_vec(str_len)?;
@@ -841,7 +837,7 @@ impl WorkerBidRequestOutput {
         let requires_postings = decoder.read_byte()?;
         let requires_bloom = decoder.read_byte()?;
         let length = decoder.read_u16_be()? as usize;
-        let mut blocks = Vec::with_capacity(length);
+        let mut blocks = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = WorkerBlockOffer::decode_with_decoder(decoder)?;
             blocks.push(item);
@@ -992,7 +988,7 @@ impl WorkerBidResponseOutput {
         let worker_id = decoder.read_bytes_vec(16)?;
         let locality_generation = decoder.read_u64_be()?;
         let length = decoder.read_u16_be()? as usize;
-        let mut locality = Vec::with_capacity(length);
+        let mut locality = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = WorkerBlockLocality::decode_with_decoder(decoder)?;
             locality.push(item);

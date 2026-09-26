@@ -463,7 +463,7 @@ impl QueryRequestOutput {
         }
         let signal = decoder.read_byte()?;
         let length = decoder.read_u16_be()? as usize;
-        let mut matchers = Vec::with_capacity(length);
+        let mut matchers = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = Matcher::decode_with_decoder(decoder)?;
             matchers.push(item);
@@ -480,11 +480,7 @@ impl QueryRequestOutput {
         let bytes = decoder.read_bytes_vec(length)?;
         let request_id: std::string::String = bytes.iter().map(|&b| b as char).collect();
         let length = decoder.read_u16_be()? as usize;
-        let mut trace_id = Vec::with_capacity(length);
-        for _ in 0..length {
-            let item = decoder.read_byte()?;
-            trace_id.push(item);
-        }
+        let trace_id = decoder.read_bytes_vec(length)?;
         let length = decoder.read_u32_be()? as usize;
         let bytes = decoder.read_bytes_vec(length)?;
         let body_contains = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
@@ -875,7 +871,7 @@ impl LabelNamesResponseOutput {
             return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 32, got {}", tag)));
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut names = Vec::with_capacity(length);
+        let mut names = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let str_len = decoder.read_u16_be()? as usize;
             let str_bytes = decoder.read_bytes_vec(str_len)?;
@@ -958,7 +954,7 @@ impl LabelValuesResponseOutput {
             return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 33, got {}", tag)));
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut values = Vec::with_capacity(length);
+        let mut values = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let str_len = decoder.read_u16_be()? as usize;
             let str_bytes = decoder.read_bytes_vec(str_len)?;
@@ -1104,7 +1100,7 @@ impl FleetStatusResponseOutput {
             return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 34, got {}", tag)));
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut instances_json = Vec::with_capacity(length);
+        let mut instances_json = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let str_len = decoder.read_u32_be()? as usize;
             let str_bytes = decoder.read_bytes_vec(str_len)?;
@@ -1257,7 +1253,7 @@ impl IssueListResponseOutput {
             return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 35, got {}", tag)));
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut issues_json = Vec::with_capacity(length);
+        let mut issues_json = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let str_len = decoder.read_u32_be()? as usize;
             let str_bytes = decoder.read_bytes_vec(str_len)?;
@@ -1340,11 +1336,7 @@ impl IssueOccurrencesRequestOutput {
             return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 6, got {}", tag)));
         }
         let length = decoder.read_u16_be()? as usize;
-        let mut issue_id = Vec::with_capacity(length);
-        for _ in 0..length {
-            let item = decoder.read_byte()?;
-            issue_id.push(item);
-        }
+        let issue_id = decoder.read_bytes_vec(length)?;
         let limit = decoder.read_u32_be()?;
         Ok(Self {
             tag,
@@ -1435,7 +1427,7 @@ impl IssueOccurrencesResponseOutput {
         let bytes = decoder.read_bytes_vec(length)?;
         let issue_json = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
         let length = decoder.read_u32_be()? as usize;
-        let mut occurrences_json = Vec::with_capacity(length);
+        let mut occurrences_json = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let str_len = decoder.read_u32_be()? as usize;
             let str_bytes = decoder.read_bytes_vec(str_len)?;
@@ -1518,11 +1510,7 @@ impl SchemaMsgOutput {
             return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 16, got {}", tag)));
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut ipc_bytes = Vec::with_capacity(length);
-        for _ in 0..length {
-            let item = decoder.read_byte()?;
-            ipc_bytes.push(item);
-        }
+        let ipc_bytes = decoder.read_bytes_vec(length)?;
         Ok(Self {
             tag,
             ipc_bytes,
@@ -1596,11 +1584,7 @@ impl BatchMsgOutput {
             return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 17, got {}", tag)));
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut ipc_bytes = Vec::with_capacity(length);
-        for _ in 0..length {
-            let item = decoder.read_byte()?;
-            ipc_bytes.push(item);
-        }
+        let ipc_bytes = decoder.read_bytes_vec(length)?;
         Ok(Self {
             tag,
             ipc_bytes,
@@ -1896,7 +1880,7 @@ impl QueryStatsOutput {
         let bytes = decoder.read_bytes_vec(length)?;
         let node_id: std::string::String = bytes.iter().map(|&b| b as char).collect();
         let length = decoder.read_u16_be()? as usize;
-        let mut live_nodes = Vec::with_capacity(length);
+        let mut live_nodes = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = LiveNodeTiming::decode_with_decoder(decoder)?;
             live_nodes.push(item);
