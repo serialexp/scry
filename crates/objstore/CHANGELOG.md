@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.24.1 (2026-09-26)
+
+### Bug Fixes
+
+- send unquoted ETag in If-Match for compare-and-swap writes
+- close object-store consistency gaps
+
 ## 0.24.0 (2026-09-22)
 
 ### Features
